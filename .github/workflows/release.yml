@@ -1,0 +1,195 @@
+name: Release
+
+# Triggers:
+#   - push of `vX.Y.Z` tag → build artefacts + create GitHub Release
+#   - push of `REL-vX.Y.Z` tag → additionally extract the matching CHANGELOG
+#     section into the release body and publish all crates to crates.io
+#   - workflow_dispatch → manual dry run (matrix only; no release created)
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+      - 'REL-v[0-9]+.[0-9]+.[0-9]+'
+      - 'REL-v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            ext: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ext: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            ext: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            ext: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            ext: zip
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Resolve version tag
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF##*/}"
+          if [[ "$ref" == REL-* ]]; then
+            version="${ref#REL-}"
+          else
+            version="${ref}"
+          fi
+          if [[ "$version" != v* ]]; then
+            version="v0.0.0-dispatch"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_bare=${version#v}" >> "$GITHUB_OUTPUT"
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --release --workspace \
+            --bin rtrt --bin rtrt-mcp --bin rtrt-dashboard \
+            --target ${{ matrix.target }}
+      - name: Stage tarball
+        id: pkg
+        shell: bash
+        run: |
+          name="rtrt-${{ steps.ver.outputs.version_bare }}-${{ matrix.target }}"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          ext="${{ matrix.ext }}"
+          for bin in rtrt rtrt-mcp rtrt-dashboard; do
+            if [ -f "target/${{ matrix.target }}/release/${bin}.exe" ]; then
+              cp "target/${{ matrix.target }}/release/${bin}.exe" "$stage/"
+            else
+              cp "target/${{ matrix.target }}/release/$bin" "$stage/"
+            fi
+          done
+          cp LICENSE README.md CHANGELOG.md "$stage/"
+          cd dist
+          if [ "$ext" = "zip" ]; then
+            7z a -tzip "$name.$ext" "$name" >/dev/null
+          else
+            tar -czf "$name.$ext" "$name"
+          fi
+          # checksum
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.$ext" | awk '{print $1}' > "$name.$ext.sha256"
+          else
+            shasum -a 256 "$name.$ext" | awk '{print $1}' > "$name.$ext.sha256"
+          fi
+          echo "asset=$name.$ext" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtrt-${{ steps.ver.outputs.version_bare }}-${{ matrix.target }}
+          path: |
+            dist/${{ steps.pkg.outputs.asset }}
+            dist/${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create / update GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve version tag
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF##*/}"
+          if [[ "$ref" == REL-* ]]; then
+            version="${ref#REL-}"
+            echo "rel=true" >> "$GITHUB_OUTPUT"
+          else
+            version="${ref}"
+            echo "rel=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+      - name: Extract CHANGELOG section (REL- tag only)
+        id: body
+        if: steps.ver.outputs.rel == 'true'
+        shell: bash
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          # awk extract: from "## [X.Y.Z]" up to the next "## " line, exclusive
+          awk -v v="${version#v}" '
+            $0 ~ "^## \\[" v "\\]" { in=1; print; next }
+            in && /^## \[/ { exit }
+            in { print }
+          ' CHANGELOG.md > body.md
+          if [ ! -s body.md ]; then
+            printf 'CHANGELOG section for %s not found; using generic body.\n' "$version" >&2
+            printf 'Release %s\n' "$version" > body.md
+          fi
+          echo "body_path=$PWD/body.md" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          body_path: ${{ steps.body.outputs.body_path }}
+          fail_on_unmatched_files: true
+          files: |
+            artefacts/**/rtrt-*.tar.gz
+            artefacts/**/rtrt-*.tar.gz.sha256
+            artefacts/**/rtrt-*.zip
+            artefacts/**/rtrt-*.zip.sha256
+
+  publish-crates:
+    name: cargo publish (REL- tag only)
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/REL-v')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in \
+            rtrt-core \
+            rtrt-compress \
+            rtrt-proxy \
+            rtrt-memory \
+            rtrt-providers \
+            rtrt-templates \
+            rtrt-mcp \
+            rtrt-dashboard \
+            rtrt-cli ; do
+            echo "== publishing $crate =="
+            cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN" --no-verify || {
+              echo "publish $crate failed (already published? continuing)" >&2
+            }
+            sleep 10  # let crates.io index settle before the next dep publishes
+          done

@@ -1,0 +1,75 @@
+# cargo-deny configuration for RTRT.
+#
+# Run locally with:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# CI gate: .github/workflows/deny.yml (blocking on PRs to main).
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------- licenses ----------
+[licenses]
+unlicensed = "deny"
+# All dependencies must resolve to a license in this allowlist. The set covers
+# the permissive licenses found in our actual dep tree as of v0.2 (run
+# `cargo deny check licenses` to see the canonical list). Any addition outside
+# this set requires an explicit decision documented in a PR.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",      # webpki-roots; weak copyleft, redistributable
+    "OpenSSL",      # ring; carries OpenSSL + ISC
+    "BSL-1.0",
+]
+copyleft = "deny"  # GPL, LGPL, AGPL not allowed
+default = "deny"
+confidence-threshold = 0.93
+
+# Permit "ring" specifically — its custom license is OpenSSL + ISC + a custom
+# clause that crates.io classifies as "non-standard". The license terms are
+# permissive but the SPDX expression is not, hence the per-crate exception.
+[[licenses.exceptions]]
+name = "ring"
+allow = ["ISC", "MIT", "OpenSSL"]
+
+# ---------- advisories ----------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "deny"
+yanked = "warn"
+notice = "warn"
+ignore = []
+
+# ---------- bans ----------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # bans go here as we discover problematic crates
+]
+
+# ---------- sources ----------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

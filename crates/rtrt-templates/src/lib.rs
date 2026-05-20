@@ -70,7 +70,10 @@ pub fn find(name: &str) -> Option<Template> {
 pub fn validate_vars(template: &Template, vars: &BTreeMap<String, String>) -> Result<()> {
     for v in &template.variables {
         if v.required && !vars.contains_key(&v.name) && v.default.is_none() {
-            return Err(Error::Config(format!("missing required variable: {}", v.name)));
+            return Err(Error::Config(format!(
+                "missing required variable: {}",
+                v.name
+            )));
         }
     }
     Ok(())

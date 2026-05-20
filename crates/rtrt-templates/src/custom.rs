@@ -87,7 +87,11 @@ pub fn load_one(dir: &Path) -> Result<Template> {
                 )));
             }
         };
-        files.push(TemplateFile { path: f.path, content, executable: f.executable });
+        files.push(TemplateFile {
+            path: f.path,
+            content,
+            executable: f.executable,
+        });
     }
 
     Ok(Template {

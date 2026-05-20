@@ -18,10 +18,22 @@ impl CommandFilter {
 }
 
 pub static FILTERS: &[CommandFilter] = &[
-    CommandFilter { command: "git status", apply: git_status },
-    CommandFilter { command: "git log", apply: git_log },
-    CommandFilter { command: "cargo build", apply: cargo_noise },
-    CommandFilter { command: "cargo test", apply: cargo_noise },
+    CommandFilter {
+        command: "git status",
+        apply: git_status,
+    },
+    CommandFilter {
+        command: "git log",
+        apply: git_log,
+    },
+    CommandFilter {
+        command: "cargo build",
+        apply: cargo_noise,
+    },
+    CommandFilter {
+        command: "cargo test",
+        apply: cargo_noise,
+    },
 ];
 
 pub fn filter_for(command: &str) -> Option<&'static CommandFilter> {
@@ -37,9 +49,8 @@ fn git_status(input: &str) -> String {
     collapse_blanks(&trimmed)
 }
 
-static GIT_LOG_FMT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(Author: .*|Date: .*)\n").unwrap()
-});
+static GIT_LOG_FMT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?m)^(Author: .*|Date: .*)\n").unwrap());
 
 fn git_log(input: &str) -> String {
     let stripped = GIT_LOG_FMT.replace_all(input, "");

@@ -42,7 +42,11 @@ pub fn plan(
         .map(|h| substitute(h, &merged))
         .collect();
 
-    Ok(RenderPlan { root, files, post_hooks })
+    Ok(RenderPlan {
+        root,
+        files,
+        post_hooks,
+    })
 }
 
 pub fn write(plan: &RenderPlan, overwrite: bool) -> Result<()> {

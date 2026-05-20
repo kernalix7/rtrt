@@ -34,24 +34,26 @@ static FILLERS: Lazy<Regex> = Lazy::new(|| {
 });
 
 static PLEASANTRIES: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"(?i)\b(sure|certainly|of course|happy to|let me|i'll|i can|i would)\b[,!\.]?\s*",
-    )
-    .unwrap()
+    Regex::new(r"(?i)\b(sure|certainly|of course|happy to|let me|i'll|i can|i would)\b[,!\.]?\s*")
+        .unwrap()
 });
 
 static ARTICLES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(a|an|the)\s+").unwrap());
 
 static MULTI_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ \t]{2,}").unwrap());
 
-static LITE_RULES: Lazy<Vec<Rule>> =
-    Lazy::new(|| vec![(&*FILLERS, ""), (&*MULTI_SPACE, " ")]);
+static LITE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| vec![(&*FILLERS, ""), (&*MULTI_SPACE, " ")]);
 
 static FULL_RULES: Lazy<Vec<Rule>> =
     Lazy::new(|| vec![(&*FILLERS, ""), (&*PLEASANTRIES, ""), (&*MULTI_SPACE, " ")]);
 
 static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
-    vec![(&*FILLERS, ""), (&*PLEASANTRIES, ""), (&*ARTICLES, ""), (&*MULTI_SPACE, " ")]
+    vec![
+        (&*FILLERS, ""),
+        (&*PLEASANTRIES, ""),
+        (&*ARTICLES, ""),
+        (&*MULTI_SPACE, " "),
+    ]
 });
 
 fn rules_for(level: CompressionLevel) -> &'static [Rule] {

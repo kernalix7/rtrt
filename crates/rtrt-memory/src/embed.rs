@@ -15,7 +15,8 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
     fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut out = self.embed(&[text])?;
-        out.pop().ok_or_else(|| Error::Memory("embedder returned no vector".into()))
+        out.pop()
+            .ok_or_else(|| Error::Memory("embedder returned no vector".into()))
     }
 }
 
@@ -32,7 +33,10 @@ pub fn vector_to_blob(v: &[f32]) -> Vec<u8> {
 /// Little-endian f32 byte BLOB → Vec<f32>. Returns an error if `blob.len() % 4 != 0`.
 pub fn vector_from_blob(blob: &[u8]) -> Result<Vec<f32>> {
     if blob.len() % 4 != 0 {
-        return Err(Error::Memory(format!("vector blob length {} is not 4-aligned", blob.len())));
+        return Err(Error::Memory(format!(
+            "vector blob length {} is not 4-aligned",
+            blob.len()
+        )));
     }
     let mut out = Vec::with_capacity(blob.len() / 4);
     for chunk in blob.chunks_exact(4) {
@@ -103,8 +107,10 @@ mod fastembed_impl {
 
         fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
-            let mut guard =
-                self.model.lock().map_err(|_| Error::Memory("embedder poisoned".into()))?;
+            let mut guard = self
+                .model
+                .lock()
+                .map_err(|_| Error::Memory("embedder poisoned".into()))?;
             guard
                 .embed(owned, None)
                 .map_err(|e| Error::Memory(format!("fastembed embed: {e}")))

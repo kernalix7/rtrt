@@ -69,6 +69,9 @@ pub trait Provider: Send + Sync {
     fn supported_models(&self) -> &[&'static str];
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse>;
     async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
-        Err(Error::Provider(format!("{}: streaming not implemented", self.name())))
+        Err(Error::Provider(format!(
+            "{}: streaming not implemented",
+            self.name()
+        )))
     }
 }

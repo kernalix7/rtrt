@@ -46,7 +46,11 @@ mod llm_impl {
 
     impl LlmSummariser {
         pub fn new(provider: Box<dyn Provider>, model: impl Into<String>) -> Self {
-            Self { provider, model: model.into(), max_tokens: 512 }
+            Self {
+                provider,
+                model: model.into(),
+                max_tokens: 512,
+            }
         }
 
         pub fn with_max_tokens(mut self, n: u32) -> Self {
@@ -58,8 +62,14 @@ mod llm_impl {
             let req = ChatRequest {
                 model: self.model.clone(),
                 messages: vec![
-                    ChatMessage { role: Role::System, content: system.to_string() },
-                    ChatMessage { role: Role::User, content: user.to_string() },
+                    ChatMessage {
+                        role: Role::System,
+                        content: system.to_string(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: user.to_string(),
+                    },
                 ],
                 max_tokens: Some(self.max_tokens),
                 temperature: Some(0.2),
@@ -92,7 +102,12 @@ mod llm_impl {
             let out = self.chat(EXTRACT_SYS, text).await?;
             let lines: Vec<String> = out
                 .lines()
-                .map(|l| l.trim().trim_start_matches(['-', '*', '•', '·']).trim().to_string())
+                .map(|l| {
+                    l.trim()
+                        .trim_start_matches(['-', '*', '•', '·'])
+                        .trim()
+                        .to_string()
+                })
                 .filter(|l| !l.is_empty())
                 .collect();
             if lines.is_empty() {
@@ -120,10 +135,17 @@ pub(crate) mod test_support {
             "mock"
         }
         async fn summarise(&self, text: &str) -> Result<String> {
-            Ok(format!("[summary] {}", text.chars().take(40).collect::<String>()))
+            Ok(format!(
+                "[summary] {}",
+                text.chars().take(40).collect::<String>()
+            ))
         }
         async fn extract_atomic(&self, text: &str) -> Result<Vec<String>> {
-            Ok(text.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            Ok(text
+                .split(';')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
         }
     }
 }

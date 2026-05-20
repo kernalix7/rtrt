@@ -91,7 +91,13 @@ impl Provider for AnthropicProvider {
         let content = parsed
             .content
             .into_iter()
-            .filter_map(|b| if b.r#type == "text" { Some(b.text.unwrap_or_default()) } else { None })
+            .filter_map(|b| {
+                if b.r#type == "text" {
+                    Some(b.text.unwrap_or_default())
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>()
             .join("");
         Ok(ChatResponse {
@@ -141,7 +147,9 @@ fn decode_event(event: &str, data: &str) -> Result<Option<ChatStreamEvent>> {
         "message_start" => {
             let v: MessageStart = serde_json::from_str(data)
                 .map_err(|e| Error::Provider(format!("anthropic message_start: {e}")))?;
-            Ok(Some(ChatStreamEvent::Usage(v.message.usage.unwrap_or_default())))
+            Ok(Some(ChatStreamEvent::Usage(
+                v.message.usage.unwrap_or_default(),
+            )))
         }
         "message_delta" => {
             let v: MessageDelta = serde_json::from_str(data)
@@ -244,8 +252,14 @@ mod tests {
             .chat(ChatRequest {
                 model: "claude-haiku-4-5".into(),
                 messages: vec![
-                    ChatMessage { role: Role::System, content: "be terse".into() },
-                    ChatMessage { role: Role::User, content: "hi".into() },
+                    ChatMessage {
+                        role: Role::System,
+                        content: "be terse".into(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: "hi".into(),
+                    },
                 ],
                 max_tokens: Some(50),
                 temperature: None,
@@ -260,9 +274,18 @@ mod tests {
     #[test]
     fn split_system_groups() {
         let msgs = vec![
-            ChatMessage { role: Role::System, content: "S1".into() },
-            ChatMessage { role: Role::System, content: "S2".into() },
-            ChatMessage { role: Role::User, content: "U".into() },
+            ChatMessage {
+                role: Role::System,
+                content: "S1".into(),
+            },
+            ChatMessage {
+                role: Role::System,
+                content: "S2".into(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "U".into(),
+            },
         ];
         let (sys, out) = split_system(&msgs);
         assert_eq!(sys, "S1\n\nS2");

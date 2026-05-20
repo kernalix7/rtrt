@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 pub mod embed;
 pub mod summarise;
 
-pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
-pub use summarise::Summariser;
+pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
 #[cfg(feature = "llm")]
 pub use summarise::LlmSummariser;
+pub use summarise::Summariser;
 
 pub struct MemoryStore {
     conn: Connection,
@@ -203,7 +203,11 @@ impl MemoryStore {
             let score = cosine(&q, &v);
             scored.push(ScoredRecord { record, score });
         }
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
         Ok(scored)
     }
@@ -289,8 +293,11 @@ impl MemoryStore {
             .collect::<Vec<_>>()
             .join("\n");
         let summary = summariser.summarise(&joined).await?;
-        let archival_id =
-            self.save(project, "archival", &format!("[compressed × {}]\n{summary}", to_summarise.len()))?;
+        let archival_id = self.save(
+            project,
+            "archival",
+            &format!("[compressed × {}]\n{summary}", to_summarise.len()),
+        )?;
         for m in to_summarise {
             self.delete(m.id)?;
         }
@@ -318,21 +325,28 @@ impl MemoryStore {
 
         for (rank, record) in bm25.into_iter().enumerate() {
             let score = 1.0 / (rrf_k + (rank + 1) as f32);
-            fused.entry(record.id).and_modify(|sr| sr.score += score).or_insert(ScoredRecord {
-                record,
-                score,
-            });
+            fused
+                .entry(record.id)
+                .and_modify(|sr| sr.score += score)
+                .or_insert(ScoredRecord { record, score });
         }
         for (rank, scored) in vector.into_iter().enumerate() {
             let score = 1.0 / (rrf_k + (rank + 1) as f32);
             fused
                 .entry(scored.record.id)
                 .and_modify(|sr| sr.score += score)
-                .or_insert(ScoredRecord { record: scored.record, score });
+                .or_insert(ScoredRecord {
+                    record: scored.record,
+                    score,
+                });
         }
 
         let mut out: Vec<ScoredRecord> = fused.into_values().collect();
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(limit);
         Ok(out)
     }
@@ -345,8 +359,12 @@ mod tests {
     #[test]
     fn save_and_recall_bm25() {
         let store = MemoryStore::open_in_memory().unwrap();
-        store.save("p1", "note", "rust is a systems language").unwrap();
-        store.save("p1", "note", "node is a javascript runtime").unwrap();
+        store
+            .save("p1", "note", "rust is a systems language")
+            .unwrap();
+        store
+            .save("p1", "note", "node is a javascript runtime")
+            .unwrap();
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
@@ -391,9 +409,15 @@ mod tests {
     fn save_embedded_and_recall_vector() {
         let store = MemoryStore::open_in_memory().unwrap();
         let embedder = WordHashEmbedder;
-        store.save_embedded("p1", "note", "cargo builds rust", &embedder).unwrap();
-        store.save_embedded("p1", "note", "npm installs javascript packages", &embedder).unwrap();
-        let hits = store.recall_vector("p1", "rust toolchain", 5, &embedder).unwrap();
+        store
+            .save_embedded("p1", "note", "cargo builds rust", &embedder)
+            .unwrap();
+        store
+            .save_embedded("p1", "note", "npm installs javascript packages", &embedder)
+            .unwrap();
+        let hits = store
+            .recall_vector("p1", "rust toolchain", 5, &embedder)
+            .unwrap();
         assert!(!hits.is_empty(), "expected at least one hit");
         assert!(hits[0].record.body.contains("cargo"), "{:?}", hits);
     }
@@ -403,7 +427,12 @@ mod tests {
         let store = MemoryStore::open_in_memory().unwrap();
         let s = crate::summarise::test_support::MockSummariser;
         let ids = store
-            .extract_and_save("p1", "note", "rust is fast; node is async; python has gil", &s)
+            .extract_and_save(
+                "p1",
+                "note",
+                "rust is fast; node is async; python has gil",
+                &s,
+            )
             .await
             .unwrap();
         assert_eq!(ids.len(), 3);
@@ -418,7 +447,11 @@ mod tests {
         for i in 0..6 {
             store.save("p1", "note", &format!("note {i}")).unwrap();
         }
-        let archival_id = store.compress_project("p1", &s, 2).await.unwrap().expect("compressed");
+        let archival_id = store
+            .compress_project("p1", &s, 2)
+            .await
+            .unwrap()
+            .expect("compressed");
         let all = store.list_by_project("p1", 10).unwrap();
         assert_eq!(all.len(), 3, "{all:?}");
         let archival = all.iter().find(|m| m.id == archival_id).unwrap();
@@ -431,9 +464,15 @@ mod tests {
         let embedder = WordHashEmbedder;
         // BM25 will rank by FTS5 token match; vector ranks by hashed-word vector.
         // Both streams should agree that the rust note wins on a rust query.
-        store.save_embedded("p1", "note", "rust cargo workspace", &embedder).unwrap();
-        store.save_embedded("p1", "note", "python pip dependencies", &embedder).unwrap();
-        store.save_embedded("p1", "note", "go module replace directive", &embedder).unwrap();
+        store
+            .save_embedded("p1", "note", "rust cargo workspace", &embedder)
+            .unwrap();
+        store
+            .save_embedded("p1", "note", "python pip dependencies", &embedder)
+            .unwrap();
+        store
+            .save_embedded("p1", "note", "go module replace directive", &embedder)
+            .unwrap();
         let hits = store.recall_hybrid("p1", "rust", 3, &embedder).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].record.body.contains("rust"), "{:?}", hits);

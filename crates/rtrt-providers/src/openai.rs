@@ -197,7 +197,10 @@ impl From<OpenAIUsage> for Usage {
         Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cache_read_input_tokens: u.prompt_tokens_details.map(|d| d.cached_tokens).unwrap_or(0),
+            cache_read_input_tokens: u
+                .prompt_tokens_details
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0),
             cache_creation_input_tokens: 0,
         }
     }
@@ -253,7 +256,10 @@ mod tests {
         let resp = provider
             .chat(ChatRequest {
                 model: "gpt-5.4-mini".into(),
-                messages: vec![ChatMessage { role: Role::User, content: "ping".into() }],
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: "ping".into(),
+                }],
                 max_tokens: None,
                 temperature: None,
             })

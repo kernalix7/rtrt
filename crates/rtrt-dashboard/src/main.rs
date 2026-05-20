@@ -4,14 +4,23 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use axum::{Json, Router, extract::Path as AxPath, http::StatusCode, response::Html, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::Path as AxPath,
+    http::StatusCode,
+    response::Html,
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("rtrt=info,tower_http=info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("rtrt=info,tower_http=info")
+        .init();
 
-    let bind = std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
+    let bind =
+        std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))

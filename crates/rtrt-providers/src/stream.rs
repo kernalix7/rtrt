@@ -19,16 +19,19 @@ pub fn decode<F>(response: reqwest::Response, mut handler: F) -> EventStream
 where
     F: FnMut(&str, &str) -> Result<Option<ChatStreamEvent>> + Send + 'static,
 {
-    let stream = response.bytes_stream().eventsource().filter_map(move |evt| {
-        let result = match evt {
-            Ok(evt) => match handler(&evt.event, &evt.data) {
-                Ok(Some(ev)) => Some(Ok(ev)),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-            Err(e) => Some(Err(Error::Provider(format!("sse error: {e}")))),
-        };
-        std::future::ready(result)
-    });
+    let stream = response
+        .bytes_stream()
+        .eventsource()
+        .filter_map(move |evt| {
+            let result = match evt {
+                Ok(evt) => match handler(&evt.event, &evt.data) {
+                    Ok(Some(ev)) => Some(Ok(ev)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                },
+                Err(e) => Some(Err(Error::Provider(format!("sse error: {e}")))),
+            };
+            std::future::ready(result)
+        });
     Box::pin(stream)
 }

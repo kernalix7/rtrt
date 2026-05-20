@@ -94,11 +94,15 @@ impl RtrtMcp {
     pub fn new(memory: MemoryStore) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            state: Arc::new(RtrtState { memory: Mutex::new(memory) }),
+            state: Arc::new(RtrtState {
+                memory: Mutex::new(memory),
+            }),
         }
     }
 
-    #[tool(description = "Compress text via the RTRT caveman-style rewriter. Levels: lite, full, ultra.")]
+    #[tool(
+        description = "Compress text via the RTRT caveman-style rewriter. Levels: lite, full, ultra."
+    )]
     fn compress(
         &self,
         Parameters(args): Parameters<CompressArgs>,
@@ -121,7 +125,9 @@ impl RtrtMcp {
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(description = "Save a memory record to the SQLite store. Returns the new id.")]
@@ -149,7 +155,9 @@ impl RtrtMcp {
             .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?;
         let body = serde_json::to_value(&hits)
             .map_err(|e| McpError::internal_error(format!("memory.recall serialize: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(description = "List built-in and custom project templates.")]
@@ -169,10 +177,14 @@ impl RtrtMcp {
                 .collect::<Vec<_>>(),
         )
         .map_err(|e| McpError::internal_error(format!("templates.list serialize: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
-    #[tool(description = "Scaffold a project from a template. Variables substitute `{{key}}` placeholders.")]
+    #[tool(
+        description = "Scaffold a project from a template. Variables substitute `{{key}}` placeholders."
+    )]
     fn templates_scaffold(
         &self,
         Parameters(args): Parameters<TemplatesScaffoldArgs>,
@@ -182,30 +194,31 @@ impl RtrtMcp {
         })?;
         let plan = rtrt_templates::render::plan(&tmpl, &args.target, args.variables)
             .map_err(|e| McpError::internal_error(format!("templates.scaffold plan: {e}"), None))?;
-        rtrt_templates::render::write(&plan, args.overwrite)
-            .map_err(|e| McpError::internal_error(format!("templates.scaffold write: {e}"), None))?;
+        rtrt_templates::render::write(&plan, args.overwrite).map_err(|e| {
+            McpError::internal_error(format!("templates.scaffold write: {e}"), None)
+        })?;
         let body = serde_json::json!({
             "files_written": plan.files.len(),
             "root": plan.root,
             "post_hooks": plan.post_hooks,
         });
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for RtrtMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder().enable_tools().build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions(
-            "RTRT MCP server. Tools: compress (caveman-style rewriter), \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(
+                "RTRT MCP server. Tools: compress (caveman-style rewriter), \
              memory_save / memory_recall (SQLite + FTS5 BM25), \
              templates_list / templates_scaffold (built-in project scaffolds).",
-        )
+            )
     }
 }
 
@@ -218,7 +231,10 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let memory = MemoryStore::open(&cli.memory)?;
-    tracing::info!("rtrt-mcp starting on stdio; memory={}", cli.memory.display());
+    tracing::info!(
+        "rtrt-mcp starting on stdio; memory={}",
+        cli.memory.display()
+    );
     let service = RtrtMcp::new(memory).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

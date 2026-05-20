@@ -174,13 +174,17 @@ enum ProviderArg {
 }
 
 fn parse_var(s: &str) -> std::result::Result<(String, String), String> {
-    let (k, v) = s.split_once('=').ok_or_else(|| format!("expected key=value, got `{s}`"))?;
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected key=value, got `{s}`"))?;
     Ok((k.trim().to_string(), v.trim().to_string()))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("rtrt=info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("rtrt=info")
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Cmd::Compress { level } => {
@@ -203,7 +207,13 @@ async fn main() -> Result<()> {
                 println!("{:<18} [{:?}]  {}", t.name, t.source, t.description);
             }
         }
-        Cmd::New { template, path, vars, overwrite, no_hooks } => {
+        Cmd::New {
+            template,
+            path,
+            vars,
+            overwrite,
+            no_hooks,
+        } => {
             let tmpl = rtrt_templates::find(&template)
                 .with_context(|| format!("unknown template: {template}"))?;
             let mut map = BTreeMap::new();
@@ -211,11 +221,18 @@ async fn main() -> Result<()> {
                 map.insert(k, v);
             }
             map.entry("project_name".into()).or_insert_with(|| {
-                path.file_name().and_then(|s| s.to_str()).unwrap_or("app").to_string()
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("app")
+                    .to_string()
             });
             let plan = rtrt_templates::render::plan(&tmpl, &path, map)?;
             rtrt_templates::render::write(&plan, overwrite)?;
-            println!("scaffolded {} files into {}", plan.files.len(), plan.root.display());
+            println!(
+                "scaffolded {} files into {}",
+                plan.files.len(),
+                plan.root.display()
+            );
             if !no_hooks {
                 for hook in &plan.post_hooks {
                     println!("$ {hook}");
@@ -240,7 +257,10 @@ fn run_hook(cwd: &std::path::Path, hook: &str) -> Result<()> {
     let Some((bin, args)) = parts.split_first() else {
         return Ok(());
     };
-    let status = std::process::Command::new(bin).args(args).current_dir(cwd).status()?;
+    let status = std::process::Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .status()?;
     if !status.success() {
         bail!("hook `{hook}` exited with {status}");
     }
@@ -271,16 +291,25 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
     let kind = provider.unwrap_or_else(|| detect_provider(&model));
     let mut messages = Vec::new();
     if let Some(sys) = system {
-        messages.push(ChatMessage { role: Role::System, content: sys });
+        messages.push(ChatMessage {
+            role: Role::System,
+            content: sys,
+        });
     }
-    messages.push(ChatMessage { role: Role::User, content: text });
-    let req =
-        ChatRequest { model: model.clone(), messages, max_tokens, temperature: None };
+    messages.push(ChatMessage {
+        role: Role::User,
+        content: text,
+    });
+    let req = ChatRequest {
+        model: model.clone(),
+        messages,
+        max_tokens,
+        temperature: None,
+    };
 
     let provider: Box<dyn Provider> = match kind {
         ProviderArg::Anthropic => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY not set")?;
+            let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
             Box::new(AnthropicProvider::new(key))
         }
         ProviderArg::Openai => {
@@ -288,8 +317,8 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
             Box::new(OpenAIProvider::new(key))
         }
         ProviderArg::OpenaiCompat => {
-            let url = base_url
-                .ok_or_else(|| anyhow::anyhow!("--base-url required for openai-compat"))?;
+            let url =
+                base_url.ok_or_else(|| anyhow::anyhow!("--base-url required for openai-compat"))?;
             let mut p = OpenAICompatibleProvider::new("openai-compat", url);
             if let Ok(key) = std::env::var("RTRT_PROVIDER_API_KEY") {
                 p = p.with_api_key(key);
@@ -330,31 +359,58 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
 
 async fn run_memory(cmd: MemoryCmd) -> Result<()> {
     match cmd {
-        MemoryCmd::Save { project, kind, body, store } => {
+        MemoryCmd::Save {
+            project,
+            kind,
+            body,
+            store,
+        } => {
             let store = MemoryStore::open(&store)?;
             let body = read_body_or_stdin(body)?;
             let id = store.save(&project, &kind, &body)?;
             println!("saved id={id}");
         }
-        MemoryCmd::Recall { project, query, limit, store } => {
+        MemoryCmd::Recall {
+            project,
+            query,
+            limit,
+            store,
+        } => {
             let store = MemoryStore::open(&store)?;
             let hits = store.recall_bm25(&project, &query, limit)?;
             for h in hits {
                 println!("[{}] {} {}", h.id, h.kind, h.body);
             }
         }
-        MemoryCmd::Extract { project, kind, body, provider, model, base_url, store } => {
+        MemoryCmd::Extract {
+            project,
+            kind,
+            body,
+            provider,
+            model,
+            base_url,
+            store,
+        } => {
             let store = MemoryStore::open(&store)?;
             let body = read_body_or_stdin(body)?;
             let p = build_provider(provider, base_url, &model)?;
             let summariser = LlmSummariser::new(p, model);
-            let ids = store.extract_and_save(&project, &kind, &body, &summariser).await?;
+            let ids = store
+                .extract_and_save(&project, &kind, &body, &summariser)
+                .await?;
             println!("extracted {} fact(s):", ids.len());
             for id in ids {
                 println!("  id={id}");
             }
         }
-        MemoryCmd::Compress { project, keep, provider, model, base_url, store } => {
+        MemoryCmd::Compress {
+            project,
+            keep,
+            provider,
+            model,
+            base_url,
+            store,
+        } => {
             let store = MemoryStore::open(&store)?;
             let p = build_provider(provider, base_url, &model)?;
             let summariser = LlmSummariser::new(p, model);
@@ -393,8 +449,8 @@ fn build_provider(
             Box::new(OpenAIProvider::new(key))
         }
         ProviderArg::OpenaiCompat => {
-            let url = base_url
-                .ok_or_else(|| anyhow::anyhow!("--base-url required for openai-compat"))?;
+            let url =
+                base_url.ok_or_else(|| anyhow::anyhow!("--base-url required for openai-compat"))?;
             let mut p = OpenAICompatibleProvider::new("openai-compat", url);
             if let Ok(key) = std::env::var("RTRT_PROVIDER_API_KEY") {
                 p = p.with_api_key(key);

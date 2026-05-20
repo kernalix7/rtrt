@@ -26,7 +26,10 @@ pub struct CompressionConfig {
 
 impl Default for CompressionConfig {
     fn default() -> Self {
-        Self { level: CompressionLevel::default(), enabled: true }
+        Self {
+            level: CompressionLevel::default(),
+            enabled: true,
+        }
     }
 }
 
@@ -40,7 +43,10 @@ pub struct MemoryConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { path: default_memory_path(), embed_model: default_embed_model() }
+        Self {
+            path: default_memory_path(),
+            embed_model: default_embed_model(),
+        }
     }
 }
 
@@ -60,7 +66,9 @@ pub struct DashboardConfig {
 
 impl Default for DashboardConfig {
     fn default() -> Self {
-        Self { bind: default_dashboard_addr() }
+        Self {
+            bind: default_dashboard_addr(),
+        }
     }
 }
 

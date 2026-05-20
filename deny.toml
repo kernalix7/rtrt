@@ -5,6 +5,10 @@
 #   cargo deny check
 #
 # CI gate: .github/workflows/deny.yml (blocking on PRs to main).
+#
+# Schema: cargo-deny 0.19+. The older `unlicensed = "deny"` / `copyleft = "deny"`
+# keys are gone; the modern shape is just `allow` + `confidence-threshold` +
+# `exceptions`, with deny-by-default for anything not on the allowlist.
 
 [graph]
 all-features = false
@@ -15,7 +19,6 @@ feature-depth = 1
 
 # ---------- licenses ----------
 [licenses]
-unlicensed = "deny"
 # All dependencies must resolve to a license in this allowlist. The set covers
 # the permissive licenses found in our actual dep tree as of v0.2 (run
 # `cargo deny check licenses` to see the canonical list). Any addition outside
@@ -29,20 +32,16 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "CC0-1.0",
     "0BSD",
-    "MPL-2.0",      # webpki-roots; weak copyleft, redistributable
-    "OpenSSL",      # ring; carries OpenSSL + ISC
+    "MPL-2.0",                # weak copyleft, redistributable
     "BSL-1.0",
+    "CDLA-Permissive-2.0",    # webpki-roots ≥ 1.0.7 (TLS root cert bundle)
 ]
-copyleft = "deny"  # GPL, LGPL, AGPL not allowed
-default = "deny"
 confidence-threshold = 0.93
 
-# Permit "ring" specifically — its custom license is OpenSSL + ISC + a custom
-# clause that crates.io classifies as "non-standard". The license terms are
-# permissive but the SPDX expression is not, hence the per-crate exception.
+# Permit `ring` specifically. Its license is OpenSSL + ISC + a custom clause
+# that crates.io classifies as a non-standard expression. The terms themselves
+# are permissive but the SPDX expression is not, hence the per-crate exception.
 [[licenses.exceptions]]
 name = "ring"
 allow = ["ISC", "MIT", "OpenSSL"]
@@ -51,11 +50,7 @@ allow = ["ISC", "MIT", "OpenSSL"]
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
 yanked = "warn"
-notice = "warn"
 ignore = []
 
 # ---------- bans ----------
@@ -64,7 +59,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 deny = [
-    # bans go here as we discover problematic crates
+    # add specific crate bans here as we discover problematic deps
 ]
 
 # ---------- sources ----------

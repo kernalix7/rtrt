@@ -72,18 +72,35 @@ rtrt new rust-cli ./hello \
 
 ## MCP 서버 (`rtrt-mcp`)
 
-```text
-rtrt-mcp
+```bash
+# stdio (기본; Claude Code / Codex / Cursor / Windsurf가 사용)
+rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
 
-v0.1.0 바이너리는 예정 도구 목록을 로깅하고 종료합니다. stdio 전송 계층은 로드맵 항목입니다. 예정 도구:
+공식 Rust MCP SDK [`rmcp`](https://crates.io/crates/rmcp) 기반. v0.2에서 제공하는 도구:
 
-- `compress` — `rtrt-compress` 래핑.
-- `memory.save` — 메모리 레코드 추가.
-- `memory.recall` — 하이브리드 회수 상위-K 반환.
-- `provider.chat` — 활성 프로바이더로 채팅 위임.
+| 도구 | 래핑 | 비고 |
+|------|------|------|
+| `compress` | `Compressor::compress` | `level = lite \| full \| ultra` (기본 `full`) |
+| `memory_save` | `MemoryStore::save` | FTS5 + BM25 인덱스에 삽입 |
+| `memory_recall` | `MemoryStore::recall_bm25` | 프로젝트 스코프, BM25 랭킹 |
+| `templates_list` | `rtrt_templates::list_all` | 빌트인 + 커스텀 템플릿 |
+| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | 템플릿 스캐폴드 |
 
-진행 상황은 [이슈](https://github.com/kernalix7/rtrt/issues)에서 확인하세요.
+`~/.claude.json` (또는 에이전트의 MCP 설정)에 등록:
+
+```json
+{
+  "mcpServers": {
+    "rtrt": {
+      "command": "rtrt-mcp",
+      "args": ["--memory", "/path/to/memory.sqlite"]
+    }
+  }
+}
+```
+
+HTTP/SSE 전송, `provider_chat`, LLM 기반 `memory_extract` / `memory_compress` 도구는 v0.3 예정.
 
 ## 대시보드 (`rtrt-dashboard`)
 

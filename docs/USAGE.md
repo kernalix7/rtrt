@@ -81,18 +81,35 @@ Print the version and the workspace crate list.
 
 ## MCP server (`rtrt-mcp`)
 
-```text
-rtrt-mcp
+```bash
+# stdio (default; what Claude Code / Codex / Cursor / Windsurf use)
+rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
 
-The v0.1.0 binary announces the planned tool surface and exits. The stdio transport implementation is on the roadmap; the planned tools are:
+Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK. Tools shipped in v0.2:
 
-- `compress` — wraps `rtrt-compress`.
-- `memory.save` — append a memory record.
-- `memory.recall` — return top-K matches via hybrid recall.
-- `provider.chat` — dispatch chat to the active provider.
+| Tool | Wraps | Notes |
+|------|-------|-------|
+| `compress` | `Compressor::compress` | accepts `level = lite \| full \| ultra` (default `full`) |
+| `memory_save` | `MemoryStore::save` | inserts into FTS5 and the BM25 index |
+| `memory_recall` | `MemoryStore::recall_bm25` | project-scoped, BM25 ranking |
+| `templates_list` | `rtrt_templates::list_all` | enumerates built-in + custom templates |
+| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | scaffolds from a template |
 
-Track progress in [issues](https://github.com/kernalix7/rtrt/issues).
+Wire it up in `~/.claude.json` (or your agent's MCP config):
+
+```json
+{
+  "mcpServers": {
+    "rtrt": {
+      "command": "rtrt-mcp",
+      "args": ["--memory", "/path/to/memory.sqlite"]
+    }
+  }
+}
+```
+
+HTTP/SSE transport, plus `provider_chat` and the LLM-backed `memory_extract` / `memory_compress` tools, are on the v0.3 roadmap.
 
 ## Dashboard (`rtrt-dashboard`)
 

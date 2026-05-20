@@ -50,6 +50,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 walkdir = "2"
 dirs = "5"
+criterion = { version = "0.5", features = ["html_reports"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+mockito = "1"
 
 [profile.release]
 opt-level = 3

@@ -91,3 +91,7 @@
 
 - `dev` — `opt-level = 0`, 디버그 정보 포함.
 - `release` — `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`. 배포 바이너리 기본값.
+
+## Cargo 리졸버
+
+워크스페이스는 `resolver = "3"` 사용(Rust 1.84에서 안정화). v3는 [워크스페이스 멤버별 feature unification](https://doc.rust-lang.org/cargo/reference/resolver.html#feature-unification)을 활성화하고 버전 선택 시 패키지별 MSRV를 존중합니다. MSRV는 `1.85`이며, `rust-toolchain.toml` 핀과 `stable` + `beta` CI 매트릭스 모두 이 조건을 만족합니다.

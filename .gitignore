@@ -37,7 +37,8 @@ id_ed25519*
 
 # AI config (kept out of git history per repo policy)
 # See CONTRIBUTING.md "No AI tool co-author trailers".
-.priv-storage/
+# AIPS-managed paths (.priv-storage/, tmp-igbkp/) are ignored via the
+# global ~/.config/git/ignore, not here.
 CLAUDE.md
 CLAUDE.local.md
 CLAUDE.md.bak

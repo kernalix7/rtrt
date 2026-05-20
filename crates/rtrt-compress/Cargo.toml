@@ -13,3 +13,14 @@ rtrt-core.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "compress_bench"
+harness = false
+
+[[example]]
+name = "compress_savings"
+path = "examples/compress_savings.rs"

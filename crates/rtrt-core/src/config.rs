@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CompressionLevel, Error, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -14,17 +14,6 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            compression: CompressionConfig::default(),
-            memory: MemoryConfig::default(),
-            dashboard: DashboardConfig::default(),
-            providers: ProvidersConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

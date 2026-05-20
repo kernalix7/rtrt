@@ -85,6 +85,7 @@ rtrt-mcp
 | [FEATURES.ko.md](FEATURES.ko.md) | 압축 규칙 / 필터 / 메모리 스키마 / 템플릿 |
 | [ARCHITECTURE.ko.md](ARCHITECTURE.ko.md) | 크레이트 경계 · 데이터 흐름 |
 | [COMPARISON.ko.md](COMPARISON.ko.md) | 참조 프로젝트들과의 비교 |
+| [INSPIRATION.ko.md](INSPIRATION.ko.md) | 15개 이상 AI 도구 프로젝트의 아이디어 백로그 |
 | [CHANGELOG.ko.md](CHANGELOG.ko.md) | 전체 변경 이력 |
 | [CONTRIBUTING.ko.md](CONTRIBUTING.ko.md) | 개발 환경 설정과 워크플로우 |
 | [SECURITY.ko.md](SECURITY.ko.md) | 보안 신고 절차 |

@@ -149,6 +149,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | [FEATURES.md](docs/FEATURES.md) | Compression rules, filter strategy, memory schema, multi-provider routing, templates |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Workspace layout, crate boundaries, data flows |
 | [COMPARISON.md](docs/COMPARISON.md) | RTRT vs caveman / agentmemory / rtk / codex-plugin-cc |
+| [INSPIRATION.md](docs/INSPIRATION.md) | Idea backlog from 15+ AI-tooling projects, mapped to RTRT crates |
 | [CHANGELOG.md](CHANGELOG.md) | Full version history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and workflow |
 | [SECURITY.md](SECURITY.md) | Security disclosure process |
@@ -192,6 +193,10 @@ CI runs the same three gates on every push and pull request to `main`.
 - [ ] `rtrt-mcp` stdio transport implementation
 - [ ] One-line install scripts (`install.sh` / `install.ps1`)
 - [ ] Claude Code plugin manifest
+
+## Inspired by
+
+RTRT borrows ideas from many other projects. See [docs/INSPIRATION.md](docs/INSPIRATION.md) for the full source list — per-project ideas, the RTRT crate they fit, and priority. Legal attribution lives in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md#reference-projects-inspiration-only-no-code-redistributed). When an idea ships in a release, the CHANGELOG entry credits the source inline.
 
 ## Contributing
 

@@ -52,11 +52,23 @@ These ship in the `[dev-dependencies]` table or in CI tooling, not in published 
 
 ## Reference projects (inspiration only, no code redistributed)
 
-RTRT re-implements ideas from these projects in Rust. No source code is copied or vendored.
+RTRT re-implements ideas from these projects in Rust. No source code is copied or vendored. The per-idea mapping (which RTRT crate borrows what) lives in [docs/INSPIRATION.md](docs/INSPIRATION.md).
+
+**Direct one-to-one inspiration:**
 
 - **[caveman](https://github.com/JuliusBrussee/caveman)** — output simplification rules. RTRT's `rtrt-compress` is an independent Rust implementation of the same idea.
 - **[agentmemory](https://github.com/rohitg00/agentmemory)** — SQLite-backed memory + hybrid recall. RTRT's `rtrt-memory` borrows the schema concept and embeddings target (`all-MiniLM-L6-v2`); the recall implementation is independent.
 - **[rtk](https://github.com/rtk-ai/rtk)** — CLI proxy for command-output reduction. RTRT's `rtrt-proxy` is an independent Rust implementation.
 - **[codex-plugin-cc](https://github.com/openai/codex-plugin-cc)** — single-provider Codex integration for Claude Code. RTRT's multi-provider design is broader and does not derive from codex-plugin-cc source.
+
+**Inspiration backlog (RTRT may borrow specific ideas; no source copied):**
+
+- **Output compression**: [microsoft/LLMLingua](https://github.com/microsoft/LLMLingua), [yamadashy/repomix](https://github.com/yamadashy/repomix).
+- **Persistent memory & retrieval**: [mem0ai/mem0](https://github.com/mem0ai/mem0), [chroma-core/chroma](https://github.com/chroma-core/chroma), [letta-ai/letta](https://github.com/letta-ai/letta), [cpacker/MemGPT](https://github.com/cpacker/MemGPT), [qdrant/qdrant](https://github.com/qdrant/qdrant), [lancedb/lancedb](https://github.com/lancedb/lancedb), [neuml/txtai](https://github.com/neuml/txtai).
+- **Multi-provider gateway & orchestration**: [Helicone/helicone](https://github.com/Helicone/helicone), [sobelio/llm-chain](https://github.com/sobelio/llm-chain), [upstash/context7](https://github.com/upstash/context7).
+- **Templates & agent scaffolds**: [mufeedvh/code2prompt](https://github.com/mufeedvh/code2prompt), [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI), [dust-tt/dust](https://github.com/dust-tt/dust).
+- **Observability & cost tracking**: [langfuse/langfuse](https://github.com/langfuse/langfuse), [Doriandarko/claude-engineer](https://github.com/Doriandarko/claude-engineer), [Aider-AI/aider](https://github.com/Aider-AI/aider).
+
+When an idea ships, the CHANGELOG entry credits the source inline (`(inspired by [project-name](url))`) and any per-feature `THIRD_PARTY_LICENSES.md` entry moves up to the "Direct one-to-one inspiration" list.
 
 If you find any attribution gap, please open an issue.

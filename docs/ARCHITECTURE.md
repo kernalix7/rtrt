@@ -131,3 +131,7 @@ The trait is wired but the chat implementations return `Error::Provider(...)`. v
 
 - `dev` — `opt-level = 0`, `debug = true`. Default for `cargo build`.
 - `release` — `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`. Used for distributed binaries.
+
+## Cargo resolver
+
+The workspace declares `resolver = "3"` (stabilised in Rust 1.84). Resolver v3 enables [feature unification per workspace member](https://doc.rust-lang.org/cargo/reference/resolver.html#feature-unification) and respects the per-package MSRV when selecting versions. MSRV is `1.85`; the toolchain pin in `rust-toolchain.toml` and the `stable` + `beta` CI matrix both satisfy this.

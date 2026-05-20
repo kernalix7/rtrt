@@ -1,11 +1,25 @@
 //! rtrt-providers — provider abstraction for chat / completion APIs.
 //!
-//! Built-in adapters: Anthropic, OpenAI, Google, xAI, Mistral, and any OpenAI-compatible
-//! local server (Ollama, llama.cpp, vLLM, LM Studio). External adapters load as plugins.
+//! Built-in adapters: Anthropic, OpenAI, and any OpenAI-compatible local server
+//! (Ollama, llama.cpp, vLLM, LM Studio). External adapters load as plugins.
+
+use std::pin::Pin;
 
 use async_trait::async_trait;
-use rtrt_core::Result;
+use futures_util::Stream;
+use rtrt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
+
+pub mod anthropic;
+pub mod openai;
+pub mod openai_compatible;
+pub mod stream;
+pub mod usage;
+
+pub use anthropic::AnthropicProvider;
+pub use openai::OpenAIProvider;
+pub use openai_compatible::OpenAICompatibleProvider;
+pub use usage::Usage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -36,21 +50,25 @@ pub struct ChatResponse {
     pub provider: String,
     pub model: String,
     pub content: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub usage: Usage,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatStreamEvent {
+    Delta { text: String },
+    Usage(Usage),
+    Done,
+}
+
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent>> + Send>>;
 
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn supported_models(&self) -> &[&'static str];
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse>;
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
+        Err(Error::Provider(format!("{}: streaming not implemented", self.name())))
+    }
 }
-
-pub mod anthropic;
-pub mod openai;
-pub mod openai_compatible;
-
-pub use anthropic::AnthropicProvider;
-pub use openai::OpenAIProvider;
-pub use openai_compatible::OpenAICompatibleProvider;

@@ -20,6 +20,7 @@ rtrt-memory.workspace = true
 rtrt-providers.workspace = true
 rtrt-templates.workspace = true
 clap.workspace = true
+futures-util = { workspace = true }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "rtrt-compress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RTRT output compression engine (caveman-style terse mode)."
+
+[dependencies]
+rtrt-core.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+serde.workspace = true

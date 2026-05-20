@@ -1,0 +1,15 @@
+[package]
+name = "rtrt-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RTRT command-output filter proxy (rtk-style)."
+
+[dependencies]
+rtrt-core.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+serde.workspace = true

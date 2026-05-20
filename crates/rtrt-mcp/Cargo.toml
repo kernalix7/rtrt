@@ -1,0 +1,25 @@
+[package]
+name = "rtrt-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RTRT MCP server (stdio + HTTP)."
+
+[[bin]]
+name = "rtrt-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rtrt-core.workspace = true
+rtrt-compress.workspace = true
+rtrt-memory.workspace = true
+rtrt-providers.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

@@ -54,6 +54,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 eventsource-stream = "0.2"
 futures-util = "0.3"
 mockito = "1"
+fastembed = "5"
 
 [profile.release]
 opt-level = 3

@@ -74,7 +74,7 @@ CREATE TABLE edges (
 );
 ```
 
-v0.1.0은 `memories_fts`를 통한 BM25 회수를 구현합니다.
+BM25 회수는 `memories_fts`를 통합니다.
 
 ```rust
 let store = MemoryStore::open(".rtrt/memory.sqlite")?;
@@ -82,7 +82,33 @@ store.save("my-project", "note", "Rust is a systems language")?;
 let hits = store.recall_bm25("my-project", "rust", 5)?;
 ```
 
-`embeddings`와 `edges` 테이블은 v0.2 예약 영역입니다. 임베딩은 로컬에서 `all-MiniLM-L6-v2`(오프라인)를 사용하고, 회수는 BM25 + 벡터 코사인 + 그래프 순회를 Reciprocal Rank Fusion으로 결합할 예정입니다.
+벡터 및 하이브리드 회수는 `Embedder`가 필요합니다. 기본은 [`fastembed`](https://crates.io/crates/fastembed) 기반 `all-MiniLM-L6-v2`(384차원, ONNX, 첫 다운로드 후 오프라인). 기능 게이트:
+
+```toml
+[dependencies]
+rtrt-memory = { version = "0.2", features = ["embeddings"] }
+```
+
+사용:
+
+```rust
+use rtrt_memory::{MemoryStore, FastEmbedder};
+
+let store = MemoryStore::open(".rtrt/memory.sqlite")?;
+let embedder = FastEmbedder::new_default()?;
+store.save_embedded("my-project", "note", "Rust is a systems language", &embedder)?;
+let hits = store.recall_hybrid("my-project", "rust toolchain", 5, &embedder)?;
+```
+
+회수 세부:
+
+- **`recall_bm25`** — FTS5 내장 BM25 랭크, 프로젝트 스코프, 임베더 불필요.
+- **`recall_vector`** — 쿼리를 임베드하고 프로젝트 메모리 전체를 코사인 유사도로 채점 후 정렬. 저장된 임베딩 수에 선형; v0.3에서 HNSW 인덱스로 교체.
+- **`recall_hybrid`** — BM25 + 벡터의 Reciprocal Rank Fusion(`rrf_k = 60`). 단일 스트림에만 등장하는 항목도 떠오르도록 각 스트림을 `limit * 2`만큼 가져옴.
+
+`edges` 테이블은 v0.3 그래프 순회 예약.
+
+**첫 사용 주의**: `FastEmbedder::new_default()`는 fastembed 캐시 디렉터리로 모델(~90 MB)을 처음에 다운로드. 이후는 오프라인.
 
 ## 멀티 프로바이더 라우팅
 

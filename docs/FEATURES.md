@@ -74,7 +74,7 @@ CREATE TABLE edges (
 );
 ```
 
-v0.1.0 implements BM25 recall against `memories_fts`:
+BM25 recall against `memories_fts`:
 
 ```rust
 let store = MemoryStore::open(".rtrt/memory.sqlite")?;
@@ -82,7 +82,33 @@ store.save("my-project", "note", "Rust is a systems language")?;
 let hits = store.recall_bm25("my-project", "rust", 5)?;
 ```
 
-The `embeddings` and `edges` tables are reserved for v0.2. Embeddings will use `all-MiniLM-L6-v2` running locally (no network calls); recall will combine BM25, vector cosine, and graph traversal via Reciprocal Rank Fusion.
+Vector and hybrid recall require an `Embedder`. The default is `all-MiniLM-L6-v2` via [`fastembed`](https://crates.io/crates/fastembed), 384-dim, ONNX, offline after first download. The feature is gated:
+
+```toml
+[dependencies]
+rtrt-memory = { version = "0.2", features = ["embeddings"] }
+```
+
+Usage:
+
+```rust
+use rtrt_memory::{MemoryStore, FastEmbedder};
+
+let store = MemoryStore::open(".rtrt/memory.sqlite")?;
+let embedder = FastEmbedder::new_default()?;
+store.save_embedded("my-project", "note", "Rust is a systems language", &embedder)?;
+let hits = store.recall_hybrid("my-project", "rust toolchain", 5, &embedder)?;
+```
+
+Recall details:
+
+- **`recall_bm25`** — FTS5 ranked by built-in BM25; project-scoped; no embedder required.
+- **`recall_vector`** — embeds the query, scores every project memory by cosine similarity, sorts in process. Linear in stored embeddings; v0.3 swaps this for an HNSW index.
+- **`recall_hybrid`** — Reciprocal Rank Fusion of BM25 + vector with `rrf_k = 60`. Each stream is fetched at `limit * 2` so single-stream-only matches still surface.
+
+The `edges` table is reserved for v0.3 graph traversal.
+
+**First-use note**: `FastEmbedder::new_default()` downloads the model (~90 MB) to fastembed's cache dir on first construction. Subsequent uses are offline.
 
 ## Multi-provider routing
 

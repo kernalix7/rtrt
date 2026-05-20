@@ -15,7 +15,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 fastembed = { workspace = true, optional = true }
+rtrt-providers = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -23,3 +25,8 @@ default = []
 # default so the workspace builds without a network round-trip; opt-in for users
 # and the `cargo test --features embeddings` lane.
 embeddings = ["dep:fastembed"]
+# Enables LlmSummariser, which wraps any rtrt-providers Provider (Anthropic /
+# OpenAI / OpenAI-compatible — including a local Ollama server) for memory
+# extraction and compression. The trait shape is always available so callers
+# can plug in their own backend.
+llm = ["dep:rtrt-providers"]

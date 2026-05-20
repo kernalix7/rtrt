@@ -2708,8 +2708,10 @@ dependencies = [
 name = "rtrt-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fastembed",
  "rtrt-core",
+ "rtrt-providers",
  "rusqlite",
  "serde",
  "serde_json",

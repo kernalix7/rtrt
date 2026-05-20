@@ -13,10 +13,14 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 pub mod embed;
+pub mod summarise;
 
 pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
+pub use summarise::Summariser;
+#[cfg(feature = "llm")]
+pub use summarise::LlmSummariser;
 
 pub struct MemoryStore {
     conn: Connection,
@@ -204,6 +208,95 @@ impl MemoryStore {
         Ok(scored)
     }
 
+    /// Lists every memory in `project`, oldest first. Used by compression.
+    pub fn list_by_project(&self, project: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at
+                   FROM memories
+                  WHERE project = ?1
+               ORDER BY created_at ASC, id ASC
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project, limit as i64], |row| {
+                Ok(MemoryRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Deletes a memory and any associated FTS / embedding rows.
+    pub fn delete(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO memories_fts(memories_fts, rowid, body) \
+                 SELECT 'delete', id, body FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// LLM-driven ingestion. The summariser extracts atomic facts from `body`
+    /// and each becomes its own `kind` memory in `project`. Returns the new ids.
+    pub async fn extract_and_save(
+        &self,
+        project: &str,
+        kind: &str,
+        body: &str,
+        summariser: &dyn Summariser,
+    ) -> Result<Vec<i64>> {
+        let facts = summariser.extract_atomic(body).await?;
+        let mut ids = Vec::with_capacity(facts.len());
+        for fact in facts {
+            let id = self.save(project, kind, &fact)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Compresses the oldest memories in `project`: keeps the most recent
+    /// `keep_recent` rows, summarises the rest into one archival entry, and
+    /// deletes the originals. Returns the new archival record id, or `None`
+    /// if nothing was eligible.
+    pub async fn compress_project(
+        &self,
+        project: &str,
+        summariser: &dyn Summariser,
+        keep_recent: usize,
+    ) -> Result<Option<i64>> {
+        let all = self.list_by_project(project, 10_000)?;
+        if all.len() <= keep_recent {
+            return Ok(None);
+        }
+        let to_summarise = &all[..all.len() - keep_recent];
+        let joined = to_summarise
+            .iter()
+            .map(|m| format!("- [{}] {}", m.kind, m.body))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = summariser.summarise(&joined).await?;
+        let archival_id =
+            self.save(project, "archival", &format!("[compressed × {}]\n{summary}", to_summarise.len()))?;
+        for m in to_summarise {
+            self.delete(m.id)?;
+        }
+        Ok(Some(archival_id))
+    }
+
     /// Hybrid recall — Reciprocal Rank Fusion of BM25 and dense-vector
     /// rankings. Score per record is `Σ 1 / (rrf_k + rank_i)` over the two
     /// streams; default `rrf_k = 60`. Each stream is fetched at `limit * 2` so
@@ -303,6 +396,33 @@ mod tests {
         let hits = store.recall_vector("p1", "rust toolchain", 5, &embedder).unwrap();
         assert!(!hits.is_empty(), "expected at least one hit");
         assert!(hits[0].record.body.contains("cargo"), "{:?}", hits);
+    }
+
+    #[tokio::test]
+    async fn extract_and_save_splits_facts() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let s = crate::summarise::test_support::MockSummariser;
+        let ids = store
+            .extract_and_save("p1", "note", "rust is fast; node is async; python has gil", &s)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        let all = store.list_by_project("p1", 10).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn compress_project_collapses_old_memories() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let s = crate::summarise::test_support::MockSummariser;
+        for i in 0..6 {
+            store.save("p1", "note", &format!("note {i}")).unwrap();
+        }
+        let archival_id = store.compress_project("p1", &s, 2).await.unwrap().expect("compressed");
+        let all = store.list_by_project("p1", 10).unwrap();
+        assert_eq!(all.len(), 3, "{all:?}");
+        let archival = all.iter().find(|m| m.id == archival_id).unwrap();
+        assert!(archival.body.contains("compressed × 4"));
     }
 
     #[test]

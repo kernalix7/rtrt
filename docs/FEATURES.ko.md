@@ -110,6 +110,53 @@ let hits = store.recall_hybrid("my-project", "rust toolchain", 5, &embedder)?;
 
 **첫 사용 주의**: `FastEmbedder::new_default()`는 fastembed 캐시 디렉터리로 모델(~90 MB)을 처음에 다운로드. 이후는 오프라인.
 
+### LLM 기반 추출 + 압축 (`llm` 피처)
+
+LLM이 필요한 두 가지 메모리 연산:
+
+- **Extract** — 긴 텍스트를 원자 사실 리스트로 분해, 한 항목당 한 행 저장. 미리 가공된 prose 보관 회피.
+- **Compress** — 프로젝트의 가장 오래된 메모리들을 한 아카이벌 요약으로 응축, 원본 삭제. 워킹 풀이 커지면 사용.
+
+둘 다 [`Summariser`](https://docs.rs/rtrt-memory/latest/rtrt_memory/summarise/trait.Summariser.html) 트레이트로 흐릅니다. 빌트인 구현 `LlmSummariser`는 `rtrt_providers::Provider`라면 무엇이든 감싸므로 Anthropic / OpenAI / OpenAI 호환 로컬 엔드포인트 동일 코드.
+
+#### 로컬 LLM via Ollama (무료 / 오프라인 권장)
+
+Ollama가 `/v1/chat/completions`를 OpenAI 포맷으로 노출 → 새 어댑터 불필요. 기존 `OpenAICompatibleProvider`로 바로 동작:
+
+```bash
+# 일회 설정
+ollama pull llama3.2          # qwen2.5:7b, gemma2:9b 등도 가능
+ollama serve                  # 기본 127.0.0.1:11434
+
+# 긴 텍스트를 프로젝트 "p1"의 원자 사실로 추출
+echo "RTRT 아키텍처 설명…" | rtrt memory extract \
+  --project p1 \
+  --provider openai-compat \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model llama3.2
+
+# 압축: 최근 20개 유지, 나머지 요약
+rtrt memory compress \
+  --project p1 \
+  --keep 20 \
+  --provider openai-compat \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model llama3.2
+```
+
+#### 클라우드 LLM (Anthropic / OpenAI)
+
+```bash
+ANTHROPIC_API_KEY=… rtrt memory extract \
+  --project p1 --provider anthropic --model claude-haiku-4-5 \
+  < passage.txt
+
+OPENAI_API_KEY=… rtrt memory compress \
+  --project p1 --keep 10 --provider openai --model gpt-5.4-mini
+```
+
+CLI 명령은 라이브러리 API의 `MemoryStore::extract_and_save` / `MemoryStore::compress_project`로 라우팅됩니다.
+
 ## 멀티 프로바이더 라우팅
 
 `rtrt-providers`는 `Provider` 트레이트를 정의합니다.

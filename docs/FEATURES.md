@@ -110,6 +110,56 @@ The `edges` table is reserved for v0.3 graph traversal.
 
 **First-use note**: `FastEmbedder::new_default()` downloads the model (~90 MB) to fastembed's cache dir on first construction. Subsequent uses are offline.
 
+### LLM-backed extract + compress (the `llm` feature)
+
+Two memory operations need an LLM rather than just an embedder:
+
+- **Extract** — turn a long passage into a list of atomic facts, one row per fact. Used at ingestion to avoid storing pre-chewed prose.
+- **Compress** — collapse the oldest memories in a project into a single archival summary, then delete the originals. Used when the working pool gets large.
+
+Both flow through the [`Summariser`](https://docs.rs/rtrt-memory/latest/rtrt_memory/summarise/trait.Summariser.html) trait. The shipped implementation, `LlmSummariser`, wraps any `rtrt_providers::Provider`, so the same code works against Anthropic, OpenAI, or any OpenAI-compatible local endpoint.
+
+#### Local LLM via Ollama (recommended for free / offline use)
+
+Ollama exposes a `/v1/chat/completions` endpoint that matches the OpenAI wire format. No new adapter is needed — RTRT's existing `OpenAICompatibleProvider` works out of the box:
+
+```bash
+# one-time setup
+ollama pull llama3.2          # or qwen2.5:7b, gemma2:9b, etc.
+ollama serve                  # binds 127.0.0.1:11434 by default
+
+# extract atomic facts from a long passage into project "p1"
+echo "Long passage about RTRT architecture..." | rtrt memory extract \
+  --project p1 \
+  --provider openai-compat \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model llama3.2
+
+# compress: keep most-recent 20, summarise the rest
+rtrt memory compress \
+  --project p1 \
+  --keep 20 \
+  --provider openai-compat \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model llama3.2
+```
+
+#### Cloud LLM (Anthropic / OpenAI)
+
+```bash
+ANTHROPIC_API_KEY=... rtrt memory extract \
+  --project p1 \
+  --provider anthropic \
+  --model claude-haiku-4-5 \
+  < passage.txt
+
+OPENAI_API_KEY=... rtrt memory compress \
+  --project p1 --keep 10 \
+  --provider openai --model gpt-5.4-mini
+```
+
+The CLI commands route to `MemoryStore::extract_and_save` and `MemoryStore::compress_project` from the library API.
+
 ## Multi-provider routing
 
 `rtrt-providers` defines a `Provider` trait:

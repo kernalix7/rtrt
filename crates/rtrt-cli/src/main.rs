@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
+use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, OpenAICompatibleProvider,
     OpenAIProvider, Provider, Role,
@@ -56,8 +57,69 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProviderCmd,
     },
+    /// Persistent memory operations (SQLite-backed).
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Show RTRT version + crate manifest.
     Info,
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCmd {
+    /// Save a raw memory record (BM25-indexed). Body from arg or stdin.
+    Save {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "note")]
+        kind: String,
+        body: Option<String>,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
+    /// Recall memories by BM25 (FTS5).
+    Recall {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
+    /// Extract atomic facts from a passage via LLM and save each.
+    Extract {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "note")]
+        kind: String,
+        body: Option<String>,
+        #[arg(short, long, value_enum)]
+        provider: ProviderArg,
+        #[arg(short, long)]
+        model: String,
+        #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
+        base_url: Option<String>,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
+    /// Compress old memories — keep the most recent N, summarise the rest.
+    Compress {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value_t = 20)]
+        keep: usize,
+        #[arg(short, long, value_enum)]
+        provider: ProviderArg,
+        #[arg(short, long)]
+        model: String,
+        #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
+        base_url: Option<String>,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +224,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,
+        Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Info => {
             println!("rtrt v{}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -263,6 +326,83 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn run_memory(cmd: MemoryCmd) -> Result<()> {
+    match cmd {
+        MemoryCmd::Save { project, kind, body, store } => {
+            let store = MemoryStore::open(&store)?;
+            let body = read_body_or_stdin(body)?;
+            let id = store.save(&project, &kind, &body)?;
+            println!("saved id={id}");
+        }
+        MemoryCmd::Recall { project, query, limit, store } => {
+            let store = MemoryStore::open(&store)?;
+            let hits = store.recall_bm25(&project, &query, limit)?;
+            for h in hits {
+                println!("[{}] {} {}", h.id, h.kind, h.body);
+            }
+        }
+        MemoryCmd::Extract { project, kind, body, provider, model, base_url, store } => {
+            let store = MemoryStore::open(&store)?;
+            let body = read_body_or_stdin(body)?;
+            let p = build_provider(provider, base_url, &model)?;
+            let summariser = LlmSummariser::new(p, model);
+            let ids = store.extract_and_save(&project, &kind, &body, &summariser).await?;
+            println!("extracted {} fact(s):", ids.len());
+            for id in ids {
+                println!("  id={id}");
+            }
+        }
+        MemoryCmd::Compress { project, keep, provider, model, base_url, store } => {
+            let store = MemoryStore::open(&store)?;
+            let p = build_provider(provider, base_url, &model)?;
+            let summariser = LlmSummariser::new(p, model);
+            match store.compress_project(&project, &summariser, keep).await? {
+                Some(id) => println!("archival id={id}; older entries deleted"),
+                None => println!("nothing to compress (have ≤ {keep} entries)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_body_or_stdin(body: Option<String>) -> Result<String> {
+    match body.as_deref() {
+        Some("-") | None => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf.trim().to_string())
+        }
+        Some(s) => Ok(s.to_string()),
+    }
+}
+
+fn build_provider(
+    kind: ProviderArg,
+    base_url: Option<String>,
+    _model: &str,
+) -> Result<Box<dyn Provider>> {
+    let provider: Box<dyn Provider> = match kind {
+        ProviderArg::Anthropic => {
+            let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
+            Box::new(AnthropicProvider::new(key))
+        }
+        ProviderArg::Openai => {
+            let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
+            Box::new(OpenAIProvider::new(key))
+        }
+        ProviderArg::OpenaiCompat => {
+            let url = base_url
+                .ok_or_else(|| anyhow::anyhow!("--base-url required for openai-compat"))?;
+            let mut p = OpenAICompatibleProvider::new("openai-compat", url);
+            if let Ok(key) = std::env::var("RTRT_PROVIDER_API_KEY") {
+                p = p.with_api_key(key);
+            }
+            Box::new(p)
+        }
+    };
+    Ok(provider)
 }
 
 fn detect_provider(model: &str) -> ProviderArg {

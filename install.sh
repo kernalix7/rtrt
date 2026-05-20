@@ -91,6 +91,25 @@ printf '== rtrt install ==\n'
 printf '  target: %s\n' "$TARGET_TRIPLE"
 printf '  prefix: %s\n' "$INSTALL_DIR"
 
+install_check() {
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) ;;
+        *)
+            printf '\nWARNING: %s is not on $PATH.\n' "$INSTALL_DIR"
+            printf '  Add this to your shell rc:\n'
+            printf '    export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
+            ;;
+    esac
+    printf 'rtrt installed:\n'
+    for bin in $BINS; do
+        printf '  %s/%s\n' "$INSTALL_DIR" "$bin"
+    done
+    printf '\nNext:\n'
+    printf '  rtrt --version\n'
+    printf '  rtrt info\n'
+    printf '  rtrt templates\n'
+}
+
 # ---------- source-build path ----------
 if [ "$USE_MAIN" -eq 1 ]; then
     if ! command -v cargo >/dev/null 2>&1; then
@@ -173,24 +192,5 @@ for bin in $BINS; do
     fi
     run "install -m 0755 \"$src\" \"$INSTALL_DIR/$bin\""
 done
-
-install_check() {
-    case ":$PATH:" in
-        *":$INSTALL_DIR:"*) ;;
-        *)
-            printf '\nWARNING: %s is not on $PATH.\n' "$INSTALL_DIR"
-            printf '  Add this to your shell rc:\n'
-            printf '    export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
-            ;;
-    esac
-    printf 'rtrt installed:\n'
-    for bin in $BINS; do
-        printf '  %s/%s\n' "$INSTALL_DIR" "$bin"
-    done
-    printf '\nNext:\n'
-    printf '  rtrt --version\n'
-    printf '  rtrt info\n'
-    printf '  rtrt templates\n'
-}
 
 install_check

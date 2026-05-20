@@ -140,9 +140,9 @@ jobs:
           version="${{ steps.ver.outputs.version }}"
           # awk extract: from "## [X.Y.Z]" up to the next "## " line, exclusive
           awk -v v="${version#v}" '
-            $0 ~ "^## \\[" v "\\]" { in=1; print; next }
-            in && /^## \[/ { exit }
-            in { print }
+            $0 ~ "^## \\[" v "\\]" { inside=1; print; next }
+            inside && /^## \[/ { exit }
+            inside { print }
           ' CHANGELOG.md > body.md
           if [ ! -s body.md ]; then
             printf 'CHANGELOG section for %s not found; using generic body.\n' "$version" >&2

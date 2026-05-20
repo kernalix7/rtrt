@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["stable", "beta"]
+        runner: ["ubuntu-latest"]
+        include:
+          # aarch64 regression catch — RTRT bundles SQLite via rusqlite's
+          # `bundled` feature, which involves a C build. Cover aarch64
+          # Linux on stable so the cross-arch build path stays green.
+          # GitHub Actions provides free aarch64 runners for public
+          # repos since 2024.
+          - toolchain: "stable"
+            runner: "ubuntu-24.04-arm"
+          - toolchain: "stable"
+            runner: "macos-latest"
+          - toolchain: "stable"
+            runner: "windows-latest"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Run cargo-audit
+        run: cargo audit
+        continue-on-error: true

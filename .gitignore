@@ -9,12 +9,20 @@ Cargo.lock.bak
 .idea/
 *.swp
 *.swo
+*.tmp
+*.bak
+*~
 .DS_Store
 
 # Env / secrets
 .env
-.env.*
+*.env
 !.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
 
 # Local data
 *.sqlite
@@ -23,6 +31,32 @@ Cargo.lock.bak
 /data/
 /.rtrt/
 
-# Build artifacts
+# Build / dist
 /dist/
 /release/
+
+# AI config (kept out of git history per repo policy)
+# See CONTRIBUTING.md "No AI tool co-author trailers".
+.priv-storage/
+CLAUDE.md
+CLAUDE.local.md
+CLAUDE.md.bak
+.cursorrules
+.cursorrules.bak
+.claude
+.codex/
+.aider*
+.continue/
+.cline/
+.roo/
+.mcp.json
+AGENTS.md
+AGENTS.md.bak
+WORK_STATUS.md
+WORK_STATUS.md.bak
+demo.png
+
+# Coverage / tarpaulin
+*.profraw
+/coverage/
+/tarpaulin-report.html

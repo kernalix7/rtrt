@@ -48,6 +48,37 @@ struct AppState {
     gateway: Arc<Gateway>,
     prompts: Option<Arc<PromptRegistry>>,
     memory: Option<Arc<Mutex<MemoryStore>>>,
+    auto_capture: bool,
+    default_project: String,
+}
+
+impl AppState {
+    /// Best-effort auto-save into the memory store. Failures are logged and
+    /// swallowed so the calling handler still returns the user-visible result.
+    async fn capture(
+        &self,
+        kind: &str,
+        body: &str,
+        metadata: &std::collections::BTreeMap<String, String>,
+    ) {
+        if !self.auto_capture {
+            return;
+        }
+        let Some(store) = &self.memory else { return };
+        let project = self.default_project.clone();
+        let body = body.to_string();
+        let kind = kind.to_string();
+        let metadata = metadata.clone();
+        let guard = store.lock().await;
+        let result = if metadata.is_empty() {
+            guard.save(&project, &kind, &body)
+        } else {
+            guard.save_with_metadata(&project, &kind, &body, &metadata)
+        };
+        if let Err(e) = result {
+            tracing::warn!("auto-capture {kind}: {e}");
+        }
+    }
 }
 
 #[tokio::main]
@@ -71,10 +102,24 @@ async fn main() -> Result<()> {
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
     let memory = open_memory_store();
+    let auto_capture = std::env::var("RTRT_AUTO_CAPTURE")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let default_project =
+        std::env::var("RTRT_DEFAULT_PROJECT").unwrap_or_else(|_| "default".into());
+    if auto_capture {
+        tracing::info!(
+            "auto-capture on (project={default_project}, kinds=chat/compress/diagnose/proxy)"
+        );
+    } else {
+        tracing::info!("auto-capture off (RTRT_AUTO_CAPTURE=0)");
+    }
     let state = AppState {
         gateway,
         prompts,
         memory,
+        auto_capture,
+        default_project,
     };
 
     let token_arc = token.clone().map(Arc::new);
@@ -310,6 +355,13 @@ async fn chat(
         .chat(chat_req)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let mut meta = BTreeMap::new();
+    meta.insert("source".into(), "chat".into());
+    meta.insert("provider".into(), resp.provider.clone());
+    meta.insert("model".into(), resp.model.clone());
+    meta.insert("input_tokens".into(), resp.usage.input_tokens.to_string());
+    meta.insert("output_tokens".into(), resp.usage.output_tokens.to_string());
+    state.capture("chat", &resp.content, &meta).await;
     Ok(Json(ChatHttpResponse {
         provider: resp.provider,
         model: resp.model,
@@ -717,6 +769,7 @@ fn default_context() -> usize {
 }
 
 async fn proxy_filter(
+    State(state): State<AppState>,
     Json(req): Json<ProxyRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mode = req.mode.as_deref().unwrap_or("command");
@@ -737,6 +790,17 @@ async fn proxy_filter(
         other => return Err((StatusCode::BAD_REQUEST, format!("unknown mode: {other}"))),
     };
     let filtered = out.chars().count();
+    let mut meta = BTreeMap::new();
+    meta.insert("source".into(), "proxy".into());
+    meta.insert("mode".into(), mode.to_string());
+    if let Some(cmd) = req.command.as_deref() {
+        meta.insert("command".into(), cmd.to_string());
+    }
+    meta.insert(
+        "saved_chars".into(),
+        original.saturating_sub(filtered).to_string(),
+    );
+    state.capture("proxy", &out, &meta).await;
     Ok(Json(serde_json::json!({
         "filtered": out,
         "mode": mode,
@@ -789,6 +853,11 @@ async fn diagnose(
         .chat(chat_req)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let mut meta = BTreeMap::new();
+    meta.insert("source".into(), "diagnose".into());
+    meta.insert("provider".into(), resp.provider.clone());
+    meta.insert("model".into(), resp.model.clone());
+    state.capture("diagnose", &resp.content, &meta).await;
     Ok(Json(serde_json::json!({
         "diagnosis": resp.content,
         "filtered": filtered,
@@ -961,6 +1030,7 @@ async fn setup_snippet(
 }
 
 async fn compress(
+    State(state): State<AppState>,
     Json(req): Json<CompressRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     use rtrt_core::CompressionLevel;
@@ -990,6 +1060,17 @@ async fn compress(
         (compressor.compress_to(&req.text, format), "rules", None)
     };
     let compressed = out.chars().count();
+    let mut meta = BTreeMap::new();
+    meta.insert("source".into(), "compress".into());
+    meta.insert("mode".into(), mode.to_string());
+    if let Some(s) = scorer.as_deref() {
+        meta.insert("scorer".into(), s.to_string());
+    }
+    meta.insert(
+        "saved_chars".into(),
+        original.saturating_sub(compressed).to_string(),
+    );
+    state.capture("compress", &out, &meta).await;
     Ok(Json(serde_json::json!({
         "compressed": out,
         "mode": mode,

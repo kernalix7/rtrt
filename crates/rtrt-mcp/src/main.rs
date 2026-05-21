@@ -82,6 +82,25 @@ fn default_limit() -> u32 {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemorySetBlockArgs {
+    project: String,
+    /// Block name. Typical: `persona`, `human`, `context`. Free-form slug.
+    name: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryGetBlockArgs {
+    project: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryListBlocksArgs {
+    project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ProviderChatArgs {
     /// Model id (e.g. `claude-haiku-4-5`, `gpt-5.4-mini`, `llama3.2`).
     model: String,
@@ -231,6 +250,50 @@ impl RtrtMcp {
     }
 
     #[tool(
+        description = "Set a Letta-style memory block. Overwrites any existing block with the same name."
+    )]
+    async fn memory_set_block(
+        &self,
+        Parameters(args): Parameters<MemorySetBlockArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let id = store
+            .set_block(&args.project, &args.name, &args.body)
+            .map_err(|e| McpError::internal_error(format!("memory.set_block: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({ "id": id }).to_string(),
+        )]))
+    }
+
+    #[tool(description = "Get a Letta-style memory block by name. Returns null when missing.")]
+    async fn memory_get_block(
+        &self,
+        Parameters(args): Parameters<MemoryGetBlockArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let block = store
+            .get_block(&args.project, &args.name)
+            .map_err(|e| McpError::internal_error(format!("memory.get_block: {e}"), None))?;
+        let body = serde_json::to_value(&block)
+            .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+    }
+
+    #[tool(description = "List every Letta-style memory block in the project.")]
+    async fn memory_list_blocks(
+        &self,
+        Parameters(args): Parameters<MemoryListBlocksArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let blocks = store
+            .list_blocks(&args.project)
+            .map_err(|e| McpError::internal_error(format!("memory.list_blocks: {e}"), None))?;
+        let body = serde_json::to_value(&blocks)
+            .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+    }
+
+    #[tool(
         description = "Chat with a registered provider via the gateway. Routes by model id (claude-* → anthropic, gpt-*/o* → openai, otherwise the openai-compat fallback)."
     )]
     async fn provider_chat(
@@ -287,6 +350,7 @@ impl ServerHandler for RtrtMcp {
             .with_instructions(
                 "RTRT MCP server. Tools: compress (caveman-style rewriter), \
                  memory_save / memory_recall (SQLite + FTS5 BM25), \
+                 memory_set_block / memory_get_block / memory_list_blocks (Letta-style blocks), \
                  templates_list / templates_scaffold (built-in project scaffolds), \
                  provider_chat (multi-provider gateway dispatch).",
             )

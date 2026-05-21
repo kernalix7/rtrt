@@ -124,6 +124,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ContextCmd,
     },
+    /// Run a command, capture failures, then ask an LLM for a fix suggestion.
+    Diagnose {
+        /// Command + args.
+        #[arg(num_args = 1..)]
+        argv: Vec<String>,
+        /// Provider for the LLM diagnosis.
+        #[arg(short, long, value_enum)]
+        provider: ProviderArg,
+        /// Model id.
+        #[arg(short, long)]
+        model: String,
+        /// Override the base URL for openai-compat providers.
+        #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
+        base_url: Option<String>,
+        /// Context lines kept around each captured error.
+        #[arg(long, default_value_t = 3)]
+        context: usize,
+    },
     /// Run a command, capture stdout+stderr, and filter to errors/warnings only.
     Run {
         /// Command + args. Quote spaces.
@@ -415,6 +433,60 @@ async fn main() -> Result<()> {
         Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
         Cmd::Context { cmd } => run_context(cmd)?,
+        Cmd::Diagnose {
+            argv,
+            provider,
+            model,
+            base_url,
+            context,
+        } => {
+            if argv.is_empty() {
+                bail!("rtrt diagnose: command is empty");
+            }
+            let (bin, args) = argv.split_first().unwrap();
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .output()
+                .with_context(|| format!("spawn {bin:?}"))?;
+            let mut combined = String::new();
+            combined.push_str(&String::from_utf8_lossy(&out.stdout));
+            if !out.stderr.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            let errors = rtrt_proxy::errors_only(&combined, context);
+            if errors.trim().is_empty() {
+                println!("no failures detected; command exited {}", out.status);
+                return Ok(());
+            }
+            eprintln!("=== captured failures ===");
+            eprintln!("{errors}");
+            eprintln!("=== llm diagnosis ===");
+            let prov = build_provider(provider, base_url, &model)?;
+            let req = ChatRequest {
+                model: model.clone(),
+                messages: vec![
+                    ChatMessage {
+                        role: Role::System,
+                        content: "You are a senior engineer triaging a build / test failure. Read the captured error output and respond with: (1) one-sentence root cause; (2) the smallest concrete fix (file + change). No filler. Cite line numbers when present.".into(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: format!("Failure log:\n\n{errors}"),
+                    },
+                ],
+                max_tokens: Some(800),
+                temperature: Some(0.2),
+            };
+            let resp = prov.chat(req).await?;
+            println!("{}", resp.content);
+            eprintln!(
+                "[usage] provider={} model={} input={} output={}",
+                resp.provider, resp.model, resp.usage.input_tokens, resp.usage.output_tokens
+            );
+        }
         Cmd::Run {
             argv,
             context,

@@ -148,12 +148,27 @@ need_cmd tar
 need_cmd uname
 
 if [ -z "$VERSION" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
         | head -1)"
     if [ -z "$VERSION" ]; then
-        printf 'could not resolve latest release. Pass --version vX.Y.Z, or --main to build from source.\n' >&2
-        exit 1
+        printf '  no GitHub Release published yet — falling back to source build (--main).\n'
+        printf '  Pass --version vX.Y.Z to pin a specific release once one is cut.\n\n'
+        if ! command -v cargo >/dev/null 2>&1; then
+            printf 'cargo not found; install Rust (https://rustup.rs) and retry, or wait for a tagged release.\n' >&2
+            exit 1
+        fi
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "$WORK"' EXIT INT TERM
+        printf '  source build from main into %s\n' "$WORK"
+        run "git clone --depth 1 https://github.com/$REPO \"$WORK\""
+        run "cd \"$WORK\" && cargo build --release --workspace"
+        run "mkdir -p \"$INSTALL_DIR\""
+        for bin in $BINS; do
+            run "install -m 0755 \"$WORK/target/release/$bin\" \"$INSTALL_DIR/$bin\""
+        done
+        install_check
+        exit 0
     fi
 fi
 printf '  version: %s\n' "$VERSION"

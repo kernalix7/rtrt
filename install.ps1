@@ -98,10 +98,39 @@ if ($Main) {
 
 # ---------- release tarball ----------
 if (-not $Version) {
-    $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
-    $Version = $latest.tag_name
+    try {
+        $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -ErrorAction Stop
+        $Version = $latest.tag_name
+    } catch {
+        $Version = $null
+    }
     if (-not $Version) {
-        throw "could not resolve latest release. Pass -Version vX.Y.Z, or -Main to build from source."
+        Write-Host "  no GitHub Release published yet — falling back to source build (-Main)."
+        Write-Host ""
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            throw "cargo not found; install Rust (https://rustup.rs) and retry, or wait for a tagged release."
+        }
+        $work = Join-Path $env:TEMP "rtrt-install-$(Get-Random)"
+        Invoke-Step "create $work" { New-Item -ItemType Directory -Path $work | Out-Null }
+        try {
+            Invoke-Step "git clone main" { git clone --depth 1 "https://github.com/$Repo" $work }
+            Invoke-Step "cargo build --release" {
+                Push-Location $work
+                try { cargo build --release --workspace } finally { Pop-Location }
+            }
+            if (-not (Test-Path $InstallDir)) {
+                Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
+            }
+            foreach ($bin in $Bins) {
+                $src = Join-Path $work "target\release\$bin"
+                $dst = Join-Path $InstallDir $bin
+                Invoke-Step "install $bin" { Copy-Item -Force $src $dst }
+            }
+        } finally {
+            if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+        }
+        Show-InstallCheck
+        return
     }
 }
 Write-Host "  version: $Version"

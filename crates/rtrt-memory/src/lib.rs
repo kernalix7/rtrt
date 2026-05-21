@@ -198,6 +198,57 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Returns one summary row per project — `(project, count, latest_ts)` —
+    /// so the dashboard can present a project picker without scanning the
+    /// whole table on the client.
+    pub fn projects(&self) -> Result<Vec<(String, usize, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT project, COUNT(*) AS n, COALESCE(MAX(created_at), 0) AS latest \
+                   FROM memories GROUP BY project ORDER BY latest DESC",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Memories in `project` ordered newest-first. Drives the dashboard
+    /// timeline / history view.
+    pub fn recent(&self, project: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at, scope FROM memories \
+                  WHERE project = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project, limit as i64], |row| {
+                let scope: String = row.get(5)?;
+                Ok(MemoryRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                    scope: MemoryScope::parse(&scope),
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
     /// Returns every `(src_id, dst_id, relation)` edge whose endpoints are
     /// inside `project`. Used by the dashboard graph view; intentionally
     /// scoped to one project so a global view doesn't degrade with growth.

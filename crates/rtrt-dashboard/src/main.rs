@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
         .route("/api/prompts/{name}", get(list_prompt_versions))
         .route("/api/prompts/{name}/{version}", get(get_prompt))
         .route("/api/budget", get(budget))
+        .route("/api/memory/projects", get(memory_projects))
+        .route("/api/memory/timeline", get(memory_timeline))
         .route("/api/memory/recall", post(memory_recall))
         .route("/api/memory/graph", get(memory_graph))
         .route("/api/memory/export", get(memory_export))
@@ -379,6 +381,64 @@ async fn memory_recall(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
     Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
+async fn memory_projects(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let rows = guard
+        .projects()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let projects: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(name, count, latest)| {
+            serde_json::json!({ "project": name, "count": count, "latest_ts": latest })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "projects": projects })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryTimelineQuery {
+    project: String,
+    #[serde(default = "default_timeline_limit")]
+    limit: usize,
+}
+
+fn default_timeline_limit() -> usize {
+    50
+}
+
+async fn memory_timeline(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryTimelineQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let rows = guard
+        .recent(&q.project, q.limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "kind": r.kind,
+                "scope": r.scope,
+                "body": r.body,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "items": items })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1164,6 +1224,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
   /* Graph canvas */
   #graph-canvas { cursor: grab; }
 
+  /* Memory project picker */
+  .proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }
+  .proj-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.1rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
+  .proj-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: var(--shadow); }
+  .proj-card .name { font-weight: 600; font-size: 1.05rem; }
+  .proj-card .row2 { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85em; margin-top: 0.35rem; }
+  .proj-head { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .proj-head h2 { font-size: 1.3rem; }
+  .hist-list { display: flex; flex-direction: column; gap: 0.4rem; }
+  .hist-item { display: flex; gap: 0.75rem; padding: 0.55rem 0.65rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: baseline; }
+  .hist-item .when { color: var(--muted); font-size: 0.82em; min-width: 72px; font-variant-numeric: tabular-nums; }
+  .hist-item .kind { color: var(--accent); font-size: 0.78em; min-width: 60px; }
+  .hist-item .body { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+
   /* Template category cards */
   .tpl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
   .tpl-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.5rem 1.25rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
@@ -1258,88 +1332,119 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 메모리 -->
     <section id="page-memory" class="page" hidden>
-      <nav class="subtabs" id="memory-subtabs">
-        <a class="active" data-sub="memquery">검색 + 저장</a>
-        <a data-sub="memmap">맵</a>
-        <a data-sub="memblocks">블록</a>
-        <a data-sub="membackup">백업</a>
-      </nav>
 
-      <div id="sub-memquery" class="subpage">
-        <div class="card">
-          <div class="head"><h2>검색</h2></div>
-          <form id="recall-form">
-            <input id="recall-project" placeholder="project (예: rtrt)" required>
-            <input id="recall-query" placeholder="검색어" required>
-            <button class="primary" type="submit">검색</button>
-            <details><summary class="muted-summary">고급 옵션</summary>
-              <div class="adv">
-                <div class="row">
-                  <input id="recall-limit" type="number" min="1" max="50" value="10" title="최대 결과 수">
-                  <input id="recall-filter" placeholder="payload 필터 (예: source=claude)">
+      <!-- 프로젝트 선택 -->
+      <div id="mem-projects" class="mem-projects">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.75rem;">
+          <h2 style="margin:0;">프로젝트</h2>
+          <a id="mem-new-project" style="cursor:pointer;">+ 새 프로젝트</a>
+        </div>
+        <div id="mem-project-grid" class="proj-grid"></div>
+      </div>
+
+      <!-- 프로젝트 상세 -->
+      <div id="mem-detail" hidden>
+        <div class="proj-head">
+          <a id="mem-back" style="cursor:pointer;">← 프로젝트 목록</a>
+          <h2 id="mem-detail-name" style="margin:0;"></h2>
+          <span id="mem-detail-meta" class="muted"></span>
+        </div>
+        <nav class="subtabs" id="memory-subtabs">
+          <a class="active" data-sub="memhistory">히스토리</a>
+          <a data-sub="memquery">검색</a>
+          <a data-sub="memmap">맵</a>
+          <a data-sub="memblocks">블록</a>
+          <a data-sub="membackup">백업</a>
+        </nav>
+
+        <div id="sub-memhistory" class="subpage">
+          <div class="card">
+            <div class="head"><h2>히스토리</h2><span class="hint">최근 저장 50건</span></div>
+            <div id="history-list" class="hist-list"><div class="empty">불러오는 중…</div></div>
+            <div style="margin-top:0.75rem;">
+              <details><summary class="muted-summary">새 메모리 빠른 저장</summary>
+                <div class="adv">
+                  <form id="save-form">
+                    <input id="save-project" type="hidden">
+                    <textarea id="save-body" rows="3" placeholder="저장할 내용" required></textarea>
+                    <div style="display:flex;gap:0.5rem;align-items:center;">
+                      <button class="primary" type="submit">저장</button>
+                    </div>
+                    <details><summary class="muted-summary">메타데이터 / kind</summary>
+                      <div class="adv">
+                        <div class="row">
+                          <input id="save-kind" placeholder="kind (기본 note)" value="note">
+                          <input id="save-metadata" placeholder='메타: {"source":"claude"}'>
+                        </div>
+                      </div>
+                    </details>
+                  </form>
+                  <div id="save-result" class="out-meta"></div>
                 </div>
-              </div>
-            </details>
-          </form>
-          <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>내용</th></tr></thead><tbody><tr><td colspan="3" class="empty">검색하면 결과가 여기에 나옵니다.</td></tr></tbody></table>
+              </details>
+            </div>
+          </div>
         </div>
-        <div class="card">
-          <div class="head"><h2>새 메모리 저장</h2></div>
-          <form id="save-form">
-            <input id="save-project" placeholder="project" required>
-            <textarea id="save-body" rows="3" placeholder="저장할 내용" required></textarea>
-            <button class="primary" type="submit">저장</button>
-            <details><summary class="muted-summary">고급 옵션</summary>
-              <div class="adv">
-                <div class="row">
-                  <input id="save-kind" placeholder="kind (기본 note)" value="note">
-                  <input id="save-metadata" placeholder='메타: {"source":"claude"}'>
+
+        <div id="sub-memquery" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>검색</h2></div>
+            <form id="recall-form">
+              <input id="recall-project" type="hidden">
+              <input id="recall-query" placeholder="검색어" required>
+              <button class="primary" type="submit">검색</button>
+              <details><summary class="muted-summary">고급 옵션</summary>
+                <div class="adv">
+                  <div class="row">
+                    <input id="recall-limit" type="number" min="1" max="50" value="10" title="최대 결과 수">
+                    <input id="recall-filter" placeholder="payload 필터 (예: source=claude)">
+                  </div>
                 </div>
-              </div>
-            </details>
-          </form>
-          <div id="save-result" class="out-meta"></div>
+              </details>
+            </form>
+            <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>내용</th></tr></thead><tbody><tr><td colspan="3" class="empty">검색어를 입력하세요.</td></tr></tbody></table>
+          </div>
         </div>
-      </div>
 
-      <div id="sub-memmap" class="subpage" hidden>
-        <div class="card">
-          <div class="head"><h2>지식 맵</h2><span class="hint">노드 = 메모리, 선 = 연결</span></div>
-          <form id="graph-form" style="grid-template-columns:1fr auto;">
-            <input id="graph-project" placeholder="project" required>
-            <button class="primary" type="submit">맵 보기</button>
-          </form>
-          <div id="graph-meta" class="out-meta"></div>
-          <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
-          <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+        <div id="sub-memmap" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>지식 맵</h2><span class="hint">노드 = 메모리, 선 = 연결</span></div>
+            <form id="graph-form" style="grid-template-columns:1fr auto;">
+              <input id="graph-project" type="hidden">
+              <button class="primary" type="submit">맵 보기</button>
+            </form>
+            <div id="graph-meta" class="out-meta"></div>
+            <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
+            <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+          </div>
         </div>
-      </div>
 
-      <div id="sub-memblocks" class="subpage" hidden>
-        <div class="card">
-          <div class="head"><h2>블록</h2><span class="hint">persona / human / context 같은 영속 슬롯</span></div>
-          <form id="blocks-list-form" style="grid-template-columns:1fr auto;">
-            <input id="blocks-project" placeholder="project" required>
-            <button type="submit">목록</button>
-          </form>
-          <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody><tr><td colspan="2" class="empty">project를 입력하고 목록을 눌러보세요.</td></tr></tbody></table>
-          <form id="blocks-set-form" style="margin-top:0.75rem;">
-            <input id="block-set-project" placeholder="project" required>
-            <input id="block-set-name" placeholder="이름 (persona / human / context)" required>
-            <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
-            <button class="primary" type="submit">저장 / 덮어쓰기</button>
-          </form>
-          <div id="block-set-result" class="out-meta"></div>
+        <div id="sub-memblocks" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>블록</h2><span class="hint">persona / human / context 같은 영속 슬롯</span></div>
+            <form id="blocks-list-form" style="grid-template-columns:1fr auto;">
+              <input id="blocks-project" type="hidden">
+              <button type="submit">목록 새로고침</button>
+            </form>
+            <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody><tr><td colspan="2" class="empty">아직 블록 없음.</td></tr></tbody></table>
+            <form id="blocks-set-form" style="margin-top:0.75rem;">
+              <input id="block-set-project" type="hidden">
+              <input id="block-set-name" placeholder="이름 (persona / human / context)" required>
+              <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
+              <button class="primary" type="submit">저장 / 덮어쓰기</button>
+            </form>
+            <div id="block-set-result" class="out-meta"></div>
+          </div>
         </div>
-      </div>
 
-      <div id="sub-membackup" class="subpage" hidden>
-        <div class="card">
-          <div class="head"><h2>백업</h2><span class="hint">JSON Lines로 내려받기</span></div>
-          <form id="export-form" style="grid-template-columns:1fr auto;">
-            <input id="export-project" placeholder="project" required>
-            <button class="primary" type="submit">다운로드</button>
-          </form>
+        <div id="sub-membackup" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>백업</h2><span class="hint">JSON Lines로 내려받기</span></div>
+            <form id="export-form">
+              <input id="export-project" type="hidden">
+              <button class="primary" type="submit">다운로드</button>
+            </form>
+          </div>
         </div>
       </div>
     </section>
@@ -1546,12 +1651,7 @@ document.getElementById('theme-toggle').onclick = () => {
 };
 
 // Sidebar nav
-document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => {
-  document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
-  document.querySelectorAll('.page').forEach(x => x.hidden = true);
-  a.classList.add('active');
-  document.getElementById('page-' + a.dataset.page).hidden = false;
-});
+document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate(a.dataset.page));
 
 // Sub-tabs (도구, 설정)
 function wireSubtabs(navId) {
@@ -1566,6 +1666,88 @@ function wireSubtabs(navId) {
   });
 }
 wireSubtabs('memory-subtabs');
+
+// Memory: project picker + drill-in
+function relativeTime(ts) {
+  if (!ts) return '—';
+  const diff = Math.floor(Date.now() / 1000 - ts);
+  if (diff < 60) return '방금 전';
+  if (diff < 3600) return `${Math.floor(diff / 60)}분 전`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}시간 전`;
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}일 전`;
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+async function loadProjects() {
+  const r = await fetch('/api/memory/projects');
+  if (!r.ok) return;
+  const d = await r.json();
+  const grid = document.getElementById('mem-project-grid');
+  if (!d.projects.length) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1;">저장된 메모리가 없습니다. 우측 상단 <a id="mem-empty-new" style="cursor:pointer;">+ 새 프로젝트</a> 또는 CLI <code>rtrt memory save</code> 로 시작하세요.</div>`;
+    const e = document.getElementById('mem-empty-new');
+    if (e) e.onclick = () => promptNewProject();
+    return;
+  }
+  grid.innerHTML = d.projects.map(p =>
+    `<div class="proj-card" data-pick="${p.project}">
+       <div class="name">${p.project}</div>
+       <div class="row2"><span>${p.count}건</span><span>${relativeTime(p.latest_ts)}</span></div>
+     </div>`
+  ).join('');
+  grid.querySelectorAll('.proj-card').forEach(c => c.onclick = () => openProject(c.dataset.pick));
+}
+function promptNewProject() {
+  const name = prompt('새 프로젝트 이름 (예: rtrt)');
+  if (name && name.trim()) openProject(name.trim());
+}
+document.getElementById('mem-new-project').onclick = promptNewProject;
+document.getElementById('mem-back').onclick = () => {
+  document.getElementById('mem-detail').hidden = true;
+  document.getElementById('mem-projects').hidden = false;
+  loadProjects();
+};
+
+let CURRENT_PROJECT = null;
+function openProject(name) {
+  CURRENT_PROJECT = name;
+  document.getElementById('mem-projects').hidden = true;
+  const detail = document.getElementById('mem-detail');
+  detail.hidden = false;
+  document.getElementById('mem-detail-name').textContent = name;
+  // Auto-fill every project input on the detail panes.
+  ['recall-project', 'save-project', 'blocks-project', 'block-set-project', 'export-project', 'graph-project'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = name;
+  });
+  localStorage.setItem('rtrt-project', name);
+  // Default sub = history.
+  document.querySelectorAll('#memory-subtabs a').forEach(x => x.classList.remove('active'));
+  document.querySelector('#memory-subtabs a[data-sub="memhistory"]').classList.add('active');
+  document.querySelectorAll('#mem-detail .subpage').forEach(x => x.hidden = true);
+  document.getElementById('sub-memhistory').hidden = false;
+  loadHistory(name);
+}
+async function loadHistory(name) {
+  const list = document.getElementById('history-list');
+  list.innerHTML = '<div class="empty">불러오는 중…</div>';
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=50`);
+  if (!r.ok) { list.innerHTML = `<div class="empty err">${r.status}: ${await r.text()}</div>`; return; }
+  const d = await r.json();
+  if (!d.items.length) {
+    list.innerHTML = `<div class="empty">아직 메모리 없음. 아래 '새 메모리 빠른 저장' 으로 시작하세요.</div>`;
+    return;
+  }
+  list.innerHTML = d.items.map(i =>
+    `<div class="hist-item">
+       <span class="when">${relativeTime(i.created_at)}</span>
+       <span class="kind">${i.kind}</span>
+       <span class="body">${i.body.replace(/</g, '&lt;')}</span>
+     </div>`
+  ).join('');
+}
+// Re-load history after save.
+const originalSaveHandler = () => {};
 
 // Project name memory — last-used value persists across reloads so the user
 // doesn't have to retype it every time.
@@ -1613,10 +1795,7 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
 // Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
 const PALETTE_ITEMS = [
   { label: '대시보드', hint: 'overview', run: () => navigate('overview') },
-  { label: '메모리 — 검색', hint: 'memory · query', run: () => { navigate('memory'); subClick('memory-subtabs', 'memquery'); document.getElementById('recall-query').focus(); } },
-  { label: '메모리 — 맵', hint: 'memory · graph', run: () => { navigate('memory'); subClick('memory-subtabs', 'memmap'); } },
-  { label: '메모리 — 블록', hint: 'memory · blocks', run: () => { navigate('memory'); subClick('memory-subtabs', 'memblocks'); } },
-  { label: '메모리 — 백업', hint: 'memory · export', run: () => { navigate('memory'); subClick('memory-subtabs', 'membackup'); } },
+  { label: '메모리 — 프로젝트', hint: 'memory · projects', run: () => navigate('memory') },
   { label: '압축', hint: 'compress / proxy', run: () => { navigate('compress'); document.getElementById('compress-input').focus(); } },
   { label: '진단', hint: 'diagnose', run: () => navigate('diagnose') },
   { label: '코드 맵', hint: 'repo-map', run: () => navigate('repomap') },
@@ -1636,6 +1815,12 @@ function navigate(page) {
   if (link) link.classList.add('active');
   const target = document.getElementById('page-' + page);
   if (target) target.hidden = false;
+  if (page === 'memory') {
+    // Show project picker by default; user can drill in.
+    document.getElementById('mem-detail').hidden = true;
+    document.getElementById('mem-projects').hidden = false;
+    loadProjects();
+  }
 }
 function subClick(navId, sub) {
   const a = document.querySelector(`#${navId} a[data-sub="${sub}"]`);

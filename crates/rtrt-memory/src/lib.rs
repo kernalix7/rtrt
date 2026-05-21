@@ -84,6 +84,22 @@ pub struct ScoredRecord {
     pub score: f32,
 }
 
+/// Outcome of [`MemoryStore::extract_and_save_unique`]: the new ids that
+/// landed and the number of duplicate facts that were skipped.
+#[derive(Debug, Clone, Default)]
+pub struct UniqueIngest {
+    pub added_ids: Vec<i64>,
+    pub skipped: usize,
+}
+
+/// Prefix applied to the `kind` column for Letta-style memory blocks.
+const BLOCK_KIND_PREFIX: &str = "block:";
+
+/// Builds the `kind` string for a Letta memory block.
+pub fn block_kind(name: &str) -> String {
+    format!("{BLOCK_KIND_PREFIX}{name}")
+}
+
 impl MemoryStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -529,6 +545,112 @@ impl MemoryStore {
         Ok(ids)
     }
 
+    /// mem0-style single-pass ADD: extracts atomic facts, drops the ones whose
+    /// body already exists for this `project` (exact string match), and saves
+    /// only the survivors. Returns counts so the caller can show "+N facts /
+    /// M duplicates skipped" feedback.
+    pub async fn extract_and_save_unique(
+        &self,
+        project: &str,
+        kind: &str,
+        body: &str,
+        summariser: &dyn Summariser,
+    ) -> Result<UniqueIngest> {
+        let facts = summariser.extract_atomic(body).await?;
+        let existing = self.list_by_project(project, 10_000)?;
+        let mut seen: std::collections::HashSet<String> =
+            existing.into_iter().map(|m| m.body).collect();
+        let mut added_ids = Vec::new();
+        let mut skipped = 0usize;
+        for fact in facts {
+            if !seen.insert(fact.clone()) {
+                skipped += 1;
+                continue;
+            }
+            let id = self.save(project, kind, &fact)?;
+            added_ids.push(id);
+        }
+        Ok(UniqueIngest { added_ids, skipped })
+    }
+
+    /// Letta-style memory block upsert. A "block" is a singleton memory keyed
+    /// by `(project, "block:<name>")` — typical names are `persona`, `human`,
+    /// `context`, but the caller picks. Setting a block overwrites any
+    /// previous version (the old row + its FTS + embedding + edges all roll
+    /// off via the cascading delete on `memories`). Returns the new id.
+    pub fn set_block(&self, project: &str, name: &str, body: &str) -> Result<i64> {
+        let kind = block_kind(name);
+        self.conn
+            .execute(
+                "DELETE FROM memories WHERE project = ?1 AND kind = ?2",
+                rusqlite::params![project, &kind],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.save(project, &kind, body)
+    }
+
+    /// Returns the singleton block for `(project, name)` if present.
+    pub fn get_block(&self, project: &str, name: &str) -> Result<Option<MemoryRecord>> {
+        let kind = block_kind(name);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at, scope
+                   FROM memories
+                  WHERE project = ?1 AND kind = ?2
+               ORDER BY created_at DESC
+                  LIMIT 1",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![project, &kind], |row| {
+                let scope: String = row.get(5)?;
+                Ok(MemoryRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                    scope: MemoryScope::parse(&scope),
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        match rows.next() {
+            Some(Ok(r)) => Ok(Some(r)),
+            Some(Err(e)) => Err(Error::Memory(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists every block in `project` (entries whose `kind` starts with
+    /// `"block:"`). Ordered by name ascending.
+    pub fn list_blocks(&self, project: &str) -> Result<Vec<MemoryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at, scope
+                   FROM memories
+                  WHERE project = ?1 AND kind LIKE 'block:%'
+               ORDER BY kind ASC, created_at DESC",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project], |row| {
+                let scope: String = row.get(5)?;
+                Ok(MemoryRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                    scope: MemoryScope::parse(&scope),
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
     /// LLM-driven entity linking. Extracts named entities from every memory
     /// in `project`, finds other memories that mention each entity via FTS5,
     /// and inserts `relation`-labelled edges between them. Returns the number
@@ -871,6 +993,49 @@ mod tests {
         // A and B both mention rust+cargo so they should be connected.
         let walk = store.recall_via_graph(&[a], 1).unwrap();
         assert!(walk.iter().any(|m| m.id == b), "{walk:?}");
+    }
+
+    #[test]
+    fn memory_block_upsert_and_list() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let id1 = store
+            .set_block("p1", "persona", "I am a careful Rust dev.")
+            .unwrap();
+        let id2 = store
+            .set_block("p1", "persona", "I am a careful Rust dev v2.")
+            .unwrap();
+        assert_ne!(id1, id2);
+        let got = store.get_block("p1", "persona").unwrap().unwrap();
+        assert!(got.body.ends_with("v2."));
+        store.set_block("p1", "human", "Kim DaeHyun").unwrap();
+        let blocks = store.list_blocks("p1").unwrap();
+        // 2 blocks (human + persona) — old persona row is deleted.
+        assert_eq!(blocks.len(), 2);
+        let names: Vec<_> = blocks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["block:human".to_string(), "block:persona".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_and_save_unique_dedupes() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let s = crate::summarise::test_support::MockSummariser;
+        // First ingest: 3 unique facts land.
+        let first = store
+            .extract_and_save_unique("p1", "note", "a is 1; b is 2; c is 3", &s)
+            .await
+            .unwrap();
+        assert_eq!(first.added_ids.len(), 3);
+        assert_eq!(first.skipped, 0);
+        // Second ingest: 2 facts already present, 1 new.
+        let second = store
+            .extract_and_save_unique("p1", "note", "a is 1; b is 2; d is 4", &s)
+            .await
+            .unwrap();
+        assert_eq!(second.added_ids.len(), 1);
+        assert_eq!(second.skipped, 2);
     }
 
     #[tokio::test]

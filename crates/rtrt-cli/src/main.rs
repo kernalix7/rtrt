@@ -119,6 +119,23 @@ enum Cmd {
         #[arg(long, default_value = ".rs")]
         ext: String,
     },
+    /// Run a command, capture stdout+stderr, and filter to errors/warnings only.
+    Run {
+        /// Command + args. Quote spaces.
+        #[arg(num_args = 1..)]
+        argv: Vec<String>,
+        /// Lines of context to keep around each match.
+        #[arg(long, default_value_t = 1)]
+        context: usize,
+        /// Apply the ultra-compact pass (strip ANSI + collapse runs) instead of
+        /// the errors-only filter.
+        #[arg(long)]
+        compact: bool,
+        /// Exit code: 0 even when the command failed (default). Pass to surface
+        /// the underlying command's exit code instead.
+        #[arg(long)]
+        passthrough_status: bool,
+    },
     /// Fetch library docs from context7 (`/owner/repo`, optional --topic).
     Docs {
         /// Library id as `<owner>/<repo>` (e.g. `facebook/react`).
@@ -369,6 +386,40 @@ async fn main() -> Result<()> {
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
+        Cmd::Run {
+            argv,
+            context,
+            compact,
+            passthrough_status,
+        } => {
+            if argv.is_empty() {
+                bail!("rtrt run: command is empty");
+            }
+            let (bin, args) = argv.split_first().unwrap();
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .output()
+                .with_context(|| format!("spawn {bin:?}"))?;
+            let mut combined = String::new();
+            combined.push_str(&String::from_utf8_lossy(&out.stdout));
+            if !out.stderr.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            let filtered = if compact {
+                rtrt_proxy::ultra_compact(&combined)
+            } else {
+                rtrt_proxy::errors_only(&combined, context)
+            };
+            print!("{filtered}");
+            if passthrough_status {
+                if let Some(code) = out.status.code() {
+                    std::process::exit(code);
+                }
+            }
+        }
         Cmd::Docs {
             library,
             topic,

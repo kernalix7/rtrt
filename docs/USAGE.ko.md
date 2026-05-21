@@ -116,10 +116,29 @@ RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
 | `proxy` | `rtrt_proxy::{filter_for, errors_only, ultra_compact}` | mode = `command \| errors_only \| ultra_compact` |
 | `memory_save` | `MemoryStore::save` | FTS5 + BM25 |
 | `memory_recall` | `MemoryStore::recall_bm25[_with_filter]` | qdrant-style 페이로드 필터 옵션 (`source=claude,topic~^auth`) |
+| `memory_timeline` | `MemoryStore::recent_paged` + `count_by_project` | 페이지네이션 히스토리; `{items, total}` |
+| `memory_profile` | `MemoryStore::projects` + 카운트 | 프로젝트별 row 수 + 최신 타임스탬프 |
+| `memory_relations` | `MemoryStore::project_edges` BFS | seed id에서 그래프 탐색, 깊이 제한 |
+| `memory_smart_search` | BM25, 임베더 부착 시 하이브리드 | 단일 쿼리 엔트리 포인트 |
+| `memory_export` | `MemoryStore::export_jsonl` | JSON Lines export (한 줄 한 행) |
+| `memory_consolidate` | `MemoryStore::archive_overflow_no_llm` | 최신 N 유지, 나머지 archive (LLM-free) |
+| `memory_sessions` | `MemoryStore::sessions` / `session_records` | 세션 요약 또는 세션 내 행 리스트 |
 | `memory_set_block` / `memory_get_block` / `memory_list_blocks` | `MemoryStore::*_block` | Letta-style persona / human / context 블록 |
+| `repo_map` | `tree-sitter` 시그니처 추출 | Rust / Python / TypeScript 시그니처 덤프 |
 | `templates_list` | `rtrt_templates::list_all` | 빌트인 + 커스텀 |
 | `templates_scaffold` | `rtrt_templates::render::{plan,write}` | 스캐폴드 |
 | `provider_chat` | `Gateway::chat` | 멀티-프로바이더 라우팅 |
+
+### MCP 자동 캡처
+
+`rtrt-mcp`는 대시보드와 동일한 자동 캡처 파이프라인을 `compress` / `compress_ml` / `proxy` / `provider_chat` 성공마다 실행. 각 호출 후 `redact_secrets` → SHA-256 dedup → `memory.save` → `session_id` 태깅. 세션 id는 프로세스 당 UUID 1개. 환경 변수는 대시보드와 공유:
+
+| Env | 기본 | 효과 |
+|-----|------|------|
+| `RTRT_AUTO_CAPTURE` | `1` | MCP 자동 캡처 마스터 스위치 |
+| `RTRT_AUTO_REDACT` | `1` | 저장 전 `redact_secrets` 실행 |
+| `RTRT_AUTO_DEDUP_WINDOW_SEC` | `300` | N초 이내 동일 body 해시 스킵 |
+| `RTRT_DEFAULT_PROJECT` | 현재 디렉토리명 | 캡처 row의 프로젝트 버킷 |
 
 HTTP 전송 옵션:
 
@@ -171,6 +190,69 @@ RTRT_DASHBOARD_BIND=127.0.0.1:7311 \
 | `/api/setup` | `POST` | 에이전트 MCP 설정 스니펫 (dry-run) |
 
 `RTRT_DASHBOARD_TOKEN` 환경변수 설정 시 `/api/*`는 베어러 토큰 미들웨어로 보호; `/`와 `/healthz`는 부트스트랩용으로 항상 통과. 비-루프백 바인드 + 토큰 미설정 시 경고.
+
+## 자동 캡처 파이프라인
+
+대시보드는 성공한 `/api/chat`, `/api/compress`, `/api/diagnose`, `/api/proxy` 호출마다 메모리 스토어에 자동 저장. [`plugins/claude-code/rtrt/`](../plugins/claude-code/rtrt/)의 Claude Code 플러그인은 훅 12종 발화마다 동일 파이프라인 수행: PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd. 대시보드 활동 피드는 `/api/stream` (Server-Sent Events) 구독으로 실시간 알림 수신, SSE 미지원 시 5초 폴링 폴백.
+
+캡처 이벤트는 다음 파이프라인 통과:
+
+```
+이벤트 발화
+  ├─ 1. SHA-256 dedup       (5분 윈도우, 설정 가능)
+  ├─ 2. 프라이버시 필터     (AWS / GitHub / OpenAI / Anthropic / Slack /
+  │                          Bearer / 개인 키 / api_key=… 모두 검열)
+  ├─ 3. SQLite 저장         (FTS5 + BM25 자동 인덱싱)
+  ├─ 4. 세션 id 태깅        (프로세스 당 UUID 1개)
+  └─ 5. 옵션 LLM 압축       (백그라운드 태스크, 기본 off)
+```
+
+### 설정
+
+| Env | 기본 | 효과 |
+|-----|------|------|
+| `RTRT_AUTO_CAPTURE` | `1` | 대시보드 자동 캡처 마스터 스위치 |
+| `RTRT_AUTO_REDACT` | `1` | 저장 전 `redact_secrets` 실행 |
+| `RTRT_AUTO_DEDUP_WINDOW_SEC` | `300` | N초 이내 동일 body 해시 스킵 |
+| `RTRT_DEFAULT_PROJECT` | `default` | 대시보드 캡처의 프로젝트 버킷 |
+| `RTRT_CONSOLIDATE_INTERVAL_SEC` | `3600` | 시간당 archive sweep 주기 (0 비활성) |
+| `RTRT_CONSOLIDATE_KEEP` | `1000` | sweep 후 프로젝트별 유지 row 수 |
+| `RTRT_AUTO_COMPRESS_LLM` | `0` | 옵트인 LLM 압축 데몬; `1`로 활성화 |
+| `RTRT_AUTO_COMPRESS_MODEL` | `claude-haiku-4-5` | 게이트웨이가 사용할 모델 id |
+| `RTRT_AUTO_COMPRESS_INTERVAL_SEC` | `1800` | sweep 주기 (초) |
+| `RTRT_AUTO_COMPRESS_AGE_SEC` | `3600` | 이보다 오래된 row만 압축 대상 |
+| `RTRT_AUTO_COMPRESS_MIN_CHARS` | `512` | 이보다 짧은 row 스킵 |
+| `RTRT_AUTO_COMPRESS_BATCH` | `20` | 프로젝트당 sweep당 최대 압축 수 |
+| `RTRT_AUTO_COMPRESS_MAX_TOKENS` | `512` | compress 호출당 최대 출력 토큰 |
+
+LLM 압축 데몬이 다시 쓴 row는 `metadata.compressed_at`, `compressed_model`, `compressed_from_chars`, `compressed_to_chars`로 태깅. LLM 출력이 비었거나 원본보다 짧지 않으면 본문은 그대로 두고 `compressed_skip=no-shrink`만 기록 — 데몬이 재시도하지 않음. 임베딩은 의도적으로 재생성하지 않음. `set_body`가 BM25 인덱스를 동기화하므로 recall은 그대로 작동.
+
+## ONNX token-importance 백엔드 (옵트인)
+
+`--features onnx`로 빌드 시 휴리스틱 `MlCompressor`가 진짜 LLMLingua-2 스타일 스코어러로 교체됨:
+
+```bash
+cargo build --release -p rtrt-cli --features onnx
+rtrt compress --ml --ratio 0.5 \
+    --onnx-model     ~/.rtrt/models/llmlingua2.onnx \
+    --onnx-tokenizer ~/.rtrt/models/tokenizer.json \
+    < verbose.md
+```
+
+두 파일은 RTRT에 동봉 안 됨 — 사용자가 직접 제공. 모델 계약은 `crates/rtrt-compress/src/ml_onnx.rs`에 문서화 (입력 `input_ids` + `attention_mask` shape `[1, seq_len]`, 출력 `[1, seq_len, 2]` per-token keep-probability 또는 `[1, seq_len]` saliency). `ort`는 `load-dynamic` 모드 — ONNX Runtime 공유 라이브러리는 시작 시 해석. 시스템 전역 설치 (`libonnxruntime.so` / `onnxruntime.dll`) 또는 `ORT_DYLIB_PATH` 설정.
+
+## BERTScore 품질 측정 (옵트인)
+
+`rtrt-eval`은 `bertscore` 피처 뒤에 BERTScore 평가기 동봉. BERT 계열 ONNX 인코더 + 매칭되는 `tokenizer.json` 전달하면 fixture 샘플마다 `Compressor::compress` 출력에 대해 점수 산출:
+
+```bash
+cargo run --release -p rtrt-eval --features bertscore -- bertscore \
+    --model     ~/.rtrt/models/bert-mini.onnx \
+    --tokenizer ~/.rtrt/models/tokenizer.json \
+    --level full
+```
+
+출력은 샘플당 한 줄 (precision / recall / F1) + mean. 인코더는 `[1, seq_len, hidden]` 출력. 점수는 subword 임베딩 greedy 코사인 정렬 (special 토큰 스킵). 실 라벨링 코퍼스는 `--fixture path/to/dataset.json` (내장 smoke fixture와 동일 스키마)로 드랍 — `docs/PERF.ko.md` 장기 정확도 목표가 기준 삼는 신뢰 가능 수치 게시.
 
 ## 설정 파일
 

@@ -161,10 +161,29 @@ Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP S
 | `proxy` | `rtrt_proxy::{filter_for, errors_only, ultra_compact}` | mode = `command \| errors_only \| ultra_compact` |
 | `memory_save` | `MemoryStore::save` | FTS5 + BM25 index |
 | `memory_recall` | `MemoryStore::recall_bm25[_with_filter]` | optional qdrant-style payload filter `source=claude,topic~^auth` |
+| `memory_timeline` | `MemoryStore::recent_paged` + `count_by_project` | paginated newest-first history; `{items, total}` |
+| `memory_profile` | `MemoryStore::projects` + per-project counts | per-project row count and last-seen timestamp |
+| `memory_relations` | `MemoryStore::project_edges` BFS | graph traversal from seed ids, depth-bounded |
+| `memory_smart_search` | BM25 today, hybrid when embedder attached | unified single-query entry point |
+| `memory_export` | `MemoryStore::export_jsonl` | JSON Lines export, one row per line |
+| `memory_consolidate` | `MemoryStore::archive_overflow_no_llm` | keep most recent N, archive the rest (LLM-free) |
+| `memory_sessions` | `MemoryStore::sessions` / `session_records` | list sessions per project, or rows in one session |
 | `memory_set_block` / `memory_get_block` / `memory_list_blocks` | `MemoryStore::*_block` | Letta-style persona / human / context slots |
+| `repo_map` | `tree-sitter` signature extraction | Rust / Python / TypeScript signature dump |
 | `templates_list` | `rtrt_templates::list_all` | built-in + custom templates |
 | `templates_scaffold` | `rtrt_templates::render::{plan,write}` | scaffold from a template |
 | `provider_chat` | `Gateway::chat` | multi-provider routing through the bundled gateway |
+
+### MCP auto-capture
+
+`rtrt-mcp` mirrors the dashboard's auto-capture pipeline on every successful `compress` / `compress_ml` / `proxy` / `provider_chat` call. Each invocation runs `redact_secrets` → SHA-256 dedup → `memory.save` → `session_id` tag before returning. The session id is one UUID per process. Same env knobs as the dashboard:
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `RTRT_AUTO_CAPTURE` | `1` | Master switch for the MCP auto-capture pipeline |
+| `RTRT_AUTO_REDACT` | `1` | Run `redact_secrets` before saving |
+| `RTRT_AUTO_DEDUP_WINDOW_SEC` | `300` | Skip duplicate body hashes seen within N seconds |
+| `RTRT_DEFAULT_PROJECT` | current dir name | Project bucket for captured rows |
 
 HTTP transport flags:
 
@@ -221,7 +240,7 @@ All `/api/*` routes are gated by a bearer-token middleware when `RTRT_DASHBOARD_
 
 ## Auto-capture pipeline
 
-The dashboard auto-saves every successful `/api/chat`, `/api/compress`, `/api/diagnose`, and `/api/proxy` request into the memory store. The Claude Code plugin under [`plugins/claude-code/rtrt/`](../plugins/claude-code/rtrt/) does the same for every hook fire (PreToolUse / PostToolUse / UserPromptSubmit / Stop / SessionStart / SessionEnd).
+The dashboard auto-saves every successful `/api/chat`, `/api/compress`, `/api/diagnose`, and `/api/proxy` request into the memory store. The Claude Code plugin under [`plugins/claude-code/rtrt/`](../plugins/claude-code/rtrt/) does the same for every hook fire across twelve event types: PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd. The dashboard's activity feed subscribes to `/api/stream` (Server-Sent Events) for live capture notifications and falls back to 5-second polling if SSE is unavailable.
 
 Every captured event runs through this pipeline:
 
@@ -245,6 +264,42 @@ event fires
 | `RTRT_DEFAULT_PROJECT` | `default` | Project bucket for dashboard captures |
 | `RTRT_CONSOLIDATE_INTERVAL_SEC` | `3600` | Hourly archive sweep cadence (0 disables) |
 | `RTRT_CONSOLIDATE_KEEP` | `1000` | Rows kept per project after each sweep |
+| `RTRT_AUTO_COMPRESS_LLM` | `0` | Opt-in LLM compress daemon; `1` enables |
+| `RTRT_AUTO_COMPRESS_MODEL` | `claude-haiku-4-5` | Model id passed to the gateway for each compress call |
+| `RTRT_AUTO_COMPRESS_INTERVAL_SEC` | `1800` | Sweep cadence (seconds) |
+| `RTRT_AUTO_COMPRESS_AGE_SEC` | `3600` | Only touch rows older than this |
+| `RTRT_AUTO_COMPRESS_MIN_CHARS` | `512` | Skip rows shorter than this |
+| `RTRT_AUTO_COMPRESS_BATCH` | `20` | Max rows compressed per project per sweep |
+| `RTRT_AUTO_COMPRESS_MAX_TOKENS` | `512` | Max output tokens per compress call |
+
+Rows the LLM compress daemon rewrites get tagged with `metadata.compressed_at`, `compressed_model`, `compressed_from_chars`, and `compressed_to_chars`. If the LLM's output is empty or no shorter than the input, the row is left untouched but `compressed_skip=no-shrink` is recorded so the daemon does not keep retrying it. Embeddings are intentionally not regenerated — recall stays serviceable off the BM25 index that `set_body` updates in lockstep.
+
+## ONNX token-importance backend (opt-in)
+
+Build with `--features onnx` to swap the heuristic `MlCompressor` for a real LLMLingua-2-style scorer:
+
+```bash
+cargo build --release -p rtrt-cli --features onnx
+rtrt compress --ml --ratio 0.5 \
+    --onnx-model     ~/.rtrt/models/llmlingua2.onnx \
+    --onnx-tokenizer ~/.rtrt/models/tokenizer.json \
+    < verbose.md
+```
+
+The two files are not shipped with RTRT — supply them yourself. The model contract is documented in `crates/rtrt-compress/src/ml_onnx.rs` (named inputs `input_ids` + `attention_mask` of shape `[1, seq_len]`, output `[1, seq_len, 2]` per-token keep-probability or `[1, seq_len]` saliency). `ort` is configured with `load-dynamic`, so the ONNX Runtime shared library is resolved at startup; install it system-wide (`libonnxruntime.so` / `onnxruntime.dll`) or set `ORT_DYLIB_PATH`.
+
+## BERTScore quality check (opt-in)
+
+`rtrt-eval` ships a BERTScore evaluator behind the `bertscore` feature. Pass any BERT-like ONNX encoder + the matching `tokenizer.json` and it scores every fixture sample against its `Compressor::compress` output:
+
+```bash
+cargo run --release -p rtrt-eval --features bertscore -- bertscore \
+    --model     ~/.rtrt/models/bert-mini.onnx \
+    --tokenizer ~/.rtrt/models/tokenizer.json \
+    --level full
+```
+
+Output is one line per sample (precision, recall, F1) plus a mean row. The encoder must emit `[1, seq_len, hidden]`; the score is greedy cosine alignment between subword embeddings (special tokens skipped). Drop in a real labelled corpus via `--fixture path/to/dataset.json` (same shape as the built-in smoke fixture) to publish the trustworthy numbers the long-term quality targets in `docs/PERF.md` are written against.
 
 ### Plugin install
 

@@ -251,9 +251,14 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] LLMLingua-style `MlCompressor` scaffold (heuristic backend; ONNX backend deferred)
 - [x] `recall_via_graph` driven by LLM entity extraction (mem0 entity linking)
 - [x] Helicone-style retry / fallback routing across providers
-- [ ] Real LLMLingua-2 ONNX backend behind the `MlCompressor` interface
-- [ ] crewAI-style multi-agent Rust runtime
-- [ ] First tagged release (`v0.2.0-rc1`)
+- [x] `rtrt-eval` opt-in crate — `R@K` / `MRR` over a labelled fixture + `compress` ratio per level + JSON output
+- [x] LLM auto-compress background daemon (opt-in via `RTRT_AUTO_COMPRESS_LLM=1`)
+- [x] `scripts/smoke.sh` — live-key smoke harness, the pre-tag gate
+- [x] Real ONNX token-importance backend behind `MlCompressor` (opt-in `--features onnx`; user-supplied model + tokenizer)
+- [x] BERTScore evaluator in `rtrt-eval` (opt-in `--features bertscore`; user-supplied encoder + tokenizer)
+- [x] MCP Prompts + Resources — `prompts/list` / `prompts/get` (with handlebars args) over the local PromptRegistry; `resources/list` / `resources/read` over project timelines + Letta blocks
+- [ ] Optional multi-agent coordination crate (deferred; see `DESIGN.md`)
+- [ ] First tagged release — once live-key smoke + browser tour pass and the user explicitly approves; version label stays `0.1.0` until then
 
 ## Inspired by
 

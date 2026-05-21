@@ -9,6 +9,51 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — MCP Prompts/Resources + ONNX backend + BERTScore
+
+**Three remaining roadmap items land in one sweep. MCP server now exposes the full handler triad (tools / prompts / resources); the heuristic `MlCompressor` graduates with an optional real ONNX-runtime backend matching the LLMLingua-2 contract; `rtrt-eval` gains a BERTScore evaluator behind the same encoder-loading machinery. All new code is feature-gated and ships zero model files.**
+
+- `rtrt-mcp` declares `enable_prompts()` + `enable_resources()` and implements the four handlers. `prompts/list` enumerates every name in the local `PromptRegistry` (default `~/.rtrt/prompts/`, override with `RTRT_PROMPTS_DIR`); `prompts/get` returns the latest version with handlebars argument substitution. `resources/list` surfaces one `memory://<project>/timeline` per project plus one `memory://<project>/block/<name>` per Letta block; `resources/read` returns either JSON-Lines timeline rows or the block body. Errors are mapped to `McpError::invalid_params` / `internal_error` and never crash the server.
+- New `rtrt-templates::render::render_str` makes the handlebars renderer public so MCP and any other consumer share the same `{{var}}` engine the scaffolder uses.
+- `rtrt-compress::OnnxImportance` — opt-in `onnx` feature pulls `ort = 2.0.0-rc.12` (`load-dynamic`), HuggingFace `tokenizers`, and `ndarray`. `MlCompressor::onnx(model, tokenizer)` constructs a session, runs the user-supplied model on `input_ids` + `attention_mask`, and maps the per-subword keep-probability back to whitespace-tokens via the tokenizer's offsets. Default build does not link `ort` — workspace size stays the same for users who only want the rule engine.
+- New CLI plumbing: `rtrt compress --ml --onnx-model <path> --onnx-tokenizer <path>` (gated by `rtrt-cli --features onnx`, forwards to `rtrt-compress/onnx`). Both env vars (`RTRT_ONNX_MODEL` / `RTRT_ONNX_TOKENIZER`) accepted.
+- `rtrt-eval::bertscore` — opt-in `bertscore` feature. `BertScoreScorer::new(encoder.onnx, tokenizer.json)` builds an L2-normalised per-subword embedder; `score(reference, hypothesis)` returns greedy-aligned `(P, R, F1)`; `evaluate_fixture(fixture, level)` runs the compressor and reports per-sample + mean scores. CLI: `rtrt-eval bertscore --model ... --tokenizer ... [--level full]`.
+- `docs/USAGE.md` + `docs/USAGE.ko.md` document the ONNX model contract, the BERTScore workflow, and the env vars / feature flags for both surfaces. README roadmaps (EN + KO) flip the three items to done and drop the deferred multi-agent line to its own bullet.
+
+### Highlights — rtrt-eval opt-in harness
+
+**Tenth workspace crate `rtrt-eval` ships. Two surfaces (recall quality + compression ratio) reduce a JSON fixture into a single number you can put on a dashboard. The built-in smoke fixture is intentionally tiny; the harness accepts external fixtures with the same shape so LongMemEval-S or an in-house corpus plugs in without code changes. R@5 = 0.857 + MRR = 0.857 on the smoke corpus, enforced by an in-crate floor test.**
+
+- New crate `crates/rtrt-eval/`: library + `rtrt-eval` binary. Subcommands `recall` and `compress`, JSON or human output, `--fixture <path>` to override the built-in smoke set.
+- Library API: `RecallFixture`, `CompressFixture`, `evaluate_recall(&fixture, k) -> RecallReport`, `evaluate_compression(&fixture, level) -> CompressReport`. Embedded fixtures published as `RECALL_SMOKE` / `COMPRESS_SMOKE` consts.
+- Smoke fixtures `crates/rtrt-eval/fixtures/recall_smoke.json` (12 docs, 7 hand-labelled queries) + `compress_smoke.json` (3 prose samples). Hand-tuned so BM25 should clear the R@5 ≥ 0.80 floor; failure to clear blocks merges via the `recall_at_5_on_smoke_fixture_clears_floor` test.
+- `docs/PERF.md` + `docs/PERF.ko.md` publish the first measured numbers from the smoke fixture. Marked explicitly as smoke (not a competition benchmark) — real numbers require a real labelled corpus.
+- README roadmap (EN + KO): rtrt-eval and the smoke script flipped to done; BERTScore numbers, ONNX backend, and tagged release remain open.
+
+### Highlights — LLM auto-compress + live-key smoke gate
+
+- Opt-in LLM compression daemon in `rtrt-dashboard`. With `RTRT_AUTO_COMPRESS_LLM=1` set, a background tokio task sweeps rows older than `RTRT_AUTO_COMPRESS_AGE_SEC` whose body exceeds `RTRT_AUTO_COMPRESS_MIN_CHARS`, asks the configured gateway model (`RTRT_AUTO_COMPRESS_MODEL`, default `claude-haiku-4-5`) to rewrite each one losslessly-of-meaning, and writes the result back. Rewritten rows are tagged with `metadata.compressed_at` / `compressed_model` / `compressed_from_chars` / `compressed_to_chars` so the next sweep skips them. Rows where the model produces empty or non-shrinking output are marked `compressed_skip=no-shrink` and left untouched.
+- New `MemoryStore::set_body` (FTS5-synced overwrite via `'delete' + insert` on the external-content index) and `MemoryStore::compress_candidates` (age / min-chars / not-yet-compressed filter) — the primitives the daemon stands on. Regression-covered by `auto_compress_primitives`.
+- `scripts/smoke.sh` — live-key smoke harness. Runs `rtrt --version` / `compress` / `proxy` / `templates` / `new` / `repo-map` unconditionally; runs Anthropic / OpenAI / OpenAI-compatible provider chats when the matching env vars are present (otherwise SKIP); spawns `rtrt-dashboard` + `rtrt-mcp` on loopback ports and probes `/healthz`, `/api/templates`, `/api/stats`, plus MCP HTTP reachability and the bearer guard's 401. Exits non-zero only when a check that actually ran failed. Designed as the gate before promoting `0.1.0` to a tagged release.
+- `docs/USAGE.md` + `docs/USAGE.ko.md` document the seven `RTRT_AUTO_COMPRESS_*` env knobs and the metadata fields the daemon writes.
+
+### Highlights — Dashboard / docs / regression coverage
+
+- Dashboard activity feed subscribes to `/api/stream` via `EventSource` and only falls back to 5-second polling when SSE is unavailable. Captures now show up live without refreshing.
+- `docs/USAGE.md` + `docs/USAGE.ko.md` document the full 18-tool MCP surface (`memory_timeline` / `memory_profile` / `memory_relations` / `memory_smart_search` / `memory_export` / `memory_consolidate` / `memory_sessions` / `repo_map` added to the table) and the four `RTRT_AUTO_*` env knobs that the MCP server honours. Korean USAGE also gains the dashboard auto-capture pipeline section that the English doc already had.
+- `rtrt-memory` regression test `auto_capture_pipeline_primitives` verifies the building blocks the dashboard and MCP both depend on: deterministic `body_sha`, `body_seen_at` dedup window (per-project scoping), `tag_row` session + sha writes, `sessions` / `session_records` grouping, and `archive_overflow_no_llm` newest-N retention.
+
+### Highlights — Direction refresh follow-ups
+
+**Schema v5 lands a covering index for the timeline pager (`recent_paged` p50 on 100 K rows dropped from 71 ms to ~32 µs — 2200×). The Claude Code plugin now wires twelve hooks instead of six. MCP gains a seventh memory tool (`memory_sessions`) that exposes the v4 `session_id` column, and four MCP tool handlers (`compress` / `compress_ml` / `proxy` / `provider_chat`) now run through the same auto-capture pipeline the dashboard uses. A PR-time perf gate (`.github/workflows/perf.yml` + `scripts/perf-gate.sh`) refuses any benchmark that regresses beyond 10 % of the baseline. Korean README is back in sync with the Unix-toolkit positioning.**
+
+- `rtrt-memory` schema v5: `idx_memories_timeline` covering `(project, created_at DESC, id DESC)`. New `sessions()` + `session_records()` helpers group rows by `session_id` for replay / export. `recent_paged` p50 is now sub-50 µs at every size we bench.
+- `rtrt-mcp` adds `memory_sessions` (per-project session summary or per-session row list) bringing the server to 18 tools. `RtrtState` grows a `auto_capture()` helper that mirrors the dashboard pipeline (`redact_secrets` → SHA-256 dedup → save → session tag); `compress`, `compress_ml`, `proxy`, and `provider_chat` all run it on success. Env knobs: `RTRT_AUTO_CAPTURE` / `RTRT_AUTO_REDACT` / `RTRT_AUTO_DEDUP_WINDOW_SEC` / `RTRT_DEFAULT_PROJECT` (same as the dashboard).
+- Claude Code plugin (`plugins/claude-code/rtrt/`) now ships twelve hooks: PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd.
+- `.github/workflows/perf.yml` benches `rtrt-memory` against the PR base ref with `--save-baseline` / `--baseline`, then `scripts/perf-gate.sh` parses criterion's `estimates.json` and exits non-zero on >10 % p50 regression. Documents the policy already in `docs/PERF.md`.
+- `docs/PERF.md` + `docs/PERF.ko.md` updated with the post-v5 measurements.
+- `docs/README.ko.md` rewritten to match the Unix-toolkit positioning, three-pillar block, DESIGN/PERF links, and the 18-tool MCP surface.
+
 ### Highlights — Direction refresh
 
 **RTRT formally commits to a Unix-philosophy toolkit. New top-level `DESIGN.md` documents the ten principles; new `docs/PERF.md` publishes the SLO table and the first measured numbers. Auto-capture is no longer optional ceremony — every dashboard `/api/*` call and every Claude Code hook fire runs through a SHA-256 dedup + privacy filter + session tag pipeline before landing in SQLite. An hourly consolidation daemon keeps each project under a row cap. Six new memory MCP tools (timeline / profile / relations / smart_search / export / consolidate) plus a Server-Sent Events live stream + a tokens aggregator close the gap with broader memory platforms while staying narrow.**

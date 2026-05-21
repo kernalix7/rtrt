@@ -58,23 +58,37 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 
 ```bash
 rtrt compress -l ultra < verbose.md
+rtrt compress --llm --provider openai-compat \
+   --base-url http://127.0.0.1:11434/v1 --model llama3.2 < verbose.md
 rtrt proxy "git status" < git-status-output
+rtrt signatures --lang rust < src/file.rs
+rtrt repo-map crates/rtrt-core
+rtrt discover
 rtrt templates
 rtrt new rust-cli ./hello --var project_name=hello
+rtrt setup --agent claude --apply
+rtrt memory save --project p --kind note "fact"
+rtrt memory recall --project p --query rust
+rtrt prompt save greet "say hi"
+rtrt prompt get greet
+rtrt docs facebook/react --topic hooks
+rtrt provider chat --model claude-haiku-4-5 "ping"
 rtrt-dashboard
-rtrt-mcp
+rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
 
 전체 명령은 [USAGE.ko.md](USAGE.ko.md)에 있습니다.
 
 ## 핵심 기능
 
-- **출력 압축** — `lite`/`full`/`ultra` 단계, 코드 블록 보호.
-- **명령 출력 필터링** — `git`/`cargo` 등 빌트인 필터, MCP 도구로도 노출.
-- **영구 메모리** — SQLite + FTS5 기반 BM25 회수, 벡터/그래프는 예정.
-- **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환(Ollama, llama.cpp 등).
-- **프로젝트 스캐폴드** — 빌트인 6종 + `~/.rtrt/templates/`의 커스텀 템플릿.
-- **MCP + 대시보드** — `rtrt-mcp`(stdio 예정), axum 기반 `rtrt-dashboard`.
+- **출력 압축** — `lite` / `full` / `ultra` / `extreme` 4단계 + 코드 블록 보호 + 시크릿 자동 검열 + LLM 압축 모드(Ollama OK).
+- **명령 출력 필터링** — `git` / `cargo` 빌트인 필터; MCP 도구로도 노출.
+- **영구 메모리** — SQLite + FTS5 BM25 + 벡터 + 그래프 + HNSW + LLM extract/compress; 메모리 스코프(user/agent/session/project).
+- **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환(Ollama, llama.cpp 등); `Gateway` + 예산 + 트레이스; `Context7Client` 라이브러리 문서 페치.
+- **프로젝트 스캐폴드 + 프롬프트** — 빌트인 6종 + 커스텀 + handlebars 렌더링; 버저닝되는 `PromptRegistry`.
+- **MCP + 대시보드** — `rtrt-mcp` rmcp stdio 6 도구; `rtrt-dashboard` axum (metrics / templates / stats 탭).
+- **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/aider --apply`.
+- **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`(셸 히스토리 스캔).
 
 ## 문서
 
@@ -92,18 +106,23 @@ rtrt-mcp
 
 ## 로드맵
 
-- [x] 워크스페이스 스캐폴드 (9개 크레이트)
-- [x] `rtrt-compress` 규칙 엔진
+- [x] 워크스페이스 스캐폴드 (9 크레이트, edition 2024)
+- [x] `rtrt-compress` 규칙 + extreme + 시크릿 검열 + tree-sitter 시그니처 + LLM 압축 모드
 - [x] `rtrt-proxy` git / cargo 필터
-- [x] `rtrt-memory` SQLite + FTS5 BM25 회수
-- [x] `rtrt-templates` 빌트인 6종 + 커스텀 로더
-- [x] `rtrt-dashboard` 최소 axum UI
-- [ ] `rtrt-compress` 벤치 하니스
-- [ ] `rtrt-memory` 벡터/그래프 · `all-MiniLM-L6-v2` 임베딩
-- [ ] `rtrt-providers` Anthropic / OpenAI 실제 채팅 구현
-- [ ] `rtrt-mcp` stdio 전송 계층 구현
-- [ ] 원라이너 설치 스크립트(`install.sh` / `install.ps1`)
-- [ ] Claude Code 플러그인 매니페스트
+- [x] `rtrt-memory` BM25 + 벡터 + RRF 하이브리드 + 그래프 + HNSW + 메모리 스코프
+- [x] `rtrt-memory` LLM extract / compress / archival (Ollama 등 모든 Provider)
+- [x] `rtrt-templates` 빌트인 6종 + handlebars + 버저닝되는 `PromptRegistry`
+- [x] `rtrt-providers` Anthropic / OpenAI / OpenAI-compat HTTP + 스트리밍 + Gateway + Budget + Context7
+- [x] `rtrt-mcp` rmcp stdio 6 도구
+- [x] `rtrt-dashboard` axum + REST API (chat / metrics / templates / stats)
+- [x] `install.sh` + `install.ps1` 원라이너 + `release.yml` 5-target 매트릭스
+- [x] `rtrt setup --agent <name>` Claude / Cursor / Codex / Windsurf 와이어업
+- [x] criterion 벤치 + per-fixture 절감률 테이블
+- [ ] MCP HTTP / SSE 전송 (stdio는 출시 완료)
+- [ ] `caveman-shrink` MCP 도구 설명 압축 미들웨어
+- [ ] LLM 엔티티 추출 기반 `recall_via_graph` (mem0 엔티티 링킹)
+- [ ] Helicone 스타일 재시도 / 폴백 라우팅
+- [ ] 첫 태그 릴리스 (`v0.2.0-rc1`)
 
 ## 라이선스
 

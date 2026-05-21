@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+### Highlights
+
+**INSPIRATION 백로그의 HIGH 12개를 한 번에 채택 — 메모리 계층 / 그래프 회수 / HNSW, gateway 예산 + 트레이스, 프롬프트 레지스트리, context7 doc fetcher, repo-map / signatures, `rtrt discover`, handlebars 템플릿, 규칙 확장 + LLM 압축 모드.**
+
+자세한 항목은 [영문 CHANGELOG](../CHANGELOG.md#unreleased)를 참고하세요. 주요 라인업:
+
+- `rtrt-providers`: `Gateway` + `Budget` + 요청별 `RequestMetric { id, parent_id, cost_usd, … }`; `Context7Client` 라이브러리 문서 페치.
+- `rtrt-memory`: 메모리 스코프(`MemoryScope`), `add_edge` + `recall_via_graph`, `with_embedder` 자동 임베드, `archive_overflow`, `hnsw` 피처(`HnswIndex`, `instant-distance`).
+- `rtrt-compress`: `Extreme` 레벨, 헤지/담화/메타 표현 규칙, `redact_secrets` 사전 검열, `LlmCompressor`(any Provider), Rust 시그니처 추출기.
+- `rtrt-templates`: handlebars 렌더링, 버저닝되는 `PromptRegistry`.
+- `rtrt-cli`: `compress --llm` / `memory {extract,compress}` / `prompt {save,get,list,versions}` / `signatures` / `repo-map` / `discover` / `docs` / `setup --agent` 전부 추가.
+- `rtrt-mcp`: 6번째 도구 `provider_chat` 추가.
+
 <!--
 릴리스 절단 시 이 스탠자를 복사해 새 버전 섹션을 만드세요.
 `### Highlights`를 항상 섹션 최상단에 두는 것이 중요합니다 — 릴리스 페이지에서

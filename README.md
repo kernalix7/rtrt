@@ -71,12 +71,27 @@ See [docs/INSTALL.md](docs/INSTALL.md) for crates.io install, pre-built binaries
 ## Launch
 
 ```bash
-rtrt compress -l ultra < verbose.md            # Caveman-style rewrite
-rtrt proxy "git status" < git-status-output    # Filter command output
-rtrt templates                                 # List built-in templates
-rtrt new rust-cli ./hello --var project_name=hello   # Scaffold a project
-rtrt-dashboard                                 # Serve http://127.0.0.1:3111
-rtrt-mcp                                       # Run the MCP server (stdio, planned)
+rtrt compress -l ultra < verbose.md             # Caveman-style rule rewrite
+rtrt compress --llm --provider openai-compat \  # LLM rewrite (Ollama / any provider)
+   --base-url http://127.0.0.1:11434/v1 --model llama3.2 < verbose.md
+rtrt proxy "git status" < git-status-output     # Filter command output
+rtrt signatures --lang rust < src/file.rs       # tree-sitter signature map
+rtrt repo-map crates/rtrt-core                  # signature map of a directory
+rtrt discover                                   # find proxy candidates in shell history
+rtrt templates                                  # list built-in templates
+rtrt new rust-cli ./hello --var project_name=hello
+rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
+rtrt memory save --project p --kind note "fact"
+rtrt memory recall --project p --query rust
+rtrt memory extract --project p --provider openai-compat \
+   --base-url http://127.0.0.1:11434/v1 --model llama3.2 < passage.md
+rtrt memory compress --project p --keep 20 --provider anthropic --model claude-haiku-4-5
+rtrt prompt save greet "say hi" --meta env=dev
+rtrt prompt get greet
+rtrt docs facebook/react --topic hooks          # context7 library docs
+rtrt provider chat --model claude-haiku-4-5 "ping"
+rtrt-dashboard                                  # http://127.0.0.1:3111 (tabs: metrics / templates / stats)
+rtrt-mcp --memory ~/.rtrt/memory.sqlite         # stdio MCP server, 6 tools
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.
@@ -106,9 +121,12 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 <tr><td width="50%">
 
 **Persistent project memory**
-- SQLite + FTS5 store with `project / kind / body` schema
-- BM25 recall via FTS5; vector + graph layers reserved in the schema
-- Local-first embeddings target: `all-MiniLM-L6-v2` (offline)
+- SQLite + FTS5 store with `scope / project / kind / body` schema; tiers: `user` / `agent` / `session` / `project`
+- BM25 (`recall_bm25`), dense-vector cosine (`recall_vector`), and BM25 ⊕ vector RRF (`recall_hybrid`)
+- Sub-linear ANN via `HnswIndex` behind the `hnsw` feature (`instant-distance`)
+- Directed labelled edges + `recall_via_graph` BFS for entity / relation traversal
+- `all-MiniLM-L6-v2` embeddings (`embeddings` feature, fastembed); attach via `MemoryStore::with_embedder` to auto-embed every `save`
+- LLM extract / compress via any `Provider` — local Ollama included — under the `llm` feature
 - [Details →](docs/FEATURES.md#persistent-memory)
 
 </td><td width="50%">
@@ -116,7 +134,9 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 **Multi-provider routing**
 - Provider trait with built-in Anthropic / OpenAI / OpenAI-compatible adapters
 - OpenAI-compatible base URL covers Ollama, llama.cpp, vLLM, LM Studio
-- Active provider per task; planned plugin slot for new providers
+- `Gateway` fronts every provider behind one entry; per-request `RequestMetric` (id / parent_id / cost / latency) feeds the dashboard `/api/metrics`
+- `Budget::new(usd)` fails-fast when the cumulative cost cap is hit
+- `Context7Client` fetches version-pinned library docs (`rtrt docs facebook/react --topic hooks`)
 - [Details →](docs/FEATURES.md#multi-provider-routing)
 
 </td></tr>
@@ -132,9 +152,10 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 </td><td width="50%">
 
 **MCP server + dashboard**
-- `rtrt-mcp` exposes `compress`, `memory.save`, `memory.recall`, `provider.chat` as MCP tools (stdio transport planned)
-- `rtrt-dashboard` (axum) serves token-savings stats, the template gallery, and a scaffold endpoint
-- Plugin format planned for compression rules and provider adapters
+- `rtrt-mcp` (rmcp 1.x, stdio) ships 6 tools: `compress`, `memory_save`, `memory_recall`, `templates_list`, `templates_scaffold`, `provider_chat`
+- `rtrt-dashboard` (axum) tabs: gateway metrics (live KPI + per-request table), templates, savings; endpoints: `/api/chat`, `/api/metrics`, `/api/templates*`, `/api/stats`
+- `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf
+- Versioned prompt registry under `~/.rtrt/prompts/<name>/<NNNN>.toml` (`rtrt prompt {save,get,list,versions}`)
 - [Details →](docs/FEATURES.md#mcp-and-dashboard)
 
 </td></tr>
@@ -161,13 +182,13 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | Crate | Role |
 |-------|------|
 | `rtrt-core` | Shared types, plugin trait, errors, config |
-| `rtrt-compress` | Output compression engine (caveman-style) |
+| `rtrt-compress` | Rule rewriter + secret redactor + tree-sitter signature extractor + LLM compression mode |
 | `rtrt-proxy` | Command-output filter (rtk-style) |
-| `rtrt-memory` | SQLite + FTS5 memory store with BM25 recall |
-| `rtrt-providers` | Multi-provider chat client trait + adapters |
-| `rtrt-templates` | Built-in + custom project scaffolds |
-| `rtrt-mcp` | MCP server binary |
-| `rtrt-dashboard` | Axum web dashboard binary |
+| `rtrt-memory` | SQLite + FTS5 BM25 + vector + graph + HNSW + LLM-driven extract/compress |
+| `rtrt-providers` | Multi-provider chat trait + Gateway + Budget + Context7 doc fetcher |
+| `rtrt-templates` | Built-in + custom scaffolds + handlebars rendering + `PromptRegistry` |
+| `rtrt-mcp` | rmcp 1.x stdio MCP server (6 tools) |
+| `rtrt-dashboard` | Axum web dashboard + REST API (`/api/{chat,metrics,templates,stats}`) |
 | `rtrt-cli` | `rtrt` command-line entry point |
 
 ## Testing
@@ -184,17 +205,22 @@ CI runs the same three gates on every push and pull request to `main`.
 ## Roadmap
 
 - [x] Workspace scaffold (9 crates, edition 2024)
-- [x] `rtrt-compress` rule engine (lite/full/ultra, code-block-safe)
+- [x] `rtrt-compress` rule engine + extreme level + secret redactor + tree-sitter signatures + LLM mode
 - [x] `rtrt-proxy` filters for git + cargo
-- [x] `rtrt-memory` SQLite + FTS5 BM25 recall
-- [x] `rtrt-templates` 6 built-ins + custom loader, web + CLI surfaces
-- [x] `rtrt-dashboard` minimal axum UI
-- [ ] `rtrt-compress` benchmark harness
-- [ ] `rtrt-memory` vector + graph layers; `all-MiniLM-L6-v2` embeddings
-- [ ] `rtrt-providers` real Anthropic + OpenAI clients (chat is currently a stub)
-- [ ] `rtrt-mcp` stdio transport implementation
-- [ ] One-line install scripts (`install.sh` / `install.ps1`)
-- [ ] Claude Code plugin manifest
+- [x] `rtrt-memory` SQLite + FTS5 BM25 + dense-vector + RRF hybrid + edges graph + HNSW + memory tiers
+- [x] `rtrt-memory` LLM-driven extract / compress / archival via any provider (local Ollama OK)
+- [x] `rtrt-templates` 6 built-ins + custom loader + handlebars + versioned `PromptRegistry`
+- [x] `rtrt-providers` real Anthropic / OpenAI / OpenAI-compatible HTTP + streaming + Gateway + Budget + Context7 docs
+- [x] `rtrt-mcp` rmcp stdio transport with 6 tools (`compress`, `memory_*`, `templates_*`, `provider_chat`)
+- [x] `rtrt-dashboard` axum UI with tabs (metrics / templates / stats) + `/api/chat` gateway endpoint
+- [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
+- [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf
+- [x] criterion benchmark harness + per-fixture savings table
+- [ ] MCP HTTP / SSE transport (stdio is shipped)
+- [ ] `caveman-shrink`-style MCP tool-description compression middleware
+- [ ] `recall_via_graph` driven by LLM entity extraction (mem0 entity linking)
+- [ ] Helicone-style retry / fallback routing across providers
+- [ ] First tagged release (`v0.2.0-rc1`)
 
 ## Inspired by
 

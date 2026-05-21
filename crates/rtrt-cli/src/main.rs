@@ -255,6 +255,24 @@ enum MemoryCmd {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Export every memory row in a project to JSON Lines (stdout if `--out` omitted).
+    Export {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+        /// Destination file. `-` (or omit) writes to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import JSON Lines emitted by `rtrt memory export` (stdin if `--in` omitted).
+    Import {
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+        /// Source file. `-` (or omit) reads from stdin.
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+    },
     /// Extract atomic facts from a passage via LLM and save each.
     Extract {
         #[arg(long)]
@@ -794,6 +812,8 @@ async fn main() -> Result<()> {
             std::io::stdin().read_to_string(&mut buf)?;
             let language = match lang.as_str() {
                 "rust" | "rs" => TsLanguage::Rust,
+                "python" | "py" => TsLanguage::Python,
+                "ts" | "typescript" | "tsx" => TsLanguage::TypeScript,
                 other => bail!("unsupported tree-sitter language: {other}"),
             };
             let out = SignatureExtractor::new(language).extract(&buf)?;
@@ -1062,6 +1082,38 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             for h in hits {
                 println!("[{}] {} {}", h.id, h.kind, h.body);
             }
+        }
+        MemoryCmd::Export {
+            project,
+            store,
+            out,
+        } => {
+            let store = MemoryStore::open(&store)?;
+            let count = match out {
+                Some(p) if p.as_os_str() != "-" => {
+                    let f = std::fs::File::create(&p)?;
+                    store.export_jsonl(&project, std::io::BufWriter::new(f))?
+                }
+                _ => {
+                    let stdout = std::io::stdout();
+                    store.export_jsonl(&project, stdout.lock())?
+                }
+            };
+            eprintln!("[rtrt memory export] {count} records");
+        }
+        MemoryCmd::Import { store, input } => {
+            let store = MemoryStore::open(&store)?;
+            let count = match input {
+                Some(p) if p.as_os_str() != "-" => {
+                    let f = std::fs::File::open(&p)?;
+                    store.import_jsonl(std::io::BufReader::new(f))?
+                }
+                _ => {
+                    let stdin = std::io::stdin();
+                    store.import_jsonl(stdin.lock())?
+                }
+            };
+            eprintln!("[rtrt memory import] {count} records");
         }
         MemoryCmd::Extract {
             project,

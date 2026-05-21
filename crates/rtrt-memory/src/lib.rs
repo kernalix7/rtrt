@@ -198,6 +198,102 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Iterates every memory row in `project`, emitting one JSON Line per
+    /// record (`{ id, project, kind, body, scope, created_at, metadata }`).
+    /// Pair with [`import_jsonl`] for portable backups across machines.
+    pub fn export_jsonl<W: std::io::Write>(&self, project: &str, mut w: W) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at, scope, metadata FROM memories WHERE project = ?1 ORDER BY id",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project], |row| {
+                let scope: String = row.get(5)?;
+                let metadata: String = row.get(6)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    scope,
+                    metadata,
+                ))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let mut count = 0usize;
+        for row in rows {
+            let (id, project, kind, body, created_at, scope, metadata) =
+                row.map_err(|e| Error::Memory(e.to_string()))?;
+            let metadata_v: serde_json::Value =
+                serde_json::from_str(&metadata).unwrap_or(serde_json::json!({}));
+            let line = serde_json::json!({
+                "id": id,
+                "project": project,
+                "kind": kind,
+                "body": body,
+                "created_at": created_at,
+                "scope": scope,
+                "metadata": metadata_v,
+            });
+            writeln!(w, "{}", line).map_err(Error::Io)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Replays a JSON-Lines stream produced by [`export_jsonl`] into the
+    /// store. Each record is inserted fresh; original ids are not preserved
+    /// (SQLite assigns a new rowid). Returns the number of rows inserted.
+    pub fn import_jsonl<R: std::io::BufRead>(&self, mut r: R) -> Result<usize> {
+        let mut count = 0usize;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = r.read_line(&mut line).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(trimmed)
+                .map_err(|e| Error::Memory(format!("jsonl decode: {e}")))?;
+            let project = v
+                .get("project")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| Error::Memory("jsonl: missing `project`".into()))?;
+            let kind = v
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| Error::Memory("jsonl: missing `kind`".into()))?;
+            let body = v
+                .get("body")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| Error::Memory("jsonl: missing `body`".into()))?;
+            let scope = v
+                .get("scope")
+                .and_then(|x| x.as_str())
+                .map(MemoryScope::parse)
+                .unwrap_or(MemoryScope::Project);
+            let id = self.save_scoped(project, kind, body, scope)?;
+            if let Some(meta) = v.get("metadata").and_then(|m| m.as_object()) {
+                let map: std::collections::BTreeMap<String, String> = meta
+                    .iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                if !map.is_empty() {
+                    self.set_metadata(id, &map)?;
+                }
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Returns the JSON payload attached to a memory row. Empty when the row
     /// was stored without metadata.
     pub fn get_metadata(&self, id: i64) -> Result<std::collections::BTreeMap<String, String>> {
@@ -905,6 +1001,27 @@ mod tests {
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
+    }
+
+    #[test]
+    fn export_import_roundtrips() {
+        use std::collections::BTreeMap;
+        let src = MemoryStore::open_in_memory().unwrap();
+        let mut m = BTreeMap::new();
+        m.insert("source".into(), "claude".into());
+        src.save_with_metadata("p1", "note", "alpha", &m).unwrap();
+        src.save("p1", "note", "beta").unwrap();
+        let mut buf = Vec::new();
+        let count = src.export_jsonl("p1", &mut buf).unwrap();
+        assert_eq!(count, 2);
+
+        let dst = MemoryStore::open_in_memory().unwrap();
+        let imported = dst.import_jsonl(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(imported, 2);
+        let hits = dst.recall_bm25("p1", "alpha", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        let meta = dst.get_metadata(hits[0].id).unwrap();
+        assert_eq!(meta.get("source").map(|s| s.as_str()), Some("claude"));
     }
 
     #[test]

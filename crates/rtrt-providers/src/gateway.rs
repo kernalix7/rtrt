@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rtrt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{ChatRequest, ChatResponse, Provider, Usage};
+use crate::{ChatRequest, ChatResponse, Provider, Role, Usage};
 
 /// One observation per chat call. Cheap to clone (`Arc`-free, all owned data).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +224,68 @@ pub struct Gateway {
     budget: Option<Arc<Budget>>,
     retry: RetryPolicy,
     next_metric_id: Arc<Mutex<u64>>,
+    cache: Option<Arc<Mutex<ResponseCache>>>,
+}
+
+/// Helicone-style response cache. The key hashes
+/// `(model, messages, max_tokens, temperature)` so identical requests reuse
+/// the previous response without re-charging the provider. Entries evict
+/// FIFO once the configured capacity is reached.
+pub(crate) struct ResponseCache {
+    cap: usize,
+    order: std::collections::VecDeque<u64>,
+    entries: HashMap<u64, ChatResponse>,
+}
+
+impl ResponseCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: std::collections::VecDeque::with_capacity(cap),
+            entries: HashMap::with_capacity(cap),
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<ChatResponse> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, resp: ChatResponse) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        while self.entries.len() >= self.cap
+            && let Some(victim) = self.order.pop_front()
+        {
+            self.entries.remove(&victim);
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, resp);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn cache_key(req: &ChatRequest) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    req.model.hash(&mut h);
+    for m in &req.messages {
+        match m.role {
+            Role::System => 0u8,
+            Role::User => 1u8,
+            Role::Assistant => 2u8,
+        }
+        .hash(&mut h);
+        m.content.hash(&mut h);
+    }
+    req.max_tokens.hash(&mut h);
+    // f32 → bits so the hash is total.
+    req.temperature.map(f32::to_bits).hash(&mut h);
+    h.finish()
 }
 
 pub struct MetricsBuffer {
@@ -281,7 +343,27 @@ impl Gateway {
             budget: None,
             retry: RetryPolicy::default(),
             next_metric_id: Arc::new(Mutex::new(1)),
+            cache: None,
         }
+    }
+
+    /// Attach a fixed-capacity response cache. When `cap == 0` the cache is
+    /// disabled. Cache keys are derived from `(model, messages, max_tokens,
+    /// temperature)`.
+    pub fn with_cache(mut self, cap: usize) -> Self {
+        self.cache = if cap == 0 {
+            None
+        } else {
+            Some(Arc::new(Mutex::new(ResponseCache::new(cap))))
+        };
+        self
+    }
+
+    /// Number of entries currently held in the response cache, or `None` if
+    /// no cache is attached.
+    pub fn cache_len(&self) -> Option<usize> {
+        let c = self.cache.as_ref()?;
+        Some(c.lock().map(|g| g.len()).unwrap_or(0))
     }
 
     /// Attaches a spending limit. Once cumulative cost exceeds the cap,
@@ -367,6 +449,16 @@ impl Gateway {
     }
 
     async fn chat_inner(&self, req: ChatRequest, parent_id: Option<u64>) -> Result<ChatResponse> {
+        // Cache hits return before retries / metrics so the operator pays
+        // neither the latency nor the budget.
+        if let Some(cache) = &self.cache {
+            let key = cache_key(&req);
+            if let Ok(g) = cache.lock()
+                && let Some(hit) = g.get(key)
+            {
+                return Ok(hit);
+            }
+        }
         if let Some(b) = &self.budget {
             let spent = self
                 .metrics
@@ -389,6 +481,7 @@ impl Gateway {
         };
         let attempts = self.retry.max_attempts.max(1);
         let mut last_err: Option<Error> = None;
+        let key = cache_key(&req);
         for attempt in 0..attempts {
             if attempt > 0 && self.retry.backoff_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.retry.backoff_ms)).await;
@@ -397,18 +490,31 @@ impl Gateway {
                 .dispatch_once(primary_idx, req.clone(), parent_id)
                 .await
             {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    if let Some(cache) = &self.cache
+                        && let Ok(mut g) = cache.lock()
+                    {
+                        g.insert(key, resp.clone());
+                    }
+                    return Ok(resp);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
-        if self.retry.fallback_to_default {
-            if let Some(default_idx) = self.default {
-                if default_idx != primary_idx {
-                    match self.dispatch_once(default_idx, req, parent_id).await {
-                        Ok(resp) => return Ok(resp),
-                        Err(e) => last_err = Some(e),
+        if self.retry.fallback_to_default
+            && let Some(default_idx) = self.default
+            && default_idx != primary_idx
+        {
+            match self.dispatch_once(default_idx, req, parent_id).await {
+                Ok(resp) => {
+                    if let Some(cache) = &self.cache
+                        && let Ok(mut g) = cache.lock()
+                    {
+                        g.insert(key, resp.clone());
                     }
+                    return Ok(resp);
                 }
+                Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Provider("gateway: no attempts ran".into())))
@@ -659,6 +765,31 @@ mod tests {
         gw.chat(req("x-expensive")).await.unwrap();
         let err = gw.chat(req("x-expensive")).await.unwrap_err();
         assert!(format!("{err}").contains("budget exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cache_returns_hit_without_recording_metric() {
+        let gw = Gateway::new()
+            .register(
+                "e",
+                Box::new(Echo {
+                    name: "e",
+                    tokens: (5, 5),
+                }),
+                ["x-"],
+            )
+            .with_cache(4);
+        gw.chat(req("x-a")).await.unwrap();
+        let len_before = gw.cache_len();
+        gw.chat(req("x-a")).await.unwrap();
+        let len_after = gw.cache_len();
+        assert_eq!(len_before, Some(1));
+        assert_eq!(len_after, Some(1));
+        let metrics = gw.metrics();
+        let guard = metrics.lock().unwrap();
+        // Only the first call should have recorded a metric — the second was
+        // a cache hit and bypassed `dispatch_once`.
+        assert_eq!(guard.summary.calls, 1);
     }
 
     #[tokio::test]

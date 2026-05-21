@@ -3189,11 +3189,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ndarray",
+ "ort",
  "rtrt-compress",
  "rtrt-core",
  "rtrt-memory",
  "serde",
  "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

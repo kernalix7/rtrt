@@ -102,6 +102,26 @@ enum Cmd {
         #[arg(long, default_value = "rust")]
         lang: String,
     },
+    /// Walk a directory and emit a tree-sitter signature map of every Rust file.
+    RepoMap {
+        /// Root directory to walk.
+        root: PathBuf,
+        /// Skip files larger than this many bytes.
+        #[arg(long, default_value_t = 524_288)]
+        max_bytes: u64,
+        /// Optional file-name suffix filter (default: `.rs`).
+        #[arg(long, default_value = ".rs")]
+        ext: String,
+    },
+    /// Scan shell history for commands routable through `rtrt proxy`.
+    Discover {
+        /// History file path. Defaults to `~/.zsh_history` then `~/.bash_history`.
+        #[arg(long)]
+        history: Option<PathBuf>,
+        /// Top-N commands to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Show RTRT version + crate manifest.
     Info,
 }
@@ -318,6 +338,109 @@ async fn main() -> Result<()> {
                 memory_path: memory,
                 binary,
             })?;
+        }
+        Cmd::RepoMap {
+            root,
+            max_bytes,
+            ext,
+        } => {
+            let lang = TsLanguage::Rust;
+            let extractor = SignatureExtractor::new(lang);
+            let mut entries: Vec<(PathBuf, String, usize, usize)> = Vec::new();
+            for entry in walk_dir(&root) {
+                if !entry.is_file() {
+                    continue;
+                }
+                if !entry.to_string_lossy().ends_with(&ext) {
+                    continue;
+                }
+                let size = std::fs::metadata(&entry).map(|m| m.len()).unwrap_or(0);
+                if size > max_bytes {
+                    continue;
+                }
+                let src = match std::fs::read_to_string(&entry) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let sig = match extractor.extract(&src) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let original = src.len();
+                let compressed = sig.len();
+                entries.push((entry, sig, original, compressed));
+            }
+            // Sort by compressed size descending (rough "centrality" proxy —
+            // bigger signature surface means more API).
+            entries.sort_by(|a, b| b.3.cmp(&a.3));
+            let total_before: usize = entries.iter().map(|(_, _, b, _)| b).sum();
+            let total_after: usize = entries.iter().map(|(_, _, _, a)| a).sum();
+            for (path, sig, before, after) in &entries {
+                let rel = path.strip_prefix(&root).unwrap_or(path);
+                println!(
+                    "// === {} ({} → {} bytes) ===",
+                    rel.display(),
+                    before,
+                    after
+                );
+                println!("{}", sig);
+            }
+            let pct = if total_before == 0 {
+                0
+            } else {
+                (total_before - total_after) * 100 / total_before
+            };
+            eprintln!(
+                "[repo-map] {} files, {} → {} bytes ({}% saved)",
+                entries.len(),
+                total_before,
+                total_after,
+                pct
+            );
+        }
+        Cmd::Discover { history, limit } => {
+            let path = history.or_else(default_history_path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no shell history found; pass --history <path> (zsh: ~/.zsh_history, bash: ~/.bash_history)"
+                )
+            })?;
+            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let raw = String::from_utf8_lossy(&bytes);
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for line in raw.lines() {
+                // zsh extended history: ": <ts>:<dur>;<cmd>"
+                let cmd = line
+                    .strip_prefix(": ")
+                    .and_then(|s| s.split_once(';').map(|x| x.1))
+                    .unwrap_or(line)
+                    .trim();
+                if cmd.is_empty() {
+                    continue;
+                }
+                if let Some(f) = rtrt_proxy::filter_for(cmd) {
+                    *counts.entry(f.command.to_string()).or_insert(0) += 1;
+                }
+            }
+            let mut sorted: Vec<_> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.truncate(limit);
+            if sorted.is_empty() {
+                println!("no proxy-eligible commands found in {}.", path.display());
+                println!(
+                    "(rtrt-proxy currently ships filters for git status, git log, cargo build, cargo test.)"
+                );
+            } else {
+                println!("== discover: {} ==", path.display());
+                let total: usize = sorted.iter().map(|(_, n)| n).sum();
+                for (cmd, n) in &sorted {
+                    println!("{:>6}× {}", n, cmd);
+                }
+                println!();
+                println!(
+                    "total: {total} eligible invocation(s). Pipe through `rtrt proxy \"<cmd>\"`."
+                );
+            }
         }
         Cmd::Signatures { lang } => {
             let mut buf = String::new();
@@ -546,6 +669,65 @@ fn build_provider(
         }
     };
     Ok(provider)
+}
+
+/// Iterative directory walk. Yields every regular file under `root`. Skips
+/// `target/`, `.git/`, `.priv-storage/`, and `node_modules/` to keep the map
+/// focused on source.
+fn walk_dir(root: &std::path::Path) -> impl Iterator<Item = PathBuf> + use<> {
+    let mut stack: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        stack.push(root.to_path_buf());
+    } else if root.is_file() {
+        return WalkIter {
+            stack: vec![root.to_path_buf()],
+        };
+    }
+    WalkIter { stack }
+}
+
+struct WalkIter {
+    stack: Vec<PathBuf>,
+}
+
+impl Iterator for WalkIter {
+    type Item = PathBuf;
+    fn next(&mut self) -> Option<PathBuf> {
+        while let Some(top) = self.stack.pop() {
+            if top.is_file() {
+                return Some(top);
+            }
+            if !top.is_dir() {
+                continue;
+            }
+            let name = top
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if matches!(
+                name.as_str(),
+                "target" | ".git" | ".priv-storage" | "node_modules" | "dist" | "build"
+            ) {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&top) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                self.stack.push(entry.path());
+            }
+        }
+        None
+    }
+}
+
+fn default_history_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = PathBuf::from(home);
+    [home.join(".zsh_history"), home.join(".bash_history")]
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 fn detect_provider(model: &str) -> ProviderArg {

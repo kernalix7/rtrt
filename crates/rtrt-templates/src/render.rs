@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use handlebars::Handlebars;
+use once_cell::sync::Lazy;
 use rtrt_core::{Error, Result};
 
 use crate::{Template, validate_vars};
@@ -29,18 +31,20 @@ pub fn plan(
     let files = template
         .files
         .iter()
-        .map(|f| RenderedFile {
-            path: root.join(substitute(&f.path, &merged)),
-            content: substitute(&f.content, &merged),
-            executable: f.executable,
+        .map(|f| -> Result<RenderedFile> {
+            Ok(RenderedFile {
+                path: root.join(substitute(&f.path, &merged)?),
+                content: substitute(&f.content, &merged)?,
+                executable: f.executable,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let post_hooks = template
         .post_hooks
         .iter()
         .map(|h| substitute(h, &merged))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(RenderPlan {
         root,
@@ -73,14 +77,21 @@ pub fn write(plan: &RenderPlan, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
-fn substitute(input: &str, vars: &BTreeMap<String, String>) -> String {
-    let mut out = input.to_string();
-    for (k, v) in vars {
-        let needle = format!("{{{{{k}}}}}");
-        out = out.replace(&needle, v);
-    }
-    out
+/// Handlebars-backed `{{var}}` substitution. The base case (a single `{{key}}`
+/// per slot) round-trips through the engine unchanged; more advanced templates
+/// can also use Handlebars conditionals (`{{#if foo}}…{{/if}}`) and loops
+/// (`{{#each items}}…{{/each}}`).
+fn substitute(input: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    HBS.render_template(input, vars)
+        .map_err(|e| Error::Config(format!("handlebars: {e}")))
 }
+
+static HBS: Lazy<Handlebars<'static>> = Lazy::new(|| {
+    let mut h = Handlebars::new();
+    h.set_strict_mode(false);
+    h.register_escape_fn(handlebars::no_escape);
+    h
+});
 
 #[cfg(test)]
 mod tests {
@@ -90,7 +101,22 @@ mod tests {
     fn substitution_replaces_vars() {
         let mut vars = BTreeMap::new();
         vars.insert("name".into(), "foo".into());
-        let out = substitute("hello {{name}}", &vars);
+        let out = substitute("hello {{name}}", &vars).unwrap();
         assert_eq!(out, "hello foo");
+    }
+
+    #[test]
+    fn missing_var_yields_empty_in_non_strict_mode() {
+        let vars: BTreeMap<String, String> = BTreeMap::new();
+        let out = substitute("hello {{name}}", &vars).unwrap();
+        assert_eq!(out, "hello ");
+    }
+
+    #[test]
+    fn conditional_block() {
+        let mut vars = BTreeMap::new();
+        vars.insert("name".into(), "foo".into());
+        let out = substitute("{{#if name}}hi {{name}}{{/if}}", &vars).unwrap();
+        assert_eq!(out, "hi foo");
     }
 }

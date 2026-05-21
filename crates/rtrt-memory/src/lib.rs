@@ -272,8 +272,9 @@ impl MemoryStore {
             return Ok(vec![]);
         }
         // Fetch the records preserving BFS order.
-        let placeholders =
-            std::iter::repeat_n("?", order.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", order.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT id, project, kind, body, created_at, scope FROM memories WHERE id IN ({placeholders})"
         );
@@ -373,8 +374,9 @@ impl MemoryStore {
         if scopes.is_empty() {
             return self.recall_bm25(project, query, limit);
         }
-        let placeholders =
-            std::iter::repeat_n("?", scopes.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", scopes.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT m.id, m.project, m.kind, m.body, m.created_at, m.scope
                FROM memories_fts f

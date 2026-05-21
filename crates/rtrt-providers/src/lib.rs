@@ -11,6 +11,7 @@ use rtrt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod context7;
 pub mod gateway;
 pub mod openai;
 pub mod openai_compatible;
@@ -18,6 +19,7 @@ pub mod stream;
 pub mod usage;
 
 pub use anthropic::AnthropicProvider;
+pub use context7::Context7Client;
 pub use gateway::{
     Budget, Gateway, GatewaySummary, MetricsView, ModelPricing, RequestMetric, default_pricing,
 };

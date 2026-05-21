@@ -15,8 +15,8 @@ use rtrt_compress::{
 use rtrt_core::CompressionLevel;
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
-    AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, OpenAICompatibleProvider,
-    OpenAIProvider, Provider, Role,
+    AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
+    OpenAICompatibleProvider, OpenAIProvider, Provider, Role,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -118,6 +118,17 @@ enum Cmd {
         /// Optional file-name suffix filter (default: `.rs`).
         #[arg(long, default_value = ".rs")]
         ext: String,
+    },
+    /// Fetch library docs from context7 (`/owner/repo`, optional --topic).
+    Docs {
+        /// Library id as `<owner>/<repo>` (e.g. `facebook/react`).
+        library: String,
+        /// Optional topic filter (e.g. `hooks`).
+        #[arg(long)]
+        topic: Option<String>,
+        /// Override the context7 base URL (useful for self-hosting).
+        #[arg(long, default_value = "https://context7.com/api/v1")]
+        base_url: String,
     },
     /// Scan shell history for commands routable through `rtrt proxy`.
     Discover {
@@ -358,6 +369,15 @@ async fn main() -> Result<()> {
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
+        Cmd::Docs {
+            library,
+            topic,
+            base_url,
+        } => {
+            let client = Context7Client::new().with_base_url(base_url);
+            let out = client.get_library_docs(&library, topic.as_deref()).await?;
+            print!("{out}");
+        }
         Cmd::Setup {
             agent,
             apply,

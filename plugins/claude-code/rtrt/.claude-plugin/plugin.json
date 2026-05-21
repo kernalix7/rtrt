@@ -1,0 +1,13 @@
+{
+  "name": "rtrt",
+  "version": "0.1.0",
+  "description": "Auto-capture coding-agent events into the rtrt memory store.",
+  "hooks": {
+    "PreToolUse":       "hooks/pre_tool_use.sh",
+    "PostToolUse":      "hooks/post_tool_use.sh",
+    "UserPromptSubmit": "hooks/user_prompt_submit.sh",
+    "Stop":             "hooks/stop.sh",
+    "SessionStart":     "hooks/session_start.sh",
+    "SessionEnd":       "hooks/session_end.sh"
+  }
+}

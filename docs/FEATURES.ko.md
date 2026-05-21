@@ -46,7 +46,18 @@ let out = c.compress("I think the bug is, perhaps, in the parser.");
 - **할 수 있는 것**: 필러, 인사말, 헤지, 담화 표지, 관사, 강조 부사 제거 + 관용구 축약.
 - **할 수 없는 것**: 자연어 산문에서 caveman의 60-75% 클레임 달성은 불가능. 그 수치는 "LLM이 처음부터 짧게 쓰기로 합의"한 결과이지, 사후 정규식 삭제 결과가 아님.
 
-caveman급 절감률은 v0.3에 추가될 `LlmCompressor`로 달성 예정(`llm-compress` 피처 게이트). 모든 `Provider`를 통해 — 로컬 Ollama 포함 — 모델에게 재작성을 위탁. caveman과 동일 원리이지만 기존 문자열에 사후 적용 가능.
+caveman급 절감률은 LLM 모드(`llm-compress` 피처)로 달성. [`LlmCompressor`](https://docs.rs/rtrt-compress/latest/rtrt_compress/struct.LlmCompressor.html)는 모든 `Provider`(로컬 Ollama 포함)를 통해 모델에게 재작성을 위탁. caveman과 동일 원리이지만 기존 문자열에 사후 적용 가능.
+
+```bash
+# 로컬 Ollama (무료 · 첫 풀 이후 오프라인)
+ollama pull llama3.2
+echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
+  --provider openai-compat --base-url http://127.0.0.1:11434/v1 --model llama3.2
+
+# 클라우드 Anthropic
+ANTHROPIC_API_KEY=... rtrt compress --llm \
+  --provider anthropic --model claude-haiku-4-5 < passage.md
+```
 
 ### 시크릿 검열
 

@@ -46,7 +46,18 @@ What rule-based passes can and can't do:
 - **Can**: drop fillers, pleasantries, hedging, discourse markers, articles, verbose qualifiers, and re-express common verbose phrases.
 - **Can't**: reach caveman's published 60-75% on natural prose without an LLM in the loop — those numbers come from the LLM agreeing to *generate* terse text up front, not from post-hoc deletion.
 
-The v0.3 path to caveman-class numbers is `LlmCompressor` (planned, gated behind the `llm-compress` feature) which routes through any `Provider` — including a local Ollama server — and asks the model to rewrite the passage. Same idea as caveman; works on existing strings instead of requiring the agent to be in caveman mode from the start.
+For caveman-class numbers, use the LLM mode (`llm-compress` feature). [`LlmCompressor`](https://docs.rs/rtrt-compress/latest/rtrt_compress/struct.LlmCompressor.html) routes through any `Provider` — including a local Ollama server — and asks the model to rewrite the passage. Same idea as caveman; works on existing strings instead of requiring the agent to be in caveman mode from the start.
+
+```bash
+# local Ollama, free, offline after first model pull
+ollama pull llama3.2
+echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
+  --provider openai-compat --base-url http://127.0.0.1:11434/v1 --model llama3.2
+
+# cloud Anthropic
+ANTHROPIC_API_KEY=... rtrt compress --llm \
+  --provider anthropic --model claude-haiku-4-5 < passage.md
+```
 
 ### Secret redaction
 

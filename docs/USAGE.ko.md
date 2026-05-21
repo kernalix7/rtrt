@@ -15,8 +15,13 @@ rtrt --help
 표준 입력을 읽어 압축 결과를 표준 출력에 씁니다.
 
 ```bash
+# 규칙 기반 (기본)
 echo "Sure, I'd be happy to help. The bug is really in the parser." \
   | rtrt compress -l ultra
+
+# LLM 기반 (어떤 프로바이더든; Ollama 예시)
+echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
+  --provider openai-compat --base-url http://127.0.0.1:11434/v1 --model llama3.2
 ```
 
 플래그:

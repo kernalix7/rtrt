@@ -17,55 +17,79 @@ struct Pattern {
     regex: &'static Lazy<Regex>,
 }
 
-static AWS_ACCESS_KEY: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b").unwrap());
+static AWS_ACCESS_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b").unwrap());
 static AWS_SECRET: Lazy<Regex> = Lazy::new(|| {
     // Heuristic: "aws_secret_access_key" prefix followed by 40 base64-ish chars.
     Regex::new(r#"(?i)\baws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?([A-Za-z0-9+/=]{40})['"]?"#)
         .unwrap()
 });
-static GITHUB_TOKEN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bgh[opsur]_[A-Za-z0-9_]{30,}\b").unwrap()
-});
-static GITHUB_PAT_CLASSIC: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bghp_[A-Za-z0-9]{36}\b").unwrap());
-static OPENAI_KEY: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bsk-(proj-)?[A-Za-z0-9_\-]{20,}\b").unwrap()
-});
-static ANTHROPIC_KEY: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b").unwrap()
-});
-static SLACK_TOKEN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b").unwrap()
-});
+static GITHUB_TOKEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bgh[opsur]_[A-Za-z0-9_]{30,}\b").unwrap());
+static GITHUB_PAT_CLASSIC: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bghp_[A-Za-z0-9]{36}\b").unwrap());
+static OPENAI_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bsk-(proj-)?[A-Za-z0-9_\-]{20,}\b").unwrap());
+static ANTHROPIC_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b").unwrap());
+static SLACK_TOKEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}\b").unwrap());
 static PRIVATE_KEY_BLOCK: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----")
         .unwrap()
 });
-static BEARER_TOKEN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bBearer\s+([A-Za-z0-9_\-]{16,})\b").unwrap()
-});
+static BEARER_TOKEN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bBearer\s+([A-Za-z0-9_\-]{16,})\b").unwrap());
 static GENERIC_API_KEY: Lazy<Regex> = Lazy::new(|| {
     // "api_key=…" / "apikey=…" / "API_KEY: …" patterns. Requires obvious context
     // so plain hex doesn't false-positive.
-    Regex::new(
-        r#"(?i)\bapi[_-]?key\s*[:=]\s*['"]?([A-Za-z0-9_\-]{20,})['"]?"#,
-    )
-    .unwrap()
+    Regex::new(r#"(?i)\bapi[_-]?key\s*[:=]\s*['"]?([A-Za-z0-9_\-]{20,})['"]?"#).unwrap()
 });
 
 static PATTERNS: Lazy<Vec<Pattern>> = Lazy::new(|| {
     vec![
-        Pattern { kind: "aws-access-key", regex: &AWS_ACCESS_KEY },
-        Pattern { kind: "aws-secret", regex: &AWS_SECRET },
-        Pattern { kind: "github-pat", regex: &GITHUB_PAT_CLASSIC },
-        Pattern { kind: "github-token", regex: &GITHUB_TOKEN },
+        Pattern {
+            kind: "aws-access-key",
+            regex: &AWS_ACCESS_KEY,
+        },
+        Pattern {
+            kind: "aws-secret",
+            regex: &AWS_SECRET,
+        },
+        Pattern {
+            kind: "github-pat",
+            regex: &GITHUB_PAT_CLASSIC,
+        },
+        Pattern {
+            kind: "github-token",
+            regex: &GITHUB_TOKEN,
+        },
         // Anthropic before OpenAI: both use the `sk-` prefix; the OpenAI regex
         // matches `sk-ant-…` too, so the more specific pattern must run first.
-        Pattern { kind: "anthropic-key", regex: &ANTHROPIC_KEY },
-        Pattern { kind: "openai-key", regex: &OPENAI_KEY },
-        Pattern { kind: "slack-token", regex: &SLACK_TOKEN },
-        Pattern { kind: "private-key", regex: &PRIVATE_KEY_BLOCK },
-        Pattern { kind: "bearer-token", regex: &BEARER_TOKEN },
-        Pattern { kind: "generic-api-key", regex: &GENERIC_API_KEY },
+        Pattern {
+            kind: "anthropic-key",
+            regex: &ANTHROPIC_KEY,
+        },
+        Pattern {
+            kind: "openai-key",
+            regex: &OPENAI_KEY,
+        },
+        Pattern {
+            kind: "slack-token",
+            regex: &SLACK_TOKEN,
+        },
+        Pattern {
+            kind: "private-key",
+            regex: &PRIVATE_KEY_BLOCK,
+        },
+        Pattern {
+            kind: "bearer-token",
+            regex: &BEARER_TOKEN,
+        },
+        Pattern {
+            kind: "generic-api-key",
+            regex: &GENERIC_API_KEY,
+        },
     ]
 });
 

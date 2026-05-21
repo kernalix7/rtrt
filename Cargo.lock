@@ -2828,11 +2828,14 @@ dependencies = [
 name = "rtrt-compress"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "criterion",
  "once_cell",
  "regex",
  "rtrt-core",
+ "rtrt-providers",
  "serde",
+ "tokio",
 ]
 
 [[package]]

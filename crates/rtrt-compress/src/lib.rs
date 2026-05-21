@@ -19,6 +19,11 @@ use rtrt_core::CompressionLevel;
 
 pub mod secrets;
 
+#[cfg(feature = "llm-compress")]
+pub mod llm;
+
+#[cfg(feature = "llm-compress")]
+pub use llm::{AsyncCompressor, LlmCompressor};
 pub use secrets::redact_secrets;
 
 #[derive(Debug, Clone, Copy)]
@@ -114,8 +119,7 @@ static PHRASE_IN_THE_EVENT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bin the event that\b").unwrap());
 static PHRASE_WITH_THE_EXCEPTION: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bwith the exception of\b").unwrap());
-static PHRASE_A_NUMBER_OF: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\ba number of\b").unwrap());
+static PHRASE_A_NUMBER_OF: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\ba number of\b").unwrap());
 static PHRASE_THE_MAJORITY_OF: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bthe majority of\b").unwrap());
 static PHRASE_IN_SPITE_OF: Lazy<Regex> =

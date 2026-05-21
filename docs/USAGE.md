@@ -15,8 +15,13 @@ rtrt --help
 Compress text read from stdin and write to stdout.
 
 ```bash
+# rule-based (default)
 echo "Sure, I'd be happy to help. The bug is really in the parser." \
   | rtrt compress -l ultra
+
+# LLM-backed (any provider; Ollama shown)
+echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
+  --provider openai-compat --base-url http://127.0.0.1:11434/v1 --model llama3.2
 ```
 
 Flags:

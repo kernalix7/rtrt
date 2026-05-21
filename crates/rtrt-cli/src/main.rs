@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use rtrt_compress::Compressor;
+use rtrt_compress::{AsyncCompressor, Compressor, LlmCompressor};
 use rtrt_core::CompressionLevel;
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
@@ -28,6 +28,20 @@ enum Cmd {
     Compress {
         #[arg(short, long, value_enum, default_value = "full")]
         level: LevelArg,
+        /// Use an LLM (any Provider) to rewrite tersely instead of the rule
+        /// pass. Required when --provider is set.
+        #[arg(long)]
+        llm: bool,
+        /// Provider (with --llm). Auto-detected from --model otherwise.
+        #[arg(long, value_enum)]
+        provider: Option<ProviderArg>,
+        /// Model id (with --llm). e.g. `claude-haiku-4-5`, `gpt-5.4-mini`,
+        /// `llama3.2` (for openai-compat against Ollama).
+        #[arg(long)]
+        model: Option<String>,
+        /// Base URL for `--provider openai-compat` (e.g. `http://127.0.0.1:11434/v1`).
+        #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
+        base_url: Option<String>,
     },
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
@@ -154,6 +168,7 @@ enum LevelArg {
     Lite,
     Full,
     Ultra,
+    Extreme,
 }
 
 impl From<LevelArg> for CompressionLevel {
@@ -162,6 +177,7 @@ impl From<LevelArg> for CompressionLevel {
             LevelArg::Lite => CompressionLevel::Lite,
             LevelArg::Full => CompressionLevel::Full,
             LevelArg::Ultra => CompressionLevel::Ultra,
+            LevelArg::Extreme => CompressionLevel::Extreme,
         }
     }
 }
@@ -187,11 +203,26 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Compress { level } => {
+        Cmd::Compress {
+            level,
+            llm,
+            provider,
+            model,
+            base_url,
+        } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            let out = Compressor::new(level.into()).compress(&buf);
-            print!("{out}");
+            if llm {
+                let model = model.ok_or_else(|| anyhow::anyhow!("--llm requires --model"))?;
+                let kind = provider.unwrap_or_else(|| detect_provider(&model));
+                let provider = build_provider(kind, base_url, &model)?;
+                let compressor = LlmCompressor::new(provider, model);
+                let out = compressor.compress(&buf).await?;
+                print!("{out}");
+            } else {
+                let out = Compressor::new(level.into()).compress(&buf);
+                print!("{out}");
+            }
         }
         Cmd::Proxy { command } => {
             let mut buf = String::new();

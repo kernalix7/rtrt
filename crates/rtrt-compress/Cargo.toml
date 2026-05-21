@@ -13,9 +13,20 @@ rtrt-core.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 serde.workspace = true
+async-trait.workspace = true
+rtrt-providers = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables LlmCompressor — caveman-class compression by routing the passage
+# through any rtrt-providers Provider (Anthropic / OpenAI / Ollama-compatible).
+# Off by default so the workspace builds without pulling reqwest into the
+# compression dep tree for users who only need the rule pass.
+llm-compress = ["dep:rtrt-providers"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [[bench]]
 name = "compress_bench"

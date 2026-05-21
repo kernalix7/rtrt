@@ -7,11 +7,8 @@ RTRT는 알파 단계입니다. 설치 경로는 **원라이너 스크립트** (
 ## 원라이너 (권장)
 
 ```bash
-# Linux / macOS / WSL — 최신 릴리스. 릴리스가 없으면 --main으로 소스 빌드
+# Linux / macOS / WSL — 최신 릴리스. 릴리스 없으면 자동으로 --main 폴백
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-
-# main 브랜치에서 직접 빌드 (사전 빌드 바이너리 출시 전)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh -s -- --main
 ```
 
 ```powershell
@@ -20,6 +17,37 @@ irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 ```
 
 설치 스크립트는 OS + arch를 감지하고 최신 GitHub Release에서 맞는 타르볼/zip을 받아 SHA256을 검증한 뒤 `rtrt` / `rtrt-mcp` / `rtrt-dashboard`를 `~/.local/bin/` (Linux/macOS) 또는 `%LOCALAPPDATA%\Programs\rtrt\` (Windows)에 배치합니다.
+
+### 플래그 + 환경 변수
+
+| 플래그 | PowerShell | 환경 변수 | 동작 |
+|--------|-----------|-----------|------|
+| `--version vX.Y.Z` | `-Version` | — | 특정 릴리스 타르볼 고정 |
+| `--main` (`--ref main` 별칭) | `-Main` | `RTRT_REF=main` | git main HEAD 빌드 |
+| `--ref TAG` | `-Ref` | `RTRT_REF` | 임의 태그 / 브랜치 / 커밋 빌드 |
+| `--source PATH` | `-Source` | `RTRT_SOURCE` | 로컬 복사본 빌드 (오프라인) |
+| `--dir PATH` | `-InstallDir` | — | 설치 경로 변경 |
+| `--skip-deps` | `-SkipDeps` | `RTRT_SKIP_DEPS=1` | cargo / git 툴체인 체크 우회 |
+| `--uninstall` | `-Uninstall` | — | 호환성 셰임 — `uninstall.sh` / `uninstall.ps1` 권장 |
+| `--dry-run` | `-DryRun` | — | 실제 쓰기 없이 동작만 출력 |
+
+플래그가 환경 변수보다 우선. 릴리스 없고 플래그도 없으면 안내 후 `--ref main`으로 자동 폴백.
+
+예시:
+
+```bash
+# 릴리스 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+
+# 토픽 브랜치 추적
+RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
+
+# 로컬 클론에서 빌드 (오프라인)
+sh install.sh --source ~/code/rtrt
+
+# 다른 경로 + 툴체인 체크 우회
+sh install.sh --dir /opt/rtrt/bin --skip-deps
+```
 
 ### 원라이너 제거
 

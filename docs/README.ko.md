@@ -36,23 +36,58 @@ cargo install --path crates/rtrt-cli</code></pre>
 
 RTRT는 네 가지 토큰 절감 기법을 하나의 CLI · MCP 서버 · 웹 대시보드로 통합합니다. 전체가 러스트(edition 2024)로 작성되었고, 핵심 크레이트에는 `unsafe`가 없습니다. 참조 프로젝트의 코드를 벤더링하지 않고 러스트로 재구현합니다.
 
-## 빠른 설치 + 제거
+## 빠른 설치
+
+원라이너 (Linux / macOS / WSL):
 
 ```bash
-# 설치 — Linux / macOS / WSL
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-
-# 설치 — Windows PowerShell
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
-
-# 제거 — 바이너리만 (~/.rtrt 유지)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
-
-# 제거 — 완전 (바이너리 + ~/.rtrt + fastembed 캐시)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
 ```
 
-릴리스가 없으면 `--main` 플래그로 main 브랜치를 소스 빌드합니다. 자세한 경로는 [INSTALL.ko.md](INSTALL.ko.md) 참고.
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+```
+
+주요 변형 — 파이프(`sh -s -- <flags>`) 또는 로컬 실행 모두 같은 플래그 사용:
+
+```bash
+# 릴리스 게시 후 특정 버전 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+
+# main HEAD 빌드 (릴리스 없을 때 기본 폴백)
+curl -fsSL .../install.sh | sh -s -- --main
+
+# 임의 태그 / 브랜치 / 커밋 빌드
+curl -fsSL .../install.sh | sh -s -- --ref my-feature
+RTRT_REF=my-feature curl -fsSL .../install.sh | sh
+
+# 로컬 클론에서 빌드 (오프라인 / 에어갭)
+curl -fsSL .../install.sh | sh -s -- --source /path/to/rtrt
+RTRT_SOURCE=/path/to/rtrt sh install.sh
+
+# ~/.local/bin 외 경로
+curl -fsSL .../install.sh | sh -s -- --dir /opt/rtrt/bin
+
+# 드라이런 (실제 쓰기 없이 동작만 출력)
+curl -fsSL .../install.sh | sh -s -- --ref main --dry-run
+```
+
+제거:
+
+```bash
+# 바이너리만 (~/.rtrt 유지)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
+
+# 완전 (바이너리 + ~/.rtrt + fastembed 모델 캐시)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
+
+# Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
+```
+
+소스 빌드 세부 / 환경 변수 (`RTRT_REF` / `RTRT_SOURCE` / `RTRT_SKIP_DEPS`) / PowerShell 제거 카운터파트는 [INSTALL.ko.md](INSTALL.ko.md) 참고.
 
 ## 실행
 

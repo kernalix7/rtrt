@@ -7,11 +7,8 @@ RTRT is in alpha. Two install paths are supported today: **one-line script** (fe
 ## One-liner (recommended)
 
 ```bash
-# Linux / macOS / WSL — latest release, falls back to `--main` if no release yet
+# Linux / macOS / WSL — latest release, auto-falls back to `--main` if none yet
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-
-# Build straight from main (until pre-built binaries ship)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh -s -- --main
 ```
 
 ```powershell
@@ -20,6 +17,37 @@ irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 ```
 
 The installers detect OS + arch, download the matching tarball / zip from the latest GitHub Release, verify the SHA256, and drop `rtrt` / `rtrt-mcp` / `rtrt-dashboard` into `~/.local/bin/` (Linux/macOS) or `%LOCALAPPDATA%\Programs\rtrt\` (Windows).
+
+### Flags + environment variables
+
+| Flag | PowerShell | Env var | Purpose |
+|------|-----------|---------|---------|
+| `--version vX.Y.Z` | `-Version` | — | Pin a specific release tarball (skip source build) |
+| `--main` (alias for `--ref main`) | `-Main` | `RTRT_REF=main` | Build from git main HEAD |
+| `--ref TAG` | `-Ref` | `RTRT_REF` | Build from a specific tag / branch / commit |
+| `--source PATH` | `-Source` | `RTRT_SOURCE` | Build from a local copy (offline / air-gapped) |
+| `--dir PATH` | `-InstallDir` | — | Install dir (default: `~/.local/bin` / `%LOCALAPPDATA%\Programs\rtrt`) |
+| `--skip-deps` | `-SkipDeps` | `RTRT_SKIP_DEPS=1` | Skip the cargo / git toolchain check |
+| `--uninstall` | `-Uninstall` | — | Compatibility shim — defers to `uninstall.sh` / `uninstall.ps1` |
+| `--dry-run` | `-DryRun` | — | Print intended actions without writing |
+
+Flags take precedence over the env-var equivalents. When no release exists and no flag is set, the installer prints a notice and falls back to `--ref main` automatically.
+
+Examples:
+
+```bash
+# Pin a release
+curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+
+# Track a topic branch
+RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
+
+# Install from a local clone (offline)
+sh install.sh --source ~/code/rtrt
+
+# Drop binaries somewhere custom + skip toolchain check
+sh install.sh --dir /opt/rtrt/bin --skip-deps
+```
 
 ### Uninstall (one-liner)
 

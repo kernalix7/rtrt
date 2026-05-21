@@ -45,6 +45,59 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 
 RTRT consolidates four token-reduction techniques behind one CLI, one MCP server, and one web dashboard. It is written entirely in Rust, edition 2024, with zero unsafe in the core crates. Reference projects are reimplemented in Rust rather than vendored.
 
+## Quick install
+
+One-liner (Linux / macOS / WSL):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+```
+
+Common variants — the installer accepts the same flags whether you pipe it through `sh` (`sh -s -- <flags>`) or run it locally:
+
+```bash
+# Pin a release once one is published
+curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+
+# Build from main HEAD (default fallback when no release exists)
+curl -fsSL .../install.sh | sh -s -- --main
+
+# Track a specific tag / branch / commit
+curl -fsSL .../install.sh | sh -s -- --ref my-feature
+RTRT_REF=my-feature curl -fsSL .../install.sh | sh
+
+# Install from a local clone (offline / air-gapped)
+curl -fsSL .../install.sh | sh -s -- --source /path/to/rtrt
+RTRT_SOURCE=/path/to/rtrt sh install.sh
+
+# Drop binaries somewhere other than ~/.local/bin
+curl -fsSL .../install.sh | sh -s -- --dir /opt/rtrt/bin
+
+# Dry-run (print actions, write nothing)
+curl -fsSL .../install.sh | sh -s -- --ref main --dry-run
+```
+
+Uninstall:
+
+```bash
+# Binaries only (state under ~/.rtrt left intact)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
+
+# Full purge (binaries + ~/.rtrt + fastembed model cache)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
+
+# Windows PowerShell counterpart
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
+```
+
+See [docs/INSTALL.md](docs/INSTALL.md) for source-build details, environment-variable equivalents (`RTRT_REF` / `RTRT_SOURCE` / `RTRT_SKIP_DEPS`), and the PowerShell uninstall counterpart.
+
 ## Launch
 
 The web dashboard is `rtrt-dashboard`. By default it serves on `http://127.0.0.1:3111`; set `RTRT_DASHBOARD_TOKEN` to gate every `/api/*` route behind a bearer token (the bundled HTML index and `/healthz` stay open so the UI can bootstrap).

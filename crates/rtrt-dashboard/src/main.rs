@@ -997,295 +997,404 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
 <meta charset="utf-8">
 <title>RTRT</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root {
-    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e6e6e6;
-    --card: #fafafa; --code-bg: #f3f3f3; --accent: #2962FF; --err: #c0392b;
+    --bg: #fafbfc; --surface: #ffffff; --fg: #0f172a; --muted: #64748b;
+    --border: #e5e7eb; --accent: #2962FF; --accent-soft: #dbe6ff;
+    --ok: #16a34a; --warn: #d97706; --err: #dc2626; --grad: linear-gradient(135deg,#2962FF 0%,#7c3aed 100%);
+    --shadow: 0 1px 2px rgba(15,23,42,.06), 0 4px 12px rgba(15,23,42,.06);
   }
   :root[data-theme="dark"] {
-    --bg: #15171a; --fg: #e6e6e6; --muted: #9aa0a6; --border: #2a2d31;
-    --card: #1c1f23; --code-bg: #23272e; --accent: #6aa3ff; --err: #ff6b6b;
+    --bg: #0b0e14; --surface: #14181f; --fg: #e6e6e6; --muted: #94a3b8;
+    --border: #232a35; --accent: #6aa3ff; --accent-soft: #1a2540;
+    --ok: #4ade80; --warn: #fbbf24; --err: #f87171; --grad: linear-gradient(135deg,#6aa3ff 0%,#a78bfa 100%);
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 12px rgba(0,0,0,.35);
   }
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 880px; margin: 1.5rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
-  header { display:flex; align-items:baseline; gap:1rem; margin-bottom: 1rem; }
-  header h1 { margin: 0; font-size: 1.6rem; }
-  header .sub { color: var(--muted); flex: 1; }
-  #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.25rem 0.6rem; border-radius: 6px; font-size: 0.9em; }
-  nav.tabs { display:flex; gap:0.5rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }
-  nav.tabs a { cursor: pointer; padding: 0.5rem 0.9rem; border-radius: 6px 6px 0 0; color: var(--muted); }
-  nav.tabs a.active { color: var(--fg); background: var(--card); border: 1px solid var(--border); border-bottom-color: var(--card); margin-bottom: -1px; }
-  section.tab { display: none; }
-  section.tab.active { display: block; }
-  h2 { margin: 0 0 0.5rem; font-size: 1.15rem; }
-  h3 { margin: 1.25rem 0 0.4rem; font-size: 1rem; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
-  .card .hint { color: var(--muted); font-size: 0.9em; margin-bottom: 0.5rem; }
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 0.75rem; }
-  .kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; }
-  .kpi .label { color: var(--muted); font-size: 0.8em; }
-  .kpi .value { font-size: 1.3rem; font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  code { background: var(--code-bg); padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 0.9em; }
-  pre { background: var(--code-bg); border: 1px solid var(--border); padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
-  form { display: grid; gap: 0.5rem; }
-  form .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
-  input, textarea, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 0.4rem 0.6rem; border-radius: 6px; font: inherit; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, -apple-system, sans-serif; min-height: 100vh; }
+  a { color: var(--accent); text-decoration: none; cursor: pointer; }
+
+  /* Top status bar */
+  .topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1.25rem; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .topbar .brand { font-weight: 700; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem; }
+  .topbar .brand .logo { width: 28px; height: 28px; border-radius: 8px; background: var(--grad); display: inline-flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 0.78rem; }
+  .topbar .pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.25rem 0.6rem; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); font-size: 0.82em; color: var(--muted); }
+  .topbar .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .topbar .pill.ok .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(22,163,74,.18); }
+  .topbar .pill.warn .dot { background: var(--warn); }
+  .topbar .spacer { flex: 1; }
+  .topbar #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.3rem 0.6rem; border-radius: 6px; font-size: 0.9em; }
+
+  /* Layout: sidebar + main */
+  .layout { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 53px - 32px); }
+  aside { background: var(--surface); border-right: 1px solid var(--border); padding: 1rem 0.5rem; }
+  aside .group { color: var(--muted); font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.6rem 0.75rem 0.25rem; }
+  aside a.nav { display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 0.75rem; border-radius: 8px; color: var(--fg); margin: 0.1rem 0; }
+  aside a.nav:hover { background: var(--bg); }
+  aside a.nav.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  aside a.nav .icon { width: 18px; text-align: center; }
+  main { padding: 1.5rem 2rem 4rem; max-width: 1100px; }
+
+  /* Section heading */
+  .section-head { margin-bottom: 1.25rem; }
+  .section-head h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+  .section-head .lede { color: var(--muted); }
+
+  /* Subtab bar */
+  .subtabs { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .subtabs a { padding: 0.5rem 0.9rem; border-radius: 8px 8px 0 0; color: var(--muted); border-bottom: 2px solid transparent; }
+  .subtabs a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; box-shadow: var(--shadow); margin-bottom: 1rem; }
+  .card .head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 0.75rem; }
+  .card h2 { margin: 0; font-size: 1.05rem; }
+  .card .hint { color: var(--muted); font-size: 0.9em; }
+
+  /* KPIs */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; }
+  .kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 0.85rem 1rem; transition: transform .15s ease; }
+  .kpi:hover { transform: translateY(-1px); }
+  .kpi .label { color: var(--muted); font-size: 0.78em; letter-spacing: 0.02em; }
+  .kpi .value { font-size: 1.55rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .sub { color: var(--muted); font-size: 0.78em; margin-top: 0.1rem; }
+  .kpi.accent .value { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+  /* Forms */
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+  form { display: grid; gap: 0.6rem; }
+  input, textarea, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 0.55rem 0.75rem; border-radius: 8px; font: inherit; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(41,98,255,.15); }
   button { cursor: pointer; }
-  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
-  details { margin-bottom: 0.6rem; }
-  details > summary { cursor: pointer; padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; font-weight: 500; }
-  details[open] > summary { border-radius: 6px 6px 0 0; }
-  details > div { border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px; padding: 0.9rem; }
-  .err { color: var(--err); }
-  .muted { color: var(--muted); font-size: 0.9em; }
-  svg.spark { width: 100%; height: 60px; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { filter: brightness(1.06); }
+  button.ghost { background: transparent; }
+  button:disabled { opacity: 0.6; cursor: progress; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; }
+  th { color: var(--muted); font-weight: 500; font-size: 0.82em; letter-spacing: 0.02em; text-transform: uppercase; }
+  th, td { padding: 0.55rem 0.5rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  td code { background: var(--bg); padding: 0 0.3rem; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 0.88em; }
+  .empty { color: var(--muted); padding: 1rem 0; text-align: center; font-size: 0.9em; }
+
+  /* Output panels */
+  pre { background: var(--bg); border: 1px solid var(--border); padding: 0.85rem; border-radius: 8px; white-space: pre-wrap; overflow-x: auto; font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .out-meta { color: var(--muted); font-size: 0.85em; margin: 0.5rem 0; }
+
+  /* Sparklines */
+  svg.spark { width: 100%; height: 64px; }
+
+  /* Status pills */
+  .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.78em; background: var(--bg); border: 1px solid var(--border); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+
+  /* Live activity strip */
+  .activity { position: sticky; bottom: 0; background: var(--surface); border-top: 1px solid var(--border); padding: 0.35rem 1.25rem; font-size: 0.82em; color: var(--muted); display: flex; align-items: center; gap: 0.75rem; max-height: 32px; overflow: hidden; }
+  .activity .dot-pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  .activity .feed { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+
+  /* Count-up animation */
+  .countup { display: inline-block; transition: opacity .2s; }
+
+  /* Mobile */
+  @media (max-width: 720px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { display: none; }
+    main { padding: 1rem; }
+    .row { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>RTRT</h1>
-  <span class="sub">웹 콘솔</span>
-  <button id="theme-toggle" title="다크 / 라이트 토글">🌗</button>
-</header>
+<div class="topbar">
+  <div class="brand"><span class="logo">RT</span> RTRT</div>
+  <span id="pill-gateway" class="pill"><span class="dot"></span>게이트웨이</span>
+  <span id="pill-memory" class="pill"><span class="dot"></span>메모리</span>
+  <span id="pill-cache" class="pill"><span class="dot"></span>캐시</span>
+  <span class="spacer"></span>
+  <button id="theme-toggle" title="다크/라이트">🌗</button>
+</div>
 
-<nav class="tabs">
-  <a data-tab="overview" class="active">개요</a>
-  <a data-tab="memory">메모리</a>
-  <a data-tab="tools">도구</a>
-</nav>
+<div class="layout">
+  <aside>
+    <div class="group">메인</div>
+    <a class="nav active" data-page="overview"><span class="icon">🏠</span>개요</a>
+    <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
+    <a class="nav" data-page="tools"><span class="icon">🛠</span>도구</a>
+    <a class="nav" data-page="settings"><span class="icon">⚙️</span>설정</a>
+  </aside>
 
-<section id="overview" class="tab active">
-  <div class="card">
-    <h2>현재 상태</h2>
-    <div class="hint">게이트웨이 요청 / 토큰 / 예산 / 캐시 요약. 5초마다 자동 새로고침.</div>
-    <div id="kpi-grid" class="kpis">불러오는 중…</div>
-  </div>
-  <div class="card">
-    <h2>응답 속도 + 토큰 추이</h2>
-    <div class="hint">최근 요청 50건 기준.</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
-      <div>
-        <div class="muted">응답 속도 (ms)</div>
-        <svg id="chart-latency" class="spark" viewBox="0 0 400 60" preserveAspectRatio="none"></svg>
+  <main>
+    <!-- 개요 -->
+    <section id="page-overview" class="page">
+      <div class="section-head">
+        <h1>오늘의 절감</h1>
+        <div class="lede">RTRT가 줄여준 토큰과 비용을 한눈에.</div>
       </div>
-      <div>
-        <div class="muted">토큰 (in + out)</div>
-        <svg id="chart-tokens" class="spark" viewBox="0 0 400 60" preserveAspectRatio="none"></svg>
+      <div class="card">
+        <div class="kpis">
+          <div class="kpi accent"><div class="label">절감 토큰</div><div class="value countup" id="kpi-saved" data-target="0">0</div><div class="sub">입력+출력 합산</div></div>
+          <div class="kpi"><div class="label">호출 수</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">게이트웨이 누적</div></div>
+          <div class="kpi"><div class="label">평균 지연</div><div class="value" id="kpi-latency">— ms</div><div class="sub">최근 50건</div></div>
+          <div class="kpi"><div class="label">사용 비용</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">한도 미설정</div></div>
+        </div>
       </div>
-    </div>
-  </div>
-  <div class="card">
-    <h2>최근 요청</h2>
-    <table id="recent-tbl"><thead><tr><th>시각</th><th>프로바이더</th><th>모델</th><th>in</th><th>out</th><th>지연</th><th>상태</th></tr></thead><tbody></tbody></table>
-  </div>
-</section>
-
-<section id="memory" class="tab">
-  <div class="card">
-    <h2>검색 (recall)</h2>
-    <div class="hint">BM25 검색. 페이로드 필터 예: <code>source=claude,topic~^auth</code></div>
-    <form id="recall-form">
-      <div class="row">
-        <input id="recall-project" placeholder="project" required>
-        <input id="recall-limit" type="number" min="1" max="50" value="10">
+      <div class="card">
+        <div class="head"><h2>응답 추이</h2><span class="hint">최근 요청 50건</span></div>
+        <div class="row">
+          <div><div class="hint">지연 (ms)</div><svg id="chart-latency" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
+          <div><div class="hint">토큰 (in + out)</div><svg id="chart-tokens" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
+        </div>
       </div>
-      <input id="recall-query" placeholder="검색어" required>
-      <input id="recall-filter" placeholder="필터 (선택)">
-      <button class="primary" type="submit">검색</button>
-    </form>
-    <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
-  </div>
-
-  <div class="card">
-    <h2>새 메모리 저장</h2>
-    <form id="save-form">
-      <div class="row">
-        <input id="save-project" placeholder="project" required>
-        <input id="save-kind" placeholder="kind (기본 note)" value="note">
+      <div class="card">
+        <div class="head"><h2>최근 호출</h2><a id="overview-refresh">새로고침</a></div>
+        <table id="recent-tbl"><thead><tr><th>시각</th><th>프로바이더</th><th>모델</th><th>in</th><th>out</th><th>지연</th><th>상태</th></tr></thead><tbody></tbody></table>
       </div>
-      <textarea id="save-body" rows="3" placeholder="내용" required></textarea>
-      <input id="save-metadata" placeholder='메타데이터 JSON (선택, 예: {"source":"claude"})'>
-      <button class="primary" type="submit">저장</button>
-    </form>
-    <div id="save-result" class="muted" style="margin-top:0.5rem;"></div>
-  </div>
+    </section>
 
-  <div class="card">
-    <h2>블록 (persona / human / context)</h2>
-    <div class="hint">에이전트 페르소나, 사용자 정보, 컨텍스트 같은 영속 슬롯.</div>
-    <form id="blocks-list-form" style="grid-template-columns: 1fr auto;">
-      <input id="blocks-project" placeholder="project" required>
-      <button type="submit">목록</button>
-    </form>
-    <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody></tbody></table>
-    <h3>블록 저장 / 덮어쓰기</h3>
-    <form id="blocks-set-form">
-      <div class="row">
-        <input id="block-set-name" placeholder="이름 (persona / human / context …)" required>
-        <input id="block-set-project" placeholder="project" required>
+    <!-- 메모리 -->
+    <section id="page-memory" class="page" hidden>
+      <div class="section-head">
+        <h1>메모리</h1>
+        <div class="lede">프로젝트마다 따로 쌓이는 SQLite 저장소. 검색은 BM25, 옵션으로 필터.</div>
       </div>
-      <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
-      <button class="primary" type="submit">저장</button>
-    </form>
-    <div id="block-set-result" class="muted" style="margin-top:0.5rem;"></div>
-  </div>
+      <div class="card">
+        <div class="head"><h2>검색</h2><span class="hint">필터 예: <code>source=claude,topic~^auth</code></span></div>
+        <form id="recall-form">
+          <div class="row">
+            <input id="recall-project" placeholder="project (예: rtrt)" required>
+            <input id="recall-limit" type="number" min="1" max="50" value="10">
+          </div>
+          <input id="recall-query" placeholder="검색어" required>
+          <input id="recall-filter" placeholder="payload 필터 (선택)">
+          <button class="primary" type="submit">검색</button>
+        </form>
+        <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>내용</th></tr></thead><tbody><tr><td colspan="4" class="empty">검색하면 결과가 여기에 나옵니다.</td></tr></tbody></table>
+      </div>
+      <div class="card">
+        <div class="head"><h2>새 메모리</h2><span class="hint">metadata는 JSON 객체로</span></div>
+        <form id="save-form">
+          <div class="row">
+            <input id="save-project" placeholder="project" required>
+            <input id="save-kind" placeholder="kind (기본 note)" value="note">
+          </div>
+          <textarea id="save-body" rows="3" placeholder="내용" required></textarea>
+          <input id="save-metadata" placeholder='{"source":"claude","topic":"auth"}'>
+          <button class="primary" type="submit">저장</button>
+        </form>
+        <div id="save-result" class="out-meta"></div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>블록</h2><span class="hint">persona / human / context 같은 영속 슬롯</span></div>
+        <form id="blocks-list-form" style="grid-template-columns:1fr auto;">
+          <input id="blocks-project" placeholder="project" required>
+          <button type="submit">목록</button>
+        </form>
+        <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody><tr><td colspan="2" class="empty">project를 입력하고 목록을 눌러보세요.</td></tr></tbody></table>
+        <form id="blocks-set-form" style="margin-top:0.75rem;">
+          <div class="row">
+            <input id="block-set-name" placeholder="이름 (persona / human / context)" required>
+            <input id="block-set-project" placeholder="project" required>
+          </div>
+          <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
+          <button class="primary" type="submit">덮어쓰기</button>
+        </form>
+        <div id="block-set-result" class="out-meta"></div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>백업</h2><span class="hint">JSON Lines로 내려받기</span></div>
+        <form id="export-form" style="grid-template-columns:1fr auto;">
+          <input id="export-project" placeholder="project" required>
+          <button type="submit">다운로드</button>
+        </form>
+      </div>
+    </section>
 
-  <div class="card">
-    <h2>백업</h2>
-    <form id="export-form" style="grid-template-columns: 1fr auto;">
-      <input id="export-project" placeholder="project" required>
-      <button type="submit">JSONL 다운로드</button>
-    </form>
-  </div>
-</section>
+    <!-- 도구 -->
+    <section id="page-tools" class="page" hidden>
+      <div class="section-head">
+        <h1>도구</h1>
+        <div class="lede">텍스트 줄이기, 실패 진단, 코드 시그니처, 템플릿 스캐폴드, 프롬프트.</div>
+      </div>
+      <nav class="subtabs" id="tool-subtabs">
+        <a class="active" data-sub="compress">압축</a>
+        <a data-sub="diagnose">진단</a>
+        <a data-sub="repomap">코드 맵</a>
+        <a data-sub="templates">템플릿</a>
+        <a data-sub="prompts">프롬프트</a>
+      </nav>
 
-<section id="tools" class="tab">
-  <details open>
-    <summary>압축 (compress)</summary>
-    <div>
-      <div class="muted">텍스트를 룰 엔진(lite/full/ultra/extreme) 또는 ML 휴리스틱으로 줄임.</div>
-      <form id="compress-form" style="margin-top:0.5rem;">
-        <div class="row">
-          <select id="compress-mode">
-            <option value="rules">룰 엔진</option>
-            <option value="ml">ML 휴리스틱</option>
-          </select>
-          <select id="compress-level">
-            <option value="lite">lite</option>
-            <option value="full" selected>full</option>
-            <option value="ultra">ultra</option>
-            <option value="extreme">extreme</option>
-          </select>
+      <div id="sub-compress" class="subpage">
+        <div class="card">
+          <div class="head"><h2>텍스트 압축</h2><span class="hint">룰 엔진 또는 ML 휴리스틱</span></div>
+          <form id="compress-form">
+            <div class="row">
+              <select id="compress-mode">
+                <option value="rules">룰 엔진 (정규식)</option>
+                <option value="ml">ML 휴리스틱 (토큰 중요도)</option>
+              </select>
+              <select id="compress-level">
+                <option value="lite">lite (약함)</option>
+                <option value="full" selected>full (기본)</option>
+                <option value="ultra">ultra (강함)</option>
+                <option value="extreme">extreme (최강)</option>
+              </select>
+            </div>
+            <div class="row">
+              <select id="compress-format">
+                <option value="plain" selected>plain</option>
+                <option value="markdown">markdown</option>
+                <option value="xml">xml</option>
+                <option value="json">json</option>
+              </select>
+              <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
+            </div>
+            <textarea id="compress-input" rows="5" placeholder="줄일 텍스트를 붙여 넣으세요" required></textarea>
+            <button class="primary" type="submit">압축</button>
+          </form>
+          <div id="compress-summary" class="out-meta"></div>
+          <pre id="compress-output" hidden></pre>
         </div>
-        <div class="row">
-          <select id="compress-format">
-            <option value="plain" selected>plain</option>
-            <option value="markdown">markdown</option>
-            <option value="xml">xml</option>
-            <option value="json">json</option>
-          </select>
-          <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
+        <div class="card">
+          <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 같은 노이즈 줄이기</span></div>
+          <form id="proxy-form">
+            <div class="row">
+              <select id="proxy-mode">
+                <option value="command">command — 명령으로 자동 감지</option>
+                <option value="errors_only">errors_only — 에러 줄만</option>
+                <option value="ultra_compact">ultra_compact — 반복 묶음</option>
+              </select>
+              <input id="proxy-command" placeholder="명령 (예: git status)">
+            </div>
+            <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
+            <textarea id="proxy-raw" rows="5" placeholder="원본 stdout / stderr 붙여넣기" required></textarea>
+            <button class="primary" type="submit">필터링</button>
+          </form>
+          <div id="proxy-summary" class="out-meta"></div>
+          <pre id="proxy-output" hidden></pre>
         </div>
-        <textarea id="compress-input" rows="5" placeholder="원본 텍스트" required></textarea>
-        <button class="primary" type="submit">압축</button>
-      </form>
-      <div id="compress-summary" class="muted" style="margin-top:0.5rem;"></div>
-      <pre id="compress-output" style="display:none;"></pre>
-    </div>
-  </details>
+      </div>
 
-  <details>
-    <summary>명령 출력 필터 (proxy)</summary>
-    <div>
-      <div class="muted">git / cargo 같은 노이즈 많은 출력을 한 줄로 줄임. errors_only / ultra_compact 모드도 가능.</div>
-      <form id="proxy-form" style="margin-top:0.5rem;">
-        <div class="row">
-          <select id="proxy-mode">
-            <option value="command">command (자동 감지)</option>
-            <option value="errors_only">errors_only</option>
-            <option value="ultra_compact">ultra_compact</option>
-          </select>
-          <input id="proxy-command" placeholder="명령 (예: git status)">
+      <div id="sub-diagnose" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄로 답</span></div>
+          <form id="diagnose-form">
+            <div class="row">
+              <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
+              <input id="diagnose-context" type="number" min="0" max="20" value="3" title="context lines">
+            </div>
+            <textarea id="diagnose-raw" rows="8" placeholder="빌드 / 테스트 실패 로그" required></textarea>
+            <button class="primary" type="submit">진단 요청</button>
+          </form>
+          <div id="diagnose-meta" class="out-meta"></div>
+          <pre id="diagnose-output" hidden></pre>
         </div>
-        <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
-        <textarea id="proxy-raw" rows="5" placeholder="원본 stdout/stderr" required></textarea>
-        <button class="primary" type="submit">필터링</button>
-      </form>
-      <div id="proxy-summary" class="muted" style="margin-top:0.5rem;"></div>
-      <pre id="proxy-output" style="display:none;"></pre>
-    </div>
-  </details>
+      </div>
 
-  <details>
-    <summary>실패 진단 (diagnose)</summary>
-    <div>
-      <div class="muted">빌드 / 테스트 실패 로그를 LLM에 넘겨 원인 + 수정 제안을 한 번에 받음.</div>
-      <form id="diagnose-form" style="margin-top:0.5rem;">
-        <div class="row">
-          <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
-          <input id="diagnose-context" type="number" min="0" max="20" value="3">
+      <div id="sub-repomap" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동 감지</span></div>
+          <form id="repomap-form">
+            <input id="repomap-root" placeholder="프로젝트 경로 (예: /home/user/projects/foo)" required>
+            <div class="row">
+              <input id="repomap-ext" placeholder="확장자 (비우면 자동: .rs/.py/.ts)">
+              <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
+            </div>
+            <button class="primary" type="submit">맵 생성</button>
+          </form>
+          <div id="repomap-summary" class="out-meta"></div>
+          <pre id="repomap-output" style="max-height:420px;overflow:auto;" hidden></pre>
         </div>
-        <textarea id="diagnose-raw" rows="6" placeholder="실패 로그" required></textarea>
-        <button class="primary" type="submit">진단</button>
-      </form>
-      <div id="diagnose-meta" class="muted" style="margin-top:0.5rem;"></div>
-      <pre id="diagnose-output" style="display:none;"></pre>
-    </div>
-  </details>
+      </div>
 
-  <details>
-    <summary>코드 시그니처 맵 (repo-map)</summary>
-    <div>
-      <div class="muted">Rust / Python / TypeScript 프로젝트의 함수·클래스 시그니처만 추출. 본문 제거.</div>
-      <form id="repomap-form" style="margin-top:0.5rem;">
-        <input id="repomap-root" placeholder="프로젝트 경로" required>
-        <div class="row">
-          <input id="repomap-ext" placeholder="확장자 (선택, 비우면 자동)" >
-          <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
+      <div id="sub-templates" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>프로젝트 템플릿</h2><span class="hint">개발 · 디자인 · 설계 카테고리</span></div>
+          <table id="tpl"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody><tr><td colspan="4" class="empty">불러오는 중…</td></tr></tbody></table>
         </div>
-        <button class="primary" type="submit">맵 생성</button>
-      </form>
-      <div id="repomap-summary" class="muted" style="margin-top:0.5rem;"></div>
-      <pre id="repomap-output" style="display:none; max-height: 360px; overflow:auto;"></pre>
-    </div>
-  </details>
+        <div class="card">
+          <div class="head"><h2>새 프로젝트 생성</h2><span class="hint">미리보기는 디스크에 쓰지 않음</span></div>
+          <form id="scaffold-form">
+            <div class="row">
+              <select id="scaffold-template" required></select>
+              <input id="scaffold-target" placeholder="대상 디렉터리 (예: ./hello)" required>
+            </div>
+            <div id="scaffold-vars"></div>
+            <label><input id="scaffold-overwrite" type="checkbox"> 기존 파일 덮어쓰기</label>
+            <div style="display:flex;gap:0.5rem;">
+              <button type="button" id="scaffold-preview" class="ghost">미리보기</button>
+              <button type="submit" class="primary">생성</button>
+            </div>
+          </form>
+          <div id="scaffold-result" class="out-meta"></div>
+        </div>
+      </div>
 
-  <details>
-    <summary>프로젝트 스캐폴드 (templates)</summary>
-    <div>
-      <div class="muted">개발 / 디자인 / 설계 카테고리별 빌트인 + 커스텀 템플릿. 미리보기는 디스크 미기록.</div>
-      <table id="tpl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody></tbody></table>
-      <h3>스캐폴드 실행</h3>
-      <form id="scaffold-form">
-        <div class="row">
-          <select id="scaffold-template" required></select>
-          <input id="scaffold-target" placeholder="대상 디렉터리" required>
+      <div id="sub-prompts" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>버전 프롬프트</h2><span class="hint">$RTRT_PROMPTS_DIR (기본 ~/.rtrt/prompts)</span></div>
+          <table id="prompts-tbl"><thead><tr><th>이름</th><th>최신</th><th>버전</th></tr></thead><tbody><tr><td colspan="3" class="empty">아직 저장된 프롬프트 없음. CLI <code>rtrt prompt save</code> 로 추가하세요.</td></tr></tbody></table>
+          <pre id="prompt-body" hidden></pre>
         </div>
-        <div id="scaffold-vars"></div>
-        <label><input id="scaffold-overwrite" type="checkbox"> 기존 파일 덮어쓰기</label>
-        <div style="display:flex;gap:0.5rem;">
-          <button type="button" id="scaffold-preview">미리보기</button>
-          <button type="submit" class="primary">생성</button>
-        </div>
-      </form>
-      <div id="scaffold-result" class="muted" style="margin-top:0.5rem;"></div>
-    </div>
-  </details>
+      </div>
+    </section>
 
-  <details>
-    <summary>프롬프트 (prompts)</summary>
-    <div>
-      <div class="muted">버전 관리되는 프롬프트 저장소. <code>$RTRT_PROMPTS_DIR</code> (기본 <code>~/.rtrt/prompts</code>).</div>
-      <table id="prompts-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>최신</th><th>버전</th></tr></thead><tbody></tbody></table>
-      <pre id="prompt-body" style="display:none; margin-top:0.5rem;"></pre>
-    </div>
-  </details>
-
-  <details>
-    <summary>에이전트 연결 (setup)</summary>
-    <div>
-      <div class="muted">Claude Code / Cursor / Codex MCP 설정 스니펫 생성 (디스크 미기록).</div>
-      <form id="setup-form" style="margin-top:0.5rem;">
-        <div class="row">
-          <select id="setup-agent">
-            <option value="claude-code">claude-code</option>
-            <option value="cursor">cursor</option>
-            <option value="codex">codex</option>
-          </select>
-          <input id="setup-memory" placeholder="memory 경로" value=".rtrt/memory.sqlite">
+    <!-- 설정 -->
+    <section id="page-settings" class="page" hidden>
+      <div class="section-head">
+        <h1>설정</h1>
+        <div class="lede">에이전트 연결 + 환경 정보.</div>
+      </div>
+      <nav class="subtabs" id="setting-subtabs">
+        <a class="active" data-sub="connect">에이전트 연결</a>
+        <a data-sub="env">환경</a>
+      </nav>
+      <div id="sub-connect" class="subpage">
+        <div class="card">
+          <div class="head"><h2>MCP 설정 스니펫 생성</h2><span class="hint">디스크에 쓰지 않음 — 복붙용 출력만</span></div>
+          <form id="setup-form">
+            <div class="row">
+              <select id="setup-agent">
+                <option value="claude-code">claude-code</option>
+                <option value="cursor">cursor</option>
+                <option value="codex">codex</option>
+              </select>
+              <input id="setup-memory" placeholder="memory 경로" value=".rtrt/memory.sqlite">
+            </div>
+            <input id="setup-binary" placeholder="rtrt-mcp 바이너리 경로 (선택)">
+            <button class="primary" type="submit">스니펫 생성</button>
+          </form>
+          <pre id="setup-output" hidden></pre>
         </div>
-        <input id="setup-binary" placeholder="rtrt-mcp 바이너리 경로 (선택)">
-        <button type="submit" class="primary">스니펫 생성</button>
-      </form>
-      <pre id="setup-output" style="display:none; margin-top:0.5rem;"></pre>
-    </div>
-  </details>
-</section>
+      </div>
+      <div id="sub-env" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>환경 정보</h2></div>
+          <table id="env-tbl"><tbody>
+            <tr><td>대시보드 바인드</td><td><code id="env-bind">—</code></td></tr>
+            <tr><td>인증 토큰</td><td id="env-token">—</td></tr>
+            <tr><td>응답 캐시</td><td id="env-cache">—</td></tr>
+            <tr><td>예산 한도</td><td id="env-budget">—</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="activity">
+  <span class="dot-pulse"></span>
+  <span class="feed" id="activity-feed">대시보드 부팅 완료. 좌측 메뉴에서 작업을 시작하세요.</span>
+</div>
 
 <script>
 (function initTheme() {
@@ -1298,67 +1407,124 @@ document.getElementById('theme-toggle').onclick = () => {
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem('rtrt-theme', next);
 };
-document.querySelectorAll('nav.tabs a').forEach(a => a.onclick = () => {
-  document.querySelectorAll('nav.tabs a').forEach(x => x.classList.remove('active'));
-  document.querySelectorAll('section.tab').forEach(x => x.classList.remove('active'));
+
+// Sidebar nav
+document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => {
+  document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(x => x.hidden = true);
   a.classList.add('active');
-  document.getElementById(a.dataset.tab).classList.add('active');
+  document.getElementById('page-' + a.dataset.page).hidden = false;
 });
 
+// Sub-tabs (도구, 설정)
+function wireSubtabs(navId) {
+  const nav = document.getElementById(navId);
+  if (!nav) return;
+  nav.querySelectorAll('a').forEach(a => a.onclick = () => {
+    nav.querySelectorAll('a').forEach(x => x.classList.remove('active'));
+    a.classList.add('active');
+    const parent = nav.parentElement;
+    parent.querySelectorAll('.subpage').forEach(x => x.hidden = true);
+    document.getElementById('sub-' + a.dataset.sub).hidden = false;
+  });
+}
+wireSubtabs('tool-subtabs');
+wireSubtabs('setting-subtabs');
+
+// Activity feed
+const FEED = [];
+function pushActivity(msg) {
+  const t = new Date().toTimeString().slice(0, 8);
+  FEED.unshift(`${t} · ${msg}`);
+  if (FEED.length > 12) FEED.pop();
+  document.getElementById('activity-feed').textContent = FEED[0] || '';
+}
+
+// Utility
 function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
+function setPill(id, ok, text) {
+  const el = document.getElementById(id);
+  el.classList.remove('ok', 'warn');
+  el.classList.add(ok === true ? 'ok' : ok === false ? 'warn' : '');
+  if (text) el.lastChild.textContent = ' ' + text;
+}
+function animateCount(el, target) {
+  if (!el) return;
+  const start = Number(el.dataset.target || 0);
+  el.dataset.target = target;
+  const startAt = performance.now();
+  const duration = 600;
+  const tick = (now) => {
+    const t = Math.min(1, (now - startAt) / duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    const value = Math.round(start + (target - start) * eased);
+    el.textContent = value.toLocaleString();
+    if (t < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
 function spark(svgId, values, color) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
   if (!values.length) { svg.innerHTML = `<text x="50%" y="55%" text-anchor="middle" fill="var(--muted)" font-size="11">데이터 없음</text>`; return; }
-  const w = 400, h = 60, pad = 4;
+  const w = 400, h = 64, pad = 4;
   const max = Math.max(1, ...values);
   const step = values.length > 1 ? (w - pad*2) / (values.length - 1) : 0;
   const pts = values.map((v, i) => {
-    const x = pad + i*step;
+    const x = pad + i * step;
     const y = h - pad - (v/max) * (h - pad*2);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
   const fill = `${pad},${h-pad} ${pts} ${(pad+(values.length-1)*step).toFixed(1)},${h-pad}`;
   svg.innerHTML =
-    `<polygon points="${fill}" fill="${color}" fill-opacity="0.18"/>` +
+    `<defs><linearGradient id="g-${svgId}" x1="0" y1="0" x2="0" y2="1">` +
+    `<stop offset="0%" stop-color="${color}" stop-opacity="0.35"/>` +
+    `<stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>` +
+    `<polygon points="${fill}" fill="url(#g-${svgId})"/>` +
     `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>` +
-    `<text x="${w-pad}" y="10" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
+    `<text x="${w-pad}" y="11" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
 }
 
 async function loadOverview() {
-  const [m, b] = await Promise.all([
-    fetch('/api/metrics').then(r => r.json()).catch(() => ({summary:{}, recent:[]})),
+  const [mRes, bRes] = await Promise.all([
+    fetch('/api/metrics').then(r => r.ok ? r.json() : ({summary:{}, recent:[]})).catch(() => ({summary:{}, recent:[]})),
     fetch('/api/budget').then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
-  const s = m.summary || {};
+  const s = mRes.summary || {};
   const calls = s.calls || 0;
-  const avgLatency = calls ? (s.total_latency_ms/Math.max(1,calls)).toFixed(0) : '—';
-  const cacheLen = (b && b.cache_len !== null && b.cache_len !== undefined) ? b.cache_len : 'off';
-  const kpis = [
-    ['호출 수', calls],
-    ['성공 / 실패', `${s.successes || 0} / ${s.failures || 0}`],
-    ['평균 지연', `${avgLatency} ms`],
-    ['입력 토큰', s.total_input_tokens || 0],
-    ['출력 토큰', s.total_output_tokens || 0],
-    ['예산 사용', b ? fmtUsd(b.spent_usd) : '—'],
-    ['예산 한도', b ? fmtUsd(b.cap_usd) : '—'],
-    ['응답 캐시', cacheLen],
-  ];
-  document.getElementById('kpi-grid').innerHTML = kpis.map(([k,v]) =>
-    `<div class="kpi"><div class="label">${k}</div><div class="value">${v}</div></div>`
-  ).join('');
-  const recent = (m.recent || []).slice();
-  spark('chart-latency', recent.slice().reverse().map(r => r.latency_ms), 'var(--accent)');
-  spark('chart-tokens', recent.slice().reverse().map(r => (r.usage.input_tokens||0)+(r.usage.output_tokens||0)), '#2ecc71');
+  const saved = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
+  const avgLatency = calls ? (s.total_latency_ms / Math.max(1, calls)).toFixed(0) : '—';
+  animateCount(document.getElementById('kpi-saved'), saved);
+  animateCount(document.getElementById('kpi-calls'), calls);
+  document.getElementById('kpi-latency').textContent = `${avgLatency} ms`;
+  document.getElementById('kpi-spent').textContent = bRes ? fmtUsd(bRes.spent_usd) : '—';
+  document.getElementById('kpi-spent-sub').textContent = bRes && bRes.cap_usd ? `한도 ${fmtUsd(bRes.cap_usd)}` : '한도 미설정';
+
+  setPill('pill-gateway', calls > 0, calls > 0 ? '게이트웨이 활성' : '게이트웨이 대기');
+  setPill('pill-memory', null, '메모리');
+  if (bRes) {
+    const cache = (bRes.cache_len === null || bRes.cache_len === undefined) ? 'off' : `${bRes.cache_len}건`;
+    setPill('pill-cache', bRes.cache_len !== null && bRes.cache_len !== undefined, `캐시 ${cache}`);
+    document.getElementById('env-cache').textContent = cache;
+    document.getElementById('env-budget').textContent = bRes.cap_usd ? `${fmtUsd(bRes.cap_usd)} (${fmtUsd(bRes.spent_usd)} 사용)` : '미설정';
+  }
+
+  const recent = mRes.recent || [];
+  spark('chart-latency', recent.slice().reverse().map(r => r.latency_ms), '#2962FF');
+  spark('chart-tokens', recent.slice().reverse().map(r => (r.usage.input_tokens || 0) + (r.usage.output_tokens || 0)), '#16a34a');
+
   const byParent = new Map(); const heads = [];
   for (const r of recent) {
-    if (r.parent_id) { (byParent.get(r.parent_id) || byParent.set(r.parent_id, []).get(r.parent_id)).push(r); }
-    else { heads.push(r); }
+    if (r.parent_id) {
+      let arr = byParent.get(r.parent_id);
+      if (!arr) { arr = []; byParent.set(r.parent_id, arr); }
+      arr.push(r);
+    } else { heads.push(r); }
   }
   function row(r, depth) {
-    const t = new Date(r.started_at * 1000).toISOString().slice(11,19);
-    const status = r.ok ? 'ok' : `<span class="err">${r.error||'failed'}</span>`;
-    const ind = depth ? `<span class="muted">└─ </span>` : '';
+    const t = new Date(r.started_at * 1000).toTimeString().slice(0, 8);
+    const status = r.ok ? '<span class="badge ok">ok</span>' : `<span class="badge err">${r.error || 'failed'}</span>`;
+    const ind = depth ? `<span style="color:var(--muted);">└─ </span>` : '';
     return `<tr><td>${ind}${t}</td><td>${r.provider}</td><td><code>${r.model}</code></td><td>${r.usage.input_tokens}</td><td>${r.usage.output_tokens}</td><td>${r.latency_ms} ms</td><td>${status}</td></tr>`;
   }
   const rows = [];
@@ -1366,9 +1532,11 @@ async function loadOverview() {
     rows.push(row(h, 0));
     for (const c of (byParent.get(h.id) || [])) rows.push(row(c, 1));
   }
-  document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="muted">아직 요청 없음</td></tr>';
+  document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">아직 호출 없음. <code>rtrt provider chat</code> 또는 MCP로 시작하세요.</td></tr>';
 }
+document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('개요 새로고침'); };
 
+// Memory
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const body = {
@@ -1378,19 +1546,20 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
     filter: document.getElementById('recall-filter').value || null,
   };
   const tbody = document.querySelector('#recall-tbl tbody');
-  tbody.innerHTML = `<tr><td colspan="4" class="muted">검색 중…</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="4" class="empty">검색 중…</td></tr>`;
   const r = await fetch('/api/memory/recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="4" class="err">${r.status}: ${await r.text()}</td></tr>`; return; }
+  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="4" class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</td></tr>`; return; }
   const d = await r.json();
   tbody.innerHTML = d.hits.length
     ? d.hits.map(h => `<tr><td>${h.id}</td><td><code>${h.kind}</code></td><td>${h.scope}</td><td>${h.body.replace(/</g,'&lt;')}</td></tr>`).join('')
-    : `<tr><td colspan="4" class="muted">결과 없음</td></tr>`;
+    : `<tr><td colspan="4" class="empty">결과 없음. 다른 검색어를 시도해보세요.</td></tr>`;
+  pushActivity(`recall ${body.project} · ${d.hits.length}건`);
 };
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   let metadata = {};
   const raw = document.getElementById('save-metadata').value.trim();
-  if (raw) { try { metadata = JSON.parse(raw); } catch (e) { document.getElementById('save-result').innerHTML = `<span class="err">JSON 파싱 실패: ${e}</span>`; return; } }
+  if (raw) { try { metadata = JSON.parse(raw); } catch (e) { document.getElementById('save-result').innerHTML = `<span style="color:var(--err);">JSON 파싱 실패: ${e}</span>`; return; } }
   const body = {
     project: document.getElementById('save-project').value,
     kind: document.getElementById('save-kind').value || 'note',
@@ -1399,21 +1568,22 @@ document.getElementById('save-form').onsubmit = async (ev) => {
   };
   const r = await fetch('/api/memory/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const out = document.getElementById('save-result');
-  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  out.textContent = `저장 완료 (id=${d.id})`;
+  out.innerHTML = `<span class="badge ok">✓ 저장 id=${d.id}</span>`;
+  pushActivity(`save ${body.project} · id=${d.id}`);
 };
 document.getElementById('blocks-list-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = document.getElementById('blocks-project').value;
   const tbody = document.querySelector('#blocks-tbl tbody');
-  tbody.innerHTML = `<tr><td colspan="2" class="muted">불러오는 중…</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="2" class="empty">불러오는 중…</td></tr>`;
   const r = await fetch(`/api/memory/blocks?project=${encodeURIComponent(project)}`);
-  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="2" class="err">${r.status}: ${await r.text()}</td></tr>`; return; }
+  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="2" class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</td></tr>`; return; }
   const d = await r.json();
   tbody.innerHTML = d.blocks.length
     ? d.blocks.map(b => `<tr><td><code>${b.kind.replace(/^block:/,'')}</code></td><td>${b.body.replace(/</g,'&lt;')}</td></tr>`).join('')
-    : `<tr><td colspan="2" class="muted">블록 없음</td></tr>`;
+    : `<tr><td colspan="2" class="empty">블록 없음. 아래에서 추가하세요.</td></tr>`;
 };
 document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1424,15 +1594,18 @@ document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   };
   const r = await fetch('/api/memory/blocks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const out = document.getElementById('block-set-result');
-  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
-  const d = await r.json(); out.textContent = `저장 완료 (id=${d.id})`;
+  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  out.innerHTML = `<span class="badge ok">✓ 저장 id=${d.id}</span>`;
 };
 document.getElementById('export-form').onsubmit = (ev) => {
   ev.preventDefault();
   const project = document.getElementById('export-project').value;
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
+  pushActivity(`export ${project}`);
 };
 
+// Tools — compress
 document.getElementById('compress-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const body = {
@@ -1444,13 +1617,14 @@ document.getElementById('compress-form').onsubmit = async (ev) => {
   };
   const sum = document.getElementById('compress-summary');
   const pre = document.getElementById('compress-output');
-  sum.textContent = '압축 중…'; pre.style.display = 'none';
+  sum.textContent = '압축 중…'; pre.hidden = true;
   const r = await fetch('/api/compress', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
   const ratio = d.original_len ? ((d.compressed_len / d.original_len) * 100).toFixed(1) : '0';
-  sum.textContent = `mode=${d.mode}${d.scorer ? ` · scorer=${d.scorer}` : ''} · ${d.original_len} → ${d.compressed_len} chars (${ratio}%) · 절감 ${d.saved_chars}`;
-  pre.style.display = 'block'; pre.textContent = d.compressed;
+  sum.innerHTML = `<span class="badge ok">✓ ${d.original_len} → ${d.compressed_len} (${ratio}%)</span> <span style="margin-left:0.5rem;">절감 ${d.saved_chars}자 · mode=${d.mode}${d.scorer ? ` · ${d.scorer}` : ''}</span>`;
+  pre.hidden = false; pre.textContent = d.compressed;
+  pushActivity(`compress · -${d.saved_chars}자`);
 };
 document.getElementById('proxy-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1462,13 +1636,13 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
   };
   const sum = document.getElementById('proxy-summary');
   const pre = document.getElementById('proxy-output');
-  sum.textContent = '필터링 중…'; pre.style.display = 'none';
+  sum.textContent = '필터링 중…'; pre.hidden = true;
   const r = await fetch('/api/proxy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
   const ratio = d.original_len ? ((d.filtered_len / d.original_len) * 100).toFixed(1) : '0';
-  sum.textContent = `mode=${d.mode} · ${d.original_len} → ${d.filtered_len} chars (${ratio}%) · 절감 ${d.saved_chars}`;
-  pre.style.display = 'block'; pre.textContent = d.filtered;
+  sum.innerHTML = `<span class="badge ok">✓ ${d.original_len} → ${d.filtered_len} (${ratio}%)</span> <span style="margin-left:0.5rem;">절감 ${d.saved_chars}자 · mode=${d.mode}</span>`;
+  pre.hidden = false; pre.textContent = d.filtered;
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1479,12 +1653,13 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
   };
   const meta = document.getElementById('diagnose-meta');
   const pre = document.getElementById('diagnose-output');
-  meta.textContent = '진단 중…'; pre.style.display = 'none';
+  meta.textContent = '진단 중…'; pre.hidden = true;
   const r = await fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { meta.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  meta.textContent = `${d.provider}/${d.model} · in ${d.input_tokens} · out ${d.output_tokens}`;
-  pre.style.display = 'block'; pre.textContent = d.diagnosis;
+  meta.innerHTML = `<span class="badge ok">${d.provider}/${d.model}</span> in ${d.input_tokens} · out ${d.output_tokens}`;
+  pre.hidden = false; pre.textContent = d.diagnosis;
+  pushActivity(`diagnose · ${d.provider}`);
 };
 document.getElementById('repomap-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1495,35 +1670,33 @@ document.getElementById('repomap-form').onsubmit = async (ev) => {
   };
   const sum = document.getElementById('repomap-summary');
   const pre = document.getElementById('repomap-output');
-  sum.textContent = '스캔 중…'; pre.style.display = 'none';
+  sum.textContent = '스캔 중…'; pre.hidden = true;
   const r = await fetch('/api/repo-map', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  sum.textContent = `${d.files} 파일 · ${d.total_bytes} bytes 스캔 · 시그니처 ${d.signature_chars} chars`;
-  pre.style.display = 'block';
+  sum.innerHTML = `<span class="badge ok">${d.files} 파일</span> ${d.total_bytes} bytes 스캔 · 시그니처 ${d.signature_chars} chars`;
+  pre.hidden = false;
   pre.textContent = d.entries.map(e => `// ${e.path} [${e.language || ''}]\n${e.signatures}\n`).join('\n');
 };
 
+// Templates
 const CAT_LABEL = { development: '개발', design: '디자인', planning: '설계' };
 let LOADED_TEMPLATES = [];
 async function loadTemplates() {
-  const tpls = await fetch('/api/templates').then(r => r.json()).catch(() => []);
+  const tpls = await fetch('/api/templates').then(r => r.ok ? r.json() : []).catch(() => []);
   LOADED_TEMPLATES = tpls;
-  const grouped = { development: [], design: [], planning: [] };
-  for (const t of tpls) {
-    const c = (t.category || 'development');
-    (grouped[c] || grouped.development).push(t);
-  }
-  const rows = [];
-  for (const cat of ['development', 'design', 'planning']) {
-    for (const t of grouped[cat]) {
-      rows.push(`<tr><td><code>${t.name}</code></td><td>${CAT_LABEL[cat]}</td><td>${t.description}</td><td><a data-pick="${t.name}" style="cursor:pointer;color:var(--accent);">사용</a></td></tr>`);
-    }
-  }
-  document.querySelector('#tpl tbody').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">템플릿 없음</td></tr>';
+  const tbody = document.querySelector('#tpl tbody');
+  if (!tpls.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">템플릿 없음</td></tr>'; return; }
+  const order = ['development', 'design', 'planning'];
+  const grouped = {};
+  for (const t of tpls) { (grouped[t.category || 'development'] ||= []).push(t); }
+  tbody.innerHTML = order.flatMap(cat => (grouped[cat] || []).map(t =>
+    `<tr><td><code>${t.name}</code></td><td><span class="badge">${CAT_LABEL[cat]}</span></td><td>${t.description}</td><td><a data-pick="${t.name}">사용</a></td></tr>`
+  )).join('');
   document.querySelectorAll('a[data-pick]').forEach(a => a.onclick = () => {
     document.getElementById('scaffold-template').value = a.dataset.pick;
     renderScaffoldVars();
+    document.querySelector('#scaffold-target').focus();
   });
   const sel = document.getElementById('scaffold-template');
   sel.innerHTML = tpls.map(t => `<option value="${t.name}">[${CAT_LABEL[t.category || 'development']}] ${t.name}</option>`).join('');
@@ -1557,39 +1730,42 @@ document.getElementById('scaffold-preview').onclick = async () => {
   const out = document.getElementById('scaffold-result');
   out.textContent = '미리보기…';
   const r = await fetch('/api/templates/scaffold/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
-  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
   const rows = d.files.map(f => `<tr><td><code>${f.path}</code></td><td>${f.bytes}</td></tr>`).join('');
-  out.innerHTML = `<div>${d.root} 아래 ${d.files.length} 파일</div><table><thead><tr><th>경로</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`;
+  out.innerHTML = `<div>${d.root} 아래 ${d.files.length} 파일 생성 예정</div><table style="margin-top:0.4rem;"><thead><tr><th>경로</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`;
 };
 document.getElementById('scaffold-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const out = document.getElementById('scaffold-result');
   out.textContent = '생성 중…';
   const r = await fetch('/api/templates/scaffold', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
-  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  out.innerHTML = `생성 완료 — <code>${d.root}</code> 아래 ${d.files_written} 파일` +
+  out.innerHTML = `<span class="badge ok">✓ ${d.files_written} 파일</span> <code>${d.root}</code>` +
     (d.post_hooks.length ? `<br>후처리: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}` : '');
+  pushActivity(`scaffold · ${d.files_written} 파일`);
 };
 
+// Prompts
 async function loadPrompts() {
   let prompts = [];
   try { prompts = await fetch('/api/prompts').then(r => r.ok ? r.json() : []); } catch (_) {}
   const tbody = document.querySelector('#prompts-tbl tbody');
-  if (!prompts.length) { tbody.innerHTML = `<tr><td colspan="3" class="muted">아직 저장된 프롬프트 없음</td></tr>`; return; }
+  if (!prompts.length) return;
   tbody.innerHTML = prompts.map(p => {
-    const versions = p.versions.map(v => `<a data-name="${p.name}" data-version="${v}" style="margin-right:0.5rem;cursor:pointer;color:var(--accent);">v${v}</a>`).join('');
+    const versions = p.versions.map(v => `<a data-name="${p.name}" data-version="${v}" style="margin-right:0.5rem;">v${v}</a>`).join('');
     return `<tr><td><code>${p.name}</code></td><td>v${p.latest}</td><td>${versions}</td></tr>`;
   }).join('');
   tbody.querySelectorAll('a[data-name]').forEach(a => a.onclick = async () => {
     const body = await fetch(`/api/prompts/${a.dataset.name}/${a.dataset.version}`).then(r => r.json());
     const pre = document.getElementById('prompt-body');
-    pre.style.display = 'block';
+    pre.hidden = false;
     pre.textContent = `# ${body.name} v${body.version}\n\n${body.body}`;
   });
 }
 
+// Settings
 document.getElementById('setup-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const body = {
@@ -1598,18 +1774,21 @@ document.getElementById('setup-form').onsubmit = async (ev) => {
     binary: document.getElementById('setup-binary').value || null,
   };
   const pre = document.getElementById('setup-output');
-  pre.style.display = 'none';
+  pre.hidden = true;
   const r = await fetch('/api/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { pre.style.display = 'block'; pre.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) { pre.hidden = false; pre.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  pre.style.display = 'block';
+  pre.hidden = false;
   pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
 };
 
+// Init
+document.getElementById('env-bind').textContent = window.location.host;
 loadOverview();
 loadTemplates();
 loadPrompts();
 setInterval(loadOverview, 5000);
+pushActivity('대시보드 부팅 완료. 좌측 메뉴에서 작업을 시작하세요.');
 </script>
 </body>
 </html>

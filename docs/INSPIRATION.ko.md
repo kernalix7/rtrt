@@ -36,6 +36,11 @@ RTRT는 다른 토큰 절감 · 메모리 · 에이전트 도구 프로젝트에
 
 | Project | 아이디어 | 크레이트 | 우선순위 |
 |---------|---------|----------|----------|
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 베이스라인 (v0.1 채택 완료) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` 기본 임베딩 (v0.2 채택 완료, fastembed 경유) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Reciprocal Rank Fusion 하이브리드 회수 (v0.2 채택 완료) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `edges` 테이블 기반 지식 그래프 엔티티 매칭 | `rtrt-memory` | high |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | 에이전트 간 메모리 공유 데몬(`:3111` HTTP) | `rtrt-memory` + `rtrt-mcp` | low (프로젝트별 SQLite가 기본 의도) |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | 다층 메모리(user / session / agent 범위) | `rtrt-memory` | high |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | 하이브리드 회수: 시맨틱 + BM25 + 엔티티 링킹 | `rtrt-memory` | high |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | 한 번에 ADD-only LLM 추출(저비용 · 저토큰) | `rtrt-memory` + `rtrt-providers` | medium |
@@ -110,6 +115,18 @@ RTRT는 다른 토큰 절감 · 메모리 · 에이전트 도구 프로젝트에
 3. **`providers.gateway`** in `rtrt-providers` — 여러 프로바이더 앞의 단일 키, 요청별 비용 / 지연 지표를 `rtrt-dashboard`로 흘림. 출처: Helicone · Langfuse · llm-chain.
 4. **`rtrt setup --agent <name>`** in `rtrt-cli` — Claude Code / Cursor / Windsurf / Codex / Aider에 한 줄로 와이어업, rtk `init` 미러.
 5. **`rtrt-compress secretlint` 사전 검사** in `rtrt-compress` — LLM 도달 전 시크릿 차단. 출처: repomix.
+
+## 이 백로그에서 이미 출시된 항목
+
+위 표에 `shipped`로 표시된 항목은 미래 작업이 아니라, RTRT 기능을 영감 출처로 추적할 수 있도록 명시한 것입니다. v0.2 기준:
+
+- `rtrt-memory` SQLite + FTS5 BM25 (agentmemory).
+- `rtrt-memory` fastembed 경유 `all-MiniLM-L6-v2` 임베딩 (agentmemory).
+- `rtrt-memory` Reciprocal Rank Fusion 하이브리드 회수 (agentmemory).
+- `rtrt-memory` LLM 기반 extract + compress (agentmemory의 cloud-only 압축을 RTRT의 Provider 트레이트로 로컬 Ollama까지 확장 — agentmemory 대비 RTRT의 부가가치).
+- `rtrt-providers` 멀티 프로바이더 채팅 트레이트 (llm-chain).
+- `rtrt-providers` OpenAI 호환 어댑터로 Ollama / llama.cpp / vLLM / LM Studio 커버 (helicone 게이트웨이 + 실용적 재사용).
+- `rtrt-compress` 시크릿 패턴 자동 검열기 (repomix secretlint 검사).
 
 ## 사용 방법
 

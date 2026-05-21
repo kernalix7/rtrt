@@ -26,6 +26,7 @@ fn main() -> ExitCode {
                     Some("lite") => Some(CompressionLevel::Lite),
                     Some("full") => Some(CompressionLevel::Full),
                     Some("ultra") => Some(CompressionLevel::Ultra),
+                    Some("extreme") => Some(CompressionLevel::Extreme),
                     other => {
                         eprintln!("unknown level: {other:?}");
                         return ExitCode::from(2);

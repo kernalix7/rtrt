@@ -6,14 +6,16 @@ This page covers the implementation details of each token-reduction surface and 
 
 ## Output compression
 
-`rtrt-compress` is a regex-based rewriter. It runs in two phases:
+`rtrt-compress` is a regex-based rewriter that runs in three phases:
 
-1. **Stash phase** — `PROTECT` matches code fences (` ``` `), inline code (`` ` ``), `https?://…` URLs, and `"…"` quoted strings and replaces each with an opaque placeholder (`\u{0001}RTRT_PROTECT_<n>\u{0002}`). The original text is stored in a slot table.
-2. **Rule phase** — a level-dependent ordered rule set applies `Regex::replace_all`. The level controls which rule classes run:
-   - `lite` — fillers + multi-space collapse.
-   - `full` — `lite` plus pleasantries.
-   - `ultra` — `full` plus articles.
-3. **Restore phase** — placeholders are swapped back for their original text.
+1. **Redact phase** — secret-shaped substrings (AWS access keys, GitHub PATs, OpenAI / Anthropic / Slack tokens, Bearer auth headers, generic `api_key=…` patterns, and PEM private-key blocks) are replaced with `<REDACTED:<kind>>` markers so they never reach the rule pass or any downstream LLM.
+2. **Stash phase** — `PROTECT` matches code fences (` ``` `), inline code (`` ` ``), `https?://…` URLs, and `"…"` quoted strings and replaces each with an opaque placeholder (`\u{0001}RTRT_PROTECT_<n>\u{0002}`). The original text is stored in a slot table.
+3. **Rule phase** — a level-dependent ordered rule set applies `Regex::replace_all`. The level controls which rule classes run:
+   - `lite` — fillers + multi-space + multi-newline collapse.
+   - `full` — `lite` + pleasantries + hedging (`I think`, `perhaps`, …) + discourse markers (`moreover`, `however`, …) + meta-phrases (`it is important to note that`, …).
+   - `ultra` — `full` + articles (`a` / `an` / `the`) + phrase shortening (`due to the fact that` → `because`, `in order to` → `to`, `a number of` → `several`, `for instance` → `e.g.`, etc.).
+   - `extreme` — `ultra` + verbose qualifiers (`very`, `extremely`, `quite`, `rather`, …).
+4. **Restore phase** — placeholders are swapped back for their original text.
 
 The protection list is intentionally conservative — anything that could be technical content (code, URLs, errors) is preserved verbatim.
 
@@ -24,9 +26,44 @@ use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
 
 let c = Compressor::new(CompressionLevel::Ultra);
-let out = c.compress("the bug is `really` in the parser");
-// out: "bug is `really` in parser"
+let out = c.compress("I think the bug is, perhaps, in the parser.");
+// out: "bug is, in parser."
 ```
+
+### Compression savings
+
+Measured by `scripts/bench.sh` over the fixtures in `crates/rtrt-compress/benches/fixtures/`. Numbers are char-reduction percentages; lower is more conservative.
+
+| Fixture | `lite` | `full` | `ultra` | `extreme` |
+|---------|-------:|-------:|--------:|----------:|
+| `short` (conversational AI reply) |  6% | 25% | **32%** | 32% |
+| `mixed` (prose + occasional code) |  3% | 12% | 18% | **19%** |
+| `long`  (multi-paragraph explainer) |  2% | 10% | **15%** | 15% |
+| `code`  (code-heavy response) |  2% |  3% |  6% | 6% |
+
+What rule-based passes can and can't do:
+
+- **Can**: drop fillers, pleasantries, hedging, discourse markers, articles, verbose qualifiers, and re-express common verbose phrases.
+- **Can't**: reach caveman's published 60-75% on natural prose without an LLM in the loop — those numbers come from the LLM agreeing to *generate* terse text up front, not from post-hoc deletion.
+
+The v0.3 path to caveman-class numbers is `LlmCompressor` (planned, gated behind the `llm-compress` feature) which routes through any `Provider` — including a local Ollama server — and asks the model to rewrite the passage. Same idea as caveman; works on existing strings instead of requiring the agent to be in caveman mode from the start.
+
+### Secret redaction
+
+The redactor runs **before** the rule pass, so secrets are scrubbed even if compression is set to `lite`. Patterns covered:
+
+- `aws-access-key`: `AKIA…` / `ASIA…` 20-char keys.
+- `aws-secret`: `aws_secret_access_key=…` 40-char base64.
+- `github-pat`: `ghp_…` 40-char PAT.
+- `github-token`: `gh[opsur]_…` (fine-grained tokens, etc.).
+- `openai-key`: `sk-…` / `sk-proj-…`.
+- `anthropic-key`: `sk-ant-…`.
+- `slack-token`: `xox[abprs]-…`.
+- `bearer-token`: `Authorization: Bearer …`.
+- `private-key`: `-----BEGIN … PRIVATE KEY-----` blocks.
+- `generic-api-key`: `api_key=…` / `apikey=…` (context-required).
+
+Each match becomes `<REDACTED:<kind>>`. Idempotent — re-running on already-redacted text is a no-op.
 
 ## Command-output filtering
 

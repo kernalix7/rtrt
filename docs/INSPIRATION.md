@@ -36,6 +36,11 @@ Priority key — **high** = clear win, queue for next minor; **medium** = future
 
 | Project | Idea | Fits | Priority |
 |---------|------|------|----------|
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 baseline (already adopted in v0.1) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` default embedding (already adopted in v0.2 via fastembed) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Hybrid recall via Reciprocal Rank Fusion (already adopted in v0.2) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Knowledge-graph entity matching on `edges` table | `rtrt-memory` | high |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Cross-agent shared memory daemon (HTTP server on `:3111`) | `rtrt-memory` + `rtrt-mcp` | low (per-project SQLite is the intentional default) |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | Multi-level memory tiers (user / session / agent scope) | `rtrt-memory` | high |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | Hybrid recall: semantic + BM25 + entity linking | `rtrt-memory` | high |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | Single-pass ADD-only LLM extraction (cheap, low-token) | `rtrt-memory` + `rtrt-providers` | medium |
@@ -113,6 +118,18 @@ These are the items that:
 3. **`providers.gateway`** in `rtrt-providers` — single key in front of many providers, cost/latency metrics per request feed `rtrt-dashboard`. Sources: Helicone + Langfuse + llm-chain.
 4. **`rtrt setup --agent <name>`** in `rtrt-cli` — wire RTRT into Claude Code / Cursor / Windsurf / Codex / Aider with one command, mirroring rtk's `init` flow.
 5. **`rtrt-compress secretlint` pre-pass** in `rtrt-compress` — block secrets before they reach the LLM. Source: repomix.
+
+## Already shipped from this backlog
+
+Items marked `shipped` above are not future work — they're called out so the reader can trace concrete RTRT features back to their inspiration source. As of v0.2:
+
+- `rtrt-memory` SQLite + FTS5 BM25 (from agentmemory).
+- `rtrt-memory` `all-MiniLM-L6-v2` embeddings via fastembed (from agentmemory).
+- `rtrt-memory` Reciprocal Rank Fusion hybrid recall (from agentmemory).
+- `rtrt-memory` LLM-backed extract + compress (from agentmemory cloud-only compression, extended to local Ollama via the shared Provider trait — this is RTRT's value-add over agentmemory).
+- `rtrt-providers` multi-provider chat trait (from llm-chain).
+- `rtrt-providers` OpenAI-compatible adapter that covers Ollama / llama.cpp / vLLM / LM Studio (from helicone-style gateway thinking + practical reuse).
+- `rtrt-compress` secret-shape redactor (from repomix secretlint pass).
 
 ## How to read this list
 

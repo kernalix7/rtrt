@@ -6,14 +6,16 @@
 
 ## 출력 압축
 
-`rtrt-compress`는 정규식 기반 재작성기로, 두 단계로 동작합니다.
+`rtrt-compress`는 정규식 기반 재작성기로, 세 단계로 동작합니다.
 
-1. **보호 단계** — `PROTECT`가 코드 펜스(` ``` `), 인라인 코드(` ` `), `https?://…` URL, `"…"` 인용 문자열을 찾아 불투명한 플레이스홀더(`\u{0001}RTRT_PROTECT_<n>\u{0002}`)로 교체합니다. 원문은 슬롯 테이블에 저장됩니다.
-2. **규칙 단계** — 레벨별 순서가 있는 규칙 집합이 `Regex::replace_all`로 적용됩니다.
-   - `lite` — 필러 + 다중 공백 압축.
-   - `full` — `lite` + 인사말.
-   - `ultra` — `full` + 관사.
-3. **복원 단계** — 플레이스홀더를 원문으로 되돌립니다.
+1. **검열 단계** — 시크릿 패턴(AWS 키, GitHub PAT, OpenAI / Anthropic / Slack 토큰, Bearer 인증, `api_key=…` 일반 패턴, PEM private-key 블록)을 `<REDACTED:<kind>>`로 치환. 규칙 패스나 다운스트림 LLM에 시크릿이 전혀 닿지 않음.
+2. **보호 단계** — `PROTECT`가 코드 펜스(` ``` `), 인라인 코드(` ` `), `https?://…` URL, `"…"` 인용 문자열을 찾아 불투명한 플레이스홀더(`\u{0001}RTRT_PROTECT_<n>\u{0002}`)로 교체합니다. 원문은 슬롯 테이블에 저장됩니다.
+3. **규칙 단계** — 레벨별 순서가 있는 규칙 집합이 `Regex::replace_all`로 적용됩니다.
+   - `lite` — 필러 + 다중 공백/개행 압축.
+   - `full` — `lite` + 인사말 + 헤지(`I think`, `perhaps`, …) + 담화 표지(`moreover`, `however`, …) + 메타 표현(`it is important to note that`, …).
+   - `ultra` — `full` + 관사(`a`/`an`/`the`) + 관용구 축약(`due to the fact that` → `because`, `in order to` → `to`, `a number of` → `several`, `for instance` → `e.g.` 등).
+   - `extreme` — `ultra` + 강조 부사(`very`, `extremely`, `quite`, `rather`, …).
+4. **복원 단계** — 플레이스홀더를 원문으로 되돌립니다.
 
 보호 대상은 의도적으로 보수적이므로, 코드 / URL / 오류 메시지 등 기술 콘텐츠는 절대 재작성되지 않습니다.
 
@@ -24,9 +26,44 @@ use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
 
 let c = Compressor::new(CompressionLevel::Ultra);
-let out = c.compress("the bug is `really` in the parser");
-// out: "bug is `really` in parser"
+let out = c.compress("I think the bug is, perhaps, in the parser.");
+// out: "bug is, in parser."
 ```
+
+### 압축 절감률
+
+`scripts/bench.sh`가 `crates/rtrt-compress/benches/fixtures/`의 fixture를 가지고 측정한 글자 수 감소율.
+
+| Fixture | `lite` | `full` | `ultra` | `extreme` |
+|---------|-------:|-------:|--------:|----------:|
+| `short` (대화체 AI 답변) |  6% | 25% | **32%** | 32% |
+| `mixed` (산문+코드 혼합) |  3% | 12% | 18% | **19%** |
+| `long`  (긴 설명문) |  2% | 10% | **15%** | 15% |
+| `code`  (코드 중심) |  2% |  3% |  6% | 6% |
+
+규칙 기반 패스의 한계:
+
+- **할 수 있는 것**: 필러, 인사말, 헤지, 담화 표지, 관사, 강조 부사 제거 + 관용구 축약.
+- **할 수 없는 것**: 자연어 산문에서 caveman의 60-75% 클레임 달성은 불가능. 그 수치는 "LLM이 처음부터 짧게 쓰기로 합의"한 결과이지, 사후 정규식 삭제 결과가 아님.
+
+caveman급 절감률은 v0.3에 추가될 `LlmCompressor`로 달성 예정(`llm-compress` 피처 게이트). 모든 `Provider`를 통해 — 로컬 Ollama 포함 — 모델에게 재작성을 위탁. caveman과 동일 원리이지만 기존 문자열에 사후 적용 가능.
+
+### 시크릿 검열
+
+검열기는 규칙 패스 **이전**에 실행되므로 `lite`에서도 시크릿이 제거됩니다. 패턴:
+
+- `aws-access-key`: `AKIA…` / `ASIA…` 20자 키.
+- `aws-secret`: `aws_secret_access_key=…` 40자 base64.
+- `github-pat`: `ghp_…` 40자 PAT.
+- `github-token`: `gh[opsur]_…` (fine-grained 등).
+- `openai-key`: `sk-…` / `sk-proj-…`.
+- `anthropic-key`: `sk-ant-…`.
+- `slack-token`: `xox[abprs]-…`.
+- `bearer-token`: `Authorization: Bearer …`.
+- `private-key`: `-----BEGIN … PRIVATE KEY-----` 블록.
+- `generic-api-key`: `api_key=…` / `apikey=…` (문맥 필요).
+
+각 매치는 `<REDACTED:<kind>>`로 치환. 멱등 — 이미 검열된 텍스트 재실행은 no-op.
 
 ## 명령 출력 필터링
 

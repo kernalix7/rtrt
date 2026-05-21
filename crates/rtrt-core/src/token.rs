@@ -7,6 +7,7 @@ pub enum CompressionLevel {
     #[default]
     Full,
     Ultra,
+    Extreme,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

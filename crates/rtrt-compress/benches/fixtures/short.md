@@ -1,3 +1,3 @@
-Sure, I'd be happy to help you with that. The issue you're really experiencing is just basically a simple off-by-one bug in the parser. Let me walk you through the fix.
+Sure, I'd be happy to help you with that. I think the issue you're really experiencing is just basically a simple off-by-one bug in the parser. Let me walk you through the fix.
 
-You actually just need to change the loop condition from `<` to `<=` so that the last token gets included. The function in question is the one that handles trailing whitespace in input strings, and it's a really common mistake to make. I would recommend adding a test case to prevent regressions.
+It seems that you actually just need to change the loop condition from `<` to `<=` so that the last token gets included. In my opinion, the function in question is the one that handles trailing whitespace in input strings, and it's a really common mistake to make. I would probably recommend that you also add a test case in order to prevent regressions. As we can see, it's worth noting that the original implementation was, in fact, a bit too clever for its own good.

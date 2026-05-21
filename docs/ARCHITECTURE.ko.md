@@ -28,9 +28,9 @@
 | 크레이트 | 공개 API | 의존성 |
 |----------|----------|--------|
 | `rtrt-core` | `Error`, `Result`, `CompressionLevel`, `TokenCount`, `TokenStats`, `Plugin`, `PluginKind`, `PluginMetadata`, `Config` | `serde`, `serde_json`, `thiserror`, `async-trait` |
-| `rtrt-compress` | `Compressor::new`, `Compressor::compress` | `rtrt-core`, `regex`, `once_cell` |
+| `rtrt-compress` | `Compressor::new`, `Compressor::compress`, `redact_secrets` | `rtrt-core`, `regex`, `once_cell` |
 | `rtrt-proxy` | `filter_for`, `CommandFilter`, `FILTERS` | `rtrt-core`, `regex`, `once_cell` |
-| `rtrt-memory` | `MemoryStore`, `MemoryRecord`, `recall_bm25` | `rtrt-core`, `rusqlite`(bundled), `serde`, `tokio` |
+| `rtrt-memory` | `MemoryStore` (`open`, `save`, `save_embedded`, `recall_bm25`, `recall_vector`, `recall_hybrid`, `list_by_project`, `delete`, `extract_and_save`, `compress_project`), `Embedder` 트레이트 (+ `FastEmbedder` `embeddings` 피처), `Summariser` 트레이트 (+ `LlmSummariser` `llm` 피처), `MemoryRecord`, `ScoredRecord` | `rtrt-core`, `rusqlite`(bundled), `serde`, `tokio`; 선택: `fastembed`, `rtrt-providers` |
 | `rtrt-providers` | `Provider`, `ChatRequest`, `ChatResponse`, 어댑터 3종 | `rtrt-core`, `reqwest`, `serde`, `tokio` |
 | `rtrt-templates` | `Template`, `RenderPlan`, `builtin::ALL`, `custom::scan_default_dir`, `render::plan`, `render::write` | `rtrt-core`, `toml`, `walkdir`, `dirs`, `once_cell` |
 | `rtrt-mcp` | 바이너리 `rtrt-mcp` | core / compress / memory / providers + tokio |

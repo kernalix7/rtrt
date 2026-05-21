@@ -28,9 +28,9 @@
 | Crate | Public API | Depends on |
 |-------|------------|------------|
 | `rtrt-core` | `Error`, `Result`, `CompressionLevel`, `TokenCount`, `TokenStats`, `Plugin`, `PluginKind`, `PluginMetadata`, `Config` | `serde`, `serde_json`, `thiserror`, `async-trait` |
-| `rtrt-compress` | `Compressor::new`, `Compressor::compress` | `rtrt-core`, `regex`, `once_cell` |
+| `rtrt-compress` | `Compressor::new`, `Compressor::compress`, `redact_secrets` | `rtrt-core`, `regex`, `once_cell` |
 | `rtrt-proxy` | `filter_for`, `CommandFilter`, `FILTERS` | `rtrt-core`, `regex`, `once_cell` |
-| `rtrt-memory` | `MemoryStore::open`, `MemoryStore::open_in_memory`, `MemoryStore::save`, `MemoryStore::recall_bm25`, `MemoryRecord` | `rtrt-core`, `rusqlite` (bundled), `serde`, `serde_json`, `tokio`, `tracing` |
+| `rtrt-memory` | `MemoryStore` (`open`, `open_in_memory`, `save`, `save_embedded`, `recall_bm25`, `recall_vector`, `recall_hybrid`, `list_by_project`, `delete`, `extract_and_save`, `compress_project`), `Embedder` trait (+ `FastEmbedder` under `embeddings`), `Summariser` trait (+ `LlmSummariser` under `llm`), `MemoryRecord`, `ScoredRecord` | `rtrt-core`, `rusqlite` (bundled), `serde`, `serde_json`, `tokio`, `tracing`; optional: `fastembed` (`embeddings`), `rtrt-providers` (`llm`) |
 | `rtrt-providers` | `Provider`, `ChatMessage`, `ChatRequest`, `ChatResponse`, `Role`, `AnthropicProvider`, `OpenAIProvider`, `OpenAICompatibleProvider` | `rtrt-core`, `reqwest`, `serde`, `serde_json`, `tokio`, `async-trait`, `tracing` |
 | `rtrt-templates` | `Template`, `TemplateFile`, `TemplateVariable`, `RenderPlan`, `RenderedFile`, `builtin::ALL`, `custom::scan_default_dir`, `render::plan`, `render::write`, `list_all`, `find` | `rtrt-core`, `toml`, `walkdir`, `dirs`, `once_cell`, `serde`, `serde_json` |
 | `rtrt-mcp` | bin `rtrt-mcp` | `rtrt-core`, `rtrt-compress`, `rtrt-memory`, `rtrt-providers`, `tokio`, `tracing-subscriber` |
@@ -69,9 +69,16 @@
 │   │       ├── error.rs
 │   │       ├── plugin.rs
 │   │       └── token.rs
-│   ├── rtrt-compress/src/lib.rs
+│   ├── rtrt-compress/
+│   │   └── src/
+│   │       ├── lib.rs                # 4-level rewriter pipeline
+│   │       └── secrets.rs            # pre-pass secret redactor
 │   ├── rtrt-proxy/src/lib.rs
-│   ├── rtrt-memory/src/lib.rs
+│   ├── rtrt-memory/
+│   │   └── src/
+│   │       ├── lib.rs                # store, BM25, vector, hybrid recall
+│   │       ├── embed.rs              # Embedder trait, FastEmbedder (embeddings feature)
+│   │       └── summarise.rs          # Summariser trait, LlmSummariser (llm feature)
 │   ├── rtrt-providers/
 │   │   └── src/
 │   │       ├── lib.rs

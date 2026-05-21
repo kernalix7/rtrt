@@ -2,10 +2,24 @@
 //!
 //! Rules-based string transforms inspired by `JuliusBrussee/caveman`.
 //! Code blocks, inline code, URLs, and quoted error strings are preserved.
+//!
+//! Four levels:
+//! - `lite`   — fillers (just/really/basically/…) + multi-space collapse only.
+//! - `full`   — `lite` + pleasantries (sure/certainly/happy to/…) + hedging
+//!   (I think/perhaps/maybe/…) + discourse markers (moreover/however/…).
+//! - `ultra`  — `full` + articles (a/an/the) + phrase shortening
+//!   (due to the fact that → because, in order to → to, …).
+//! - `extreme` — `ultra` + verbose qualifiers (very/extremely/…) +
+//!   meta-phrases (it should be noted that, it is worth mentioning that, …)
+//!   collapsed away. Readable but terse.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use rtrt_core::CompressionLevel;
+
+pub mod secrets;
+
+pub use secrets::redact_secrets;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Compressor {
@@ -17,8 +31,15 @@ impl Compressor {
         Self { level }
     }
 
+    /// Compresses `input`. The pipeline:
+    /// 1. Redact secret-shaped substrings (AWS / GitHub / OpenAI / Bearer / …).
+    /// 2. Stash code blocks, inline code, URLs, and `"quoted strings"` into
+    ///    placeholders so rules never touch them.
+    /// 3. Apply the level-dependent ordered rule set.
+    /// 4. Restore placeholders.
     pub fn compress(&self, input: &str) -> String {
-        let (placeheld, slots) = stash_protected(input);
+        let redacted = redact_secrets(input);
+        let (placeheld, slots) = stash_protected(&redacted);
         let mut out = placeheld;
         for (regex, replacement) in rules_for(self.level) {
             out = regex.replace_all(&out, *replacement).into_owned();
@@ -29,30 +50,147 @@ impl Compressor {
 
 type Rule = (&'static Regex, &'static str);
 
+// ---------- atomic rule regexes ----------
+
 static FILLERS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(just|really|basically|actually|simply|very|quite|literally)\s+").unwrap()
+    Regex::new(
+        r"(?i)\b(just|really|basically|actually|simply|literally|honestly|frankly|truly|essentially|kind of|sort of)\s+",
+    )
+    .unwrap()
 });
 
 static PLEASANTRIES: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(sure|certainly|of course|happy to|let me|i'll|i can|i would)\b[,!\.]?\s*")
-        .unwrap()
+    Regex::new(
+        r"(?i)\b(sure|certainly|of course|happy to|let me|i'll|i can|i would|i'd be happy to)\b[,!\.]?\s*",
+    )
+    .unwrap()
+});
+
+static HEDGES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(i (think|believe|suspect|guess|imagine|suppose)( that)?|in my opinion|to my mind|if you ask me|perhaps|maybe|probably|possibly|likely|it (seems|appears) (that|to be)|i('m| am) (pretty |fairly |reasonably )?(sure|confident)( that)?|if i('m| am) not mistaken|if i recall correctly)[,!\.]?\s*",
+    )
+    .unwrap()
+});
+
+static DISCOURSE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(moreover|furthermore|additionally|besides|however|nevertheless|nonetheless|as (you|we) can see|as a matter of fact|needless to say|it('s| is) worth (noting|mentioning) that|of course|naturally|obviously|clearly)\b[,!\.]?\s*",
+    )
+    .unwrap()
 });
 
 static ARTICLES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(a|an|the)\s+").unwrap());
 
 static MULTI_SPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[ \t]{2,}").unwrap());
 
-static LITE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| vec![(&*FILLERS, ""), (&*MULTI_SPACE, " ")]);
+static MULTI_NEWLINE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
 
-static FULL_RULES: Lazy<Vec<Rule>> =
-    Lazy::new(|| vec![(&*FILLERS, ""), (&*PLEASANTRIES, ""), (&*MULTI_SPACE, " ")]);
+// Verbose qualifiers — leftover adjectives/adverbs after FILLERS that still
+// add no signal in agent output.
+static QUALIFIERS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(very|extremely|quite|rather|fairly|somewhat|extremely|highly)\s+").unwrap()
+});
+
+// Meta-phrases that announce intent without adding info. Always-on at full+ to
+// match caveman's "drop hedging" philosophy.
+static META_PHRASES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(it is important to (note|remember|understand|mention) that |it should be noted that |it is worth (mentioning|noting|pointing out) that |as we (mentioned|noted|discussed) (earlier|above|previously),? )",
+    )
+    .unwrap()
+});
+
+// ---------- phrase-shortening regexes (paired with replacement strings) ----------
+
+static PHRASE_DUE_TO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bdue to the fact that\b").unwrap());
+static PHRASE_IN_ORDER_TO: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bin order to\b").unwrap());
+static PHRASE_AT_THIS_POINT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bat this point in time\b").unwrap());
+static PHRASE_FOR_THE_PURPOSE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bfor the purpose of\b").unwrap());
+static PHRASE_IN_THE_EVENT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bin the event that\b").unwrap());
+static PHRASE_WITH_THE_EXCEPTION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bwith the exception of\b").unwrap());
+static PHRASE_A_NUMBER_OF: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\ba number of\b").unwrap());
+static PHRASE_THE_MAJORITY_OF: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bthe majority of\b").unwrap());
+static PHRASE_IN_SPITE_OF: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bin spite of( the fact that)?\b").unwrap());
+static PHRASE_ON_THE_BASIS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bon the basis of\b").unwrap());
+static PHRASE_FOR_INSTANCE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bfor (instance|example)\b").unwrap());
+
+static LITE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
+    vec![
+        (&*FILLERS, ""),
+        (&*MULTI_SPACE, " "),
+        (&*MULTI_NEWLINE, "\n\n"),
+    ]
+});
+
+static FULL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
+    vec![
+        (&*FILLERS, ""),
+        (&*PLEASANTRIES, ""),
+        (&*HEDGES, ""),
+        (&*DISCOURSE, ""),
+        (&*META_PHRASES, ""),
+        (&*MULTI_SPACE, " "),
+        (&*MULTI_NEWLINE, "\n\n"),
+    ]
+});
 
 static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         (&*FILLERS, ""),
         (&*PLEASANTRIES, ""),
+        (&*HEDGES, ""),
+        (&*DISCOURSE, ""),
+        (&*META_PHRASES, ""),
+        (&*PHRASE_DUE_TO, "because"),
+        (&*PHRASE_IN_ORDER_TO, "to"),
+        (&*PHRASE_AT_THIS_POINT, "now"),
+        (&*PHRASE_FOR_THE_PURPOSE, "for"),
+        (&*PHRASE_IN_THE_EVENT, "if"),
+        (&*PHRASE_WITH_THE_EXCEPTION, "except"),
+        (&*PHRASE_A_NUMBER_OF, "several"),
+        (&*PHRASE_THE_MAJORITY_OF, "most"),
+        (&*PHRASE_IN_SPITE_OF, "despite"),
+        (&*PHRASE_ON_THE_BASIS, "based on"),
+        (&*PHRASE_FOR_INSTANCE, "e.g."),
         (&*ARTICLES, ""),
         (&*MULTI_SPACE, " "),
+        (&*MULTI_NEWLINE, "\n\n"),
+    ]
+});
+
+static EXTREME_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
+    vec![
+        (&*FILLERS, ""),
+        (&*PLEASANTRIES, ""),
+        (&*HEDGES, ""),
+        (&*DISCOURSE, ""),
+        (&*META_PHRASES, ""),
+        (&*QUALIFIERS, ""),
+        (&*PHRASE_DUE_TO, "because"),
+        (&*PHRASE_IN_ORDER_TO, "to"),
+        (&*PHRASE_AT_THIS_POINT, "now"),
+        (&*PHRASE_FOR_THE_PURPOSE, "for"),
+        (&*PHRASE_IN_THE_EVENT, "if"),
+        (&*PHRASE_WITH_THE_EXCEPTION, "except"),
+        (&*PHRASE_A_NUMBER_OF, "several"),
+        (&*PHRASE_THE_MAJORITY_OF, "most"),
+        (&*PHRASE_IN_SPITE_OF, "despite"),
+        (&*PHRASE_ON_THE_BASIS, "based on"),
+        (&*PHRASE_FOR_INSTANCE, "e.g."),
+        (&*ARTICLES, ""),
+        (&*MULTI_SPACE, " "),
+        (&*MULTI_NEWLINE, "\n\n"),
     ]
 });
 
@@ -61,6 +199,7 @@ fn rules_for(level: CompressionLevel) -> &'static [Rule] {
         CompressionLevel::Lite => LITE_RULES.as_slice(),
         CompressionLevel::Full => FULL_RULES.as_slice(),
         CompressionLevel::Ultra => ULTRA_RULES.as_slice(),
+        CompressionLevel::Extreme => EXTREME_RULES.as_slice(),
     }
 }
 
@@ -113,5 +252,38 @@ mod tests {
         let out = c.compress("the bug is really bad");
         assert!(out.contains("the bug"), "{out}");
         assert!(!out.contains("really"), "{out}");
+    }
+
+    #[test]
+    fn full_drops_hedges() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("I think the parser has a bug, perhaps in the lexer.");
+        assert!(!out.to_lowercase().contains("i think"), "{out}");
+        assert!(!out.to_lowercase().contains("perhaps"), "{out}");
+    }
+
+    #[test]
+    fn ultra_rewrites_phrases() {
+        let c = Compressor::new(CompressionLevel::Ultra);
+        let out = c.compress("Due to the fact that we forgot to escape the input, in order to fix the bug, we need to add quotes.");
+        assert!(out.to_lowercase().contains("because"), "{out}");
+        assert!(!out.to_lowercase().contains("in order to"), "{out}");
+    }
+
+    #[test]
+    fn extreme_drops_qualifiers() {
+        let c = Compressor::new(CompressionLevel::Extreme);
+        let out = c.compress("This is a very extremely complex problem, but it is rather elegant.");
+        assert!(!out.to_lowercase().contains("very"), "{out}");
+        assert!(!out.to_lowercase().contains("extremely"), "{out}");
+        assert!(!out.to_lowercase().contains("rather"), "{out}");
+    }
+
+    #[test]
+    fn redacts_aws_key() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("aws key AKIAIOSFODNN7EXAMPLE goes here");
+        assert!(out.contains("<REDACTED:"), "{out}");
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
     }
 }

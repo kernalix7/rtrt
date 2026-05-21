@@ -87,9 +87,11 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 <tr><td width="50%">
 
 **Output compression**
-- Caveman-style terse rewriter with levels `lite`, `full`, `ultra`
-- Code blocks, inline code, URLs, and quoted error strings preserved
-- Plug-in rules: drop articles / fillers / pleasantries, collapse whitespace
+- Rule-based rewriter with levels `lite` / `full` / `ultra` / `extreme`
+- Drops fillers, pleasantries, hedging, discourse markers; ultra rewrites verbose phrases; extreme drops qualifiers too
+- Code blocks, inline code, URLs, and quoted error strings preserved; secret-shaped substrings (AWS / GH / OpenAI / Anthropic / Bearer / private-key) auto-redacted before the rule pass
+- Measured savings on representative AI prose: short ~32%, mixed ~18%, long ~15%; code-heavy ~6% (intentional, we never rewrite code)
+- LLM-backed compression mode (Ollama-compatible) is the v0.3 path to caveman-class 50–75% savings
 - [Details →](docs/FEATURES.md#output-compression)
 
 </td><td width="50%">

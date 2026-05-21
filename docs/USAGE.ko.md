@@ -21,15 +21,16 @@ echo "Sure, I'd be happy to help. The bug is really in the parser." \
 
 플래그:
 
-- `-l, --level <lite|full|ultra>` — 압축 강도. 기본값 `full`.
+- `-l, --level <lite|full|ultra|extreme>` — 압축 강도. 기본값 `full`.
 
-규칙:
+레벨별 규칙 (누적):
 
-- `lite` — 필러(`just`, `really`, `basically` …) 제거 + 다중 공백 압축.
-- `full` — `lite` + 인사말(`sure`, `certainly`, `happy to` …) 제거.
-- `ultra` — `full` + 관사(`a`, `an`, `the`) 제거.
+- `lite` — 필러(`just`, `really`, `basically`, `actually`, `simply`, `literally`, `honestly`, `frankly`, `truly`, `essentially`, `kind of`, `sort of`) + 다중 공백/개행 압축.
+- `full` — `lite` + 인사말(`sure`, `certainly`, `of course`, `happy to`, `let me`, `I'll`, `I can`, `I would`) + 헤지(`I think`, `perhaps`, `maybe`, `probably`, `it seems`, `if I recall correctly` 등) + 담화 표지(`moreover`, `however`, `as you can see`, `needless to say`, `obviously`, `clearly` 등) + 메타 표현(`it is important to note that`, `as we mentioned earlier` 등).
+- `ultra` — `full` + 관사(`a`/`an`/`the`) + 관용구 축약(`due to the fact that` → `because`, `in order to` → `to`, `at this point in time` → `now`, `a number of` → `several`, `the majority of` → `most`, `for instance` → `e.g.` 등).
+- `extreme` — `ultra` + 강조 부사(`very`, `extremely`, `quite`, `rather`, `fairly`, `somewhat`, `highly`).
 
-코드 블록(` ``` `, ` ` `), URL, `"인용 문자열"`은 규칙 적용 전에 보호되어 원문 그대로 복원됩니다.
+코드 블록(` ``` `, ` ` `), URL, `"인용 문자열"`은 규칙 적용 전에 보호되어 원문 그대로 복원됩니다. 시크릿 패턴(AWS / GitHub / OpenAI / Anthropic / Slack / Bearer / private-key / `api_key=…`)은 규칙 패스 **이전**에 `<REDACTED:<kind>>`로 치환됩니다.
 
 ### `rtrt proxy`
 

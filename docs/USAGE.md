@@ -21,15 +21,16 @@ echo "Sure, I'd be happy to help. The bug is really in the parser." \
 
 Flags:
 
-- `-l, --level <lite|full|ultra>` — compression intensity. Default `full`.
+- `-l, --level <lite|full|ultra|extreme>` — compression intensity. Default `full`.
 
-Rules:
+Rules per level (cumulative):
 
-- `lite` — drop filler words (`just`, `really`, `basically`, …) and collapse multi-spaces.
-- `full` — `lite` plus pleasantries (`sure`, `certainly`, `happy to`, …).
-- `ultra` — `full` plus articles (`a`, `an`, `the`).
+- `lite` — fillers (`just`, `really`, `basically`, `actually`, `simply`, `literally`, `honestly`, `frankly`, `truly`, `essentially`, `kind of`, `sort of`) + multi-space and multi-newline collapse.
+- `full` — `lite` + pleasantries (`sure`, `certainly`, `of course`, `happy to`, `let me`, `I'll`, `I can`, `I would`, `I'd be happy to`) + hedging (`I think / believe / suspect / guess`, `in my opinion`, `perhaps / maybe / probably / possibly`, `it seems / appears`, `if I recall correctly`) + discourse markers (`moreover`, `furthermore`, `however`, `nevertheless`, `as you can see`, `needless to say`, `it's worth noting that`, `of course`, `obviously`, `clearly`) + meta-phrases (`it is important to note that`, `it should be noted that`, `as we mentioned earlier`).
+- `ultra` — `full` + articles (`a`, `an`, `the`) + phrase shortening (`due to the fact that` → `because`, `in order to` → `to`, `at this point in time` → `now`, `for the purpose of` → `for`, `in the event that` → `if`, `with the exception of` → `except`, `a number of` → `several`, `the majority of` → `most`, `in spite of` → `despite`, `on the basis of` → `based on`, `for instance` → `e.g.`).
+- `extreme` — `ultra` + verbose qualifiers (`very`, `extremely`, `quite`, `rather`, `fairly`, `somewhat`, `highly`).
 
-Code blocks (` ``` ` and ` ` `), URLs, and `"quoted strings"` are stashed before the rule pass and restored afterwards, so technical content is never rewritten.
+Code blocks (` ``` ` and ` ` `), URLs, and `"quoted strings"` are stashed before the rule pass and restored afterwards, so technical content is never rewritten. Secret-shaped substrings (AWS / GitHub / OpenAI / Anthropic / Slack / Bearer / private-key / `api_key=…`) are replaced with `<REDACTED:<kind>>` **before** the rule pass.
 
 ### `rtrt proxy`
 

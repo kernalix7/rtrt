@@ -329,6 +329,26 @@ impl Gateway {
         self.metrics.clone()
     }
 
+    /// Attached budget cap in USD, if any. Used by the dashboard to render the
+    /// remaining headroom.
+    pub fn budget_cap_usd(&self) -> Option<f64> {
+        self.budget.as_ref().map(|b| b.cap_usd)
+    }
+
+    /// Cumulative cost of every recorded request, computed against the
+    /// attached budget's pricing table. Returns `0.0` when no budget is set.
+    pub fn budget_spent_usd(&self) -> f64 {
+        let Some(b) = &self.budget else {
+            return 0.0;
+        };
+        let metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        metrics
+            .inner
+            .iter()
+            .map(|m| b.cost_for(&m.model, &m.usage))
+            .sum()
+    }
+
     /// Dispatches the chat request to the matching provider and records a
     /// metric. The caller sees the [`ChatResponse`]; the metric is observable
     /// via [`Gateway::metrics`].

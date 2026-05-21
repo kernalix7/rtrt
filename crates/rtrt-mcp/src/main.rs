@@ -276,7 +276,9 @@ impl RtrtMcp {
             .map_err(|e| McpError::internal_error(format!("memory.get_block: {e}"), None))?;
         let body = serde_json::to_value(&block)
             .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(description = "List every Letta-style memory block in the project.")]
@@ -290,7 +292,9 @@ impl RtrtMcp {
             .map_err(|e| McpError::internal_error(format!("memory.list_blocks: {e}"), None))?;
         let body = serde_json::to_value(&blocks)
             .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(body.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(

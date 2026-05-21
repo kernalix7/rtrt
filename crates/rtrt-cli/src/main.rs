@@ -48,6 +48,9 @@ enum Cmd {
         /// Base URL for `--provider openai-compat` (e.g. `http://127.0.0.1:11434/v1`).
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
+        /// Output framing — chroma-style multi-format.
+        #[arg(long, value_enum, default_value = "plain")]
+        format: FormatArg,
     },
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
@@ -347,6 +350,25 @@ enum ProviderArg {
     OpenaiCompat,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum FormatArg {
+    Plain,
+    Markdown,
+    Xml,
+    Json,
+}
+
+impl From<FormatArg> for rtrt_compress::OutputFormat {
+    fn from(f: FormatArg) -> Self {
+        match f {
+            FormatArg::Plain => rtrt_compress::OutputFormat::Plain,
+            FormatArg::Markdown => rtrt_compress::OutputFormat::Markdown,
+            FormatArg::Xml => rtrt_compress::OutputFormat::Xml,
+            FormatArg::Json => rtrt_compress::OutputFormat::Json,
+        }
+    }
+}
+
 fn parse_var(s: &str) -> std::result::Result<(String, String), String> {
     let (k, v) = s
         .split_once('=')
@@ -367,6 +389,7 @@ async fn main() -> Result<()> {
             provider,
             model,
             base_url,
+            format,
         } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -378,7 +401,8 @@ async fn main() -> Result<()> {
                 let out = compressor.compress(&buf).await?;
                 print!("{out}");
             } else {
-                let out = Compressor::new(level.into()).compress(&buf);
+                let compressor = Compressor::new(level.into());
+                let out = compressor.compress_to(&buf, format.into());
                 print!("{out}");
             }
         }

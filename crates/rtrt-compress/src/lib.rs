@@ -55,6 +55,74 @@ impl Compressor {
         }
         restore_protected(&out, &slots)
     }
+
+    /// Compresses `input` and wraps the result in the chosen output format —
+    /// inspired by chroma's per-collection encoder choices. The compressed
+    /// payload is identical across formats; only the framing differs so a
+    /// downstream agent can pick the encoding that fits its prompt budget.
+    pub fn compress_to(&self, input: &str, format: OutputFormat) -> String {
+        let body = self.compress(input);
+        match format {
+            OutputFormat::Plain => body,
+            OutputFormat::Markdown => format!(
+                "```text rtrt-level={}\n{}\n```\n",
+                level_slug(self.level),
+                body.trim_end_matches('\n')
+            ),
+            OutputFormat::Xml => {
+                let escaped = xml_escape(&body);
+                format!(
+                    "<rtrt level=\"{}\"><![CDATA[{}]]></rtrt>",
+                    level_slug(self.level),
+                    escaped
+                )
+            }
+            OutputFormat::Json => serde_json::json!({
+                "level": level_slug(self.level),
+                "content": body,
+            })
+            .to_string(),
+        }
+    }
+}
+
+/// Output encoding picked by the caller. `Plain` keeps the historical
+/// behaviour (`compress()` is `compress_to(.., Plain)`). The structured
+/// variants make it cheap for an agent to parse the compressed payload back
+/// out of a tool-call response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Plain,
+    Markdown,
+    Xml,
+    Json,
+}
+
+impl OutputFormat {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "plain" | "text" | "txt" => Some(OutputFormat::Plain),
+            "md" | "markdown" => Some(OutputFormat::Markdown),
+            "xml" => Some(OutputFormat::Xml),
+            "json" => Some(OutputFormat::Json),
+            _ => None,
+        }
+    }
+}
+
+fn level_slug(level: CompressionLevel) -> &'static str {
+    match level {
+        CompressionLevel::Lite => "lite",
+        CompressionLevel::Full => "full",
+        CompressionLevel::Ultra => "ultra",
+        CompressionLevel::Extreme => "extreme",
+    }
+}
+
+fn xml_escape(input: &str) -> String {
+    // CDATA can carry every character except the literal terminator. Splice
+    // any `]]>` so we can't break out of the section.
+    input.replace("]]>", "]]]]><![CDATA[>")
 }
 
 type Rule = (&'static Regex, &'static str);
@@ -293,5 +361,50 @@ mod tests {
         let out = c.compress("aws key AKIAIOSFODNN7EXAMPLE goes here");
         assert!(out.contains("<REDACTED:"), "{out}");
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "{out}");
+    }
+
+    #[test]
+    fn output_format_plain_matches_compress() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let input = "I think the parser has a bug, perhaps in the lexer.";
+        assert_eq!(c.compress(input), c.compress_to(input, OutputFormat::Plain));
+    }
+
+    #[test]
+    fn output_format_markdown_wraps_in_fence() {
+        let c = Compressor::new(CompressionLevel::Lite);
+        let out = c.compress_to("the bug is really bad", OutputFormat::Markdown);
+        assert!(out.starts_with("```text rtrt-level=lite\n"), "{out}");
+        assert!(out.trim_end().ends_with("```"), "{out}");
+        assert!(!out.contains("really"), "{out}");
+    }
+
+    #[test]
+    fn output_format_xml_wraps_in_cdata() {
+        let c = Compressor::new(CompressionLevel::Ultra);
+        let out = c.compress_to("the bug is in the parser", OutputFormat::Xml);
+        assert!(out.starts_with("<rtrt level=\"ultra\"><![CDATA["), "{out}");
+        assert!(out.ends_with("]]></rtrt>"), "{out}");
+    }
+
+    #[test]
+    fn output_format_json_is_parseable() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress_to("really bad bug", OutputFormat::Json);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["level"], "full");
+        assert!(v["content"].as_str().unwrap().contains("bug"));
+    }
+
+    #[test]
+    fn output_format_parse_accepts_aliases() {
+        assert_eq!(OutputFormat::parse("md"), Some(OutputFormat::Markdown));
+        assert_eq!(
+            OutputFormat::parse("MARKDOWN"),
+            Some(OutputFormat::Markdown)
+        );
+        assert_eq!(OutputFormat::parse("xml"), Some(OutputFormat::Xml));
+        assert_eq!(OutputFormat::parse("text"), Some(OutputFormat::Plain));
+        assert_eq!(OutputFormat::parse("nope"), None);
     }
 }

@@ -13,6 +13,7 @@ rtrt-core.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 async-trait.workspace = true
 rtrt-providers = { workspace = true, optional = true }
 tree-sitter = { workspace = true, optional = true }

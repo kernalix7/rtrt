@@ -3019,6 +3019,7 @@ dependencies = [
  "rtrt-core",
  "rtrt-providers",
  "serde",
+ "serde_json",
  "tokio",
  "tree-sitter",
  "tree-sitter-rust",

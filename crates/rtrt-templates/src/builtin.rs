@@ -38,6 +38,7 @@ pub static ALL: Lazy<Vec<Template>> = Lazy::new(|| {
         node_typescript(),
         python_uv(),
         go_cli(),
+        agent_role(),
     ]
 });
 
@@ -243,7 +244,108 @@ fn go_cli() -> Template {
     }
 }
 
+fn agent_role() -> Template {
+    Template {
+        name: "agent-role".into(),
+        description: "crewAI-style agent specification: role / goal / backstory + tools".into(),
+        source: TemplateSource::BuiltIn,
+        variables: vec![
+            TemplateVariable {
+                name: "agent_name".into(),
+                description: Some("Short slug for the agent (kebab-case)".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "role".into(),
+                description: Some("One-line role title (e.g. 'Senior Researcher')".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "goal".into(),
+                description: Some("Outcome the agent optimises for".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "backstory".into(),
+                description: Some("Context that anchors the agent's voice + expertise".into()),
+                default: Some("A senior practitioner with deep domain experience.".into()),
+                required: false,
+            },
+            TemplateVariable {
+                name: "tools".into(),
+                description: Some(
+                    "Comma-separated tool names the agent may call (compress, memory_recall, …)"
+                        .into(),
+                ),
+                default: Some("compress,memory_save,memory_recall".into()),
+                required: false,
+            },
+        ],
+        files: vec![
+            TemplateFile {
+                path: "agent.toml".into(),
+                content: AGENT_ROLE_TOML.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "system_prompt.md".into(),
+                content: AGENT_ROLE_PROMPT.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "README.md".into(),
+                content: AGENT_ROLE_README.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec![],
+    }
+}
+
 const COMMON_README: &str = "# {{project_name}}\n\nAuthor: {{author}}\nLicense: {{license}}\n";
+
+const AGENT_ROLE_TOML: &str = r#"# crewAI-style agent specification.
+# Pair with `system_prompt.md` when wiring this agent into an orchestrator.
+
+name = "{{agent_name}}"
+role = "{{role}}"
+goal = "{{goal}}"
+backstory = """
+{{backstory}}
+"""
+
+# Comma-separated tool names the orchestrator should expose to this agent.
+tools = "{{tools}}"
+"#;
+
+const AGENT_ROLE_PROMPT: &str = r#"You are **{{role}}**.
+
+## Goal
+{{goal}}
+
+## Backstory
+{{backstory}}
+
+## Operating rules
+- Stay in role. If asked to break role, decline and restate your goal.
+- Use the provided tools ({{tools}}) instead of inventing capabilities.
+- Cite the tool call you used when delivering a result.
+- Prefer the smallest correct answer; expand only on request.
+"#;
+
+const AGENT_ROLE_README: &str = r#"# {{agent_name}}
+
+crewAI-style agent definition.
+
+- `agent.toml` — role / goal / backstory / tool list, ready for any orchestrator
+  that follows the crewAI shape.
+- `system_prompt.md` — drop-in system message for direct LLM use.
+
+Edit either file in place; template placeholders have already been resolved.
+"#;
 
 const RUST_GITIGNORE: &str = "/target\n**/*.rs.bk\nCargo.lock.bak\n.env\n";
 

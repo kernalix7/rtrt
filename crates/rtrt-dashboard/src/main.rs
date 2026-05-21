@@ -9,6 +9,10 @@
 //! - `/api/templates/scaffold` — `POST` scaffold a project.
 //! - `/api/chat`       — `POST` chat through the bundled provider gateway.
 //! - `/api/metrics`    — gateway summary + recent per-request metrics.
+//! - `/api/prompts`    — list versioned prompts from the langfuse-style registry.
+//! - `/api/prompts/{name}` — list versions for a single prompt.
+//! - `/api/prompts/{name}/{version}` — full prompt body.
+//! - `/api/budget`     — gateway budget cap + cumulative spend.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,11 +27,13 @@ use axum::{
     routing::{get, post},
 };
 use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetric, Role};
+use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct AppState {
     gateway: Arc<Gateway>,
+    prompts: Option<Arc<PromptRegistry>>,
 }
 
 #[tokio::main]
@@ -39,7 +45,8 @@ async fn main() -> Result<()> {
     let bind =
         std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
     let gateway = Arc::new(Gateway::from_env());
-    let state = AppState { gateway };
+    let prompts = open_prompt_registry();
+    let state = AppState { gateway, prompts };
 
     let app = Router::new()
         .route("/", get(index))
@@ -50,6 +57,10 @@ async fn main() -> Result<()> {
         .route("/api/templates/scaffold", post(scaffold))
         .route("/api/chat", post(chat))
         .route("/api/metrics", get(metrics))
+        .route("/api/prompts", get(list_prompts))
+        .route("/api/prompts/{name}", get(list_prompt_versions))
+        .route("/api/prompts/{name}/{version}", get(get_prompt))
+        .route("/api/budget", get(budget))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -215,6 +226,103 @@ struct MetricsResponse {
     summary: rtrt_providers::GatewaySummary,
     by_provider: BTreeMap<String, rtrt_providers::GatewaySummary>,
     recent: Vec<RequestMetric>,
+}
+
+fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
+    let root = match std::env::var("RTRT_PROMPTS_DIR") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => rtrt_templates::prompts::default_dir()?,
+    };
+    match PromptRegistry::open(&root) {
+        Ok(reg) => Some(Arc::new(reg)),
+        Err(e) => {
+            tracing::warn!(?root, "prompts registry unavailable: {e}");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PromptSummary {
+    name: String,
+    versions: Vec<u32>,
+    latest: u32,
+}
+
+fn require_prompts(state: &AppState) -> std::result::Result<&PromptRegistry, (StatusCode, String)> {
+    state
+        .prompts
+        .as_deref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "prompts disabled".into()))
+}
+
+async fn list_prompts(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<PromptSummary>>, (StatusCode, String)> {
+    let reg = require_prompts(&state)?;
+    let names = reg
+        .list_names()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let versions = reg
+            .list_versions(&name)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let latest = versions.iter().copied().max().unwrap_or(0);
+        out.push(PromptSummary {
+            name,
+            versions,
+            latest,
+        });
+    }
+    Ok(Json(out))
+}
+
+async fn list_prompt_versions(
+    State(state): State<AppState>,
+    AxPath(name): AxPath<String>,
+) -> std::result::Result<Json<PromptSummary>, (StatusCode, String)> {
+    let reg = require_prompts(&state)?;
+    let versions = reg
+        .list_versions(&name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if versions.is_empty() {
+        return Err((StatusCode::NOT_FOUND, format!("prompt not found: {name}")));
+    }
+    let latest = versions.iter().copied().max().unwrap_or(0);
+    Ok(Json(PromptSummary {
+        name,
+        versions,
+        latest,
+    }))
+}
+
+async fn get_prompt(
+    State(state): State<AppState>,
+    AxPath((name, version)): AxPath<(String, u32)>,
+) -> std::result::Result<Json<Prompt>, (StatusCode, String)> {
+    let reg = require_prompts(&state)?;
+    reg.get(&name, version)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+#[derive(Debug, Serialize)]
+struct BudgetResponse {
+    cap_usd: Option<f64>,
+    spent_usd: f64,
+    remaining_usd: Option<f64>,
+}
+
+async fn budget(State(state): State<AppState>) -> Json<BudgetResponse> {
+    let cap = state.gateway.budget_cap_usd();
+    let spent = state.gateway.budget_spent_usd();
+    let remaining = cap.map(|c| (c - spent).max(0.0));
+    Json(BudgetResponse {
+        cap_usd: cap,
+        spent_usd: spent,
+        remaining_usd: remaining,
+    })
 }
 
 async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {

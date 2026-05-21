@@ -78,5 +78,5 @@ GitHub release page because `release.yml`'s extract takes the section verbatim.
 
 - MCP stdio transport is not implemented; `rtrt-mcp` logs the planned tools and exits.
 - Provider `chat` returns `Error::Provider("... not implemented yet")`; only model lists and adapter shapes are wired.
-- `rtrt-memory` has no embeddings yet; the `embeddings` and `edges` tables are reserved for v0.2.
+- `rtrt-memory` has no embeddings yet; the `embeddings` and `edges` tables are reserved.
 - `install.sh` / `install.ps1` are referenced in the README but not yet present in the tree.

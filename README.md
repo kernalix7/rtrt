@@ -91,7 +91,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 - Drops fillers, pleasantries, hedging, discourse markers; ultra rewrites verbose phrases; extreme drops qualifiers too
 - Code blocks, inline code, URLs, and quoted error strings preserved; secret-shaped substrings (AWS / GH / OpenAI / Anthropic / Bearer / private-key) auto-redacted before the rule pass
 - Measured savings on representative AI prose: short ~32%, mixed ~18%, long ~15%; code-heavy ~6% (intentional, we never rewrite code)
-- LLM-backed compression mode (Ollama-compatible) is the v0.3 path to caveman-class 50–75% savings
+- LLM-backed compression mode (Ollama-compatible) is the path to caveman-class 50–75% savings
 - [Details →](docs/FEATURES.md#output-compression)
 
 </td><td width="50%">
@@ -107,7 +107,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 
 **Persistent project memory**
 - SQLite + FTS5 store with `project / kind / body` schema
-- BM25 recall via FTS5; vector + graph layers reserved in schema for v0.2
+- BM25 recall via FTS5; vector + graph layers reserved in the schema
 - Local-first embeddings target: `all-MiniLM-L6-v2` (offline)
 - [Details →](docs/FEATURES.md#persistent-memory)
 

@@ -113,7 +113,7 @@ The compressor is `Copy` and holds no per-call state.
 2. `save(project, kind, body)` inserts a row into `memories` and a mirror into `memories_fts`.
 3. `recall_bm25(project, query, limit)` joins `memories_fts` (ranked) against `memories` filtered by `project`.
 
-Vector recall + graph traversal are reserved for v0.2 — the tables exist but no code path writes to them yet.
+Graph traversal is reserved — the `edges` table exists but no code path writes to it yet. Vector recall is shipped via `recall_vector` / `recall_hybrid` under the `embeddings` feature.
 
 ### Templates
 
@@ -125,7 +125,7 @@ Vector recall + graph traversal are reserved for v0.2 — the tables exist but n
 
 ### Provider chat (planned)
 
-The trait is wired but the chat implementations return `Error::Provider(...)`. v0.2 will route requests through `reqwest` with provider-specific headers and parse the streaming response.
+Chat is wired against the real HTTP APIs: Anthropic Messages, OpenAI Chat Completions, and OpenAI-compatible endpoints (Ollama, llama.cpp, vLLM, LM Studio). Streaming is exposed via `chat_stream` returning a `Stream<Item = ChatStreamEvent>` (`Delta` / `Usage` / `Done`); the shared SSE decoder lives in `stream.rs`. The `Gateway` in front of registered providers records per-request `RequestMetric { provider, model, started_at, latency_ms, usage, ok }` so dashboards can observe live token spend.
 
 ## Concurrency model
 

@@ -54,5 +54,5 @@
 
 - MCP stdio 전송 계층은 미구현. `rtrt-mcp`는 예정 도구 목록을 로깅하고 종료.
 - 프로바이더 `chat`은 `Error::Provider("... not implemented yet")` 반환. 모델 목록과 어댑터 형태만 연결됨.
-- `rtrt-memory`는 아직 임베딩 없음. `embeddings`/`edges` 테이블은 v0.2 예약.
+- `rtrt-memory`는 아직 임베딩 없음. `embeddings`/`edges` 테이블은 예약.
 - `install.sh` / `install.ps1`은 README에 명시되어 있으나 트리에 아직 없음.

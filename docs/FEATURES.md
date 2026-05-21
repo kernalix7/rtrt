@@ -162,10 +162,10 @@ let hits = store.recall_hybrid("my-project", "rust toolchain", 5, &embedder)?;
 Recall details:
 
 - **`recall_bm25`** — FTS5 ranked by built-in BM25; project-scoped; no embedder required.
-- **`recall_vector`** — embeds the query, scores every project memory by cosine similarity, sorts in process. Linear in stored embeddings; v0.3 swaps this for an HNSW index.
+- **`recall_vector`** — embeds the query, scores every project memory by cosine similarity, sorts in process. Linear in stored embeddings; this will be replaced by an HNSW index when scale demands.
 - **`recall_hybrid`** — Reciprocal Rank Fusion of BM25 + vector with `rrf_k = 60`. Each stream is fetched at `limit * 2` so single-stream-only matches still surface.
 
-The `edges` table is reserved for v0.3 graph traversal.
+The `edges` table is reserved for graph traversal.
 
 **First-use note**: `FastEmbedder::new_default()` downloads the model (~90 MB) to fastembed's cache dir on first construction. Subsequent uses are offline.
 

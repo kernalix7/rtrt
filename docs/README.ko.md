@@ -71,7 +71,7 @@ rtrt-mcp
 
 - **출력 압축** — `lite`/`full`/`ultra` 단계, 코드 블록 보호.
 - **명령 출력 필터링** — `git`/`cargo` 등 빌트인 필터, MCP 도구로도 노출.
-- **영구 메모리** — SQLite + FTS5 기반 BM25 회수, 벡터/그래프는 v0.2 예정.
+- **영구 메모리** — SQLite + FTS5 기반 BM25 회수, 벡터/그래프는 예정.
 - **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환(Ollama, llama.cpp 등).
 - **프로젝트 스캐폴드** — 빌트인 6종 + `~/.rtrt/templates/`의 커스텀 템플릿.
 - **MCP + 대시보드** — `rtrt-mcp`(stdio 예정), axum 기반 `rtrt-dashboard`.

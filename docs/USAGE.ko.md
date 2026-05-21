@@ -94,7 +94,7 @@ rtrt new rust-cli ./hello \
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
 
-공식 Rust MCP SDK [`rmcp`](https://crates.io/crates/rmcp) 기반. v0.2에서 제공하는 도구:
+공식 Rust MCP SDK [`rmcp`](https://crates.io/crates/rmcp) 기반. 현재 제공하는 도구:
 
 | 도구 | 래핑 | 비고 |
 |------|------|------|
@@ -117,7 +117,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 }
 ```
 
-HTTP/SSE 전송, `provider_chat`, LLM 기반 `memory_extract` / `memory_compress` 도구는 v0.3 예정.
+HTTP/SSE 전송, `provider_chat`, LLM 기반 `memory_extract` / `memory_compress` 도구는 예정.
 
 ## 대시보드 (`rtrt-dashboard`)
 

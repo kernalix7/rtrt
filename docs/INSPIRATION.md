@@ -36,9 +36,9 @@ Priority key — **high** = clear win, queue for next minor; **medium** = future
 
 | Project | Idea | Fits | Priority |
 |---------|------|------|----------|
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 baseline (already adopted in v0.1) | `rtrt-memory` | shipped |
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` default embedding (already adopted in v0.2 via fastembed) | `rtrt-memory` | shipped |
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Hybrid recall via Reciprocal Rank Fusion (already adopted in v0.2) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 baseline | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` default embedding (shipped via fastembed) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Hybrid recall via Reciprocal Rank Fusion | `rtrt-memory` | shipped |
 | [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Knowledge-graph entity matching on `edges` table | `rtrt-memory` | high |
 | [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Cross-agent shared memory daemon (HTTP server on `:3111`) | `rtrt-memory` + `rtrt-mcp` | low (per-project SQLite is the intentional default) |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | Multi-level memory tiers (user / session / agent scope) | `rtrt-memory` | high |
@@ -100,13 +100,13 @@ Priority key — **high** = clear win, queue for next minor; **medium** = future
 
 Multiple sources point in the same direction; RTRT should adopt these early:
 
-1. **Hybrid recall (BM25 + vector + entity / graph)** — mem0, chroma, qdrant, lancedb, letta all converge. Sets the schema target for `rtrt-memory` v0.2/v0.3.
+1. **Hybrid recall (BM25 + vector + entity / graph)** — mem0, chroma, qdrant, lancedb, letta all converge. Sets the schema target for `rtrt-memory`.
 2. **Tree-sitter–aware compression** — repomix and aider both use it. Highest-leverage borrow for `rtrt-compress`; signature-only mode adds another savings tier.
 3. **Multi-provider gateway with built-in observability** — Helicone + Langfuse + llm-chain converge. Maps directly onto `rtrt-providers` + `rtrt-proxy` + `rtrt-dashboard`.
 4. **Memory tiers + virtual-context paging** — Letta and MemGPT converge. Pairs well with the existing `rtrt-compress` archival pipeline.
 5. **Per-agent installers / setup wizard** — rtk and context7 converge. Lowest-friction onboarding for the `rtrt` CLI.
 
-## Immediate adoption candidates (queue for v0.3)
+## Immediate adoption candidates
 
 These are the items that:
 - map to an existing crate without new dependencies,
@@ -114,14 +114,14 @@ These are the items that:
 - and have at least two reference projects suggesting the same shape.
 
 1. **`compress.tree_sitter` mode** in `rtrt-compress` — extract signatures, drop bodies. Sources: repomix + aider.
-2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + vector + entity, Reciprocal Rank Fusion. Sources: mem0 + chroma + qdrant. (v0.2 already plans BM25 + vector; entity stays for v0.3.)
+2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + vector + entity, Reciprocal Rank Fusion. Sources: mem0 + chroma + qdrant. (BM25 + vector are shipped; entity is planned.)
 3. **`providers.gateway`** in `rtrt-providers` — single key in front of many providers, cost/latency metrics per request feed `rtrt-dashboard`. Sources: Helicone + Langfuse + llm-chain.
 4. **`rtrt setup --agent <name>`** in `rtrt-cli` — wire RTRT into Claude Code / Cursor / Windsurf / Codex / Aider with one command, mirroring rtk's `init` flow.
 5. **`rtrt-compress secretlint` pre-pass** in `rtrt-compress` — block secrets before they reach the LLM. Source: repomix.
 
 ## Already shipped from this backlog
 
-Items marked `shipped` above are not future work — they're called out so the reader can trace concrete RTRT features back to their inspiration source. As of v0.2:
+Items marked `shipped` above are're called out so the reader can trace concrete RTRT features back to their inspiration source:
 
 - `rtrt-memory` SQLite + FTS5 BM25 (from agentmemory).
 - `rtrt-memory` `all-MiniLM-L6-v2` embeddings via fastembed (from agentmemory).

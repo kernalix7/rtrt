@@ -24,8 +24,8 @@ RTRT consolidates several existing token-reduction techniques into one Rust tool
 | Storage | SQLite (via iii-engine) | SQLite (via `rusqlite::bundled`) |
 | FTS | Bundled BM25 + synonym expansion | SQLite FTS5 BM25 ✅ (synonym layer planned) |
 | Embeddings | `all-MiniLM-L6-v2` default; Gemini / OpenAI / Voyage / Cohere optional | `all-MiniLM-L6-v2` via `fastembed` ✅ (`embeddings` feature, offline after first download); other backends pluggable through the `Embedder` trait |
-| Graph | Knowledge-graph entity matching | Reserved schema (`edges` table); v0.3 will wire entity matching |
-| Recall | Reciprocal Rank Fusion across BM25 + vector + graph | BM25 + vector via RRF ✅ (`recall_hybrid`); graph stays for v0.3 |
+| Graph | Knowledge-graph entity matching | Reserved schema (`edges` table); entity matching planned |
+| Recall | Reciprocal Rank Fusion across BM25 + vector + graph | BM25 + vector via RRF ✅ (`recall_hybrid`); graph planned |
 | LLM-driven extract / compress | Cloud LLMs only (OpenAI / Anthropic) | Any `Provider`, including a local Ollama server via the existing OpenAI-compatible adapter — no extra HTTP code (`llm` feature, `extract_and_save` / `compress_project`). **This is RTRT's value-add over agentmemory.** |
 | Process model | Memory server on `:3111` shared by agents | Library + MCP tool in the same process as `rtrt-mcp`; dashboard observes |
 | Cross-agent sharing | All agents hit one shared server | Per-project SQLite files; sharing is opt-in |

@@ -12,7 +12,8 @@
 #   brew install --build-from-source --formula packaging/homebrew/rtrt.rb
 #   brew test --build-from-source --formula packaging/homebrew/rtrt.rb
 #
-# When v0.3.0 ships, replace the URL + sha256 below with the released tarball.
+# When the first release ships, replace the URL + sha256 below with the
+# released tarball, and bump the `version` line to match the tag.
 
 class Rtrt < Formula
   desc "Rust-based Token Reduction Toolkit — caveman-style compression, multi-provider gateway, MCP server"
@@ -22,10 +23,12 @@ class Rtrt < Formula
   # Source-build path — fetches the matching tag's source tarball. After the
   # first release attach pre-built binaries to the GitHub Release and switch
   # this formula to the binary-install pattern (`url` → release asset,
-  # `bin.install` the three executables).
-  url "https://github.com/kernalix7/rtrt/archive/refs/tags/v0.3.0.tar.gz"
+  # `bin.install` the three executables). The placeholder URL/sha256 below
+  # MUST be updated before publishing the tap; until then the formula is a
+  # local-dev artefact only.
+  url "https://github.com/kernalix7/rtrt/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  version "0.3.0"
+  version "0.1.0"
 
   head "https://github.com/kernalix7/rtrt.git", branch: "main"
 

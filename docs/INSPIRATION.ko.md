@@ -36,9 +36,9 @@ RTRT는 다른 토큰 절감 · 메모리 · 에이전트 도구 프로젝트에
 
 | Project | 아이디어 | 크레이트 | 우선순위 |
 |---------|---------|----------|----------|
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 베이스라인 (v0.1 채택 완료) | `rtrt-memory` | shipped |
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` 기본 임베딩 (v0.2 채택 완료, fastembed 경유) | `rtrt-memory` | shipped |
-| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Reciprocal Rank Fusion 하이브리드 회수 (v0.2 채택 완료) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | SQLite + FTS5 BM25 베이스라인 | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `all-MiniLM-L6-v2` 기본 임베딩 (fastembed 경유) | `rtrt-memory` | shipped |
+| [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | Reciprocal Rank Fusion 하이브리드 회수 | `rtrt-memory` | shipped |
 | [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | `edges` 테이블 기반 지식 그래프 엔티티 매칭 | `rtrt-memory` | high |
 | [rohitg00/agentmemory](https://github.com/rohitg00/agentmemory) | 에이전트 간 메모리 공유 데몬(`:3111` HTTP) | `rtrt-memory` + `rtrt-mcp` | low (프로젝트별 SQLite가 기본 의도) |
 | [mem0ai/mem0](https://github.com/mem0ai/mem0) | 다층 메모리(user / session / agent 범위) | `rtrt-memory` | high |
@@ -100,25 +100,25 @@ RTRT는 다른 토큰 절감 · 메모리 · 에이전트 도구 프로젝트에
 
 여러 출처가 같은 방향을 가리키는 항목 — RTRT가 빠르게 채택해야 함:
 
-1. **하이브리드 회수(BM25 + 벡터 + 엔티티 / 그래프)** — mem0, chroma, qdrant, lancedb, letta 모두 동의. `rtrt-memory` v0.2/v0.3 스키마 목표.
+1. **하이브리드 회수(BM25 + 벡터 + 엔티티 / 그래프)** — mem0, chroma, qdrant, lancedb, letta 모두 동의. `rtrt-memory` 스키마 목표.
 2. **tree-sitter 기반 압축** — repomix · aider. `rtrt-compress`에서 가장 큰 차용 효과; 시그니처-only 모드는 새 절감 단계.
 3. **빌트인 옵저버빌리티 포함 멀티 프로바이더 게이트웨이** — Helicone + Langfuse + llm-chain 수렴. `rtrt-providers` + `rtrt-proxy` + `rtrt-dashboard`에 매핑.
 4. **메모리 계층 + 가상 컨텍스트 페이징** — Letta · MemGPT. 기존 `rtrt-compress` 아카이벌 파이프라인과 자연스럽게 짝.
 5. **에이전트별 설치 도구 / 설정 위저드** — rtk + context7. `rtrt` CLI 온보딩 마찰 최소화.
 
-## 즉시 채택 후보 (v0.3 큐)
+## 즉시 채택 후보
 
 다음 조건을 모두 만족하는 항목 — 새 의존성 없이 기존 크레이트에 매핑, 독립적으로 사용 가능, 2개 이상 참조가 같은 형태 제안:
 
 1. **`compress.tree_sitter` 모드** in `rtrt-compress` — 시그니처 추출, 본문 제거. 출처: repomix · aider.
-2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + 벡터 + 엔티티, Reciprocal Rank Fusion. 출처: mem0 · chroma · qdrant. (v0.2는 BM25 + 벡터 예정, 엔티티는 v0.3.)
+2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + 벡터 + 엔티티, Reciprocal Rank Fusion. 출처: mem0 · chroma · qdrant. (BM25 + 벡터는 출시 완료, 엔티티는 예정.)
 3. **`providers.gateway`** in `rtrt-providers` — 여러 프로바이더 앞의 단일 키, 요청별 비용 / 지연 지표를 `rtrt-dashboard`로 흘림. 출처: Helicone · Langfuse · llm-chain.
 4. **`rtrt setup --agent <name>`** in `rtrt-cli` — Claude Code / Cursor / Windsurf / Codex / Aider에 한 줄로 와이어업, rtk `init` 미러.
 5. **`rtrt-compress secretlint` 사전 검사** in `rtrt-compress` — LLM 도달 전 시크릿 차단. 출처: repomix.
 
 ## 이 백로그에서 이미 출시된 항목
 
-위 표에 `shipped`로 표시된 항목은 미래 작업이 아니라, RTRT 기능을 영감 출처로 추적할 수 있도록 명시한 것입니다. v0.2 기준:
+위 표에 `shipped`로 표시된 항목은 미래 작업이 아니라, RTRT 기능을 영감 출처로 추적할 수 있도록 명시한 것입니다. 기준:
 
 - `rtrt-memory` SQLite + FTS5 BM25 (agentmemory).
 - `rtrt-memory` fastembed 경유 `all-MiniLM-L6-v2` 임베딩 (agentmemory).

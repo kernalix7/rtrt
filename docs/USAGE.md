@@ -105,7 +105,7 @@ Print the version and the workspace crate list.
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
 
-Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK. Tools shipped in v0.2:
+Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK. Tools currently shipped:
 
 | Tool | Wraps | Notes |
 |------|-------|-------|
@@ -128,7 +128,7 @@ Wire it up in `~/.claude.json` (or your agent's MCP config):
 }
 ```
 
-HTTP/SSE transport, plus `provider_chat` and the LLM-backed `memory_extract` / `memory_compress` tools, are on the v0.3 roadmap.
+HTTP/SSE transport and LLM-backed `memory_extract` / `memory_compress` tools remain on the roadmap.
 
 ## Dashboard (`rtrt-dashboard`)
 

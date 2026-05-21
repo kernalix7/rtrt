@@ -524,8 +524,28 @@ async fn main() -> Result<()> {
             print!("{out}");
         }
         Cmd::Templates => {
-            for t in rtrt_templates::list_all() {
-                println!("{:<18} [{:?}]  {}", t.name, t.source, t.description);
+            use rtrt_templates::TemplateCategory;
+            fn rank(c: TemplateCategory) -> u8 {
+                match c {
+                    TemplateCategory::Development => 0,
+                    TemplateCategory::Design => 1,
+                    TemplateCategory::Planning => 2,
+                }
+            }
+            let mut all = rtrt_templates::list_all();
+            all.sort_by_key(|t| (rank(t.category), t.name.clone()));
+            let mut current: Option<TemplateCategory> = None;
+            for t in all {
+                if current != Some(t.category) {
+                    let label = match t.category {
+                        TemplateCategory::Development => "개발 (Development)",
+                        TemplateCategory::Design => "디자인 (Design)",
+                        TemplateCategory::Planning => "설계 (Planning)",
+                    };
+                    println!("\n── {label} ──");
+                    current = Some(t.category);
+                }
+                println!("  {:<18} [{:?}]  {}", t.name, t.source, t.description);
             }
         }
         Cmd::New {

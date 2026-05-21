@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use rtrt_core::{Error, Result};
 use serde::Deserialize;
 
-use crate::{Template, TemplateFile, TemplateSource, TemplateVariable};
+use crate::{Template, TemplateCategory, TemplateFile, TemplateSource, TemplateVariable};
 
 #[derive(Debug, Deserialize)]
 struct ManifestToml {
     name: String,
     description: String,
+    #[serde(default)]
+    category: Option<TemplateCategory>,
     #[serde(default)]
     variables: Vec<TemplateVariable>,
     #[serde(default)]
@@ -98,6 +100,7 @@ pub fn load_one(dir: &Path) -> Result<Template> {
         name: parsed.name,
         description: parsed.description,
         source: TemplateSource::Custom,
+        category: parsed.category.unwrap_or_default(),
         variables: parsed.variables,
         files,
         post_hooks: parsed.post_hooks,

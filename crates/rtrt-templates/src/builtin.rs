@@ -5,7 +5,7 @@
 
 use once_cell::sync::Lazy;
 
-use crate::{Template, TemplateFile, TemplateSource, TemplateVariable};
+use crate::{Template, TemplateCategory, TemplateFile, TemplateSource, TemplateVariable};
 
 fn common_vars() -> Vec<TemplateVariable> {
     vec![
@@ -32,12 +32,20 @@ fn common_vars() -> Vec<TemplateVariable> {
 
 pub static ALL: Lazy<Vec<Template>> = Lazy::new(|| {
     vec![
+        // 개발 (Development) — code projects.
         rust_cli(),
         rust_lib(),
         rust_axum(),
         node_typescript(),
         python_uv(),
         go_cli(),
+        // 디자인 (Design) — UI / brand assets.
+        brand_kit(),
+        wireframe(),
+        // 설계 (Planning) — specs, decisions, roadmaps, agent definitions.
+        prd_spec(),
+        adr_decision(),
+        roadmap(),
         agent_role(),
     ]
 });
@@ -47,6 +55,7 @@ fn rust_cli() -> Template {
         name: "rust-cli".into(),
         description: "Rust binary crate with clap + anyhow + tracing".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -79,6 +88,7 @@ fn rust_lib() -> Template {
         name: "rust-lib".into(),
         description: "Rust library crate with criterion benches".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -111,6 +121,7 @@ fn rust_axum() -> Template {
         name: "rust-axum".into(),
         description: "Rust HTTP service with axum + tokio + tracing".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -143,6 +154,7 @@ fn node_typescript() -> Template {
         name: "node-typescript".into(),
         description: "Node.js TypeScript project (ESM, tsx runner)".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -180,6 +192,7 @@ fn python_uv() -> Template {
         name: "python-uv".into(),
         description: "Python project managed with uv (pyproject.toml)".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -217,6 +230,7 @@ fn go_cli() -> Template {
         name: "go-cli".into(),
         description: "Go CLI with cobra + standard layout".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
@@ -244,11 +258,146 @@ fn go_cli() -> Template {
     }
 }
 
+fn project_meta_vars() -> Vec<TemplateVariable> {
+    vec![
+        TemplateVariable {
+            name: "project_name".into(),
+            description: Some("Project / initiative name".into()),
+            default: None,
+            required: true,
+        },
+        TemplateVariable {
+            name: "author".into(),
+            description: Some("Author or team".into()),
+            default: Some("Unknown".into()),
+            required: false,
+        },
+    ]
+}
+
+fn brand_kit() -> Template {
+    Template {
+        name: "brand-kit".into(),
+        description: "Brand guide skeleton — voice / tokens / logo placeholders".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Design,
+        variables: project_meta_vars(),
+        files: vec![
+            TemplateFile {
+                path: "README.md".into(),
+                content: BRAND_KIT_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "tokens.css".into(),
+                content: BRAND_KIT_TOKENS.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "logo/README.md".into(),
+                content: BRAND_KIT_LOGO_README.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec![],
+    }
+}
+
+fn wireframe() -> Template {
+    Template {
+        name: "wireframe".into(),
+        description: "Wireframe + screen-flow notebook (Markdown + ASCII frames)".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Design,
+        variables: project_meta_vars(),
+        files: vec![
+            TemplateFile {
+                path: "README.md".into(),
+                content: WIREFRAME_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "screens/01-home.md".into(),
+                content: WIREFRAME_HOME.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "screens/02-detail.md".into(),
+                content: WIREFRAME_DETAIL.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec![],
+    }
+}
+
+fn prd_spec() -> Template {
+    Template {
+        name: "prd-spec".into(),
+        description: "Product requirements doc — problem / audience / scope / metrics".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: project_meta_vars(),
+        files: vec![TemplateFile {
+            path: "PRD.md".into(),
+            content: PRD_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
+fn adr_decision() -> Template {
+    Template {
+        name: "adr-decision".into(),
+        description: "Architecture Decision Record — context / decision / consequences".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: vec![
+            TemplateVariable {
+                name: "title".into(),
+                description: Some("Decision title (e.g. 'Choose Rust for the core')".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "author".into(),
+                description: Some("Author or team".into()),
+                default: Some("Unknown".into()),
+                required: false,
+            },
+        ],
+        files: vec![TemplateFile {
+            path: "0001-{{title}}.md".into(),
+            content: ADR_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
+fn roadmap() -> Template {
+    Template {
+        name: "roadmap".into(),
+        description: "Quarterly roadmap with milestones + risks".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: project_meta_vars(),
+        files: vec![TemplateFile {
+            path: "ROADMAP.md".into(),
+            content: ROADMAP_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
 fn agent_role() -> Template {
     Template {
         name: "agent-role".into(),
-        description: "crewAI-style agent specification: role / goal / backstory + tools".into(),
+        description: "Agent specification: role / goal / backstory + tool list".into(),
         source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
         variables: vec![
             TemplateVariable {
                 name: "agent_name".into(),
@@ -306,6 +455,187 @@ fn agent_role() -> Template {
 }
 
 const COMMON_README: &str = "# {{project_name}}\n\nAuthor: {{author}}\nLicense: {{license}}\n";
+
+const BRAND_KIT_README: &str = r#"# {{project_name}} — brand kit
+
+Owner: {{author}}
+
+## Voice
+- Tone: (e.g. confident, warm, technical)
+- Don'ts: (e.g. exclamation points, marketing fluff)
+
+## Palette
+Drop hex values into `tokens.css` — those flow straight into web / Figma.
+
+## Typography
+- Display:
+- Body:
+
+## Logo
+See `logo/`. Drop a primary SVG + a monochrome SVG for dark backgrounds.
+"#;
+
+const BRAND_KIT_TOKENS: &str = r#":root {
+    /* Primary palette */
+    --color-bg: #ffffff;
+    --color-fg: #0e0e0f;
+    --color-accent: #2962FF;
+    --color-muted: #6b6b6b;
+
+    /* Spacing scale (4px base) */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+
+    /* Type scale */
+    --type-body: 14px;
+    --type-display: 32px;
+}
+"#;
+
+const BRAND_KIT_LOGO_README: &str = r#"# Logo
+
+- `primary.svg` — full-colour mark.
+- `mono.svg` — single-fill mark for dark / light backgrounds.
+
+Keep clearspace = the height of the mark on every side.
+"#;
+
+const WIREFRAME_README: &str = r#"# {{project_name}} — wireframes
+
+Owner: {{author}}
+
+Each screen lives in its own file under `screens/`. Use ASCII boxes for
+low-fidelity layout, then link to the Figma frame once it lands.
+
+| Screen | File | Status |
+|--------|------|--------|
+| Home   | screens/01-home.md   | draft |
+| Detail | screens/02-detail.md | draft |
+"#;
+
+const WIREFRAME_HOME: &str = r#"# Home
+
+```
++----------------------------------+
+| logo                  [profile]  |
++----------------------------------+
+|                                  |
+|        Hero headline             |
+|        sub-line                  |
+|        [primary CTA]             |
+|                                  |
++----------------------------------+
+| feature 1 | feature 2 | feature 3|
++----------------------------------+
+```
+
+Notes:
+- Sticky nav once scrolled past hero.
+- Hero CTA opens onboarding modal.
+"#;
+
+const WIREFRAME_DETAIL: &str = r#"# Detail
+
+```
++----------------------------------+
+| < back                           |
++----------------------------------+
+|  Title                           |
+|  meta · meta · meta              |
++----------------------------------+
+|                                  |
+|  body / preview                  |
+|                                  |
++----------------------------------+
+|  [primary action]  [secondary]   |
++----------------------------------+
+```
+"#;
+
+const PRD_BODY: &str = r#"# {{project_name}} — Product Requirements
+
+Owner: {{author}}
+Status: draft
+
+## Problem
+What pain are we solving? Who hits it today? Quantify if you can.
+
+## Audience
+Primary user: …
+Secondary user: …
+
+## Goals (in priority order)
+1. …
+2. …
+3. …
+
+## Non-goals
+- …
+
+## Solution sketch
+One paragraph on the proposed approach. Include the simplest cut that
+ships value, plus the next two enhancement waves.
+
+## Success metrics
+- North-star: …
+- Guardrails: …
+
+## Open questions
+- …
+
+## Milestones
+| When | Slice | Owner |
+|------|-------|-------|
+| M1   | …     | …     |
+| M2   | …     | …     |
+"#;
+
+const ADR_BODY: &str = r#"# ADR 0001 — {{title}}
+
+Author: {{author}}
+Status: proposed
+Date: <today>
+
+## Context
+What forces are at play? What constraints does this need to respect?
+
+## Decision
+The one-paragraph answer.
+
+## Consequences
+Positive:
+- …
+
+Negative:
+- …
+
+Follow-up:
+- …
+"#;
+
+const ROADMAP_BODY: &str = r#"# {{project_name}} — Roadmap
+
+Owner: {{author}}
+Horizon: 4 quarters
+
+## This quarter (now)
+- [ ] …
+- [ ] …
+
+## Next quarter
+- [ ] …
+
+## Quarter +2
+- [ ] …
+
+## Quarter +3
+- [ ] …
+
+## Risks
+- …
+"#;
 
 const AGENT_ROLE_TOML: &str = r#"# crewAI-style agent specification.
 # Pair with `system_prompt.md` when wiring this agent into an orchestrator.

@@ -161,6 +161,7 @@ struct TemplateSummary {
     name: String,
     description: String,
     source: rtrt_templates::TemplateSource,
+    category: rtrt_templates::TemplateCategory,
     variables: Vec<rtrt_templates::TemplateVariable>,
 }
 
@@ -170,6 +171,7 @@ impl From<rtrt_templates::Template> for TemplateSummary {
             name: t.name,
             description: t.description,
             source: t.source,
+            category: t.category,
             variables: t.variables,
         }
     }
@@ -998,301 +1000,533 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>RTRT Dashboard</title>
+<title>RTRT</title>
 <style>
   :root {
-    --bg: #ffffff;
-    --fg: #1a1a1a;
-    --muted: #666666;
-    --border: #eeeeee;
-    --code-bg: #f3f3f3;
-    --pre-bg: #fafafa;
-    --accent: #2962FF;
-    --err: #c0392b;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e6e6e6;
+    --card: #fafafa; --code-bg: #f3f3f3; --accent: #2962FF; --err: #c0392b;
   }
   :root[data-theme="dark"] {
-    --bg: #15171a;
-    --fg: #e6e6e6;
-    --muted: #9aa0a6;
-    --border: #2a2d31;
-    --code-bg: #23272e;
-    --pre-bg: #1c1f23;
-    --accent: #6aa3ff;
-    --err: #ff6b6b;
+    --bg: #15171a; --fg: #e6e6e6; --muted: #9aa0a6; --border: #2a2d31;
+    --card: #1c1f23; --code-bg: #23272e; --accent: #6aa3ff; --err: #ff6b6b;
   }
-  body { font: 14px/1.45 system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
-  h1 { margin-bottom: 0.25rem; }
-  .sub { color: var(--muted); margin-bottom: 1.5rem; }
-  nav { margin-bottom: 1.5rem; display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
-  nav a { cursor: pointer; color: var(--accent); text-decoration: none; }
-  nav a.active { font-weight: 600; text-decoration: underline; }
-  nav .spacer { flex: 1; }
-  #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.9em; }
-  section { display: none; margin-bottom: 2rem; }
-  section.active { display: block; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 880px; margin: 1.5rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
+  header { display:flex; align-items:baseline; gap:1rem; margin-bottom: 1rem; }
+  header h1 { margin: 0; font-size: 1.6rem; }
+  header .sub { color: var(--muted); flex: 1; }
+  #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.25rem 0.6rem; border-radius: 6px; font-size: 0.9em; }
+  nav.tabs { display:flex; gap:0.5rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }
+  nav.tabs a { cursor: pointer; padding: 0.5rem 0.9rem; border-radius: 6px 6px 0 0; color: var(--muted); }
+  nav.tabs a.active { color: var(--fg); background: var(--card); border: 1px solid var(--border); border-bottom-color: var(--card); margin-bottom: -1px; }
+  section.tab { display: none; }
+  section.tab.active { display: block; }
+  h2 { margin: 0 0 0.5rem; font-size: 1.15rem; }
+  h3 { margin: 1.25rem 0 0.4rem; font-size: 1rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .card .hint { color: var(--muted); font-size: 0.9em; margin-bottom: 0.5rem; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 0.75rem; }
+  .kpi { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; }
+  .kpi .label { color: var(--muted); font-size: 0.8em; }
+  .kpi .value { font-size: 1.3rem; font-weight: 600; }
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  code { background: var(--code-bg); padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; }
-  pre { background: var(--pre-bg); border: 1px solid var(--border); }
-  input, textarea, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 0.3rem 0.5rem; border-radius: 3px; font: inherit; }
+  code { background: var(--code-bg); padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 0.9em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
+  form { display: grid; gap: 0.5rem; }
+  form .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+  input, textarea, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 0.4rem 0.6rem; border-radius: 6px; font: inherit; }
   button { cursor: pointer; }
-  .kpi { display: inline-block; margin-right: 1.5rem; }
-  .kpi b { font-size: 1.4rem; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  details { margin-bottom: 0.6rem; }
+  details > summary { cursor: pointer; padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; font-weight: 500; }
+  details[open] > summary { border-radius: 6px 6px 0 0; }
+  details > div { border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px; padding: 0.9rem; }
   .err { color: var(--err); }
+  .muted { color: var(--muted); font-size: 0.9em; }
+  svg.spark { width: 100%; height: 60px; }
 </style>
 </head>
 <body>
-<h1>RTRT</h1>
-<div class="sub">Rust-based Token Reduction Toolkit</div>
+<header>
+  <h1>RTRT</h1>
+  <span class="sub">웹 콘솔</span>
+  <button id="theme-toggle" title="다크 / 라이트 토글">🌗</button>
+</header>
 
-<nav>
-  <a data-tab="metrics" class="active">Metrics</a>
-  <a data-tab="budget">Budget</a>
-  <a data-tab="prompts">Prompts</a>
-  <a data-tab="memory">Memory</a>
-  <a data-tab="templates">Templates</a>
-  <a data-tab="stats">Compression</a>
-  <a data-tab="proxy">Proxy</a>
-  <a data-tab="diagnose">Diagnose</a>
-  <a data-tab="repomap">RepoMap</a>
-  <a data-tab="setup">Setup</a>
-  <span class="spacer"></span>
-  <button id="theme-toggle" title="Toggle dark / light mode">🌗</button>
+<nav class="tabs">
+  <a data-tab="overview" class="active">개요</a>
+  <a data-tab="memory">메모리</a>
+  <a data-tab="tools">도구</a>
 </nav>
 
-<section id="metrics" class="active">
-  <h2>Gateway metrics</h2>
-  <div id="metrics-summary">loading…</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">
-    <div>
-      <h3 style="margin-bottom:0.3rem;">Latency (ms)</h3>
-      <svg id="chart-latency" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none" style="border:1px solid var(--border);border-radius:4px;"></svg>
-    </div>
-    <div>
-      <h3 style="margin-bottom:0.3rem;">Tokens (in + out)</h3>
-      <svg id="chart-tokens" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none" style="border:1px solid var(--border);border-radius:4px;"></svg>
+<section id="overview" class="tab active">
+  <div class="card">
+    <h2>현재 상태</h2>
+    <div class="hint">게이트웨이 요청 / 토큰 / 예산 / 캐시 요약. 5초마다 자동 새로고침.</div>
+    <div id="kpi-grid" class="kpis">불러오는 중…</div>
+  </div>
+  <div class="card">
+    <h2>응답 속도 + 토큰 추이</h2>
+    <div class="hint">최근 요청 50건 기준.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+      <div>
+        <div class="muted">응답 속도 (ms)</div>
+        <svg id="chart-latency" class="spark" viewBox="0 0 400 60" preserveAspectRatio="none"></svg>
+      </div>
+      <div>
+        <div class="muted">토큰 (in + out)</div>
+        <svg id="chart-tokens" class="spark" viewBox="0 0 400 60" preserveAspectRatio="none"></svg>
+      </div>
     </div>
   </div>
-  <h3>Recent requests</h3>
-  <table id="metrics-recent"><thead>
-    <tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>latency</th><th>status</th></tr>
-  </thead><tbody></tbody></table>
+  <div class="card">
+    <h2>최근 요청</h2>
+    <table id="recent-tbl"><thead><tr><th>시각</th><th>프로바이더</th><th>모델</th><th>in</th><th>out</th><th>지연</th><th>상태</th></tr></thead><tbody></tbody></table>
+  </div>
 </section>
 
-<section id="budget">
-  <h2>Spending budget</h2>
-  <div id="budget-summary">loading…</div>
-  <p style="color:#666;margin-top:1rem;">Attach a cap via <code>Gateway::with_budget</code>. Spend is priced from the recorded metrics window.</p>
+<section id="memory" class="tab">
+  <div class="card">
+    <h2>검색 (recall)</h2>
+    <div class="hint">BM25 검색. 페이로드 필터 예: <code>source=claude,topic~^auth</code></div>
+    <form id="recall-form">
+      <div class="row">
+        <input id="recall-project" placeholder="project" required>
+        <input id="recall-limit" type="number" min="1" max="50" value="10">
+      </div>
+      <input id="recall-query" placeholder="검색어" required>
+      <input id="recall-filter" placeholder="필터 (선택)">
+      <button class="primary" type="submit">검색</button>
+    </form>
+    <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>새 메모리 저장</h2>
+    <form id="save-form">
+      <div class="row">
+        <input id="save-project" placeholder="project" required>
+        <input id="save-kind" placeholder="kind (기본 note)" value="note">
+      </div>
+      <textarea id="save-body" rows="3" placeholder="내용" required></textarea>
+      <input id="save-metadata" placeholder='메타데이터 JSON (선택, 예: {"source":"claude"})'>
+      <button class="primary" type="submit">저장</button>
+    </form>
+    <div id="save-result" class="muted" style="margin-top:0.5rem;"></div>
+  </div>
+
+  <div class="card">
+    <h2>블록 (persona / human / context)</h2>
+    <div class="hint">에이전트 페르소나, 사용자 정보, 컨텍스트 같은 영속 슬롯.</div>
+    <form id="blocks-list-form" style="grid-template-columns: 1fr auto;">
+      <input id="blocks-project" placeholder="project" required>
+      <button type="submit">목록</button>
+    </form>
+    <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody></tbody></table>
+    <h3>블록 저장 / 덮어쓰기</h3>
+    <form id="blocks-set-form">
+      <div class="row">
+        <input id="block-set-name" placeholder="이름 (persona / human / context …)" required>
+        <input id="block-set-project" placeholder="project" required>
+      </div>
+      <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
+      <button class="primary" type="submit">저장</button>
+    </form>
+    <div id="block-set-result" class="muted" style="margin-top:0.5rem;"></div>
+  </div>
+
+  <div class="card">
+    <h2>백업</h2>
+    <form id="export-form" style="grid-template-columns: 1fr auto;">
+      <input id="export-project" placeholder="project" required>
+      <button type="submit">JSONL 다운로드</button>
+    </form>
+  </div>
 </section>
 
-<section id="prompts">
-  <h2>Versioned prompts</h2>
-  <p style="color:#666;">Backed by <code>PromptRegistry</code> at <code>$RTRT_PROMPTS_DIR</code> (defaults to <code>~/.rtrt/prompts</code>).</p>
-  <table id="prompts-tbl"><thead><tr><th>Name</th><th>Latest</th><th>Versions</th></tr></thead><tbody></tbody></table>
-  <pre id="prompt-body" style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:0.75rem;border-radius:4px;display:none;"></pre>
-</section>
-
-<section id="memory">
-  <h2>Memory recall</h2>
-  <p style="color:#666;">BM25 over <code>$RTRT_MEMORY_PATH</code> (defaults to <code>.rtrt/memory.sqlite</code>). qdrant-style payload filter supported.</p>
-  <form id="recall-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;">
-    <input id="recall-project" placeholder="project" required>
-    <input id="recall-limit" type="number" min="1" max="50" value="10">
-    <input id="recall-query" placeholder="query" required style="grid-column:1 / span 2;">
-    <input id="recall-filter" placeholder="filter (e.g. source=claude,topic~^auth)" style="grid-column:1 / span 2;">
-    <button type="submit" style="grid-column:1 / span 2;">Recall</button>
-  </form>
-  <table id="recall-tbl" style="margin-top:1rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
-
-  <h3 style="margin-top:2rem;">Letta blocks</h3>
-  <form id="blocks-list-form" style="display:flex;gap:0.5rem;max-width:600px;align-items:center;">
-    <input id="blocks-project" placeholder="project" required>
-    <button type="submit">List</button>
-  </form>
-  <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>name</th><th>body</th></tr></thead><tbody></tbody></table>
-  <form id="blocks-set-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;margin-top:1rem;">
-    <input id="block-set-name" placeholder="name (persona / human / context)" required>
-    <input id="block-set-project" placeholder="project" required>
-    <textarea id="block-set-body" placeholder="body" required rows="3" style="grid-column:1 / span 2;"></textarea>
-    <button type="submit" style="grid-column:1 / span 2;">Set block</button>
-  </form>
-  <div id="block-set-result" style="margin-top:0.5rem;color:#666;"></div>
-
-  <h3 style="margin-top:2rem;">Save memory</h3>
-  <form id="save-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;">
-    <input id="save-project" placeholder="project" required>
-    <input id="save-kind" placeholder="kind (default: note)" value="note">
-    <textarea id="save-body" placeholder="body" required rows="3" style="grid-column:1 / span 2;"></textarea>
-    <input id="save-metadata" placeholder="metadata JSON (e.g. {\"source\":\"claude\"})" style="grid-column:1 / span 2;">
-    <button type="submit" style="grid-column:1 / span 2;">Save</button>
-  </form>
-  <div id="save-result" style="margin-top:0.5rem;color:#666;"></div>
-</section>
-
-<section id="templates">
-  <h2>Project templates</h2>
-  <table id="tpl"><thead><tr><th>Name</th><th>Source</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
-
-  <h3 style="margin-top:2rem;">Scaffold</h3>
-  <form id="scaffold-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <select id="scaffold-template" required></select>
-    <input id="scaffold-target" placeholder="target directory" required>
-    <div id="scaffold-vars" style="grid-column:1 / span 2;"></div>
-    <label style="grid-column:1 / span 2;"><input id="scaffold-overwrite" type="checkbox"> overwrite existing files</label>
-    <div style="grid-column:1 / span 2;display:flex;gap:0.5rem;">
-      <button type="button" id="scaffold-preview">Preview</button>
-      <button type="submit">Scaffold</button>
+<section id="tools" class="tab">
+  <details open>
+    <summary>압축 (compress)</summary>
+    <div>
+      <div class="muted">텍스트를 룰 엔진(lite/full/ultra/extreme) 또는 ML 휴리스틱으로 줄임.</div>
+      <form id="compress-form" style="margin-top:0.5rem;">
+        <div class="row">
+          <select id="compress-mode">
+            <option value="rules">룰 엔진</option>
+            <option value="ml">ML 휴리스틱</option>
+          </select>
+          <select id="compress-level">
+            <option value="lite">lite</option>
+            <option value="full" selected>full</option>
+            <option value="ultra">ultra</option>
+            <option value="extreme">extreme</option>
+          </select>
+        </div>
+        <div class="row">
+          <select id="compress-format">
+            <option value="plain" selected>plain</option>
+            <option value="markdown">markdown</option>
+            <option value="xml">xml</option>
+            <option value="json">json</option>
+          </select>
+          <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
+        </div>
+        <textarea id="compress-input" rows="5" placeholder="원본 텍스트" required></textarea>
+        <button class="primary" type="submit">압축</button>
+      </form>
+      <div id="compress-summary" class="muted" style="margin-top:0.5rem;"></div>
+      <pre id="compress-output" style="display:none;"></pre>
     </div>
-  </form>
-  <div id="scaffold-result" style="margin-top:0.5rem;color:#666;"></div>
-</section>
+  </details>
 
-<section id="proxy">
-  <h2>Proxy filter</h2>
-  <p style="color:var(--muted);">Run rtrt-proxy filters against captured stdout/stderr.</p>
-  <form id="proxy-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <select id="proxy-mode">
-      <option value="command">command (auto-detect by label)</option>
-      <option value="errors_only">errors_only</option>
-      <option value="ultra_compact">ultra_compact</option>
-    </select>
-    <input id="proxy-command" placeholder="command (e.g. git status)">
-    <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
-    <textarea id="proxy-raw" rows="8" placeholder="paste raw output" required style="grid-column:1 / span 2;"></textarea>
-    <button type="submit" style="grid-column:1 / span 2;">Filter</button>
-  </form>
-  <div id="proxy-summary" style="margin-top:0.75rem;color:var(--muted);"></div>
-  <pre id="proxy-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;"></pre>
-</section>
+  <details>
+    <summary>명령 출력 필터 (proxy)</summary>
+    <div>
+      <div class="muted">git / cargo 같은 노이즈 많은 출력을 한 줄로 줄임. errors_only / ultra_compact 모드도 가능.</div>
+      <form id="proxy-form" style="margin-top:0.5rem;">
+        <div class="row">
+          <select id="proxy-mode">
+            <option value="command">command (자동 감지)</option>
+            <option value="errors_only">errors_only</option>
+            <option value="ultra_compact">ultra_compact</option>
+          </select>
+          <input id="proxy-command" placeholder="명령 (예: git status)">
+        </div>
+        <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
+        <textarea id="proxy-raw" rows="5" placeholder="원본 stdout/stderr" required></textarea>
+        <button class="primary" type="submit">필터링</button>
+      </form>
+      <div id="proxy-summary" class="muted" style="margin-top:0.5rem;"></div>
+      <pre id="proxy-output" style="display:none;"></pre>
+    </div>
+  </details>
 
-<section id="diagnose">
-  <h2>Diagnose</h2>
-  <p style="color:var(--muted);">Pipe build/test failure to a provider for one-shot triage. Uses gateway routing.</p>
-  <form id="diagnose-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <input id="diagnose-model" placeholder="model (e.g. claude-haiku-4-5)" required>
-    <input id="diagnose-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
-    <textarea id="diagnose-raw" rows="8" placeholder="paste failing build/test output" required style="grid-column:1 / span 2;"></textarea>
-    <button type="submit" style="grid-column:1 / span 2;">Diagnose</button>
-  </form>
-  <div id="diagnose-meta" style="margin-top:0.75rem;color:var(--muted);"></div>
-  <pre id="diagnose-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;"></pre>
-</section>
+  <details>
+    <summary>실패 진단 (diagnose)</summary>
+    <div>
+      <div class="muted">빌드 / 테스트 실패 로그를 LLM에 넘겨 원인 + 수정 제안을 한 번에 받음.</div>
+      <form id="diagnose-form" style="margin-top:0.5rem;">
+        <div class="row">
+          <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
+          <input id="diagnose-context" type="number" min="0" max="20" value="3">
+        </div>
+        <textarea id="diagnose-raw" rows="6" placeholder="실패 로그" required></textarea>
+        <button class="primary" type="submit">진단</button>
+      </form>
+      <div id="diagnose-meta" class="muted" style="margin-top:0.5rem;"></div>
+      <pre id="diagnose-output" style="display:none;"></pre>
+    </div>
+  </details>
 
-<section id="repomap">
-  <h2>RepoMap</h2>
-  <p style="color:var(--muted);">tree-sitter signature index of a Rust project — bodies stripped.</p>
-  <form id="repomap-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <input id="repomap-root" placeholder="root path" required>
-    <input id="repomap-ext" placeholder="ext (default .rs)" value=".rs">
-    <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="max bytes per file">
-    <button type="submit" style="grid-column:1 / span 2;">Map</button>
-  </form>
-  <div id="repomap-summary" style="margin-top:0.75rem;color:var(--muted);"></div>
-  <pre id="repomap-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;max-height:480px;overflow:auto;"></pre>
-</section>
+  <details>
+    <summary>코드 시그니처 맵 (repo-map)</summary>
+    <div>
+      <div class="muted">Rust / Python / TypeScript 프로젝트의 함수·클래스 시그니처만 추출. 본문 제거.</div>
+      <form id="repomap-form" style="margin-top:0.5rem;">
+        <input id="repomap-root" placeholder="프로젝트 경로" required>
+        <div class="row">
+          <input id="repomap-ext" placeholder="확장자 (선택, 비우면 자동)" >
+          <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
+        </div>
+        <button class="primary" type="submit">맵 생성</button>
+      </form>
+      <div id="repomap-summary" class="muted" style="margin-top:0.5rem;"></div>
+      <pre id="repomap-output" style="display:none; max-height: 360px; overflow:auto;"></pre>
+    </div>
+  </details>
 
-<section id="setup">
-  <h2>Agent setup</h2>
-  <p style="color:var(--muted);">Generate an MCP config snippet for popular coding agents (dry-run only — never writes).</p>
-  <form id="setup-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <select id="setup-agent">
-      <option value="claude-code">claude-code</option>
-      <option value="cursor">cursor</option>
-      <option value="codex">codex</option>
-    </select>
-    <input id="setup-memory" placeholder="memory path (default .rtrt/memory.sqlite)" value=".rtrt/memory.sqlite">
-    <input id="setup-binary" placeholder="rtrt-mcp binary path (optional)" style="grid-column:1 / span 2;">
-    <button type="submit" style="grid-column:1 / span 2;">Render</button>
-  </form>
-  <pre id="setup-output" style="white-space:pre-wrap;display:none;margin-top:0.75rem;padding:0.75rem;border-radius:4px;"></pre>
-</section>
+  <details>
+    <summary>프로젝트 스캐폴드 (templates)</summary>
+    <div>
+      <div class="muted">개발 / 디자인 / 설계 카테고리별 빌트인 + 커스텀 템플릿. 미리보기는 디스크 미기록.</div>
+      <table id="tpl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody></tbody></table>
+      <h3>스캐폴드 실행</h3>
+      <form id="scaffold-form">
+        <div class="row">
+          <select id="scaffold-template" required></select>
+          <input id="scaffold-target" placeholder="대상 디렉터리" required>
+        </div>
+        <div id="scaffold-vars"></div>
+        <label><input id="scaffold-overwrite" type="checkbox"> 기존 파일 덮어쓰기</label>
+        <div style="display:flex;gap:0.5rem;">
+          <button type="button" id="scaffold-preview">미리보기</button>
+          <button type="submit" class="primary">생성</button>
+        </div>
+      </form>
+      <div id="scaffold-result" class="muted" style="margin-top:0.5rem;"></div>
+    </div>
+  </details>
 
-<section id="stats">
-  <h2>Compression</h2>
-  <p style="color:#666;">Run the rule engine (level: lite/full/ultra/extreme) or the LLMLingua-style ML compressor against arbitrary text.</p>
-  <form id="compress-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
-    <select id="compress-mode">
-      <option value="rules">rules</option>
-      <option value="ml">ml (heuristic)</option>
-    </select>
-    <select id="compress-level">
-      <option value="lite">lite</option>
-      <option value="full" selected>full</option>
-      <option value="ultra">ultra</option>
-      <option value="extreme">extreme</option>
-    </select>
-    <select id="compress-format">
-      <option value="plain" selected>plain</option>
-      <option value="markdown">markdown</option>
-      <option value="xml">xml</option>
-      <option value="json">json</option>
-    </select>
-    <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
-    <textarea id="compress-input" rows="6" placeholder="paste text to compress" required style="grid-column:1 / span 2;"></textarea>
-    <button type="submit" style="grid-column:1 / span 2;">Compress</button>
-  </form>
-  <div id="compress-summary" style="margin-top:0.75rem;color:#666;"></div>
-  <pre id="compress-output" style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:0.75rem;border-radius:4px;display:none;"></pre>
+  <details>
+    <summary>프롬프트 (prompts)</summary>
+    <div>
+      <div class="muted">버전 관리되는 프롬프트 저장소. <code>$RTRT_PROMPTS_DIR</code> (기본 <code>~/.rtrt/prompts</code>).</div>
+      <table id="prompts-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>최신</th><th>버전</th></tr></thead><tbody></tbody></table>
+      <pre id="prompt-body" style="display:none; margin-top:0.5rem;"></pre>
+    </div>
+  </details>
+
+  <details>
+    <summary>에이전트 연결 (setup)</summary>
+    <div>
+      <div class="muted">Claude Code / Cursor / Codex MCP 설정 스니펫 생성 (디스크 미기록).</div>
+      <form id="setup-form" style="margin-top:0.5rem;">
+        <div class="row">
+          <select id="setup-agent">
+            <option value="claude-code">claude-code</option>
+            <option value="cursor">cursor</option>
+            <option value="codex">codex</option>
+          </select>
+          <input id="setup-memory" placeholder="memory 경로" value=".rtrt/memory.sqlite">
+        </div>
+        <input id="setup-binary" placeholder="rtrt-mcp 바이너리 경로 (선택)">
+        <button type="submit" class="primary">스니펫 생성</button>
+      </form>
+      <pre id="setup-output" style="display:none; margin-top:0.5rem;"></pre>
+    </div>
+  </details>
 </section>
 
 <script>
-function sparkline(svgId, values, color) {
+(function initTheme() {
+  const saved = localStorage.getItem('rtrt-theme');
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.setAttribute('data-theme', saved || (prefersDark ? 'dark' : 'light'));
+})();
+document.getElementById('theme-toggle').onclick = () => {
+  const next = (document.documentElement.getAttribute('data-theme') === 'dark') ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('rtrt-theme', next);
+};
+document.querySelectorAll('nav.tabs a').forEach(a => a.onclick = () => {
+  document.querySelectorAll('nav.tabs a').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('section.tab').forEach(x => x.classList.remove('active'));
+  a.classList.add('active');
+  document.getElementById(a.dataset.tab).classList.add('active');
+});
+
+function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
+function spark(svgId, values, color) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
-  if (!values.length) {
-    svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="var(--muted)">no data</text>`;
-    return;
-  }
-  const w = 400, h = 120, pad = 4;
+  if (!values.length) { svg.innerHTML = `<text x="50%" y="55%" text-anchor="middle" fill="var(--muted)" font-size="11">데이터 없음</text>`; return; }
+  const w = 400, h = 60, pad = 4;
   const max = Math.max(1, ...values);
-  const step = values.length > 1 ? (w - pad * 2) / (values.length - 1) : 0;
-  const points = values.map((v, i) => {
-    const x = pad + i * step;
-    const y = h - pad - (v / max) * (h - pad * 2);
+  const step = values.length > 1 ? (w - pad*2) / (values.length - 1) : 0;
+  const pts = values.map((v, i) => {
+    const x = pad + i*step;
+    const y = h - pad - (v/max) * (h - pad*2);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
-  const fillPoints = `${pad},${h - pad} ${points} ${(pad + (values.length - 1) * step).toFixed(1)},${h - pad}`;
+  const fill = `${pad},${h-pad} ${pts} ${(pad+(values.length-1)*step).toFixed(1)},${h-pad}`;
   svg.innerHTML =
-    `<polygon points="${fillPoints}" fill="${color}" fill-opacity="0.15" stroke="none"/>` +
-    `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5"/>` +
-    `<text x="${w - pad}" y="12" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
+    `<polygon points="${fill}" fill="${color}" fill-opacity="0.18"/>` +
+    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>` +
+    `<text x="${w-pad}" y="10" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
 }
-async function loadMetrics() {
-  const m = await fetch('/api/metrics').then(r => r.json());
-  const s = m.summary;
-  document.getElementById('metrics-summary').innerHTML = `
-    <span class="kpi">calls<br><b>${s.calls}</b></span>
-    <span class="kpi">ok<br><b>${s.successes}</b></span>
-    <span class="kpi">fail<br><b>${s.failures}</b></span>
-    <span class="kpi">input tokens<br><b>${s.total_input_tokens}</b></span>
-    <span class="kpi">output tokens<br><b>${s.total_output_tokens}</b></span>
-    <span class="kpi">avg latency<br><b>${(s.total_latency_ms/Math.max(1,s.calls)).toFixed(0)} ms</b></span>
-  `;
-  const series = m.recent.slice().reverse();
-  sparkline('chart-latency', series.map(r => r.latency_ms), 'var(--accent)');
-  sparkline('chart-tokens', series.map(r => (r.usage.input_tokens || 0) + (r.usage.output_tokens || 0)), '#2ecc71');
-  const tbody = document.querySelector('#metrics-recent tbody');
-  tbody.innerHTML = m.recent.map(r => {
+
+async function loadOverview() {
+  const [m, b] = await Promise.all([
+    fetch('/api/metrics').then(r => r.json()).catch(() => ({summary:{}, recent:[]})),
+    fetch('/api/budget').then(r => r.ok ? r.json() : null).catch(() => null),
+  ]);
+  const s = m.summary || {};
+  const calls = s.calls || 0;
+  const avgLatency = calls ? (s.total_latency_ms/Math.max(1,calls)).toFixed(0) : '—';
+  const cacheLen = (b && b.cache_len !== null && b.cache_len !== undefined) ? b.cache_len : 'off';
+  const kpis = [
+    ['호출 수', calls],
+    ['성공 / 실패', `${s.successes || 0} / ${s.failures || 0}`],
+    ['평균 지연', `${avgLatency} ms`],
+    ['입력 토큰', s.total_input_tokens || 0],
+    ['출력 토큰', s.total_output_tokens || 0],
+    ['예산 사용', b ? fmtUsd(b.spent_usd) : '—'],
+    ['예산 한도', b ? fmtUsd(b.cap_usd) : '—'],
+    ['응답 캐시', cacheLen],
+  ];
+  document.getElementById('kpi-grid').innerHTML = kpis.map(([k,v]) =>
+    `<div class="kpi"><div class="label">${k}</div><div class="value">${v}</div></div>`
+  ).join('');
+  const recent = (m.recent || []).slice();
+  spark('chart-latency', recent.slice().reverse().map(r => r.latency_ms), 'var(--accent)');
+  spark('chart-tokens', recent.slice().reverse().map(r => (r.usage.input_tokens||0)+(r.usage.output_tokens||0)), '#2ecc71');
+  const byParent = new Map(); const heads = [];
+  for (const r of recent) {
+    if (r.parent_id) { (byParent.get(r.parent_id) || byParent.set(r.parent_id, []).get(r.parent_id)).push(r); }
+    else { heads.push(r); }
+  }
+  function row(r, depth) {
     const t = new Date(r.started_at * 1000).toISOString().slice(11,19);
     const status = r.ok ? 'ok' : `<span class="err">${r.error||'failed'}</span>`;
-    return `<tr><td>${t}</td><td>${r.provider}</td><td><code>${r.model}</code></td><td>${r.usage.input_tokens}</td><td>${r.usage.output_tokens}</td><td>${r.latency_ms} ms</td><td>${status}</td></tr>`;
-  }).join('');
+    const ind = depth ? `<span class="muted">└─ </span>` : '';
+    return `<tr><td>${ind}${t}</td><td>${r.provider}</td><td><code>${r.model}</code></td><td>${r.usage.input_tokens}</td><td>${r.usage.output_tokens}</td><td>${r.latency_ms} ms</td><td>${status}</td></tr>`;
+  }
+  const rows = [];
+  for (const h of heads) {
+    rows.push(row(h, 0));
+    for (const c of (byParent.get(h.id) || [])) rows.push(row(c, 1));
+  }
+  document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="muted">아직 요청 없음</td></tr>';
 }
+
+document.getElementById('recall-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    project: document.getElementById('recall-project').value,
+    query: document.getElementById('recall-query').value,
+    limit: Number(document.getElementById('recall-limit').value) || 10,
+    filter: document.getElementById('recall-filter').value || null,
+  };
+  const tbody = document.querySelector('#recall-tbl tbody');
+  tbody.innerHTML = `<tr><td colspan="4" class="muted">검색 중…</td></tr>`;
+  const r = await fetch('/api/memory/recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="4" class="err">${r.status}: ${await r.text()}</td></tr>`; return; }
+  const d = await r.json();
+  tbody.innerHTML = d.hits.length
+    ? d.hits.map(h => `<tr><td>${h.id}</td><td><code>${h.kind}</code></td><td>${h.scope}</td><td>${h.body.replace(/</g,'&lt;')}</td></tr>`).join('')
+    : `<tr><td colspan="4" class="muted">결과 없음</td></tr>`;
+};
+document.getElementById('save-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  let metadata = {};
+  const raw = document.getElementById('save-metadata').value.trim();
+  if (raw) { try { metadata = JSON.parse(raw); } catch (e) { document.getElementById('save-result').innerHTML = `<span class="err">JSON 파싱 실패: ${e}</span>`; return; } }
+  const body = {
+    project: document.getElementById('save-project').value,
+    kind: document.getElementById('save-kind').value || 'note',
+    body: document.getElementById('save-body').value,
+    metadata,
+  };
+  const r = await fetch('/api/memory/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const out = document.getElementById('save-result');
+  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  out.textContent = `저장 완료 (id=${d.id})`;
+};
+document.getElementById('blocks-list-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const project = document.getElementById('blocks-project').value;
+  const tbody = document.querySelector('#blocks-tbl tbody');
+  tbody.innerHTML = `<tr><td colspan="2" class="muted">불러오는 중…</td></tr>`;
+  const r = await fetch(`/api/memory/blocks?project=${encodeURIComponent(project)}`);
+  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="2" class="err">${r.status}: ${await r.text()}</td></tr>`; return; }
+  const d = await r.json();
+  tbody.innerHTML = d.blocks.length
+    ? d.blocks.map(b => `<tr><td><code>${b.kind.replace(/^block:/,'')}</code></td><td>${b.body.replace(/</g,'&lt;')}</td></tr>`).join('')
+    : `<tr><td colspan="2" class="muted">블록 없음</td></tr>`;
+};
+document.getElementById('blocks-set-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    project: document.getElementById('block-set-project').value,
+    name: document.getElementById('block-set-name').value,
+    body: document.getElementById('block-set-body').value,
+  };
+  const r = await fetch('/api/memory/blocks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const out = document.getElementById('block-set-result');
+  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json(); out.textContent = `저장 완료 (id=${d.id})`;
+};
+document.getElementById('export-form').onsubmit = (ev) => {
+  ev.preventDefault();
+  const project = document.getElementById('export-project').value;
+  window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
+};
+
+document.getElementById('compress-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    text: document.getElementById('compress-input').value,
+    ml: document.getElementById('compress-mode').value === 'ml',
+    level: document.getElementById('compress-level').value,
+    format: document.getElementById('compress-format').value,
+    ratio: Number(document.getElementById('compress-ratio').value),
+  };
+  const sum = document.getElementById('compress-summary');
+  const pre = document.getElementById('compress-output');
+  sum.textContent = '압축 중…'; pre.style.display = 'none';
+  const r = await fetch('/api/compress', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  const ratio = d.original_len ? ((d.compressed_len / d.original_len) * 100).toFixed(1) : '0';
+  sum.textContent = `mode=${d.mode}${d.scorer ? ` · scorer=${d.scorer}` : ''} · ${d.original_len} → ${d.compressed_len} chars (${ratio}%) · 절감 ${d.saved_chars}`;
+  pre.style.display = 'block'; pre.textContent = d.compressed;
+};
+document.getElementById('proxy-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    mode: document.getElementById('proxy-mode').value,
+    command: document.getElementById('proxy-command').value || null,
+    raw: document.getElementById('proxy-raw').value,
+    context: Number(document.getElementById('proxy-context').value) || 3,
+  };
+  const sum = document.getElementById('proxy-summary');
+  const pre = document.getElementById('proxy-output');
+  sum.textContent = '필터링 중…'; pre.style.display = 'none';
+  const r = await fetch('/api/proxy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  const ratio = d.original_len ? ((d.filtered_len / d.original_len) * 100).toFixed(1) : '0';
+  sum.textContent = `mode=${d.mode} · ${d.original_len} → ${d.filtered_len} chars (${ratio}%) · 절감 ${d.saved_chars}`;
+  pre.style.display = 'block'; pre.textContent = d.filtered;
+};
+document.getElementById('diagnose-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    model: document.getElementById('diagnose-model').value,
+    raw: document.getElementById('diagnose-raw').value,
+    context: Number(document.getElementById('diagnose-context').value) || 3,
+  };
+  const meta = document.getElementById('diagnose-meta');
+  const pre = document.getElementById('diagnose-output');
+  meta.textContent = '진단 중…'; pre.style.display = 'none';
+  const r = await fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { meta.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  meta.textContent = `${d.provider}/${d.model} · in ${d.input_tokens} · out ${d.output_tokens}`;
+  pre.style.display = 'block'; pre.textContent = d.diagnosis;
+};
+document.getElementById('repomap-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    root: document.getElementById('repomap-root').value,
+    ext: document.getElementById('repomap-ext').value || '',
+    max_bytes: Number(document.getElementById('repomap-max').value) || 524288,
+  };
+  const sum = document.getElementById('repomap-summary');
+  const pre = document.getElementById('repomap-output');
+  sum.textContent = '스캔 중…'; pre.style.display = 'none';
+  const r = await fetch('/api/repo-map', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { sum.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  sum.textContent = `${d.files} 파일 · ${d.total_bytes} bytes 스캔 · 시그니처 ${d.signature_chars} chars`;
+  pre.style.display = 'block';
+  pre.textContent = d.entries.map(e => `// ${e.path} [${e.language || ''}]\n${e.signatures}\n`).join('\n');
+};
+
+const CAT_LABEL = { development: '개발', design: '디자인', planning: '설계' };
 let LOADED_TEMPLATES = [];
 async function loadTemplates() {
-  const tpls = await fetch('/api/templates').then(r => r.json());
+  const tpls = await fetch('/api/templates').then(r => r.json()).catch(() => []);
   LOADED_TEMPLATES = tpls;
-  document.querySelector('#tpl tbody').innerHTML = tpls.map(t =>
-    `<tr><td><code>${t.name}</code></td><td>${t.source}</td><td>${t.description}</td>` +
-    `<td><a data-pick="${t.name}" style="cursor:pointer;color:#2962FF;">use</a></td></tr>`
-  ).join('');
+  const grouped = { development: [], design: [], planning: [] };
+  for (const t of tpls) {
+    const c = (t.category || 'development');
+    (grouped[c] || grouped.development).push(t);
+  }
+  const rows = [];
+  for (const cat of ['development', 'design', 'planning']) {
+    for (const t of grouped[cat]) {
+      rows.push(`<tr><td><code>${t.name}</code></td><td>${CAT_LABEL[cat]}</td><td>${t.description}</td><td><a data-pick="${t.name}" style="cursor:pointer;color:var(--accent);">사용</a></td></tr>`);
+    }
+  }
+  document.querySelector('#tpl tbody').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">템플릿 없음</td></tr>';
   document.querySelectorAll('a[data-pick]').forEach(a => a.onclick = () => {
-    document.querySelector('[data-tab="templates"]').click();
     document.getElementById('scaffold-template').value = a.dataset.pick;
     renderScaffoldVars();
   });
   const sel = document.getElementById('scaffold-template');
-  sel.innerHTML = tpls.map(t => `<option value="${t.name}">${t.name}</option>`).join('');
+  sel.innerHTML = tpls.map(t => `<option value="${t.name}">[${CAT_LABEL[t.category || 'development']}] ${t.name}</option>`).join('');
   sel.onchange = renderScaffoldVars;
   renderScaffoldVars();
 }
@@ -1304,8 +1538,7 @@ function renderScaffoldVars() {
   wrap.innerHTML = `<table style="margin-top:0.5rem;"><tbody>` +
     tpl.variables.map(v =>
       `<tr><td style="width:30%;"><code>${v.name}</code>${v.required ? ' *' : ''}</td>` +
-      `<td><input data-var="${v.name}" placeholder="${v.description || ''}"` +
-      ` value="${v.default || ''}" style="width:100%;"></td></tr>`
+      `<td><input data-var="${v.name}" placeholder="${v.description || ''}" value="${v.default || ''}" style="width:100%;"></td></tr>`
     ).join('') + `</tbody></table>`;
 }
 function buildScaffoldBody() {
@@ -1322,242 +1555,31 @@ function buildScaffoldBody() {
 }
 document.getElementById('scaffold-preview').onclick = async () => {
   const out = document.getElementById('scaffold-result');
-  out.textContent = 'previewing…';
-  const resp = await fetch('/api/templates/scaffold/preview', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(buildScaffoldBody()),
-  });
-  if (!resp.ok) {
-    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
-    return;
-  }
-  const d = await resp.json();
-  const rows = d.files.map(f =>
-    `<tr><td><code>${f.path}</code></td><td>${f.bytes}</td><td>${f.executable ? 'exec' : ''}</td></tr>`
-  ).join('');
-  out.innerHTML = `<div>preview · root <code>${d.root}</code> · ${d.files.length} files</div>` +
-    `<table style="margin-top:0.5rem;"><thead><tr><th>path</th><th>bytes</th><th></th></tr></thead><tbody>${rows}</tbody></table>` +
-    (d.post_hooks.length ? `<div>post-hooks: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}</div>` : '');
+  out.textContent = '미리보기…';
+  const r = await fetch('/api/templates/scaffold/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
+  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  const rows = d.files.map(f => `<tr><td><code>${f.path}</code></td><td>${f.bytes}</td></tr>`).join('');
+  out.innerHTML = `<div>${d.root} 아래 ${d.files.length} 파일</div><table><thead><tr><th>경로</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`;
 };
 document.getElementById('scaffold-form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const body = buildScaffoldBody();
   const out = document.getElementById('scaffold-result');
-  out.textContent = 'scaffolding…';
-  const resp = await fetch('/api/templates/scaffold', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
-    return;
-  }
-  const d = await resp.json();
-  out.innerHTML = `wrote ${d.files_written} files into <code>${d.root}</code>` +
-    (d.post_hooks.length ? `<br>post-hooks: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}` : '');
-};
-document.getElementById('blocks-list-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const project = document.getElementById('blocks-project').value;
-  const tbody = document.querySelector('#blocks-tbl tbody');
-  tbody.innerHTML = `<tr><td colspan="2" style="color:#666;">loading…</td></tr>`;
-  const resp = await fetch(`/api/memory/blocks?project=${encodeURIComponent(project)}`);
-  if (!resp.ok) {
-    tbody.innerHTML = `<tr><td colspan="2" class="err">${resp.status}: ${await resp.text()}</td></tr>`;
-    return;
-  }
-  const d = await resp.json();
-  if (!d.blocks.length) {
-    tbody.innerHTML = `<tr><td colspan="2" style="color:#666;">no blocks</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = d.blocks.map(b => {
-    const name = b.kind.replace(/^block:/, '');
-    return `<tr><td><code>${name}</code></td><td>${b.body.replace(/</g, '&lt;')}</td></tr>`;
-  }).join('');
-};
-document.getElementById('blocks-set-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const body = {
-    project: document.getElementById('block-set-project').value,
-    name: document.getElementById('block-set-name').value,
-    body: document.getElementById('block-set-body').value,
-  };
-  const out = document.getElementById('block-set-result');
-  const resp = await fetch('/api/memory/blocks', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
-    return;
-  }
-  const d = await resp.json();
-  out.textContent = `set id=${d.id}`;
+  out.textContent = '생성 중…';
+  const r = await fetch('/api/templates/scaffold', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
+  if (!r.ok) { out.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  out.innerHTML = `생성 완료 — <code>${d.root}</code> 아래 ${d.files_written} 파일` +
+    (d.post_hooks.length ? `<br>후처리: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}` : '');
 };
 
-document.getElementById('save-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  let metadata = {};
-  const rawMeta = document.getElementById('save-metadata').value.trim();
-  if (rawMeta) {
-    try { metadata = JSON.parse(rawMeta); }
-    catch (e) {
-      document.getElementById('save-result').innerHTML = `<span class="err">metadata JSON: ${e}</span>`;
-      return;
-    }
-  }
-  const body = {
-    project: document.getElementById('save-project').value,
-    kind: document.getElementById('save-kind').value || 'note',
-    body: document.getElementById('save-body').value,
-    metadata,
-  };
-  const out = document.getElementById('save-result');
-  const resp = await fetch('/api/memory/save', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
-    return;
-  }
-  const data = await resp.json();
-  out.textContent = `saved id=${data.id}`;
-};
-
-document.getElementById('proxy-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const body = {
-    mode: document.getElementById('proxy-mode').value,
-    command: document.getElementById('proxy-command').value || null,
-    raw: document.getElementById('proxy-raw').value,
-    context: Number(document.getElementById('proxy-context').value) || 3,
-  };
-  const sum = document.getElementById('proxy-summary');
-  const pre = document.getElementById('proxy-output');
-  sum.textContent = 'filtering…';
-  pre.style.display = 'none';
-  const resp = await fetch('/api/proxy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!resp.ok) { sum.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
-  const d = await resp.json();
-  const ratio = d.original_len ? ((d.filtered_len / d.original_len) * 100).toFixed(1) : '0';
-  sum.textContent = `mode=${d.mode} · ${d.original_len} → ${d.filtered_len} chars (${ratio}%) · saved ${d.saved_chars}`;
-  pre.style.display = 'block';
-  pre.textContent = d.filtered;
-};
-document.getElementById('diagnose-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const body = {
-    model: document.getElementById('diagnose-model').value,
-    raw: document.getElementById('diagnose-raw').value,
-    context: Number(document.getElementById('diagnose-context').value) || 3,
-  };
-  const meta = document.getElementById('diagnose-meta');
-  const pre = document.getElementById('diagnose-output');
-  meta.textContent = 'diagnosing…';
-  pre.style.display = 'none';
-  const resp = await fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!resp.ok) { meta.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
-  const d = await resp.json();
-  meta.textContent = `${d.provider}/${d.model} · in ${d.input_tokens} · out ${d.output_tokens}`;
-  pre.style.display = 'block';
-  pre.textContent = d.diagnosis;
-};
-document.getElementById('repomap-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const body = {
-    root: document.getElementById('repomap-root').value,
-    ext: document.getElementById('repomap-ext').value || '.rs',
-    max_bytes: Number(document.getElementById('repomap-max').value) || 524288,
-  };
-  const sum = document.getElementById('repomap-summary');
-  const pre = document.getElementById('repomap-output');
-  sum.textContent = 'walking…';
-  pre.style.display = 'none';
-  const resp = await fetch('/api/repo-map', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!resp.ok) { sum.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
-  const d = await resp.json();
-  sum.textContent = `${d.files} files · ${d.total_bytes} bytes scanned · ${d.signature_chars} chars of signatures`;
-  pre.style.display = 'block';
-  pre.textContent = d.entries.map(e => `// ${e.path}\n${e.signatures}\n`).join('\n');
-};
-document.getElementById('setup-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const body = {
-    agent: document.getElementById('setup-agent').value,
-    memory: document.getElementById('setup-memory').value || null,
-    binary: document.getElementById('setup-binary').value || null,
-  };
-  const pre = document.getElementById('setup-output');
-  pre.style.display = 'none';
-  const resp = await fetch('/api/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!resp.ok) { pre.style.display = 'block'; pre.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
-  const d = await resp.json();
-  pre.style.display = 'block';
-  pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
-};
-document.getElementById('compress-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const mode = document.getElementById('compress-mode').value;
-  const body = {
-    text: document.getElementById('compress-input').value,
-    ml: mode === 'ml',
-    level: document.getElementById('compress-level').value,
-    format: document.getElementById('compress-format').value,
-    ratio: Number(document.getElementById('compress-ratio').value),
-  };
-  const summary = document.getElementById('compress-summary');
-  const pre = document.getElementById('compress-output');
-  summary.textContent = 'compressing…';
-  pre.style.display = 'none';
-  const resp = await fetch('/api/compress', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    summary.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
-    return;
-  }
-  const d = await resp.json();
-  const ratio = d.original_len ? ((d.compressed_len / d.original_len) * 100).toFixed(1) : '0';
-  summary.textContent = `mode=${d.mode}${d.scorer ? ` scorer=${d.scorer}` : ''} · ${d.original_len} → ${d.compressed_len} chars (${ratio}%) · saved ${d.saved_chars}`;
-  pre.style.display = 'block';
-  pre.textContent = d.compressed;
-};
-async function loadStats() {
-  // legacy stats endpoint kept for backwards compat; compression UI handles
-  // the real interaction now.
-  return;
-}
-function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
-async function loadBudget() {
-  const b = await fetch('/api/budget').then(r => r.json());
-  const cache = b.cache_len === null || b.cache_len === undefined ? 'off' : b.cache_len;
-  document.getElementById('budget-summary').innerHTML = `
-    <span class="kpi">cap<br><b>${fmtUsd(b.cap_usd)}</b></span>
-    <span class="kpi">spent<br><b>${fmtUsd(b.spent_usd)}</b></span>
-    <span class="kpi">remaining<br><b>${fmtUsd(b.remaining_usd)}</b></span>
-    <span class="kpi">cache<br><b>${cache}</b></span>
-  `;
-}
 async function loadPrompts() {
   let prompts = [];
   try { prompts = await fetch('/api/prompts').then(r => r.ok ? r.json() : []); } catch (_) {}
   const tbody = document.querySelector('#prompts-tbl tbody');
-  if (!prompts.length) {
-    tbody.innerHTML = `<tr><td colspan="3" style="color:#666;">no prompts registered yet</td></tr>`;
-    return;
-  }
+  if (!prompts.length) { tbody.innerHTML = `<tr><td colspan="3" class="muted">아직 저장된 프롬프트 없음</td></tr>`; return; }
   tbody.innerHTML = prompts.map(p => {
-    const versions = p.versions.map(v =>
-      `<a data-name="${p.name}" data-version="${v}" style="margin-right:0.5rem;cursor:pointer;color:#2962FF;">v${v}</a>`
-    ).join('');
+    const versions = p.versions.map(v => `<a data-name="${p.name}" data-version="${v}" style="margin-right:0.5rem;cursor:pointer;color:var(--accent);">v${v}</a>`).join('');
     return `<tr><td><code>${p.name}</code></td><td>v${p.latest}</td><td>${versions}</td></tr>`;
   }).join('');
   tbody.querySelectorAll('a[data-name]').forEach(a => a.onclick = async () => {
@@ -1567,64 +1589,27 @@ async function loadPrompts() {
     pre.textContent = `# ${body.name} v${body.version}\n\n${body.body}`;
   });
 }
-(function initTheme() {
-  const saved = localStorage.getItem('rtrt-theme');
-  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const theme = saved || (prefersDark ? 'dark' : 'light');
-  document.documentElement.setAttribute('data-theme', theme);
-})();
-document.getElementById('theme-toggle').onclick = () => {
-  const cur = document.documentElement.getAttribute('data-theme') || 'light';
-  const next = cur === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('rtrt-theme', next);
-};
-document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
-  document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
-  document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
-  a.classList.add('active');
-  const target = a.dataset.tab;
-  document.getElementById(target).classList.add('active');
-});
-document.getElementById('recall-form').onsubmit = async (ev) => {
+
+document.getElementById('setup-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const body = {
-    project: document.getElementById('recall-project').value,
-    query: document.getElementById('recall-query').value,
-    limit: Number(document.getElementById('recall-limit').value) || 10,
-    filter: document.getElementById('recall-filter').value || null,
+    agent: document.getElementById('setup-agent').value,
+    memory: document.getElementById('setup-memory').value || null,
+    binary: document.getElementById('setup-binary').value || null,
   };
-  const tbody = document.querySelector('#recall-tbl tbody');
-  tbody.innerHTML = `<tr><td colspan="4" style="color:#666;">searching…</td></tr>`;
-  try {
-    const resp = await fetch('/api/memory/recall', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      tbody.innerHTML = `<tr><td colspan="4" class="err">${resp.status}: ${await resp.text()}</td></tr>`;
-      return;
-    }
-    const data = await resp.json();
-    if (!data.hits.length) {
-      tbody.innerHTML = `<tr><td colspan="4" style="color:#666;">no hits</td></tr>`;
-      return;
-    }
-    tbody.innerHTML = data.hits.map(h =>
-      `<tr><td>${h.id}</td><td><code>${h.kind}</code></td><td>${h.scope}</td><td>${h.body.replace(/</g, '&lt;')}</td></tr>`
-    ).join('');
-  } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="4" class="err">${e}</td></tr>`;
-  }
+  const pre = document.getElementById('setup-output');
+  pre.style.display = 'none';
+  const r = await fetch('/api/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { pre.style.display = 'block'; pre.innerHTML = `<span class="err">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  pre.style.display = 'block';
+  pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
 };
-loadMetrics();
+
+loadOverview();
 loadTemplates();
-loadStats();
-loadBudget();
 loadPrompts();
-setInterval(loadMetrics, 5000);
-setInterval(loadBudget, 5000);
+setInterval(loadOverview, 5000);
 </script>
 </body>
 </html>

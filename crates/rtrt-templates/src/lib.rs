@@ -25,6 +25,11 @@ pub struct Template {
     pub name: String,
     pub description: String,
     pub source: TemplateSource,
+    /// Project kind. Drives the grouping shown in `rtrt templates` and the
+    /// dashboard Tools tab. Defaults to `Development` so older custom
+    /// manifests that don't set the field still land in a sensible bucket.
+    #[serde(default)]
+    pub category: TemplateCategory,
     #[serde(default)]
     pub variables: Vec<TemplateVariable>,
     pub files: Vec<TemplateFile>,
@@ -37,6 +42,30 @@ pub struct Template {
 pub enum TemplateSource {
     BuiltIn,
     Custom,
+}
+
+/// Project kind. Keeps the surface organised around what the user is trying
+/// to start, not which programming language fronts the scaffold.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TemplateCategory {
+    /// Code projects (CLI / lib / service across any language).
+    #[default]
+    Development,
+    /// UI / brand / wireframe assets.
+    Design,
+    /// Specs, decision records, roadmaps, agent definitions.
+    Planning,
+}
+
+impl TemplateCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Design => "design",
+            Self::Planning => "planning",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

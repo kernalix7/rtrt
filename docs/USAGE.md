@@ -37,6 +37,19 @@ Rules per level (cumulative):
 
 Code blocks (` ``` ` and ` ` `), URLs, and `"quoted strings"` are stashed before the rule pass and restored afterwards, so technical content is never rewritten. Secret-shaped substrings (AWS / GitHub / OpenAI / Anthropic / Slack / Bearer / private-key / `api_key=…`) are replaced with `<REDACTED:<kind>>` **before** the rule pass.
 
+### `rtrt signatures`
+
+Strip function bodies from source via tree-sitter, keep top-level signatures
+only. Best for code-heavy LLM context windows.
+
+```bash
+rtrt signatures --lang rust < crates/rtrt-providers/src/anthropic.rs
+# 8972 bytes → 1948 bytes  (78% saved on a real file)
+```
+
+Currently supports `--lang rust`. Other languages can be added by enabling the
+matching `tree-sitter-<lang>` grammar; see `crates/rtrt-compress/src/treesitter.rs`.
+
 ### `rtrt proxy`
 
 Filter a command's stdout for a known command name.

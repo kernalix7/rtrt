@@ -59,6 +59,17 @@ ANTHROPIC_API_KEY=... rtrt compress --llm \
   --provider anthropic --model claude-haiku-4-5 < passage.md
 ```
 
+### tree-sitter 시그니처 추출 (`treesitter` 피처)
+
+코드 중심 응답에서는 `SignatureExtractor`가 AST를 순회하며 최상위 시그니처만 출력 — `fn` 헤더, `struct` / `enum` / `trait` / `type` / `const` 선언, `impl` 블록 헤더 + 메서드 시그니처. 모든 함수 본문을 `{ /* body */ }`로 치환.
+
+```bash
+rtrt signatures --lang rust < src/anthropic.rs
+# 일반 Rust 소스 기준 70–80% 바이트 절감
+```
+
+현재 그래머: Rust(`tree-sitter-rust`). 다른 언어는 해당 그래머 크레이트를 활성화하고 [`Language`](https://docs.rs/rtrt-compress/latest/rtrt_compress/enum.Language.html)를 확장하면 됨. CLI 바이너리는 `treesitter`가 기본 활성. 라이브러리 사용자는 `features = ["treesitter"]`로 옵트인.
+
 ### 시크릿 검열
 
 검열기는 규칙 패스 **이전**에 실행되므로 `lite`에서도 시크릿이 제거됩니다. 패턴:

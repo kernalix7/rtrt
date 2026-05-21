@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use rtrt_compress::{AsyncCompressor, Compressor, LlmCompressor};
+use rtrt_compress::{
+    AsyncCompressor, Compressor, Language as TsLanguage, LlmCompressor, SignatureExtractor,
+};
 use rtrt_core::CompressionLevel;
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
@@ -75,6 +77,12 @@ enum Cmd {
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Extract top-level signatures from source via tree-sitter (drops bodies).
+    Signatures {
+        /// Language. Currently: `rust`.
+        #[arg(long, default_value = "rust")]
+        lang: String,
     },
     /// Show RTRT version + crate manifest.
     Info,
@@ -273,6 +281,16 @@ async fn main() -> Result<()> {
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
+        Cmd::Signatures { lang } => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let language = match lang.as_str() {
+                "rust" | "rs" => TsLanguage::Rust,
+                other => bail!("unsupported tree-sitter language: {other}"),
+            };
+            let out = SignatureExtractor::new(language).extract(&buf)?;
+            print!("{out}");
+        }
         Cmd::Info => {
             println!("rtrt v{}", env!("CARGO_PKG_VERSION"));
             println!(

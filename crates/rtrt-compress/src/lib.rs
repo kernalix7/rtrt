@@ -21,10 +21,14 @@ pub mod secrets;
 
 #[cfg(feature = "llm-compress")]
 pub mod llm;
+#[cfg(feature = "treesitter")]
+pub mod treesitter;
 
 #[cfg(feature = "llm-compress")]
 pub use llm::{AsyncCompressor, LlmCompressor};
 pub use secrets::redact_secrets;
+#[cfg(feature = "treesitter")]
+pub use treesitter::{Language, SignatureExtractor};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Compressor {

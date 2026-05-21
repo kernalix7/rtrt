@@ -59,6 +59,17 @@ ANTHROPIC_API_KEY=... rtrt compress --llm \
   --provider anthropic --model claude-haiku-4-5 < passage.md
 ```
 
+### Tree-sitter signature extraction (the `treesitter` feature)
+
+For code-heavy responses, `SignatureExtractor` walks the parsed AST and emits only the top-level signatures — `fn` headers, `struct` / `enum` / `trait` / `type` / `const` declarations, and `impl` block headers with method signatures inside — replacing every function body with `{ /* body */ }`.
+
+```bash
+rtrt signatures --lang rust < src/anthropic.rs
+# typical: 70–80% byte savings on a normal Rust source file
+```
+
+Current grammar: Rust (`tree-sitter-rust`). Adding another language is a matter of enabling the matching grammar crate and extending [`Language`](https://docs.rs/rtrt-compress/latest/rtrt_compress/enum.Language.html). The CLI binary builds with `treesitter` enabled by default; library users pulling `rtrt-compress` directly opt in via `features = ["treesitter"]`.
+
 ### Secret redaction
 
 The redactor runs **before** the rule pass, so secrets are scrubbed even if compression is set to `lite`. Patterns covered:

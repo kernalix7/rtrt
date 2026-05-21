@@ -37,6 +37,17 @@ echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
 
 코드 블록(` ``` `, ` ` `), URL, `"인용 문자열"`은 규칙 적용 전에 보호되어 원문 그대로 복원됩니다. 시크릿 패턴(AWS / GitHub / OpenAI / Anthropic / Slack / Bearer / private-key / `api_key=…`)은 규칙 패스 **이전**에 `<REDACTED:<kind>>`로 치환됩니다.
 
+### `rtrt signatures`
+
+tree-sitter로 함수 body 제거, 최상위 시그니처만 남김. 코드 중심 LLM 컨텍스트에 최적.
+
+```bash
+rtrt signatures --lang rust < crates/rtrt-providers/src/anthropic.rs
+# 8972 bytes → 1948 bytes  (실 파일 기준 78% 절감)
+```
+
+현재 `--lang rust`만 지원. 다른 언어는 해당 `tree-sitter-<lang>` 그래머를 활성화하면 됨. `crates/rtrt-compress/src/treesitter.rs` 참조.
+
 ### `rtrt proxy`
 
 명령 이름을 알려주면 그 명령의 표준 출력을 필터링합니다.

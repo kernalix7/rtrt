@@ -225,28 +225,56 @@ impl MemoryStore {
     /// Memories in `project` ordered newest-first. Drives the dashboard
     /// timeline / history view.
     pub fn recent(&self, project: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
+        self.recent_paged(project, limit, 0)
+    }
+
+    /// Paginated newest-first view. `offset` skips that many rows before
+    /// returning up to `limit` records.
+    pub fn recent_paged(
+        &self,
+        project: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<MemoryRecord>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, project, kind, body, created_at, scope FROM memories \
-                  WHERE project = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+                  WHERE project = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![project, limit as i64], |row| {
-                let scope: String = row.get(5)?;
-                Ok(MemoryRecord {
-                    id: row.get(0)?,
-                    project: row.get(1)?,
-                    kind: row.get(2)?,
-                    body: row.get(3)?,
-                    created_at: row.get(4)?,
-                    scope: MemoryScope::parse(&scope),
-                })
-            })
+            .query_map(
+                rusqlite::params![project, limit as i64, offset as i64],
+                |row| {
+                    let scope: String = row.get(5)?;
+                    Ok(MemoryRecord {
+                        id: row.get(0)?,
+                        project: row.get(1)?,
+                        kind: row.get(2)?,
+                        body: row.get(3)?,
+                        created_at: row.get(4)?,
+                        scope: MemoryScope::parse(&scope),
+                    })
+                },
+            )
             .map_err(|e| Error::Memory(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Row count for one project. Used by paginated views to compute the
+    /// total page count without scanning every row client-side.
+    pub fn count_by_project(&self, project: &str) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(n as usize)
     }
 
     /// Returns every `(src_id, dst_id, relation)` edge whose endpoints are

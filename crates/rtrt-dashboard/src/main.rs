@@ -408,6 +408,8 @@ struct MemoryTimelineQuery {
     project: String,
     #[serde(default = "default_timeline_limit")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 fn default_timeline_limit() -> usize {
@@ -424,7 +426,10 @@ async fn memory_timeline(
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
     let rows = guard
-        .recent(&q.project, q.limit)
+        .recent_paged(&q.project, q.limit, q.offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total = guard
+        .count_by_project(&q.project)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let items: Vec<serde_json::Value> = rows
         .into_iter()
@@ -438,7 +443,12 @@ async fn memory_timeline(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "items": items })))
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "total": total,
+        "limit": q.limit,
+        "offset": q.offset,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1237,6 +1247,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .hist-item .when { color: var(--muted); font-size: 0.82em; min-width: 72px; font-variant-numeric: tabular-nums; }
   .hist-item .kind { color: var(--accent); font-size: 0.78em; min-width: 60px; }
   .hist-item .body { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .pager { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.85rem; justify-content: center; }
+  .pager button:disabled { opacity: 0.4; cursor: default; }
 
   /* Template category cards */
   .tpl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
@@ -1359,8 +1371,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
         <div id="sub-memhistory" class="subpage">
           <div class="card">
-            <div class="head"><h2>히스토리</h2><span class="hint">최근 저장 50건</span></div>
+            <div class="head"><h2>히스토리</h2><span id="history-meta" class="hint">전부 영구 저장 · 페이지 단위 50건</span></div>
             <div id="history-list" class="hist-list"><div class="empty">불러오는 중…</div></div>
+            <div id="history-pager" class="pager" hidden>
+              <button id="history-prev" class="ghost" type="button">← 이전</button>
+              <span id="history-page" class="muted"></span>
+              <button id="history-next" class="ghost" type="button">다음 →</button>
+            </div>
             <div style="margin-top:0.75rem;">
               <details><summary class="muted-summary">새 메모리 빠른 저장</summary>
                 <div class="adv">
@@ -1728,14 +1745,22 @@ function openProject(name) {
   document.getElementById('sub-memhistory').hidden = false;
   loadHistory(name);
 }
-async function loadHistory(name) {
+const HISTORY_PAGE_SIZE = 50;
+let HISTORY_OFFSET = 0;
+let HISTORY_TOTAL = 0;
+async function loadHistory(name, offset) {
+  if (offset === undefined) offset = 0;
+  HISTORY_OFFSET = offset;
   const list = document.getElementById('history-list');
   list.innerHTML = '<div class="empty">불러오는 중…</div>';
-  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=50`);
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
   if (!r.ok) { list.innerHTML = `<div class="empty err">${r.status}: ${await r.text()}</div>`; return; }
   const d = await r.json();
+  HISTORY_TOTAL = d.total || 0;
   if (!d.items.length) {
     list.innerHTML = `<div class="empty">아직 메모리 없음. 아래 '새 메모리 빠른 저장' 으로 시작하세요.</div>`;
+    document.getElementById('history-pager').hidden = true;
+    document.getElementById('history-meta').textContent = '전부 영구 저장 · 페이지 단위 50건';
     return;
   }
   list.innerHTML = d.items.map(i =>
@@ -1745,7 +1770,23 @@ async function loadHistory(name) {
        <span class="body">${i.body.replace(/</g, '&lt;')}</span>
      </div>`
   ).join('');
+  const pager = document.getElementById('history-pager');
+  const totalPages = Math.max(1, Math.ceil(HISTORY_TOTAL / HISTORY_PAGE_SIZE));
+  const currentPage = Math.floor(offset / HISTORY_PAGE_SIZE) + 1;
+  document.getElementById('history-page').textContent = `${currentPage} / ${totalPages} · 총 ${HISTORY_TOTAL}건`;
+  document.getElementById('history-prev').disabled = currentPage <= 1;
+  document.getElementById('history-next').disabled = currentPage >= totalPages;
+  pager.hidden = totalPages <= 1;
+  document.getElementById('history-meta').textContent = `${HISTORY_TOTAL}건 전체 영구 저장 · 페이지당 ${HISTORY_PAGE_SIZE}건`;
 }
+document.getElementById('history-prev').onclick = () => {
+  if (!CURRENT_PROJECT) return;
+  loadHistory(CURRENT_PROJECT, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
+};
+document.getElementById('history-next').onclick = () => {
+  if (!CURRENT_PROJECT) return;
+  loadHistory(CURRENT_PROJECT, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
+};
 // Re-load history after save.
 const originalSaveHandler = () => {};
 

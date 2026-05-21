@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         .route("/api/prompts/{name}/{version}", get(get_prompt))
         .route("/api/budget", get(budget))
         .route("/api/memory/recall", post(memory_recall))
+        .route("/api/memory/export", get(memory_export))
         .route("/api/memory/save", post(memory_save))
         .route("/api/memory/blocks", get(list_blocks).post(set_block))
         .route("/api/memory/blocks/{name}", get(get_block))
@@ -366,6 +367,36 @@ async fn memory_recall(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
     Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryExportQuery {
+    project: String,
+}
+
+async fn memory_export(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryExportQuery>,
+) -> std::result::Result<axum::response::Response, (StatusCode, String)> {
+    use axum::http::header;
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let mut buf = Vec::new();
+    guard
+        .export_jsonl(&q.project, &mut buf)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let filename = format!("{}.jsonl", q.project.replace(['/', '\\'], "_"));
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    let resp = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(axum::body::Body::from(buf))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(resp)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1099,7 +1130,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <input id="scaffold-target" placeholder="target directory" required>
     <div id="scaffold-vars" style="grid-column:1 / span 2;"></div>
     <label style="grid-column:1 / span 2;"><input id="scaffold-overwrite" type="checkbox"> overwrite existing files</label>
-    <button type="submit" style="grid-column:1 / span 2;">Scaffold</button>
+    <div style="grid-column:1 / span 2;display:flex;gap:0.5rem;">
+      <button type="button" id="scaffold-preview">Preview</button>
+      <button type="submit">Scaffold</button>
+    </div>
   </form>
   <div id="scaffold-result" style="margin-top:0.5rem;color:#666;"></div>
 </section>
@@ -1265,18 +1299,41 @@ function renderScaffoldVars() {
       ` value="${v.default || ''}" style="width:100%;"></td></tr>`
     ).join('') + `</tbody></table>`;
 }
-document.getElementById('scaffold-form').onsubmit = async (ev) => {
-  ev.preventDefault();
+function buildScaffoldBody() {
   const variables = {};
   document.querySelectorAll('#scaffold-vars [data-var]').forEach(inp => {
     if (inp.value) variables[inp.dataset.var] = inp.value;
   });
-  const body = {
+  return {
     template: document.getElementById('scaffold-template').value,
     target: document.getElementById('scaffold-target').value,
     variables,
     overwrite: document.getElementById('scaffold-overwrite').checked,
   };
+}
+document.getElementById('scaffold-preview').onclick = async () => {
+  const out = document.getElementById('scaffold-result');
+  out.textContent = 'previewing…';
+  const resp = await fetch('/api/templates/scaffold/preview', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(buildScaffoldBody()),
+  });
+  if (!resp.ok) {
+    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
+    return;
+  }
+  const d = await resp.json();
+  const rows = d.files.map(f =>
+    `<tr><td><code>${f.path}</code></td><td>${f.bytes}</td><td>${f.executable ? 'exec' : ''}</td></tr>`
+  ).join('');
+  out.innerHTML = `<div>preview · root <code>${d.root}</code> · ${d.files.length} files</div>` +
+    `<table style="margin-top:0.5rem;"><thead><tr><th>path</th><th>bytes</th><th></th></tr></thead><tbody>${rows}</tbody></table>` +
+    (d.post_hooks.length ? `<div>post-hooks: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}</div>` : '');
+};
+document.getElementById('scaffold-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = buildScaffoldBody();
   const out = document.getElementById('scaffold-result');
   out.textContent = 'scaffolding…';
   const resp = await fetch('/api/templates/scaffold', {

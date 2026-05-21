@@ -22,7 +22,9 @@ rmcp = { workspace = true, features = [
     "server",
     "macros",
     "transport-io",
+    "transport-streamable-http-server",
 ] }
+axum.workspace = true
 schemars = { workspace = true }
 tokio.workspace = true
 serde.workspace = true

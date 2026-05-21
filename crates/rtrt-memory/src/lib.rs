@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub mod embed;
 #[cfg(feature = "hnsw")]
 pub mod hnsw_index;
+pub mod payload;
 pub mod summarise;
 
 #[cfg(feature = "embeddings")]
@@ -23,6 +24,7 @@ pub use embed::FastEmbedder;
 pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
 #[cfg(feature = "hnsw")]
 pub use hnsw_index::{EmbVec, HnswIndex};
+pub use payload::{PayloadFilter, PayloadPredicate};
 #[cfg(feature = "llm")]
 pub use summarise::LlmSummariser;
 pub use summarise::Summariser;
@@ -181,7 +183,93 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v3: add `metadata` column holding a JSON-encoded BTreeMap<String,
+        // String> for qdrant-style payload filtering.
+        if v < 3 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    ALTER TABLE memories ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+                    PRAGMA user_version = 3;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
         Ok(())
+    }
+
+    /// Returns the JSON payload attached to a memory row. Empty when the row
+    /// was stored without metadata.
+    pub fn get_metadata(&self, id: i64) -> Result<std::collections::BTreeMap<String, String>> {
+        let raw: String = self
+            .conn
+            .query_row(
+                "SELECT metadata FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        if raw.is_empty() {
+            return Ok(Default::default());
+        }
+        serde_json::from_str(&raw).map_err(|e| Error::Memory(format!("metadata decode: {e}")))
+    }
+
+    /// Stores `metadata` against an existing memory row.
+    pub fn set_metadata(
+        &self,
+        id: i64,
+        metadata: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let raw = serde_json::to_string(metadata)
+            .map_err(|e| Error::Memory(format!("metadata encode: {e}")))?;
+        self.conn
+            .execute(
+                "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+                rusqlite::params![raw, id],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Saves a project-scoped memory along with a metadata payload.
+    pub fn save_with_metadata(
+        &self,
+        project: &str,
+        kind: &str,
+        body: &str,
+        metadata: &std::collections::BTreeMap<String, String>,
+    ) -> Result<i64> {
+        let id = self.save(project, kind, body)?;
+        self.set_metadata(id, metadata)?;
+        Ok(id)
+    }
+
+    /// BM25 recall + qdrant-style payload filter. Over-fetches by 4× to keep
+    /// the post-filter pass from starving the caller of hits; the limit is
+    /// the maximum number of rows returned after filtering.
+    pub fn recall_bm25_with_filter(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+        filter: &crate::payload::PayloadFilter,
+    ) -> Result<Vec<MemoryRecord>> {
+        if filter.is_empty() {
+            return self.recall_bm25(project, query, limit);
+        }
+        let prelim = self.recall_bm25(project, query, limit.saturating_mul(4))?;
+        let mut out = Vec::with_capacity(limit);
+        for rec in prelim {
+            let payload = self.get_metadata(rec.id)?;
+            if filter.matches(&payload) {
+                out.push(rec);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn save(&self, project: &str, kind: &str, body: &str) -> Result<i64> {
@@ -817,6 +905,38 @@ mod tests {
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
+    }
+
+    #[test]
+    fn payload_filter_narrows_bm25_recall() {
+        use std::collections::BTreeMap;
+        let store = MemoryStore::open_in_memory().unwrap();
+        let mut m_a = BTreeMap::new();
+        m_a.insert("source".into(), "claude".into());
+        m_a.insert("topic".into(), "auth_flow".into());
+        store
+            .save_with_metadata("p1", "note", "rust auth token rotation", &m_a)
+            .unwrap();
+        let mut m_b = BTreeMap::new();
+        m_b.insert("source".into(), "cursor".into());
+        m_b.insert("topic".into(), "billing".into());
+        store
+            .save_with_metadata("p1", "note", "rust billing flow", &m_b)
+            .unwrap();
+
+        let filter = PayloadFilter::parse("source=claude").unwrap();
+        let hits = store
+            .recall_bm25_with_filter("p1", "rust", 5, &filter)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].body.contains("auth"), "{hits:?}");
+
+        let neg = PayloadFilter::parse("source!=cursor,topic~^auth").unwrap();
+        let hits = store
+            .recall_bm25_with_filter("p1", "rust", 5, &neg)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].body.contains("auth"), "{hits:?}");
     }
 
     /// Mock embedder that produces deterministic vectors so we can test

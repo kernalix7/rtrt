@@ -17,6 +17,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use rtrt_core::CompressionLevel;
 
+pub mod ml;
 pub mod secrets;
 
 #[cfg(feature = "llm-compress")]
@@ -26,6 +27,7 @@ pub mod treesitter;
 
 #[cfg(feature = "llm-compress")]
 pub use llm::{AsyncCompressor, LlmCompressor};
+pub use ml::{CompressionTarget, HeuristicImportance, MlCompressor, TokenImportance};
 pub use secrets::redact_secrets;
 #[cfg(feature = "treesitter")]
 pub use treesitter::{Language, SignatureExtractor};

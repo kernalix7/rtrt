@@ -208,6 +208,9 @@ enum MemoryCmd {
         limit: usize,
         #[arg(long, default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
+        /// qdrant-style payload filter (e.g. `source=claude,topic~^auth`).
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Extract atomic facts from a passage via LLM and save each.
     Extract {
@@ -937,9 +940,16 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             query,
             limit,
             store,
+            filter,
         } => {
             let store = MemoryStore::open(&store)?;
-            let hits = store.recall_bm25(&project, &query, limit)?;
+            let hits = match filter {
+                Some(spec) => {
+                    let f = rtrt_memory::PayloadFilter::parse(&spec)?;
+                    store.recall_bm25_with_filter(&project, &query, limit, &f)?
+                }
+                None => store.recall_bm25(&project, &query, limit)?,
+            };
             for h in hits {
                 println!("[{}] {} {}", h.id, h.kind, h.body);
             }

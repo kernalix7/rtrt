@@ -1,15 +1,16 @@
 //! rtrt-mcp — MCP server exposing the RTRT toolkit's surfaces as tools.
 //!
-//! v0.2 ships the stdio transport via the official Rust MCP SDK (`rmcp`). The
-//! tools wrap the public APIs of `rtrt-compress`, `rtrt-memory`, and
-//! `rtrt-templates` — no behaviour is reimplemented inside this crate. HTTP/SSE
-//! transport is on the v0.3 roadmap.
+//! Two transports:
+//! - **stdio** (default) — standard MCP framing for local agent integrations.
+//! - **http** — Streamable HTTP (MCP 2025-06-18) served by `rmcp`'s
+//!   `StreamableHttpService` behind an axum router. Defaults to loopback for
+//!   DNS-rebinding safety; the bind address is configurable.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -17,7 +18,12 @@ use rmcp::{
         CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     schemars, tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    },
 };
 use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
@@ -27,11 +33,27 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Parser)]
-#[command(name = "rtrt-mcp", version, about = "RTRT MCP server (stdio)", long_about = None)]
+#[command(name = "rtrt-mcp", version, about = "RTRT MCP server (stdio + http)", long_about = None)]
 struct Cli {
     /// Path to the SQLite memory store. Created if missing.
     #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
     memory: PathBuf,
+    /// Transport. `stdio` is the default for local agent integrations;
+    /// `http` exposes the Streamable HTTP transport over an axum router.
+    #[arg(long, value_enum, default_value = "stdio")]
+    transport: Transport,
+    /// Bind address for `--transport http`.
+    #[arg(long, default_value = "127.0.0.1:3112")]
+    bind: String,
+    /// HTTP mount path for the MCP endpoint.
+    #[arg(long, default_value = "/mcp")]
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Transport {
+    Stdio,
+    Http,
 }
 
 #[derive(Clone)]
@@ -75,6 +97,9 @@ struct MemoryRecallArgs {
     query: String,
     #[serde(default = "default_limit")]
     limit: u32,
+    /// Optional qdrant-style payload filter — e.g. `source=claude,topic~^auth`.
+    #[serde(default)]
+    filter: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -132,13 +157,13 @@ struct TemplatesScaffoldArgs {
 
 #[tool_router]
 impl RtrtMcp {
-    pub fn new(memory: MemoryStore, gateway: Arc<Gateway>) -> Self {
+    /// Build from an already-shared state — same state is reused across stdio
+    /// and HTTP transports so every session shares one SQLite handle + one
+    /// gateway.
+    pub fn with_state(state: Arc<RtrtState>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            state: Arc::new(RtrtState {
-                memory: Mutex::new(memory),
-                gateway,
-            }),
+            state,
         }
     }
 
@@ -192,9 +217,24 @@ impl RtrtMcp {
         Parameters(args): Parameters<MemoryRecallArgs>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.state.memory.lock().await;
-        let hits = store
-            .recall_bm25(&args.project, &args.query, args.limit as usize)
-            .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?;
+        let hits = match args.filter.as_deref() {
+            Some(spec) if !spec.is_empty() => {
+                let filter = rtrt_memory::PayloadFilter::parse(spec).map_err(|e| {
+                    McpError::invalid_params(format!("memory.recall filter: {e}"), None)
+                })?;
+                store
+                    .recall_bm25_with_filter(
+                        &args.project,
+                        &args.query,
+                        args.limit as usize,
+                        &filter,
+                    )
+                    .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?
+            }
+            _ => store
+                .recall_bm25(&args.project, &args.query, args.limit as usize)
+                .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?,
+        };
         let body = serde_json::to_value(&hits)
             .map_err(|e| McpError::internal_error(format!("memory.recall serialize: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -371,11 +411,36 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let memory = MemoryStore::open(&cli.memory)?;
     let gateway = Arc::new(Gateway::from_env());
-    tracing::info!(
-        "rtrt-mcp starting on stdio; memory={}",
-        cli.memory.display()
-    );
-    let service = RtrtMcp::new(memory, gateway).serve(stdio()).await?;
-    service.waiting().await?;
+    let shared_state = Arc::new(RtrtState {
+        memory: Mutex::new(memory),
+        gateway,
+    });
+    match cli.transport {
+        Transport::Stdio => {
+            tracing::info!(
+                "rtrt-mcp starting on stdio; memory={}",
+                cli.memory.display()
+            );
+            let service = RtrtMcp::with_state(shared_state).serve(stdio()).await?;
+            service.waiting().await?;
+        }
+        Transport::Http => {
+            tracing::info!(
+                "rtrt-mcp starting on http://{}{}; memory={}",
+                cli.bind,
+                cli.path,
+                cli.memory.display()
+            );
+            let factory_state = shared_state.clone();
+            let mcp_service = StreamableHttpService::new(
+                move || Ok(RtrtMcp::with_state(factory_state.clone())),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default(),
+            );
+            let app = axum::Router::new().route_service(&cli.path, mcp_service);
+            let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
+            axum::serve(listener, app).await?;
+        }
+    }
     Ok(())
 }

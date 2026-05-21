@@ -369,6 +369,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 <nav>
   <a data-tab="metrics" class="active">Metrics</a>
+  <a data-tab="budget">Budget</a>
+  <a data-tab="prompts">Prompts</a>
   <a data-tab="templates">Templates</a>
   <a data-tab="stats">Compression</a>
 </nav>
@@ -380,6 +382,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <table id="metrics-recent"><thead>
     <tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>latency</th><th>status</th></tr>
   </thead><tbody></tbody></table>
+</section>
+
+<section id="budget">
+  <h2>Spending budget</h2>
+  <div id="budget-summary">loading…</div>
+  <p style="color:#666;margin-top:1rem;">Attach a cap via <code>Gateway::with_budget</code>. Spend is priced from the recorded metrics window.</p>
+</section>
+
+<section id="prompts">
+  <h2>Versioned prompts</h2>
+  <p style="color:#666;">Backed by <code>PromptRegistry</code> at <code>$RTRT_PROMPTS_DIR</code> (defaults to <code>~/.rtrt/prompts</code>).</p>
+  <table id="prompts-tbl"><thead><tr><th>Name</th><th>Latest</th><th>Versions</th></tr></thead><tbody></tbody></table>
+  <pre id="prompt-body" style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:0.75rem;border-radius:4px;display:none;"></pre>
 </section>
 
 <section id="templates">
@@ -422,6 +437,36 @@ async function loadStats() {
   document.getElementById('stats-body').textContent =
     `input saved: ${s.input_saved}   ·   output saved: ${s.output_saved}`;
 }
+function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
+async function loadBudget() {
+  const b = await fetch('/api/budget').then(r => r.json());
+  document.getElementById('budget-summary').innerHTML = `
+    <span class="kpi">cap<br><b>${fmtUsd(b.cap_usd)}</b></span>
+    <span class="kpi">spent<br><b>${fmtUsd(b.spent_usd)}</b></span>
+    <span class="kpi">remaining<br><b>${fmtUsd(b.remaining_usd)}</b></span>
+  `;
+}
+async function loadPrompts() {
+  let prompts = [];
+  try { prompts = await fetch('/api/prompts').then(r => r.ok ? r.json() : []); } catch (_) {}
+  const tbody = document.querySelector('#prompts-tbl tbody');
+  if (!prompts.length) {
+    tbody.innerHTML = `<tr><td colspan="3" style="color:#666;">no prompts registered yet</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = prompts.map(p => {
+    const versions = p.versions.map(v =>
+      `<a data-name="${p.name}" data-version="${v}" style="margin-right:0.5rem;cursor:pointer;color:#2962FF;">v${v}</a>`
+    ).join('');
+    return `<tr><td><code>${p.name}</code></td><td>v${p.latest}</td><td>${versions}</td></tr>`;
+  }).join('');
+  tbody.querySelectorAll('a[data-name]').forEach(a => a.onclick = async () => {
+    const body = await fetch(`/api/prompts/${a.dataset.name}/${a.dataset.version}`).then(r => r.json());
+    const pre = document.getElementById('prompt-body');
+    pre.style.display = 'block';
+    pre.textContent = `# ${body.name} v${body.version}\n\n${body.body}`;
+  });
+}
 document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
   document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
@@ -432,7 +477,10 @@ document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
 loadMetrics();
 loadTemplates();
 loadStats();
+loadBudget();
+loadPrompts();
 setInterval(loadMetrics, 5000);
+setInterval(loadBudget, 5000);
 </script>
 </body>
 </html>

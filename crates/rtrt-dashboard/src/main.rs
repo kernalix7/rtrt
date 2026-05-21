@@ -1164,6 +1164,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
   /* Graph canvas */
   #graph-canvas { cursor: grab; }
 
+  /* Command palette */
+  .palette-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.4); display: none; align-items: flex-start; justify-content: center; padding-top: 10vh; z-index: 100; }
+  .palette-backdrop.open { display: flex; }
+  .palette { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 48px rgba(0,0,0,.25); width: min(520px, 90vw); overflow: hidden; }
+  .palette input { width: 100%; padding: 1rem; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; font-size: 1.05rem; }
+  .palette input:focus { box-shadow: none; }
+  .palette ul { list-style: none; margin: 0; padding: 0.25rem; max-height: 50vh; overflow-y: auto; }
+  .palette li { padding: 0.55rem 0.75rem; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 0.6rem; }
+  .palette li.active, .palette li:hover { background: var(--accent-soft); color: var(--accent); }
+  .palette li .meta { color: var(--muted); font-size: 0.85em; margin-left: auto; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -1180,6 +1191,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <span id="pill-memory" class="pill"><span class="dot"></span>메모리</span>
   <span id="pill-cache" class="pill"><span class="dot"></span>캐시</span>
   <span class="spacer"></span>
+  <button id="open-palette" title="빠른 이동 (Ctrl/Cmd + K)" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--muted);padding:0.3rem 0.7rem;border-radius:6px;font-size:0.85em;">⌘K 빠른 이동</button>
   <button id="theme-toggle" title="다크/라이트">🌗</button>
 </div>
 
@@ -1331,7 +1343,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="head"><h2>텍스트 압축</h2><span class="hint">기본은 full 레벨 룰 엔진</span></div>
           <form id="compress-form">
             <textarea id="compress-input" rows="5" placeholder="줄일 텍스트를 붙여 넣으세요" required></textarea>
-            <button class="primary" type="submit">압축</button>
+            <div style="display:flex;gap:0.5rem;">
+              <button class="primary" type="submit">압축</button>
+              <button type="button" class="ghost" data-sample="compress">예시 채우기</button>
+            </div>
             <details><summary class="muted-summary">고급 옵션</summary>
               <div class="adv">
                 <div class="row">
@@ -1366,7 +1381,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <form id="proxy-form">
             <input id="proxy-command" placeholder="명령 (예: git status)">
             <textarea id="proxy-raw" rows="5" placeholder="원본 stdout / stderr" required></textarea>
-            <button class="primary" type="submit">필터링</button>
+            <div style="display:flex;gap:0.5rem;">
+              <button class="primary" type="submit">필터링</button>
+              <button type="button" class="ghost" data-sample="proxy">예시 채우기</button>
+            </div>
             <details><summary class="muted-summary">고급 옵션</summary>
               <div class="adv">
                 <div class="row">
@@ -1391,7 +1409,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <form id="diagnose-form">
             <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
             <textarea id="diagnose-raw" rows="8" placeholder="빌드 / 테스트 실패 로그" required></textarea>
-            <button class="primary" type="submit">진단 요청</button>
+            <div style="display:flex;gap:0.5rem;">
+              <button class="primary" type="submit">진단 요청</button>
+              <button type="button" class="ghost" data-sample="diagnose">예시 채우기</button>
+            </div>
             <details><summary class="muted-summary">고급 옵션</summary>
               <div class="adv">
                 <input id="diagnose-context" type="number" min="0" max="20" value="3" title="컨텍스트 줄 수">
@@ -1498,6 +1519,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </main>
 </div>
 
+<div id="palette-backdrop" class="palette-backdrop" role="dialog" aria-hidden="true">
+  <div class="palette">
+    <input id="palette-input" placeholder="이동할 곳 또는 작업 (예: 메모리, 압축, 진단)" autocomplete="off">
+    <ul id="palette-list"></ul>
+  </div>
+</div>
+
 <div class="activity">
   <span class="dot-pulse"></span>
   <span class="feed" id="activity-feed">대시보드 부팅 완료. 좌측 메뉴에서 작업을 시작하세요.</span>
@@ -1554,6 +1582,111 @@ if (savedProject) {
 PROJECT_INPUTS.forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', () => syncProject(el.value));
+});
+
+// Sample data — one-click form fillers so the user can try a tool without
+// digging up an example. Each entry is a function so it can vary per call.
+const SAMPLES = {
+  compress() {
+    const ta = document.getElementById('compress-input');
+    ta.value = '솔직히 말하자면, 사실 이 버그는 정말 기본적으로 파서에서 발생합니다. 제가 생각하기에 우리가 해야 할 일은, 사실 입력 검증을 좀 더 추가하는 것입니다. 다시 말해, 모든 사용자 입력에 대해 기본적으로 sanitize를 적용해야 합니다.';
+    pushActivity('압축 예시 채움');
+  },
+  proxy() {
+    document.getElementById('proxy-command').value = 'cargo build';
+    const ta = document.getElementById('proxy-raw');
+    ta.value = '   Compiling rtrt-core v0.1.0\n   Compiling rtrt-compress v0.1.0\n   Compiling rtrt-memory v0.1.0\nerror[E0599]: no method named `foo` found for struct `Bar`\n   --> crates/rtrt-memory/src/lib.rs:204:18\n    |\n204 |         store.foo();\n    |               ^^^ method not found\n   Compiling rtrt-providers v0.1.0\nwarning: unused variable `x`\n   --> src/lib.rs:42:9\nerror: could not compile `rtrt-memory` due to previous error';
+    pushActivity('필터 예시 채움');
+  },
+  diagnose() {
+    document.getElementById('diagnose-model').value = 'claude-haiku-4-5';
+    const ta = document.getElementById('diagnose-raw');
+    ta.value = 'test result: FAILED. 1 passed; 1 failed; 0 ignored\n\nfailures:\n---- tests::roundtrip stdout ----\nthread \'tests::roundtrip\' panicked at \'assertion `left == right` failed\n  left: "hello"\n right: "Hello"\', src/lib.rs:42:9\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace';
+    pushActivity('진단 예시 채움');
+  },
+};
+document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
+  const fn = SAMPLES[btn.dataset.sample];
+  if (fn) fn();
+});
+
+// Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
+const PALETTE_ITEMS = [
+  { label: '개요로 이동',     hint: 'Overview', run: () => navigate('overview') },
+  { label: '메모리 — 검색', hint: 'Memory · query', run: () => { navigate('memory'); subClick('memory-subtabs', 'memquery'); document.getElementById('recall-query').focus(); } },
+  { label: '메모리 — 맵', hint: 'Memory · graph', run: () => { navigate('memory'); subClick('memory-subtabs', 'memmap'); } },
+  { label: '메모리 — 블록', hint: 'Memory · blocks', run: () => { navigate('memory'); subClick('memory-subtabs', 'memblocks'); } },
+  { label: '메모리 — 백업', hint: 'Memory · export', run: () => { navigate('memory'); subClick('memory-subtabs', 'membackup'); } },
+  { label: '도구 — 압축', hint: 'Tools · compress', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); document.getElementById('compress-input').focus(); } },
+  { label: '도구 — 진단', hint: 'Tools · diagnose', run: () => { navigate('tools'); subClick('tool-subtabs', 'diagnose'); } },
+  { label: '도구 — 코드 맵', hint: 'Tools · repo-map', run: () => { navigate('tools'); subClick('tool-subtabs', 'repomap'); } },
+  { label: '도구 — 템플릿', hint: 'Tools · templates', run: () => { navigate('tools'); subClick('tool-subtabs', 'templates'); } },
+  { label: '도구 — 프롬프트', hint: 'Tools · prompts', run: () => { navigate('tools'); subClick('tool-subtabs', 'prompts'); } },
+  { label: '설정 — 에이전트 연결', hint: 'Settings · connect', run: () => { navigate('settings'); subClick('setting-subtabs', 'connect'); } },
+  { label: '설정 — 환경', hint: 'Settings · env', run: () => { navigate('settings'); subClick('setting-subtabs', 'env'); } },
+  { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
+  { label: '예시: 압축', hint: 'sample · compress', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); SAMPLES.compress(); } },
+  { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); SAMPLES.proxy(); } },
+  { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('tools'); subClick('tool-subtabs', 'diagnose'); SAMPLES.diagnose(); } },
+];
+function navigate(page) {
+  document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(x => x.hidden = true);
+  const link = document.querySelector(`aside a.nav[data-page="${page}"]`);
+  if (link) link.classList.add('active');
+  const target = document.getElementById('page-' + page);
+  if (target) target.hidden = false;
+}
+function subClick(navId, sub) {
+  const a = document.querySelector(`#${navId} a[data-sub="${sub}"]`);
+  if (a) a.click();
+}
+
+const palette = document.getElementById('palette-backdrop');
+const paletteInput = document.getElementById('palette-input');
+const paletteList = document.getElementById('palette-list');
+let paletteIdx = 0;
+function renderPalette() {
+  const q = paletteInput.value.trim().toLowerCase();
+  const items = PALETTE_ITEMS.filter(it => !q || it.label.toLowerCase().includes(q) || it.hint.toLowerCase().includes(q));
+  paletteList.innerHTML = items.map((it, i) =>
+    `<li data-idx="${i}" class="${i === paletteIdx ? 'active' : ''}">${it.label}<span class="meta">${it.hint}</span></li>`
+  ).join('') || '<li class="meta" style="padding:0.75rem;">결과 없음</li>';
+  paletteList.dataset.items = JSON.stringify(items.map((_, i) => i));
+  paletteList.querySelectorAll('li[data-idx]').forEach(li => li.onclick = () => {
+    const idx = Number(li.dataset.idx);
+    if (items[idx]) { items[idx].run(); closePalette(); }
+  });
+}
+function openPalette() {
+  palette.classList.add('open');
+  palette.setAttribute('aria-hidden', 'false');
+  paletteInput.value = '';
+  paletteIdx = 0;
+  renderPalette();
+  paletteInput.focus();
+}
+function closePalette() {
+  palette.classList.remove('open');
+  palette.setAttribute('aria-hidden', 'true');
+}
+paletteInput.addEventListener('input', () => { paletteIdx = 0; renderPalette(); });
+paletteInput.addEventListener('keydown', (ev) => {
+  const items = JSON.parse(paletteList.dataset.items || '[]');
+  if (ev.key === 'ArrowDown') { ev.preventDefault(); paletteIdx = (paletteIdx + 1) % Math.max(1, items.length); renderPalette(); }
+  else if (ev.key === 'ArrowUp') { ev.preventDefault(); paletteIdx = (paletteIdx - 1 + items.length) % Math.max(1, items.length); renderPalette(); }
+  else if (ev.key === 'Enter') {
+    const q = paletteInput.value.trim().toLowerCase();
+    const filtered = PALETTE_ITEMS.filter(it => !q || it.label.toLowerCase().includes(q) || it.hint.toLowerCase().includes(q));
+    if (filtered[paletteIdx]) { filtered[paletteIdx].run(); closePalette(); }
+  } else if (ev.key === 'Escape') { closePalette(); }
+});
+palette.addEventListener('click', (ev) => { if (ev.target === palette) closePalette(); });
+document.addEventListener('keydown', (ev) => {
+  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'k') {
+    ev.preventDefault();
+    palette.classList.contains('open') ? closePalette() : openPalette();
+  }
 });
 
 // Activity feed
@@ -2047,7 +2180,8 @@ loadOverview();
 loadTemplates();
 loadPrompts();
 setInterval(loadOverview, 5000);
-pushActivity('대시보드 부팅 완료. 좌측 메뉴에서 작업을 시작하세요.');
+document.getElementById('open-palette').onclick = openPalette;
+pushActivity('대시보드 부팅 완료. ⌘K 또는 Ctrl+K 로 빠르게 이동하세요.');
 </script>
 </body>
 </html>

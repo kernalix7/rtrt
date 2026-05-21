@@ -1197,11 +1197,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 <div class="layout">
   <aside>
-    <div class="group">메인</div>
-    <a class="nav active" data-page="overview"><span class="icon">🏠</span>개요</a>
+    <div class="group">개요</div>
+    <a class="nav active" data-page="overview"><span class="icon">🏠</span>대시보드</a>
     <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
-    <a class="nav" data-page="tools"><span class="icon">🛠</span>도구</a>
-    <a class="nav" data-page="settings"><span class="icon">⚙️</span>설정</a>
+    <div class="group">도구</div>
+    <a class="nav" data-page="compress"><span class="icon">🗜</span>압축</a>
+    <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
+    <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드 맵</a>
+    <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
+    <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
+    <div class="group">설정</div>
+    <a class="nav" data-page="connect"><span class="icon">🔌</span>에이전트 연결</a>
+    <a class="nav" data-page="env"><span class="icon">⚙️</span>환경</a>
   </aside>
 
   <main>
@@ -1324,21 +1331,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
       </div>
     </section>
 
-    <!-- 도구 -->
-    <section id="page-tools" class="page" hidden>
+    <!-- 압축 -->
+    <section id="page-compress" class="page" hidden>
       <div class="section-head">
-        <h1>도구</h1>
-        <div class="lede">텍스트 줄이기, 실패 진단, 코드 시그니처, 템플릿 스캐폴드, 프롬프트.</div>
+        <h1>압축</h1>
+        <div class="lede">텍스트 또는 명령 출력을 줄여 토큰 사용량 절감.</div>
       </div>
-      <nav class="subtabs" id="tool-subtabs">
-        <a class="active" data-sub="compress">압축</a>
-        <a data-sub="diagnose">진단</a>
-        <a data-sub="repomap">코드 맵</a>
-        <a data-sub="templates">템플릿</a>
-        <a data-sub="prompts">프롬프트</a>
-      </nav>
-
-      <div id="sub-compress" class="subpage">
         <div class="card">
           <div class="head"><h2>텍스트 압축</h2><span class="hint">기본은 full 레벨 룰 엔진</span></div>
           <form id="compress-form">
@@ -1401,9 +1399,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div id="proxy-summary" class="out-meta"></div>
           <pre id="proxy-output" hidden></pre>
         </div>
-      </div>
+    </section>
 
-      <div id="sub-diagnose" class="subpage" hidden>
+    <!-- 진단 -->
+    <section id="page-diagnose" class="page" hidden>
+      <div class="section-head">
+        <h1>진단</h1>
+        <div class="lede">빌드 / 테스트 실패 로그를 LLM 에게 던지고 한 줄 답을 받음.</div>
+      </div>
         <div class="card">
           <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄</span></div>
           <form id="diagnose-form">
@@ -1422,9 +1425,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div id="diagnose-meta" class="out-meta"></div>
           <pre id="diagnose-output" hidden></pre>
         </div>
-      </div>
+    </section>
 
-      <div id="sub-repomap" class="subpage" hidden>
+    <!-- 코드 맵 -->
+    <section id="page-repomap" class="page" hidden>
+      <div class="section-head">
+        <h1>코드 맵</h1>
+        <div class="lede">소스 트리에서 함수 / 클래스 시그니처만 추출.</div>
+      </div>
         <div class="card">
           <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동</span></div>
           <form id="repomap-form">
@@ -1442,9 +1450,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div id="repomap-summary" class="out-meta"></div>
           <pre id="repomap-output" style="max-height:420px;overflow:auto;" hidden></pre>
         </div>
-      </div>
+    </section>
 
-      <div id="sub-templates" class="subpage" hidden>
+    <!-- 템플릿 -->
+    <section id="page-templates" class="page" hidden>
+      <div class="section-head">
+        <h1>템플릿</h1>
+        <div class="lede">새 프로젝트 시작. 개발 / 디자인 / 설계 카테고리.</div>
+      </div>
         <div class="card">
           <div class="head"><h2>프로젝트 템플릿</h2><span class="hint">개발 · 디자인 · 설계 카테고리</span></div>
           <table id="tpl"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody><tr><td colspan="4" class="empty">불러오는 중…</td></tr></tbody></table>
@@ -1465,30 +1478,29 @@ const INDEX_HTML: &str = r#"<!doctype html>
           </form>
           <div id="scaffold-result" class="out-meta"></div>
         </div>
-      </div>
+    </section>
 
-      <div id="sub-prompts" class="subpage" hidden>
+    <!-- 프롬프트 -->
+    <section id="page-prompts" class="page" hidden>
+      <div class="section-head">
+        <h1>프롬프트</h1>
+        <div class="lede">버전 관리되는 프롬프트 라이브러리.</div>
+      </div>
         <div class="card">
           <div class="head"><h2>버전 프롬프트</h2><span class="hint">$RTRT_PROMPTS_DIR (기본 ~/.rtrt/prompts)</span></div>
           <table id="prompts-tbl"><thead><tr><th>이름</th><th>최신</th><th>버전</th></tr></thead><tbody><tr><td colspan="3" class="empty">아직 저장된 프롬프트 없음. CLI <code>rtrt prompt save</code> 로 추가하세요.</td></tr></tbody></table>
           <pre id="prompt-body" hidden></pre>
         </div>
-      </div>
     </section>
 
-    <!-- 설정 -->
-    <section id="page-settings" class="page" hidden>
+    <!-- 에이전트 연결 -->
+    <section id="page-connect" class="page" hidden>
       <div class="section-head">
-        <h1>설정</h1>
-        <div class="lede">에이전트 연결 + 환경 정보.</div>
+        <h1>에이전트 연결</h1>
+        <div class="lede">Claude Code / Cursor / Codex 의 MCP 설정 스니펫 생성. 디스크 미기록.</div>
       </div>
-      <nav class="subtabs" id="setting-subtabs">
-        <a class="active" data-sub="connect">에이전트 연결</a>
-        <a data-sub="env">환경</a>
-      </nav>
-      <div id="sub-connect" class="subpage">
         <div class="card">
-          <div class="head"><h2>MCP 설정 스니펫 생성</h2><span class="hint">디스크에 쓰지 않음 — 복붙용 출력만</span></div>
+          <div class="head"><h2>MCP 설정 스니펫</h2></div>
           <form id="setup-form">
             <div class="row">
               <select id="setup-agent">
@@ -1503,8 +1515,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
           </form>
           <pre id="setup-output" hidden></pre>
         </div>
+    </section>
+
+    <!-- 환경 -->
+    <section id="page-env" class="page" hidden>
+      <div class="section-head">
+        <h1>환경</h1>
+        <div class="lede">현재 대시보드 바인딩 / 인증 / 캐시 / 예산 한도.</div>
       </div>
-      <div id="sub-env" class="subpage" hidden>
         <div class="card">
           <div class="head"><h2>환경 정보</h2></div>
           <table id="env-tbl"><tbody>
@@ -1514,7 +1532,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <tr><td>예산 한도</td><td id="env-budget">—</td></tr>
           </tbody></table>
         </div>
-      </div>
     </section>
   </main>
 </div>
@@ -1563,8 +1580,6 @@ function wireSubtabs(navId) {
     document.getElementById('sub-' + a.dataset.sub).hidden = false;
   });
 }
-wireSubtabs('tool-subtabs');
-wireSubtabs('setting-subtabs');
 wireSubtabs('memory-subtabs');
 
 // Project name memory — last-used value persists across reloads so the user
@@ -1612,22 +1627,22 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
 
 // Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
 const PALETTE_ITEMS = [
-  { label: '개요로 이동',     hint: 'Overview', run: () => navigate('overview') },
-  { label: '메모리 — 검색', hint: 'Memory · query', run: () => { navigate('memory'); subClick('memory-subtabs', 'memquery'); document.getElementById('recall-query').focus(); } },
-  { label: '메모리 — 맵', hint: 'Memory · graph', run: () => { navigate('memory'); subClick('memory-subtabs', 'memmap'); } },
-  { label: '메모리 — 블록', hint: 'Memory · blocks', run: () => { navigate('memory'); subClick('memory-subtabs', 'memblocks'); } },
-  { label: '메모리 — 백업', hint: 'Memory · export', run: () => { navigate('memory'); subClick('memory-subtabs', 'membackup'); } },
-  { label: '도구 — 압축', hint: 'Tools · compress', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); document.getElementById('compress-input').focus(); } },
-  { label: '도구 — 진단', hint: 'Tools · diagnose', run: () => { navigate('tools'); subClick('tool-subtabs', 'diagnose'); } },
-  { label: '도구 — 코드 맵', hint: 'Tools · repo-map', run: () => { navigate('tools'); subClick('tool-subtabs', 'repomap'); } },
-  { label: '도구 — 템플릿', hint: 'Tools · templates', run: () => { navigate('tools'); subClick('tool-subtabs', 'templates'); } },
-  { label: '도구 — 프롬프트', hint: 'Tools · prompts', run: () => { navigate('tools'); subClick('tool-subtabs', 'prompts'); } },
-  { label: '설정 — 에이전트 연결', hint: 'Settings · connect', run: () => { navigate('settings'); subClick('setting-subtabs', 'connect'); } },
-  { label: '설정 — 환경', hint: 'Settings · env', run: () => { navigate('settings'); subClick('setting-subtabs', 'env'); } },
+  { label: '대시보드', hint: 'overview', run: () => navigate('overview') },
+  { label: '메모리 — 검색', hint: 'memory · query', run: () => { navigate('memory'); subClick('memory-subtabs', 'memquery'); document.getElementById('recall-query').focus(); } },
+  { label: '메모리 — 맵', hint: 'memory · graph', run: () => { navigate('memory'); subClick('memory-subtabs', 'memmap'); } },
+  { label: '메모리 — 블록', hint: 'memory · blocks', run: () => { navigate('memory'); subClick('memory-subtabs', 'memblocks'); } },
+  { label: '메모리 — 백업', hint: 'memory · export', run: () => { navigate('memory'); subClick('memory-subtabs', 'membackup'); } },
+  { label: '압축', hint: 'compress / proxy', run: () => { navigate('compress'); document.getElementById('compress-input').focus(); } },
+  { label: '진단', hint: 'diagnose', run: () => navigate('diagnose') },
+  { label: '코드 맵', hint: 'repo-map', run: () => navigate('repomap') },
+  { label: '템플릿', hint: 'project scaffolds', run: () => navigate('templates') },
+  { label: '프롬프트', hint: 'prompts', run: () => navigate('prompts') },
+  { label: '에이전트 연결', hint: 'mcp setup', run: () => navigate('connect') },
+  { label: '환경', hint: 'env info', run: () => navigate('env') },
   { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
-  { label: '예시: 압축', hint: 'sample · compress', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); SAMPLES.compress(); } },
-  { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('tools'); subClick('tool-subtabs', 'compress'); SAMPLES.proxy(); } },
-  { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('tools'); subClick('tool-subtabs', 'diagnose'); SAMPLES.diagnose(); } },
+  { label: '예시: 압축', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
+  { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
+  { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
 ];
 function navigate(page) {
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));

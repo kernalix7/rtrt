@@ -39,3 +39,10 @@ llm = ["dep:rtrt-providers"]
 # which is fine for a few thousand memories but starts costing real time
 # beyond ~50k.
 hnsw = ["dep:instant-distance"]
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "recall_bench"
+harness = false

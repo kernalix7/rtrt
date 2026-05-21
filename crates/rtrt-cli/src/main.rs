@@ -119,6 +119,11 @@ enum Cmd {
         #[arg(long, default_value = ".rs")]
         ext: String,
     },
+    /// Build a compressed git-state context for the LLM.
+    Context {
+        #[command(subcommand)]
+        cmd: ContextCmd,
+    },
     /// Run a command, capture stdout+stderr, and filter to errors/warnings only.
     Run {
         /// Command + args. Quote spaces.
@@ -213,6 +218,29 @@ enum MemoryCmd {
         base_url: Option<String>,
         #[arg(long, default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCmd {
+    /// `git status` filtered through `rtrt-proxy`.
+    Status {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// `git diff [base]` filtered through `rtrt-proxy`.
+    Diff {
+        /// Base ref. Empty = working tree vs HEAD.
+        base: Option<String>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// `git log -<n>` filtered through `rtrt-proxy`.
+    Log {
+        #[arg(short, long, default_value_t = 20)]
+        count: u32,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
     },
 }
 
@@ -386,6 +414,7 @@ async fn main() -> Result<()> {
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
+        Cmd::Context { cmd } => run_context(cmd)?,
         Cmd::Run {
             argv,
             context,
@@ -675,6 +704,55 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_context(cmd: ContextCmd) -> Result<()> {
+    match cmd {
+        ContextCmd::Status { repo } => {
+            let out = git_capture(&repo, &["status", "--short", "--branch"])?;
+            print_filtered(&out, "git status");
+        }
+        ContextCmd::Diff { base, repo } => {
+            let mut args = vec!["diff"];
+            if let Some(b) = base.as_deref() {
+                args.push(b);
+            }
+            let out = git_capture(&repo, &args)?;
+            print!("{out}");
+        }
+        ContextCmd::Log { count, repo } => {
+            let n = count.to_string();
+            let out = git_capture(&repo, &["log", "--oneline", "-n", &n])?;
+            print_filtered(&out, "git log");
+        }
+    }
+    Ok(())
+}
+
+fn git_capture(repo: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&out.stdout));
+    if !out.stderr.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(combined)
+}
+
+fn print_filtered(raw: &str, command: &str) {
+    let out = match rtrt_proxy::filter_for(command) {
+        Some(f) => f.apply(raw),
+        None => raw.to_string(),
+    };
+    print!("{out}");
 }
 
 fn run_prompt(cmd: PromptCmd) -> Result<()> {

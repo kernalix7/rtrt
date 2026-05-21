@@ -3119,12 +3119,15 @@ dependencies = [
 name = "rtrt-templates"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dirs 5.0.1",
  "handlebars",
  "once_cell",
  "rtrt-core",
+ "rtrt-providers",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
  "walkdir",
 ]

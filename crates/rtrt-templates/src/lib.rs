@@ -5,10 +5,14 @@
 //! `~/.rtrt/templates/<name>/` with a `manifest.toml`.
 
 pub mod builtin;
+#[cfg(feature = "chains")]
+pub mod chains;
 pub mod custom;
 pub mod prompts;
 pub mod render;
 
+#[cfg(feature = "chains")]
+pub use chains::{PromptChain, PromptStep, StepOutput};
 pub use prompts::{Prompt, PromptRegistry};
 
 use std::collections::BTreeMap;

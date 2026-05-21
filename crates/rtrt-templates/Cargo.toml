@@ -17,3 +17,15 @@ toml = { workspace = true }
 walkdir = { workspace = true }
 dirs = { workspace = true }
 handlebars = { workspace = true }
+async-trait.workspace = true
+rtrt-providers = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables `chains::PromptChain` — sequential prompt composition that routes
+# each step through a `rtrt_providers::Provider` and threads the previous
+# step's output into the next via `{{previous}}`.
+chains = ["dep:rtrt-providers"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

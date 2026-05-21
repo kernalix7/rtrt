@@ -51,6 +51,13 @@ enum Cmd {
         /// Output framing — chroma-style multi-format.
         #[arg(long, value_enum, default_value = "plain")]
         format: FormatArg,
+        /// Use the LLMLingua-style ML compressor (token importance scoring)
+        /// instead of the rule engine. Mutually exclusive with --llm.
+        #[arg(long, conflicts_with = "llm")]
+        ml: bool,
+        /// Target ratio for --ml (fraction of input tokens to keep). Default 0.5.
+        #[arg(long, default_value_t = 0.5)]
+        ratio: f32,
     },
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
@@ -393,6 +400,8 @@ async fn main() -> Result<()> {
             model,
             base_url,
             format,
+            ml,
+            ratio,
         } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -403,6 +412,10 @@ async fn main() -> Result<()> {
                 let compressor = LlmCompressor::new(provider, model);
                 let out = compressor.compress(&buf).await?;
                 print!("{out}");
+            } else if ml {
+                let target = rtrt_compress::CompressionTarget::new(ratio)?;
+                let compressor = rtrt_compress::MlCompressor::heuristic();
+                print!("{}", compressor.compress(&buf, target));
             } else {
                 let compressor = Compressor::new(level.into());
                 let out = compressor.compress_to(&buf, format.into());

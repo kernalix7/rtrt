@@ -92,6 +92,15 @@ fn default_kind() -> String {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CompressMlArgs {
+    /// Text to compress.
+    text: String,
+    /// Target ratio (kept-token fraction) in (0.05, 1.0]. Defaults to 0.5.
+    #[serde(default)]
+    ratio: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MemoryRecallArgs {
     project: String,
     query: String,
@@ -189,6 +198,28 @@ impl RtrtMcp {
         let body = serde_json::json!({
             "compressed": out,
             "saved_chars": args.text.chars().count().saturating_sub(out.chars().count()),
+            "original_len": args.text.chars().count(),
+            "compressed_len": out.chars().count(),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "LLMLingua-style ML compression. Keeps roughly `ratio` of the input tokens by token-importance scoring (heuristic backend until real ONNX scorer lands)."
+    )]
+    fn compress_ml(
+        &self,
+        Parameters(args): Parameters<CompressMlArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let target = rtrt_compress::CompressionTarget::new(args.ratio.unwrap_or(0.5))
+            .map_err(|e| McpError::invalid_params(format!("compress_ml: {e}"), None))?;
+        let compressor = rtrt_compress::MlCompressor::heuristic();
+        let out = compressor.compress(&args.text, target);
+        let body = serde_json::json!({
+            "compressed": out,
+            "scorer": compressor.scorer_name(),
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
@@ -393,7 +424,8 @@ impl ServerHandler for RtrtMcp {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "RTRT MCP server. Tools: compress (caveman-style rewriter), \
-                 memory_save / memory_recall (SQLite + FTS5 BM25), \
+                 compress_ml (LLMLingua-style token-importance compression), \
+                 memory_save / memory_recall (SQLite + FTS5 BM25; recall accepts a qdrant-style payload filter), \
                  memory_set_block / memory_get_block / memory_list_blocks (Letta-style blocks), \
                  templates_list / templates_scaffold (built-in project scaffolds), \
                  provider_chat (multi-provider gateway dispatch).",

@@ -13,6 +13,7 @@
 //! - `/api/prompts/{name}` — list versions for a single prompt.
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
+//! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -26,14 +27,17 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
+use rtrt_memory::{MemoryStore, PayloadFilter};
 use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetric, Role};
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct AppState {
     gateway: Arc<Gateway>,
     prompts: Option<Arc<PromptRegistry>>,
+    memory: Option<Arc<Mutex<MemoryStore>>>,
 }
 
 #[tokio::main]
@@ -46,7 +50,12 @@ async fn main() -> Result<()> {
         std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
-    let state = AppState { gateway, prompts };
+    let memory = open_memory_store();
+    let state = AppState {
+        gateway,
+        prompts,
+        memory,
+    };
 
     let app = Router::new()
         .route("/", get(index))
@@ -61,6 +70,7 @@ async fn main() -> Result<()> {
         .route("/api/prompts/{name}", get(list_prompt_versions))
         .route("/api/prompts/{name}/{version}", get(get_prompt))
         .route("/api/budget", get(budget))
+        .route("/api/memory/recall", post(memory_recall))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -228,6 +238,63 @@ struct MetricsResponse {
     recent: Vec<RequestMetric>,
 }
 
+fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
+    let path = std::env::var("RTRT_MEMORY_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match MemoryStore::open(&path) {
+        Ok(store) => Some(Arc::new(Mutex::new(store))),
+        Err(e) => {
+            tracing::warn!(?path, "memory store unavailable: {e}");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryRecallRequest {
+    project: String,
+    query: String,
+    #[serde(default = "default_recall_limit")]
+    limit: u32,
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+fn default_recall_limit() -> u32 {
+    10
+}
+
+async fn memory_recall(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryRecallRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let hits = match req.filter.as_deref() {
+        Some(spec) if !spec.is_empty() => {
+            let f =
+                PayloadFilter::parse(spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            guard
+                .recall_bm25_with_filter(&req.project, &req.query, req.limit as usize, &f)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
+        _ => guard
+            .recall_bm25(&req.project, &req.query, req.limit as usize)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    };
+    Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
 fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
     let root = match std::env::var("RTRT_PROMPTS_DIR") {
         Ok(p) => PathBuf::from(p),
@@ -371,6 +438,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <a data-tab="metrics" class="active">Metrics</a>
   <a data-tab="budget">Budget</a>
   <a data-tab="prompts">Prompts</a>
+  <a data-tab="memory">Memory</a>
   <a data-tab="templates">Templates</a>
   <a data-tab="stats">Compression</a>
 </nav>
@@ -395,6 +463,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <p style="color:#666;">Backed by <code>PromptRegistry</code> at <code>$RTRT_PROMPTS_DIR</code> (defaults to <code>~/.rtrt/prompts</code>).</p>
   <table id="prompts-tbl"><thead><tr><th>Name</th><th>Latest</th><th>Versions</th></tr></thead><tbody></tbody></table>
   <pre id="prompt-body" style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:0.75rem;border-radius:4px;display:none;"></pre>
+</section>
+
+<section id="memory">
+  <h2>Memory recall</h2>
+  <p style="color:#666;">BM25 over <code>$RTRT_MEMORY_PATH</code> (defaults to <code>.rtrt/memory.sqlite</code>). qdrant-style payload filter supported.</p>
+  <form id="recall-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;">
+    <input id="recall-project" placeholder="project" required>
+    <input id="recall-limit" type="number" min="1" max="50" value="10">
+    <input id="recall-query" placeholder="query" required style="grid-column:1 / span 2;">
+    <input id="recall-filter" placeholder="filter (e.g. source=claude,topic~^auth)" style="grid-column:1 / span 2;">
+    <button type="submit" style="grid-column:1 / span 2;">Recall</button>
+  </form>
+  <table id="recall-tbl" style="margin-top:1rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
 </section>
 
 <section id="templates">
@@ -474,6 +555,38 @@ document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
   const target = a.dataset.tab;
   document.getElementById(target).classList.add('active');
 });
+document.getElementById('recall-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    project: document.getElementById('recall-project').value,
+    query: document.getElementById('recall-query').value,
+    limit: Number(document.getElementById('recall-limit').value) || 10,
+    filter: document.getElementById('recall-filter').value || null,
+  };
+  const tbody = document.querySelector('#recall-tbl tbody');
+  tbody.innerHTML = `<tr><td colspan="4" style="color:#666;">searching…</td></tr>`;
+  try {
+    const resp = await fetch('/api/memory/recall', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      tbody.innerHTML = `<tr><td colspan="4" class="err">${resp.status}: ${await resp.text()}</td></tr>`;
+      return;
+    }
+    const data = await resp.json();
+    if (!data.hits.length) {
+      tbody.innerHTML = `<tr><td colspan="4" style="color:#666;">no hits</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = data.hits.map(h =>
+      `<tr><td>${h.id}</td><td><code>${h.kind}</code></td><td>${h.scope}</td><td>${h.body.replace(/</g, '&lt;')}</td></tr>`
+    ).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="err">${e}</td></tr>`;
+  }
+};
 loadMetrics();
 loadTemplates();
 loadStats();

@@ -22,6 +22,7 @@ use rmcp::{
 use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
 use rtrt_memory::MemoryStore;
+use rtrt_providers::{ChatMessage, ChatRequest, Gateway, Role};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -44,6 +45,7 @@ struct RtrtMcp {
 
 struct RtrtState {
     memory: Mutex<MemoryStore>,
+    gateway: Arc<Gateway>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -80,6 +82,26 @@ fn default_limit() -> u32 {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProviderChatArgs {
+    /// Model id (e.g. `claude-haiku-4-5`, `gpt-5.4-mini`, `llama3.2`).
+    model: String,
+    /// Messages in order; roles are `system` / `user` / `assistant`.
+    messages: Vec<ProviderChatMessage>,
+    /// Optional max tokens (defaults to 1024 in the Anthropic adapter).
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// Optional sampling temperature.
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProviderChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TemplatesScaffoldArgs {
     template: String,
     target: PathBuf,
@@ -91,11 +113,12 @@ struct TemplatesScaffoldArgs {
 
 #[tool_router]
 impl RtrtMcp {
-    pub fn new(memory: MemoryStore) -> Self {
+    pub fn new(memory: MemoryStore, gateway: Arc<Gateway>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             state: Arc::new(RtrtState {
                 memory: Mutex::new(memory),
+                gateway,
             }),
         }
     }
@@ -206,6 +229,53 @@ impl RtrtMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Chat with a registered provider via the gateway. Routes by model id (claude-* → anthropic, gpt-*/o* → openai, otherwise the openai-compat fallback)."
+    )]
+    async fn provider_chat(
+        &self,
+        Parameters(args): Parameters<ProviderChatArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let messages = args
+            .messages
+            .into_iter()
+            .map(|m| {
+                let role = match m.role.as_str() {
+                    "system" => Role::System,
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    _ => Role::User,
+                };
+                ChatMessage {
+                    role,
+                    content: m.content,
+                }
+            })
+            .collect();
+        let req = ChatRequest {
+            model: args.model,
+            messages,
+            max_tokens: args.max_tokens,
+            temperature: args.temperature,
+        };
+        let resp = self
+            .state
+            .gateway
+            .chat(req)
+            .await
+            .map_err(|e| McpError::internal_error(format!("provider.chat: {e}"), None))?;
+        let body = serde_json::json!({
+            "provider": resp.provider,
+            "model": resp.model,
+            "content": resp.content,
+            "input_tokens": resp.usage.input_tokens,
+            "output_tokens": resp.usage.output_tokens,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -216,8 +286,9 @@ impl ServerHandler for RtrtMcp {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "RTRT MCP server. Tools: compress (caveman-style rewriter), \
-             memory_save / memory_recall (SQLite + FTS5 BM25), \
-             templates_list / templates_scaffold (built-in project scaffolds).",
+                 memory_save / memory_recall (SQLite + FTS5 BM25), \
+                 templates_list / templates_scaffold (built-in project scaffolds), \
+                 provider_chat (multi-provider gateway dispatch).",
             )
     }
 }
@@ -231,11 +302,12 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let memory = MemoryStore::open(&cli.memory)?;
+    let gateway = Arc::new(Gateway::from_env());
     tracing::info!(
         "rtrt-mcp starting on stdio; memory={}",
         cli.memory.display()
     );
-    let service = RtrtMcp::new(memory).serve(stdio()).await?;
+    let service = RtrtMcp::new(memory, gateway).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

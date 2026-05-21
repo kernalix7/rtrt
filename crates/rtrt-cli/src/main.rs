@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod setup;
+
 use rtrt_compress::{
     AsyncCompressor, Compressor, Language as TsLanguage, LlmCompressor, SignatureExtractor,
 };
@@ -16,6 +18,7 @@ use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, OpenAICompatibleProvider,
     OpenAIProvider, Provider, Role,
 };
+use setup::{AgentKind, SetupPlan};
 
 #[derive(Debug, Parser)]
 #[command(name = "rtrt", version, about = "Rust-based Token Reduction Toolkit", long_about = None)]
@@ -77,6 +80,21 @@ enum Cmd {
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
+    },
+    /// Wire RTRT into a popular coding agent's MCP config.
+    Setup {
+        /// Target agent.
+        #[arg(short, long, value_enum)]
+        agent: AgentKind,
+        /// Apply the change. Without this, only a dry-run snippet is printed.
+        #[arg(long)]
+        apply: bool,
+        /// Path to the memory store (passed to `rtrt-mcp --memory`).
+        #[arg(long)]
+        memory: Option<PathBuf>,
+        /// Override the discovered `rtrt-mcp` binary path.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
     /// Extract top-level signatures from source via tree-sitter (drops bodies).
     Signatures {
@@ -281,6 +299,26 @@ async fn main() -> Result<()> {
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
+        Cmd::Setup {
+            agent,
+            apply,
+            memory,
+            binary,
+        } => {
+            let binary = binary.unwrap_or_else(|| {
+                // Best-effort: assume `rtrt-mcp` is on PATH at the same prefix as the running CLI.
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("rtrt-mcp")))
+                    .unwrap_or_else(|| PathBuf::from("rtrt-mcp"))
+            });
+            setup::run(SetupPlan {
+                agent,
+                apply,
+                memory_path: memory,
+                binary,
+            })?;
+        }
         Cmd::Signatures { lang } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;

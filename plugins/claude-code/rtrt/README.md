@@ -1,7 +1,9 @@
 # rtrt — Claude Code plugin
 
-Auto-captures every Claude Code event (PreToolUse / PostToolUse / Stop /
-SessionStart / SessionEnd / UserPromptSubmit) into the rtrt memory store
+Auto-captures every Claude Code event (PreToolUse / PostToolUse /
+PostToolUseFailure / PreCompact / UserPromptSubmit /
+PostUserPromptSubmit / Notification / Stop / SubagentStart /
+SubagentStop / SessionStart / SessionEnd) into the rtrt memory store
 so the conversation history shows up under the project's timeline
 without manual `memory save` calls.
 
@@ -38,8 +40,14 @@ stripped of control bytes and clipped to 4 KB.
 |------|-------------|
 | PreToolUse | `pre-tool-use` |
 | PostToolUse | `post-tool-use` |
+| PostToolUseFailure | `post-tool-use-failure` |
+| PreCompact | `pre-compact` |
 | UserPromptSubmit | `user-prompt-submit` |
+| PostUserPromptSubmit | `post-user-prompt-submit` |
+| Notification | `notification` |
 | Stop | `stop` |
+| SubagentStart | `subagent-start` |
+| SubagentStop | `subagent-stop` |
 | SessionStart | `session-start` |
 | SessionEnd | `session-end` |
 

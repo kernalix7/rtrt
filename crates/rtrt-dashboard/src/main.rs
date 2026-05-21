@@ -1164,6 +1164,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
   /* Graph canvas */
   #graph-canvas { cursor: grab; }
 
+  /* Template category cards */
+  .tpl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+  .tpl-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.5rem 1.25rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
+  .tpl-card:hover { transform: translateY(-3px); border-color: var(--accent); box-shadow: var(--shadow); }
+  .tpl-card .num { color: var(--muted); font-size: 0.78em; letter-spacing: 0.08em; }
+  .tpl-card h3 { margin: 0.4rem 0 0.4rem; font-size: 1.35rem; }
+  .tpl-card .desc { color: var(--muted); font-size: 0.92em; line-height: 1.5; }
+  .tpl-card .go { color: var(--accent); font-weight: 600; margin-top: 0.85rem; display: inline-block; }
+
+  /* Modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal-backdrop[hidden] { display: none; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem 1.5rem; width: min(480px, 90vw); box-shadow: 0 12px 48px rgba(0,0,0,.25); }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+  .modal-head h2 { margin: 0; font-size: 1.1rem; }
+  .modal-head button { background: transparent; border: 0; cursor: pointer; font-size: 1.1rem; }
+
   /* Command palette */
   .palette-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.4); display: none; align-items: flex-start; justify-content: center; padding-top: 10vh; z-index: 100; }
   .palette-backdrop.open { display: flex; }
@@ -1201,8 +1218,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <a class="nav active" data-page="overview"><span class="icon">🏠</span>대시보드</a>
     <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
     <div class="group">도구</div>
-    <a class="nav" data-page="compress"><span class="icon">🗜</span>텍스트 압축</a>
-    <a class="nav" data-page="proxy"><span class="icon">🪒</span>명령 출력 필터</a>
+    <a class="nav" data-page="compress"><span class="icon">🗜</span>압축</a>
     <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
     <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드 맵</a>
     <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
@@ -1367,10 +1383,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div id="compress-summary" class="out-meta"></div>
         <pre id="compress-output" hidden></pre>
       </div>
-    </section>
-
-    <!-- 명령 출력 필터 -->
-    <section id="page-proxy" class="page" hidden>
       <div class="card">
         <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 정리</span></div>
         <form id="proxy-form">
@@ -1443,26 +1455,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 템플릿 -->
     <section id="page-templates" class="page" hidden>
-        <div class="card">
-          <div class="head"><h2>프로젝트 템플릿</h2><span class="hint">개발 · 디자인 · 설계 카테고리</span></div>
-          <table id="tpl"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody><tr><td colspan="4" class="empty">불러오는 중…</td></tr></tbody></table>
-        </div>
-        <div class="card">
-          <div class="head"><h2>새 프로젝트 생성</h2><span class="hint">미리보기는 디스크에 쓰지 않음</span></div>
+      <div id="tpl-grid" class="tpl-grid"></div>
+      <div id="scaffold-modal" class="modal-backdrop" hidden>
+        <div class="modal">
+          <div class="modal-head">
+            <h2 id="scaffold-title">새 프로젝트</h2>
+            <button id="scaffold-close" class="ghost" aria-label="닫기">✕</button>
+          </div>
           <form id="scaffold-form">
-            <div class="row">
-              <select id="scaffold-template" required></select>
-              <input id="scaffold-target" placeholder="대상 디렉터리 (예: ./hello)" required>
-            </div>
+            <input id="scaffold-template" type="hidden">
+            <input id="scaffold-target" placeholder="대상 디렉터리 (예: ./my-project)" required>
             <div id="scaffold-vars"></div>
             <label><input id="scaffold-overwrite" type="checkbox"> 기존 파일 덮어쓰기</label>
-            <div style="display:flex;gap:0.5rem;">
-              <button type="button" id="scaffold-preview" class="ghost">미리보기</button>
+            <div style="display:flex;gap:0.5rem;align-items:center;">
               <button type="submit" class="primary">생성</button>
+              <a id="scaffold-preview" style="cursor:pointer;">미리보기</a>
             </div>
           </form>
           <div id="scaffold-result" class="out-meta"></div>
         </div>
+      </div>
     </section>
 
     <!-- 프롬프트 -->
@@ -2062,27 +2074,43 @@ document.getElementById('repomap-form').onsubmit = async (ev) => {
 // Templates
 const CAT_LABEL = { development: '개발', design: '디자인', planning: '설계' };
 let LOADED_TEMPLATES = [];
+const CAT_NUM = { development: '01', design: '02', planning: '03' };
 async function loadTemplates() {
   const tpls = await fetch('/api/templates').then(r => r.ok ? r.json() : []).catch(() => []);
   LOADED_TEMPLATES = tpls;
-  const tbody = document.querySelector('#tpl tbody');
-  if (!tpls.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">템플릿 없음</td></tr>'; return; }
+  const grid = document.getElementById('tpl-grid');
+  if (!grid) return;
   const order = ['development', 'design', 'planning'];
-  const grouped = {};
-  for (const t of tpls) { (grouped[t.category || 'development'] ||= []).push(t); }
-  tbody.innerHTML = order.flatMap(cat => (grouped[cat] || []).map(t =>
-    `<tr><td><code>${t.name}</code></td><td><span class="badge">${CAT_LABEL[cat]}</span></td><td>${t.description}</td><td><a data-pick="${t.name}">사용</a></td></tr>`
-  )).join('');
-  document.querySelectorAll('a[data-pick]').forEach(a => a.onclick = () => {
-    document.getElementById('scaffold-template').value = a.dataset.pick;
-    renderScaffoldVars();
-    document.querySelector('#scaffold-target').focus();
-  });
-  const sel = document.getElementById('scaffold-template');
-  sel.innerHTML = tpls.map(t => `<option value="${t.name}">[${CAT_LABEL[t.category || 'development']}] ${t.name}</option>`).join('');
-  sel.onchange = renderScaffoldVars;
-  renderScaffoldVars();
+  const byCat = {};
+  for (const t of tpls) { (byCat[t.category || 'development'] ||= []).push(t); }
+  grid.innerHTML = order.map(cat => {
+    const list = byCat[cat] || [];
+    if (!list.length) return '';
+    const t = list[0];
+    return `<div class="tpl-card" data-pick="${t.name}">
+      <div class="num">${CAT_NUM[cat]} · ${CAT_LABEL[cat].toUpperCase()}</div>
+      <h3>${CAT_LABEL[cat]}</h3>
+      <div class="desc">${t.description}</div>
+      <div class="go">시작 →</div>
+    </div>`;
+  }).join('');
+  grid.querySelectorAll('.tpl-card').forEach(card => card.onclick = () => openScaffoldModal(card.dataset.pick));
 }
+function openScaffoldModal(name) {
+  const tpl = LOADED_TEMPLATES.find(t => t.name === name);
+  if (!tpl) return;
+  document.getElementById('scaffold-title').textContent = `새 ${CAT_LABEL[tpl.category]} 프로젝트`;
+  document.getElementById('scaffold-template').value = name;
+  document.getElementById('scaffold-target').value = '';
+  document.getElementById('scaffold-overwrite').checked = false;
+  document.getElementById('scaffold-result').textContent = '';
+  renderScaffoldVars();
+  document.getElementById('scaffold-modal').hidden = false;
+  setTimeout(() => document.getElementById('scaffold-target').focus(), 0);
+}
+function closeScaffoldModal() { document.getElementById('scaffold-modal').hidden = true; }
+document.getElementById('scaffold-close').onclick = closeScaffoldModal;
+document.getElementById('scaffold-modal').onclick = (ev) => { if (ev.target.id === 'scaffold-modal') closeScaffoldModal(); };
 function renderScaffoldVars() {
   const name = document.getElementById('scaffold-template').value;
   const tpl = LOADED_TEMPLATES.find(t => t.name === name);

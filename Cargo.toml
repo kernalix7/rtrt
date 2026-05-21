@@ -10,6 +10,7 @@ members = [
     "crates/rtrt-dashboard",
     "crates/rtrt-cli",
     "crates/rtrt-templates",
+    "crates/rtrt-eval",
 ]
 # `fuzz/` is a cargo-fuzz crate that depends on libfuzzer-sys; keep it out of
 # the workspace so a default `cargo build` doesn't drag nightly-only deps in.

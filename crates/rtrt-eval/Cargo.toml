@@ -1,0 +1,29 @@
+[package]
+name = "rtrt-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional evaluation harness for rtrt-memory recall and rtrt-compress shrink ratio."
+
+# Opt-in by design — kept narrow per DESIGN.md. The built-in fixtures are
+# smoke-sized; real evaluation against LongMemEval / Memorybench plugs in
+# via the same `Fixture` trait without changing the harness.
+
+[[bin]]
+name = "rtrt-eval"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rtrt-memory.workspace = true
+rtrt-compress.workspace = true
+rtrt-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

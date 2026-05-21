@@ -1,0 +1,18 @@
+{
+  "name": "compress_smoke",
+  "description": "Short prose passages with a known floor of meaningful tokens. Useful for catching gross compression regressions; not a stand-in for BERTScore.",
+  "samples": [
+    {
+      "id": "hedging-heavy",
+      "body": "Honestly, I think we might possibly want to consider just basically rewriting the whole thing, you know? It's really, really not working out for us at all in any way, shape, or form right now."
+    },
+    {
+      "id": "code-protected",
+      "body": "Run `cargo test --workspace` first. Then bump the patch version in Cargo.toml and tag the release. If the CI passes, the release workflow uploads the artefacts automatically."
+    },
+    {
+      "id": "log-noise",
+      "body": "INFO: Starting server on port 8080\nINFO: Connected to database\nINFO: Loaded 1234 records into cache\nINFO: Ready to accept connections\nWARN: Deprecation notice: the legacy /v1 endpoint will be removed in the next major release\nINFO: First request received from 127.0.0.1\nERROR: Failed to process request: invalid token signature\nINFO: Request closed"
+    }
+  ]
+}

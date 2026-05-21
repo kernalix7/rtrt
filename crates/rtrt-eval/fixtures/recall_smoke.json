@@ -1,0 +1,27 @@
+{
+  "name": "recall_smoke",
+  "description": "Hand-labelled fixture used to smoke-test the recall pipeline. Not a competition benchmark — every row is short and the relevance judgments are obvious. Plug in LongMemEval-S or a custom JSON file for real numbers.",
+  "corpus": [
+    { "id": "rust-cargo",      "body": "rust workspace cargo build profile dev opt-level 0" },
+    { "id": "rust-clippy",     "body": "rust lint clippy deny warnings before commit" },
+    { "id": "rust-sqlx",       "body": "rust sqlx postgres compile time query checking" },
+    { "id": "python-pip",      "body": "python pip install package from pypi virtual env" },
+    { "id": "python-pytest",   "body": "python pytest fixture monkeypatch conftest sharing" },
+    { "id": "ts-bun",          "body": "typescript bun runtime test bundler all in one" },
+    { "id": "ts-vite",         "body": "typescript vite dev server hmr esbuild bundler" },
+    { "id": "go-mod",          "body": "go module replace directive local path development" },
+    { "id": "go-net-http",     "body": "go net http server graceful shutdown context" },
+    { "id": "sql-fts5",        "body": "sqlite full text search fts5 bm25 ranking external content table" },
+    { "id": "sql-vacuum",      "body": "sqlite vacuum into snapshot reclaim disk after delete" },
+    { "id": "auth-jwt",        "body": "json web token signature rotation key id header" }
+  ],
+  "queries": [
+    { "query": "rust",            "relevant": ["rust-cargo", "rust-clippy", "rust-sqlx"] },
+    { "query": "python",          "relevant": ["python-pip", "python-pytest"] },
+    { "query": "typescript",      "relevant": ["ts-bun", "ts-vite"] },
+    { "query": "go module",       "relevant": ["go-mod"] },
+    { "query": "sqlite fts5",     "relevant": ["sql-fts5"] },
+    { "query": "jwt key",         "relevant": ["auth-jwt"] },
+    { "query": "graceful shutdown","relevant": ["go-net-http"] }
+  ]
+}

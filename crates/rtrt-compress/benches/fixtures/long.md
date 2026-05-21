@@ -16,7 +16,7 @@ Then there's `rtrt-memory`. I think this is the persistent-memory layer, basical
 
 `rtrt-mcp` is the MCP server binary. In v0.2 it's a real server built on the `rmcp` Rust SDK, and it exposes five tools over stdio: `compress`, `memory_save`, `memory_recall`, `templates_list`, and `templates_scaffold`. Furthermore, in v0.3 we'll wire up the HTTP/SSE transport and add a `provider_chat` tool. Naturally, the existing tools all flow through the public APIs of the underlying crates with no behaviour duplicated.
 
-`rtrt-dashboard` is the axum-based web UI. It serves a minimal HTML index plus a REST API with endpoints for token-savings statistics, template listing, individual template manifests, and scaffold execution. The dashboard binds to `127.0.0.1:3111` by default, configurable via `RTRT_DASHBOARD_BIND`. Of course, remote exposure is opt-in by design.
+`rtrt-dashboard` is the axum-based web UI. It serves a minimal HTML index plus a REST API with endpoints for token-savings statistics, template listing, individual template manifests, and scaffold execution. The dashboard binds to `127.0.0.1:7311` by default, configurable via `RTRT_DASHBOARD_BIND`. Of course, remote exposure is opt-in by design.
 
 Finally, `rtrt-cli` is the top-level binary. As you can see, it's just a thin clap-based wrapper that dispatches to the underlying crates. The subcommands are `compress`, `proxy`, `templates`, `new`, `provider chat`, `memory {save,recall,extract,compress}`, and `info`. It is worth mentioning that the subcommand layout was picked to mirror the underlying crate boundaries, which makes the cross-reference easy to follow.
 

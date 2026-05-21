@@ -110,7 +110,7 @@ enum Cmd {
         #[arg(long, default_value = "stdio")]
         transport: String,
         /// Bind address for `--transport http`.
-        #[arg(long, default_value = "127.0.0.1:3112")]
+        #[arg(long, default_value = "127.0.0.1:7312")]
         bind: String,
         /// HTTP mount path for the MCP endpoint.
         #[arg(long, default_value = "/mcp")]

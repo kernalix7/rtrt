@@ -27,7 +27,7 @@ RTRT consolidates several existing token-reduction techniques into one Rust tool
 | Graph | Knowledge-graph entity matching | Reserved schema (`edges` table); entity matching planned |
 | Recall | Reciprocal Rank Fusion across BM25 + vector + graph | BM25 + vector via RRF ✅ (`recall_hybrid`); graph planned |
 | LLM-driven extract / compress | Cloud LLMs only (OpenAI / Anthropic) | Any `Provider`, including a local Ollama server via the existing OpenAI-compatible adapter — no extra HTTP code (`llm` feature, `extract_and_save` / `compress_project`). **This is RTRT's value-add over agentmemory.** |
-| Process model | Memory server on `:3111` shared by agents | Library + MCP tool in the same process as `rtrt-mcp`; dashboard observes |
+| Process model | Memory server on `:3111` shared by agents | Library + MCP tool in the same process as `rtrt-mcp`; dashboard observes on `:7311` |
 | Cross-agent sharing | All agents hit one shared server | Per-project SQLite files; sharing is opt-in |
 
 ## RTRT vs rtk (rtk-ai/rtk)

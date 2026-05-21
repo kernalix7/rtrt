@@ -104,7 +104,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) — axum 라우터
 RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
-  rtrt-mcp --transport http --bind 127.0.0.1:3112 --path /mcp
+  rtrt-mcp --transport http --bind 127.0.0.1:7312 --path /mcp
 ```
 
 공식 Rust MCP SDK [`rmcp`](https://crates.io/crates/rmcp) 기반. 현재 제공하는 도구:
@@ -145,7 +145,7 @@ HTTP 전송 옵션:
 ## 대시보드 (`rtrt-dashboard`)
 
 ```text
-RTRT_DASHBOARD_BIND=127.0.0.1:3111 \
+RTRT_DASHBOARD_BIND=127.0.0.1:7311 \
   RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
   rtrt-dashboard
 ```

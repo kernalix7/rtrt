@@ -73,7 +73,7 @@ impl Default for DashboardConfig {
 }
 
 fn default_dashboard_addr() -> String {
-    "127.0.0.1:3111".to_string()
+    "127.0.0.1:7311".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

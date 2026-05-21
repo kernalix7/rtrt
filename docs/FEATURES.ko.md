@@ -297,7 +297,7 @@ source = "src/main.rs.tmpl"
 
 `rtrt-mcp`는 현재 스텁이며 예정 도구(`compress`, `memory.save`, `memory.recall`, `provider.chat`) 목록만 출력합니다. stdio 전송 계층은 로드맵.
 
-`rtrt-dashboard`는 기본적으로 `127.0.0.1:3111`에 바인딩하는 axum 서버입니다.
+`rtrt-dashboard`는 기본적으로 `127.0.0.1:7311`에 바인딩하는 axum 서버입니다.
 
 - `/` — HTML 인덱스(절감 통계 + 템플릿 갤러리)
 - `/api/stats` — JSON 절감 통계

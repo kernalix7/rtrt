@@ -127,7 +127,7 @@ rtrt diagnose --provider anthropic --model claude-haiku-4-5 \
 Launch the bundled MCP server without remembering the binary name.
 
 ```bash
-rtrt mcp --transport http --bind 127.0.0.1:3112 \
+rtrt mcp --transport http --bind 127.0.0.1:7312 \
   --http-token "$RTRT_MCP_HTTP_TOKEN" \
   --allowed-origins https://app.example.com
 ```
@@ -149,7 +149,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) behind axum
 RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
-  rtrt-mcp --transport http --bind 127.0.0.1:3112 --path /mcp
+  rtrt-mcp --transport http --bind 127.0.0.1:7312 --path /mcp
 ```
 
 Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK. Tools currently shipped:
@@ -190,7 +190,7 @@ Wire it up in `~/.claude.json` (or your agent's MCP config):
 ## Dashboard (`rtrt-dashboard`)
 
 ```text
-RTRT_DASHBOARD_BIND=127.0.0.1:3111 \
+RTRT_DASHBOARD_BIND=127.0.0.1:7311 \
   RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
   rtrt-dashboard
 ```

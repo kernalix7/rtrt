@@ -43,7 +43,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "stdio")]
     transport: Transport,
     /// Bind address for `--transport http`.
-    #[arg(long, default_value = "127.0.0.1:3112")]
+    #[arg(long, default_value = "127.0.0.1:7312")]
     bind: String,
     /// HTTP mount path for the MCP endpoint.
     #[arg(long, default_value = "/mcp")]
@@ -717,7 +717,7 @@ async fn main() -> Result<()> {
             let listener = match tokio::net::TcpListener::bind(&cli.bind).await {
                 Ok(l) => l,
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    let port = cli.bind.rsplit(':').next().unwrap_or("3112").to_string();
+                    let port = cli.bind.rsplit(':').next().unwrap_or("7312").to_string();
                     anyhow::bail!(
                         "address {bind} is already in use. Free the port (lsof -i :{port}) or pass --bind 127.0.0.1:<other> (or set --bind via env).",
                         bind = cli.bind,

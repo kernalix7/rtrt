@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
         .init();
 
     let bind =
-        std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
+        std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:7311".to_string());
     let token = std::env::var("RTRT_DASHBOARD_TOKEN").ok();
     if token.is_none()
         && !bind.starts_with("127.")
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             anyhow::bail!(
                 "address {bind} is already in use. Free the port (lsof -i :{port}) or set RTRT_DASHBOARD_BIND to another address (e.g. RTRT_DASHBOARD_BIND=127.0.0.1:3211 rtrt-dashboard).",
-                port = bind.rsplit(':').next().unwrap_or("3111"),
+                port = bind.rsplit(':').next().unwrap_or("7311"),
             );
         }
         Err(e) => return Err(e.into()),

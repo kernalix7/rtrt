@@ -300,7 +300,7 @@ Each `[[files]]` entry either points to a `source` file (relative to the manifes
 
 `rtrt-mcp` is currently a stub that announces the planned tool surface (`compress`, `memory.save`, `memory.recall`, `provider.chat`). The stdio transport implementation is on the roadmap.
 
-`rtrt-dashboard` is an axum server bound to `127.0.0.1:3111` by default. It serves:
+`rtrt-dashboard` is an axum server bound to `127.0.0.1:7311` by default. It serves:
 
 - `/` — minimal HTML with the savings stats and template gallery.
 - `/api/stats` — JSON savings.

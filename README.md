@@ -76,14 +76,14 @@ See [docs/INSTALL.md](docs/INSTALL.md) for the full flag matrix, environment-var
 
 ## Launch
 
-The web dashboard is `rtrt-dashboard`. By default it serves on `http://127.0.0.1:3111`; set `RTRT_DASHBOARD_TOKEN` to gate every `/api/*` route behind a bearer token (the bundled HTML index and `/healthz` stay open so the UI can bootstrap).
+The web dashboard is `rtrt-dashboard`. By default it serves on `http://127.0.0.1:7311`; set `RTRT_DASHBOARD_TOKEN` to gate every `/api/*` route behind a bearer token (the bundled HTML index and `/healthz` stay open so the UI can bootstrap).
 
 ```bash
-# Open dashboard at http://127.0.0.1:3111 (10 tabs incl. dark mode + bearer-token guard)
+# Open dashboard at http://127.0.0.1:7311 (10 tabs incl. dark mode + bearer-token guard)
 rtrt-dashboard
 
 # Production-style bind with auth
-RTRT_DASHBOARD_BIND=0.0.0.0:3111 \
+RTRT_DASHBOARD_BIND=0.0.0.0:7311 \
 RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
   rtrt-dashboard
 ```
@@ -112,7 +112,7 @@ rtrt docs facebook/react --topic hooks          # context7 library docs
 rtrt provider chat --model claude-haiku-4-5 "ping"
 rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
 rtrt benchmark                                  # cargo bench wrapper
-rtrt-mcp --transport http --bind 127.0.0.1:3112 # stdio or Streamable HTTP, 12 tools, bearer-token guard
+rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 12 tools, bearer-token guard
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.

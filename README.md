@@ -8,13 +8,14 @@
 multi-provider routing, and standardized project scaffolds — under one CLI,<br>
 one MCP server, one web dashboard.</p>
 
-<pre><code># Install (planned)
+<pre><code># Install — Linux / macOS / WSL
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 
-# From source
-git clone https://github.com/kernalix7/rtrt
-cd rtrt
-cargo install --path crates/rtrt-cli</code></pre>
+# Install — Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+
+# Uninstall (binaries only · use --purge to wipe ~/.rtrt too)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm</code></pre>
 
 [![Alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge)](#status-alpha)
 [![Latest](https://img.shields.io/github/v/release/kernalix7/rtrt?include_prereleases&style=for-the-badge&label=latest&color=2962FF)](https://github.com/kernalix7/rtrt/releases)
@@ -40,53 +41,25 @@ cargo install --path crates/rtrt-cli</code></pre>
 ---
 
 > ### Status: Alpha
-> RTRT is early. **v0.1.0** is a scaffold release: the workspace compiles, output compression / command-output filtering / SQLite-FTS5 BM25 recall / template scaffolding are usable end-to-end, but the MCP transport, provider chat clients, vector embeddings, and one-line install scripts are explicit stubs marked in the [roadmap](#roadmap). File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. **v0.1.0** is the active development line aimed at a `v0.2.0-rc1` cut: every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible), vector + BM25 + graph + HNSW memory, the 10-tab axum dashboard, and curl-pipe install + uninstall — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. The tag is held back until live API smoke tests pass in the user environment. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 RTRT consolidates four token-reduction techniques behind one CLI, one MCP server, and one web dashboard. It is written entirely in Rust, edition 2024, with zero unsafe in the core crates. Reference projects are reimplemented in Rust rather than vendored.
 
-## Quick install + uninstall
-
-```bash
-# Install — Linux / macOS / WSL
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-
-# Install — Windows PowerShell
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
-
-# Uninstall — binaries only (Linux/macOS/WSL)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
-
-# Uninstall — full purge (Linux/macOS/WSL)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
-```
-
-See [docs/INSTALL.md](docs/INSTALL.md) for the source-build path, `--main` source-build fallback, and the PowerShell uninstall counterpart.
-
-## Quick install
-
-From source (recommended while pre-release):
-
-```bash
-git clone https://github.com/kernalix7/rtrt
-cd rtrt
-cargo install --path crates/rtrt-cli
-```
-
-Planned one-liners (not yet wired):
-
-```bash
-# macOS / Linux / WSL
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-```
-
-```powershell
-# Windows
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
-```
-
-See [docs/INSTALL.md](docs/INSTALL.md) for crates.io install, pre-built binaries, and uninstall.
-
 ## Launch
+
+The web dashboard is `rtrt-dashboard`. By default it serves on `http://127.0.0.1:3111`; set `RTRT_DASHBOARD_TOKEN` to gate every `/api/*` route behind a bearer token (the bundled HTML index and `/healthz` stay open so the UI can bootstrap).
+
+```bash
+# Open dashboard at http://127.0.0.1:3111 (10 tabs incl. dark mode + bearer-token guard)
+rtrt-dashboard
+
+# Production-style bind with auth
+RTRT_DASHBOARD_BIND=0.0.0.0:3111 \
+RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
+  rtrt-dashboard
+```
+
+CLI surface (everything below is one process, no daemon required):
 
 ```bash
 rtrt compress -l ultra < verbose.md             # Caveman-style rule rewrite
@@ -110,8 +83,7 @@ rtrt docs facebook/react --topic hooks          # context7 library docs
 rtrt provider chat --model claude-haiku-4-5 "ping"
 rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
 rtrt benchmark                                  # cargo bench wrapper
-rtrt-dashboard                                  # http://127.0.0.1:3111 (10 tabs incl. Memory / Proxy / Diagnose / RepoMap / Setup, dark-mode)
-rtrt-mcp --transport http --bind 127.0.0.1:3112 # stdio or Streamable HTTP, 11 tools, bearer-token guard
+rtrt-mcp --transport http --bind 127.0.0.1:3112 # stdio or Streamable HTTP, 12 tools, bearer-token guard
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.

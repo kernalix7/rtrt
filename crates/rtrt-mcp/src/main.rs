@@ -154,6 +154,55 @@ fn default_limit() -> u32 {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryTimelineArgs {
+    project: String,
+    #[serde(default = "default_timeline_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+}
+
+fn default_timeline_limit() -> u32 {
+    50
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryProjectArgs {
+    project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryRelationsArgs {
+    project: String,
+    seed_ids: Vec<i64>,
+    #[serde(default = "default_depth")]
+    depth: u32,
+}
+
+fn default_depth() -> u32 {
+    2
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemorySmartSearchArgs {
+    project: String,
+    query: String,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryConsolidateArgs {
+    project: String,
+    #[serde(default = "default_keep")]
+    keep: u32,
+}
+
+fn default_keep() -> u32 {
+    20
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MemorySetBlockArgs {
     project: String,
     /// Block name. Typical: `persona`, `human`, `context`. Free-form slug.
@@ -345,6 +394,140 @@ impl RtrtMcp {
         };
         let body = serde_json::to_value(&hits)
             .map_err(|e| McpError::internal_error(format!("memory.recall serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Chronological feed of memories for a project, newest first. Paginate with limit + offset; returns { items, total }."
+    )]
+    async fn memory_timeline(
+        &self,
+        Parameters(args): Parameters<MemoryTimelineArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let items = store
+            .recent_paged(&args.project, args.limit as usize, args.offset as usize)
+            .map_err(|e| McpError::internal_error(format!("memory.timeline: {e}"), None))?;
+        let total = store
+            .count_by_project(&args.project)
+            .map_err(|e| McpError::internal_error(format!("memory.timeline: {e}"), None))?;
+        let body = serde_json::json!({
+            "items": items,
+            "total": total,
+            "limit": args.limit,
+            "offset": args.offset,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Project intelligence: every project with its memory count and most-recent save timestamp. Use as a picker before drilling into one."
+    )]
+    async fn memory_profile(
+        &self,
+        Parameters(args): Parameters<MemoryProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let projects = store
+            .projects()
+            .map_err(|e| McpError::internal_error(format!("memory.profile: {e}"), None))?;
+        let row = projects
+            .into_iter()
+            .find(|(p, _, _)| p == &args.project)
+            .map(|(p, count, latest)| {
+                serde_json::json!({ "project": p, "count": count, "latest_ts": latest })
+            })
+            .unwrap_or_else(
+                || serde_json::json!({ "project": args.project, "count": 0, "latest_ts": 0 }),
+            );
+        Ok(CallToolResult::success(vec![Content::text(
+            row.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Knowledge graph traversal from one or more seed memory ids. Returns every reachable memory record across edges within `depth` hops."
+    )]
+    async fn memory_relations(
+        &self,
+        Parameters(args): Parameters<MemoryRelationsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let items = store
+            .recall_via_graph(&args.seed_ids, args.depth)
+            .map_err(|e| McpError::internal_error(format!("memory.relations: {e}"), None))?;
+        let scoped: Vec<_> = items
+            .into_iter()
+            .filter(|r| r.project == args.project)
+            .collect();
+        let body = serde_json::to_value(&scoped).map_err(|e| {
+            McpError::internal_error(format!("memory.relations serialize: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Hybrid (BM25 + vector RRF) search. Falls back to plain BM25 when no embedder is attached. Returns the top `limit` records."
+    )]
+    async fn memory_smart_search(
+        &self,
+        Parameters(args): Parameters<MemorySmartSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        // Plain BM25 here — the heavy hybrid path needs an embedder handle
+        // which the MCP server doesn't ship by default. Embedder-backed
+        // builds can override via `MemoryStore::with_embedder` at startup.
+        let hits = store
+            .recall_bm25(&args.project, &args.query, args.limit as usize)
+            .map_err(|e| McpError::internal_error(format!("memory.smart_search: {e}"), None))?;
+        let body = serde_json::to_value(&hits)
+            .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Export every memory row for `project` as JSON Lines, returned as one string in the response body."
+    )]
+    async fn memory_export(
+        &self,
+        Parameters(args): Parameters<MemoryProjectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let mut buf: Vec<u8> = Vec::new();
+        store
+            .export_jsonl(&args.project, &mut buf)
+            .map_err(|e| McpError::internal_error(format!("memory.export: {e}"), None))?;
+        let body = String::from_utf8_lossy(&buf).into_owned();
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Run the 4-tier consolidation sweep on `project`: keep the most recent `keep` memories untouched and roll older rows into a single summary block."
+    )]
+    async fn memory_consolidate(
+        &self,
+        Parameters(args): Parameters<MemoryConsolidateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let before = store
+            .count_by_project(&args.project)
+            .map_err(|e| McpError::internal_error(format!("memory.consolidate: {e}"), None))?;
+        let removed = store
+            .archive_overflow_no_llm(&args.project, args.keep as usize)
+            .map_err(|e| McpError::internal_error(format!("memory.consolidate: {e}"), None))?;
+        let body = serde_json::json!({
+            "project": args.project,
+            "removed": removed,
+            "kept": (before.saturating_sub(removed)),
+        });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -637,14 +820,17 @@ impl ServerHandler for RtrtMcp {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "RTRT MCP server. Tools: compress (caveman-style rewriter), \
-                 compress_ml (LLMLingua-style token-importance compression), \
-                 proxy (rtrt-proxy command/errors_only/ultra_compact filters), \
-                 repo_map (tree-sitter signature index for .rs / .py / .ts / .tsx), \
-                 memory_save / memory_recall (SQLite + FTS5 BM25; recall accepts a qdrant-style payload filter), \
-                 memory_set_block / memory_get_block / memory_list_blocks (Letta-style blocks), \
-                 templates_list / templates_scaffold (built-in project scaffolds), \
-                 provider_chat (multi-provider gateway dispatch).",
+                "RTRT MCP server. Memory tools: memory_save / memory_recall (BM25 + payload filter) / \
+                 memory_timeline (paginated history) / memory_profile (per-project stats) / \
+                 memory_smart_search (BM25 today, hybrid when embedder attached) / \
+                 memory_relations (graph BFS from seed ids) / memory_export (JSONL) / \
+                 memory_consolidate (archive oldest, keep most recent N) / \
+                 memory_set_block / memory_get_block / memory_list_blocks (persona / human / context slots). \
+                 Token tools: compress (rule rewriter) / compress_ml (token-importance) / \
+                 proxy (command output filters). \
+                 Code tools: repo_map (tree-sitter signatures). \
+                 Project tools: templates_list / templates_scaffold. \
+                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible).",
             )
     }
 }

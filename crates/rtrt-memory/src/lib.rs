@@ -1011,6 +1011,21 @@ impl MemoryStore {
         self.compress_project(project, summariser, hot_limit).await
     }
 
+    /// LLM-free consolidation: deletes the oldest rows beyond `keep_recent`,
+    /// returns how many were removed. Used by the hourly background daemon
+    /// when no summariser is wired and by the `memory_consolidate` MCP tool.
+    pub fn archive_overflow_no_llm(&self, project: &str, keep_recent: usize) -> Result<usize> {
+        let all = self.list_by_project(project, 100_000)?;
+        if all.len() <= keep_recent {
+            return Ok(0);
+        }
+        let to_remove = &all[..all.len() - keep_recent];
+        for m in to_remove {
+            self.delete(m.id)?;
+        }
+        Ok(to_remove.len())
+    }
+
     /// Compresses the oldest memories in `project`: keeps the most recent
     /// `keep_recent` rows, summarises the rest into one archival entry, and
     /// deletes the originals. Returns the new archival record id, or `None`

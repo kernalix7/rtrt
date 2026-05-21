@@ -27,6 +27,44 @@ pub trait Summariser: Send + Sync {
 
     /// Splits `text` into atomic facts, one per item. Use for ingestion.
     async fn extract_atomic(&self, text: &str) -> Result<Vec<String>>;
+
+    /// Extracts distinct named entities (people, projects, libraries, files,
+    /// products, …) from `text`. One entity per item, lowercased. Used by
+    /// [`crate::MemoryStore::link_entities`] to auto-build the graph.
+    ///
+    /// The default implementation derives entities from `extract_atomic`'s
+    /// output as a fallback for backends that don't have a dedicated prompt;
+    /// LLM-backed summarisers override this with a task-specific system
+    /// prompt for higher precision.
+    async fn extract_entities(&self, text: &str) -> Result<Vec<String>> {
+        let atomic = self.extract_atomic(text).await?;
+        Ok(naive_entities(&atomic))
+    }
+}
+
+fn naive_entities(lines: &[String]) -> Vec<String> {
+    // Pick the longest capitalised run on each line as a coarse entity hint.
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in lines {
+        for token in line.split_whitespace() {
+            let cleaned: String = token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .to_string();
+            if cleaned.len() < 3 {
+                continue;
+            }
+            let first = cleaned.chars().next().unwrap_or(' ');
+            if !first.is_uppercase() {
+                continue;
+            }
+            let key = cleaned.to_lowercase();
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(feature = "llm")]
@@ -83,6 +121,8 @@ mod llm_impl {
 
     const EXTRACT_SYS: &str = "You extract atomic memory facts. Read the passage and emit one fact per line. Each fact is a single short sentence covering exactly one piece of information (a name, a date, a number, a relationship, a decision). Output only the lines, no numbering, no bullets, no commentary.";
 
+    const ENTITY_SYS: &str = "You extract distinct named entities from a passage: people, organisations, products, projects, libraries, file paths, programming-language identifiers, models. One entity per line, lowercased (preserve hyphens and dots). Output only the lines, no numbering, no bullets, no commentary. If the passage has no entities, output nothing.";
+
     #[async_trait]
     impl Summariser for LlmSummariser {
         fn model(&self) -> &str {
@@ -114,6 +154,26 @@ mod llm_impl {
                 return Err(Error::Memory("extract_atomic returned no lines".into()));
             }
             Ok(lines)
+        }
+
+        async fn extract_entities(&self, text: &str) -> Result<Vec<String>> {
+            let out = self.chat(ENTITY_SYS, text).await?;
+            let mut seen = std::collections::HashSet::new();
+            let mut entities = Vec::new();
+            for line in out.lines() {
+                let cleaned = line
+                    .trim()
+                    .trim_start_matches(['-', '*', '•', '·'])
+                    .trim()
+                    .to_lowercase();
+                if cleaned.is_empty() || cleaned.len() > 80 {
+                    continue;
+                }
+                if seen.insert(cleaned.clone()) {
+                    entities.push(cleaned);
+                }
+            }
+            Ok(entities)
         }
     }
 }

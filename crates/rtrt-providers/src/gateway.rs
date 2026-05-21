@@ -190,6 +190,31 @@ struct Registration {
     provider: Box<dyn Provider>,
 }
 
+/// Helicone-style retry + fallback policy. Empty default means "single try,
+/// no fallback", which is what every Gateway has unless [`Gateway::with_retry`]
+/// is called.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Number of attempts on the primary provider (including the first).
+    pub max_attempts: u32,
+    /// Sleep between retries, in milliseconds. Constant backoff.
+    pub backoff_ms: u64,
+    /// When `true` and the primary provider keeps failing, the default
+    /// fallback provider (set via [`Gateway::with_default_last`]) gets one
+    /// last attempt before the error is surfaced.
+    pub fallback_to_default: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            backoff_ms: 0,
+            fallback_to_default: false,
+        }
+    }
+}
+
 pub struct Gateway {
     providers: Vec<Registration>,
     default: Option<usize>,
@@ -197,6 +222,7 @@ pub struct Gateway {
     /// Cap on retained per-request metrics. Older entries roll off.
     pub metric_window: usize,
     budget: Option<Arc<Budget>>,
+    retry: RetryPolicy,
     next_metric_id: Arc<Mutex<u64>>,
 }
 
@@ -253,6 +279,7 @@ impl Gateway {
             })),
             metric_window: 1024,
             budget: None,
+            retry: RetryPolicy::default(),
             next_metric_id: Arc::new(Mutex::new(1)),
         }
     }
@@ -261,6 +288,15 @@ impl Gateway {
     /// subsequent `chat` calls return an error before reaching the provider.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = Some(Arc::new(budget));
+        self
+    }
+
+    /// Attaches a [`RetryPolicy`]. Failed chat attempts on the primary
+    /// provider are retried up to `max_attempts` times with constant backoff;
+    /// if `fallback_to_default` is set, the default provider (configured via
+    /// [`Gateway::with_default_last`]) gets one last attempt afterwards.
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -293,19 +329,6 @@ impl Gateway {
         self.metrics.clone()
     }
 
-    fn lookup(&self, model: &str) -> Option<(&str, &dyn Provider)> {
-        for r in &self.providers {
-            if r.prefixes.iter().any(|p| model.starts_with(p.as_str())) {
-                return Some((&r.name, r.provider.as_ref()));
-            }
-        }
-        if let Some(i) = self.default {
-            let r = &self.providers[i];
-            return Some((&r.name, r.provider.as_ref()));
-        }
-        None
-    }
-
     /// Dispatches the chat request to the matching provider and records a
     /// metric. The caller sees the [`ChatResponse`]; the metric is observable
     /// via [`Gateway::metrics`].
@@ -324,7 +347,6 @@ impl Gateway {
     }
 
     async fn chat_inner(&self, req: ChatRequest, parent_id: Option<u64>) -> Result<ChatResponse> {
-        // Budget gate: refuse before dispatch when over cap.
         if let Some(b) = &self.budget {
             let spent = self
                 .metrics
@@ -339,19 +361,63 @@ impl Gateway {
                 )));
             }
         }
-        let Some((name, provider)) = self.lookup(&req.model) else {
+        let Some(primary_idx) = self.lookup_index(&req.model) else {
             return Err(Error::Provider(format!(
                 "gateway: no provider registered for model '{}'",
                 req.model
             )));
         };
+        let attempts = self.retry.max_attempts.max(1);
+        let mut last_err: Option<Error> = None;
+        for attempt in 0..attempts {
+            if attempt > 0 && self.retry.backoff_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.retry.backoff_ms)).await;
+            }
+            match self
+                .dispatch_once(primary_idx, req.clone(), parent_id)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if self.retry.fallback_to_default {
+            if let Some(default_idx) = self.default {
+                if default_idx != primary_idx {
+                    match self.dispatch_once(default_idx, req, parent_id).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Provider("gateway: no attempts ran".into())))
+    }
+
+    fn lookup_index(&self, model: &str) -> Option<usize> {
+        for (i, r) in self.providers.iter().enumerate() {
+            if r.prefixes.iter().any(|p| model.starts_with(p.as_str())) {
+                return Some(i);
+            }
+        }
+        self.default
+    }
+
+    async fn dispatch_once(
+        &self,
+        idx: usize,
+        req: ChatRequest,
+        parent_id: Option<u64>,
+    ) -> Result<ChatResponse> {
+        let registration = &self.providers[idx];
+        let name = registration.name.clone();
         let started = Instant::now();
         let started_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let model = req.model.clone();
-        let result = provider.chat(req).await;
+        let result = registration.provider.chat(req).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         let id = {
             let mut guard = self
@@ -378,8 +444,8 @@ impl Gateway {
         let metric = RequestMetric {
             id,
             parent_id,
-            provider: name.to_string(),
-            model: model.clone(),
+            provider: name,
+            model,
             started_at,
             latency_ms,
             usage,
@@ -609,6 +675,69 @@ mod tests {
         );
         let err = gw.chat(req("gpt-x")).await.unwrap_err();
         assert!(format!("{err}").contains("no provider registered"), "{err}");
+    }
+
+    /// Always-failing provider for retry tests.
+    struct Flaky {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for Flaky {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn supported_models(&self) -> &[&'static str] {
+            &[]
+        }
+        async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse> {
+            Err(rtrt_core::Error::Provider("simulated outage".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_falls_back_to_default_provider() {
+        let gw = Gateway::new()
+            .register("primary", Box::new(Flaky { name: "primary" }), ["claude-"])
+            .register(
+                "fallback",
+                Box::new(Echo {
+                    name: "fallback",
+                    tokens: (1, 1),
+                }),
+                [],
+            )
+            .with_default_last()
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff_ms: 0,
+                fallback_to_default: true,
+            });
+        let resp = gw.chat(req("claude-haiku-4-5")).await.unwrap();
+        assert_eq!(resp.provider, "fallback");
+        let metrics = gw.metrics();
+        let g = metrics.lock().unwrap();
+        // 2 primary attempts + 1 fallback = 3 records.
+        assert_eq!(g.summary.calls, 3);
+        assert_eq!(g.summary.failures, 2);
+        assert_eq!(g.summary.successes, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_without_fallback_surfaces_last_error() {
+        let gw = Gateway::new()
+            .register("primary", Box::new(Flaky { name: "primary" }), ["x-"])
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff_ms: 0,
+                fallback_to_default: false,
+            });
+        let err = gw.chat(req("x-anything")).await.unwrap_err();
+        assert!(format!("{err}").contains("simulated outage"));
+        let g = gw.metrics();
+        let g = g.lock().unwrap();
+        assert_eq!(g.summary.calls, 3);
+        assert_eq!(g.summary.failures, 3);
     }
 
     #[tokio::test]

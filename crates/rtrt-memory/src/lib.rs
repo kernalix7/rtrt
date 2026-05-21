@@ -529,6 +529,64 @@ impl MemoryStore {
         Ok(ids)
     }
 
+    /// LLM-driven entity linking. Extracts named entities from every memory
+    /// in `project`, finds other memories that mention each entity via FTS5,
+    /// and inserts `relation`-labelled edges between them. Returns the number
+    /// of new edges actually written.
+    ///
+    /// Inspired by mem0's entity-linking step. The summariser supplies the
+    /// entity list per memory; the search reuses the existing FTS5 index so
+    /// no extra dependency or schema change is required.
+    pub async fn link_entities(
+        &self,
+        project: &str,
+        summariser: &dyn Summariser,
+        relation: &str,
+    ) -> Result<usize> {
+        let mems = self.list_by_project(project, 10_000)?;
+        let mut new_edges = 0usize;
+        for source in &mems {
+            let entities = summariser.extract_entities(&source.body).await?;
+            for entity in entities {
+                let cleaned = entity.replace('"', "");
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let query = format!("\"{cleaned}\"");
+                let hits = match self.recall_bm25(project, &query, 16) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                for hit in hits {
+                    if hit.id == source.id {
+                        continue;
+                    }
+                    let before: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM edges WHERE src_id = ?1 AND dst_id = ?2 AND relation = ?3",
+                            rusqlite::params![source.id, hit.id, relation],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    self.add_edge(source.id, hit.id, relation)?;
+                    let after: i64 = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM edges WHERE src_id = ?1 AND dst_id = ?2 AND relation = ?3",
+                            rusqlite::params![source.id, hit.id, relation],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if after > before {
+                        new_edges += 1;
+                    }
+                }
+            }
+        }
+        Ok(new_edges)
+    }
+
     /// Letta / MemGPT-style alias for [`compress_project`]: archives the
     /// oldest entries beyond `hot_limit` into a single summary while keeping
     /// the hot context intact. Returns the new archival entry id, if any.
@@ -764,6 +822,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Stub summariser that lets us drive `link_entities` deterministically.
+    struct EntitySummariser;
+
+    #[async_trait::async_trait]
+    impl Summariser for EntitySummariser {
+        fn model(&self) -> &str {
+            "entity-stub"
+        }
+        async fn summarise(&self, text: &str) -> Result<String> {
+            Ok(text.to_string())
+        }
+        async fn extract_atomic(&self, text: &str) -> Result<Vec<String>> {
+            Ok(vec![text.to_string()])
+        }
+        async fn extract_entities(&self, text: &str) -> Result<Vec<String>> {
+            // Pull bare words ≥ 3 chars, lowercased. Good enough for tests.
+            Ok(text
+                .split_whitespace()
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                })
+                .filter(|w| w.len() >= 3)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn link_entities_creates_edges_between_co_mentioning_memories() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store
+            .save("p", "fact", "rust cargo workspace ships well")
+            .unwrap();
+        let b = store
+            .save("p", "fact", "cargo is rust's package manager")
+            .unwrap();
+        let _c = store.save("p", "fact", "go modules are similar").unwrap();
+        let created = store
+            .link_entities("p", &EntitySummariser, "mentions")
+            .await
+            .unwrap();
+        assert!(created >= 2, "expected ≥2 edges, got {created}");
+        // A and B both mention rust+cargo so they should be connected.
+        let walk = store.recall_via_graph(&[a], 1).unwrap();
+        assert!(walk.iter().any(|m| m.id == b), "{walk:?}");
     }
 
     #[tokio::test]

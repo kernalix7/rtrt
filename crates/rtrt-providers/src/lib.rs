@@ -11,12 +11,14 @@ use rtrt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod gateway;
 pub mod openai;
 pub mod openai_compatible;
 pub mod stream;
 pub mod usage;
 
 pub use anthropic::AnthropicProvider;
+pub use gateway::{Gateway, GatewaySummary, MetricsView, RequestMetric};
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use usage::Usage;

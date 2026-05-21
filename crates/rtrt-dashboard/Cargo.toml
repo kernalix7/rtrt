@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 rtrt-core.workspace = true
 rtrt-templates.workspace = true
+rtrt-providers.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

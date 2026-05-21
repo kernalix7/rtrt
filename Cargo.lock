@@ -2857,6 +2857,7 @@ dependencies = [
  "anyhow",
  "axum",
  "rtrt-core",
+ "rtrt-providers",
  "rtrt-templates",
  "serde",
  "serde_json",

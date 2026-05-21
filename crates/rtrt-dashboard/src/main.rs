@@ -1,17 +1,34 @@
-//! rtrt-dashboard — axum web UI for token savings, recall stats, project templates.
+//! rtrt-dashboard — axum web UI + REST API.
+//!
+//! Surfaces:
+//! - `/`               — bundled HTML index (mini-app: stats / templates / metrics).
+//! - `/healthz`        — liveness probe.
+//! - `/api/stats`      — compression / proxy savings JSON.
+//! - `/api/templates`  — list built-in + custom templates.
+//! - `/api/templates/{name}` — full manifest for one template.
+//! - `/api/templates/scaffold` — `POST` scaffold a project.
+//! - `/api/chat`       — `POST` chat through the bundled provider gateway.
+//! - `/api/metrics`    — gateway summary + recent per-request metrics.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::Path as AxPath,
+    extract::{Path as AxPath, State},
     http::StatusCode,
     response::Html,
     routing::{get, post},
 };
+use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetric, Role};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+struct AppState {
+    gateway: Arc<Gateway>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,13 +38,19 @@ async fn main() -> Result<()> {
 
     let bind =
         std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
+    let gateway = Arc::new(Gateway::from_env());
+    let state = AppState { gateway };
+
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/api/stats", get(stats))
         .route("/api/templates", get(list_templates))
         .route("/api/templates/{name}", get(get_template))
-        .route("/api/templates/scaffold", post(scaffold));
+        .route("/api/templates/scaffold", post(scaffold))
+        .route("/api/chat", post(chat))
+        .route("/api/metrics", get(metrics))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("rtrt-dashboard listening on http://{bind}");
@@ -122,51 +145,186 @@ async fn scaffold(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatHttpRequest {
+    model: String,
+    messages: Vec<ChatHttpMessage>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatHttpMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatHttpResponse {
+    provider: String,
+    model: String,
+    content: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+async fn chat(
+    State(state): State<AppState>,
+    Json(req): Json<ChatHttpRequest>,
+) -> std::result::Result<Json<ChatHttpResponse>, (StatusCode, String)> {
+    let messages = req
+        .messages
+        .into_iter()
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => Role::System,
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => Role::User,
+            };
+            ChatMessage {
+                role,
+                content: m.content,
+            }
+        })
+        .collect();
+    let chat_req = ChatRequest {
+        model: req.model,
+        messages,
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+    };
+    let resp = state
+        .gateway
+        .chat(chat_req)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(ChatHttpResponse {
+        provider: resp.provider,
+        model: resp.model,
+        content: resp.content,
+        input_tokens: resp.usage.input_tokens,
+        output_tokens: resp.usage.output_tokens,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct MetricsResponse {
+    summary: rtrt_providers::GatewaySummary,
+    by_provider: BTreeMap<String, rtrt_providers::GatewaySummary>,
+    recent: Vec<RequestMetric>,
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    let metrics = state.gateway.metrics();
+    let guard = metrics.lock().unwrap_or_else(|p| p.into_inner());
+    let view = MetricsView::new(&guard);
+    let by_provider = view
+        .by_provider()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    Json(MetricsResponse {
+        summary: view.summary(),
+        by_provider,
+        recent: view.recent(50),
+    })
+}
+
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>RTRT Dashboard</title>
 <style>
-  body { font: 14px/1.45 system-ui, sans-serif; max-width: 920px; margin: 2rem auto; padding: 0 1rem; }
+  body { font: 14px/1.45 system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
   h1 { margin-bottom: 0.25rem; }
   .sub { color: #666; margin-bottom: 1.5rem; }
-  section { margin-bottom: 2rem; }
+  nav { margin-bottom: 1.5rem; }
+  nav a { margin-right: 1rem; cursor: pointer; color: #2962FF; text-decoration: none; }
+  nav a.active { font-weight: 600; text-decoration: underline; }
+  section { display: none; margin-bottom: 2rem; }
+  section.active { display: block; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; text-align: left; }
-  code { background: #f3f3f3; padding: 0 0.25rem; border-radius: 3px; }
-  button { padding: 0.4rem 0.8rem; border: 1px solid #888; background: #fff; cursor: pointer; }
+  th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+  code { background: #f3f3f3; padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; }
+  .kpi { display: inline-block; margin-right: 1.5rem; }
+  .kpi b { font-size: 1.4rem; }
+  .err { color: #c0392b; }
 </style>
 </head>
 <body>
 <h1>RTRT</h1>
 <div class="sub">Rust-based Token Reduction Toolkit</div>
 
-<section>
-  <h2>Token savings</h2>
-  <div id="stats">loading…</div>
+<nav>
+  <a data-tab="metrics" class="active">Metrics</a>
+  <a data-tab="templates">Templates</a>
+  <a data-tab="stats">Compression</a>
+</nav>
+
+<section id="metrics" class="active">
+  <h2>Gateway metrics</h2>
+  <div id="metrics-summary">loading…</div>
+  <h3>Recent requests</h3>
+  <table id="metrics-recent"><thead>
+    <tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>latency</th><th>status</th></tr>
+  </thead><tbody></tbody></table>
 </section>
 
-<section>
+<section id="templates">
   <h2>Project templates</h2>
   <table id="tpl"><thead><tr><th>Name</th><th>Source</th><th>Description</th></tr></thead><tbody></tbody></table>
 </section>
 
+<section id="stats">
+  <h2>Compression savings</h2>
+  <div id="stats-body">loading…</div>
+</section>
+
 <script>
-async function load() {
-  const stats = await fetch('/api/stats').then(r => r.json());
-  document.getElementById('stats').textContent =
-    `input saved: ${stats.input_saved}  ·  output saved: ${stats.output_saved}`;
-  const tpls = await fetch('/api/templates').then(r => r.json());
-  const tbody = document.querySelector('#tpl tbody');
-  tbody.innerHTML = tpls.map(t => `
-    <tr>
-      <td><code>${t.name}</code></td>
-      <td>${t.source}</td>
-      <td>${t.description}</td>
-    </tr>`).join('');
+async function loadMetrics() {
+  const m = await fetch('/api/metrics').then(r => r.json());
+  const s = m.summary;
+  document.getElementById('metrics-summary').innerHTML = `
+    <span class="kpi">calls<br><b>${s.calls}</b></span>
+    <span class="kpi">ok<br><b>${s.successes}</b></span>
+    <span class="kpi">fail<br><b>${s.failures}</b></span>
+    <span class="kpi">input tokens<br><b>${s.total_input_tokens}</b></span>
+    <span class="kpi">output tokens<br><b>${s.total_output_tokens}</b></span>
+    <span class="kpi">avg latency<br><b>${(s.total_latency_ms/Math.max(1,s.calls)).toFixed(0)} ms</b></span>
+  `;
+  const tbody = document.querySelector('#metrics-recent tbody');
+  tbody.innerHTML = m.recent.map(r => {
+    const t = new Date(r.started_at * 1000).toISOString().slice(11,19);
+    const status = r.ok ? 'ok' : `<span class="err">${r.error||'failed'}</span>`;
+    return `<tr><td>${t}</td><td>${r.provider}</td><td><code>${r.model}</code></td><td>${r.usage.input_tokens}</td><td>${r.usage.output_tokens}</td><td>${r.latency_ms} ms</td><td>${status}</td></tr>`;
+  }).join('');
 }
-load();
+async function loadTemplates() {
+  const tpls = await fetch('/api/templates').then(r => r.json());
+  document.querySelector('#tpl tbody').innerHTML = tpls.map(t =>
+    `<tr><td><code>${t.name}</code></td><td>${t.source}</td><td>${t.description}</td></tr>`
+  ).join('');
+}
+async function loadStats() {
+  const s = await fetch('/api/stats').then(r => r.json());
+  document.getElementById('stats-body').textContent =
+    `input saved: ${s.input_saved}   ·   output saved: ${s.output_saved}`;
+}
+document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
+  document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
+  a.classList.add('active');
+  const target = a.dataset.tab;
+  document.getElementById(target).classList.add('active');
+});
+loadMetrics();
+loadTemplates();
+loadStats();
+setInterval(loadMetrics, 5000);
 </script>
 </body>
 </html>

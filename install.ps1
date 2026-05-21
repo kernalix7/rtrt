@@ -1,31 +1,47 @@
 # RTRT installer — Windows PowerShell.
 #
-# One-liner install (latest release):
+# One-liner install:
 #   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 #
-# One-liner uninstall:
-#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
-#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
-#
 # Flags:
-#   -Version vX.Y.Z   pin a specific release (default: latest)
-#   -Main             ignore releases; clone main and `cargo build --release`
-#   -InstallDir <p>   install dir (default: $env:LOCALAPPDATA\Programs\rtrt)
-#   -Uninstall        compatibility shim — defers to uninstall.ps1 logic
-#   -DryRun           print intended actions without writing anything
+#   -Version vX.Y.Z       Pin a specific release tarball (skip source build).
+#   -Main                 Build from git main HEAD. Same as -Ref main.
+#                         (env: RTRT_REF=main)
+#   -Ref <tag>            Build from a specific tag / branch / commit.
+#                         (env: RTRT_REF=<ref>)
+#   -Source <path>        Build from a local copy instead of git clone.
+#                         (env: RTRT_SOURCE)
+#   -InstallDir <path>    Install dir (default: $env:LOCALAPPDATA\Programs\rtrt).
+#   -SkipDeps             Skip toolchain check (fail early if missing).
+#                         (env: RTRT_SKIP_DEPS=1)
+#   -Uninstall            Compat shim — defers to uninstall.ps1.
+#   -DryRun               Print intended actions without writing anything.
 
 [CmdletBinding()]
 param(
-    [string] $Version = "",
-    [switch] $Main,
-    [string] $InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\rtrt"),
-    [switch] $Uninstall,
-    [switch] $DryRun
+    [string]   $Version    = "",
+    [switch]   $Main,
+    [string]   $Ref        = "",
+    [string]   $Source     = "",
+    [string]   $InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\rtrt"),
+    [switch]   $SkipDeps,
+    [switch]   $Uninstall,
+    [switch]   $DryRun
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = "kernalix7/rtrt"
 $Bins = @("rtrt.exe", "rtrt-mcp.exe", "rtrt-dashboard.exe")
+
+# Env-var fallbacks. Flag values above already take precedence.
+if (-not $Ref    -and $env:RTRT_REF)        { $Ref    = $env:RTRT_REF }
+if (-not $Source -and $env:RTRT_SOURCE)     { $Source = $env:RTRT_SOURCE }
+if (-not $SkipDeps -and $env:RTRT_SKIP_DEPS) { $SkipDeps = $true }
+if ($Main) { $Ref = "main" }
+
+function Write-Log($Message)  { Write-Host "[rtrt] $Message"  -ForegroundColor Green }
+function Write-Warn($Message) { Write-Host "[warn] $Message"  -ForegroundColor Yellow }
+function Write-Err($Message)  { Write-Host "[error] $Message" -ForegroundColor Red }
 
 function Invoke-Step($Action, $Script) {
     if ($DryRun) {
@@ -36,23 +52,28 @@ function Invoke-Step($Action, $Script) {
     }
 }
 
+function Require-Cmd($Name) {
+    if ($SkipDeps) { return }
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "required command not found: $Name (use -SkipDeps to bypass)"
+    }
+}
+
 # ---------- uninstall (compat shim) ----------
-# Canonical uninstaller is uninstall.ps1 (interactive + -Confirm + -Purge).
-# This branch keeps `install.ps1 -Uninstall` working for users who memorised it.
 if ($Uninstall) {
-    Write-Host "== rtrt uninstall (compat shim) =="
-    Write-Host "For interactive / purge flow, use uninstall.ps1 instead:"
-    Write-Host "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex -Args '-Confirm'"
+    Write-Log "== rtrt uninstall (compat shim) =="
+    Write-Log "For interactive / purge flow, use uninstall.ps1:"
+    Write-Log "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex -Args '-Confirm'"
     Write-Host ""
     foreach ($bin in $Bins) {
         $target = Join-Path $InstallDir $bin
         if (Test-Path $target) {
             Invoke-Step "remove $target" { Remove-Item -Force $target }
         } else {
-            Write-Host "  skip $target (not present)"
+            Write-Warn "  skip $target (not present)"
         }
     }
-    Write-Host "rtrt uninstalled. Local state under `$env:USERPROFILE\.rtrt is untouched."
+    Write-Log "rtrt uninstalled. Local state under `$env:USERPROFILE\.rtrt is untouched."
     return
 }
 
@@ -64,35 +85,77 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $TargetTriple = "$arch-pc-windows-msvc"
 
-Write-Host "== rtrt install =="
-Write-Host "  target: $TargetTriple"
-Write-Host "  prefix: $InstallDir"
+Write-Log "== rtrt install =="
+Write-Log "  target: $TargetTriple"
+Write-Log "  prefix: $InstallDir"
 
-# ---------- source build ----------
-if ($Main) {
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        throw "cargo not found; install Rust (https://rustup.rs) and retry, or omit -Main."
+function Show-InstallCheck {
+    $pathSep = ';'
+    $current = "$env:PATH"
+    if (-not ($current.Split($pathSep) -contains $InstallDir)) {
+        Write-Host ""
+        Write-Warn "$InstallDir is not on `$env:PATH."
+        Write-Warn "  Add it via:  setx PATH `"$InstallDir;$env:PATH`""
+        Write-Host ""
     }
+    Write-Log "rtrt installed:"
+    foreach ($bin in $Bins) {
+        Write-Log "  $(Join-Path $InstallDir $bin)"
+    }
+    Write-Host ""
+    Write-Log "Next:"
+    Write-Log "  rtrt --version"
+    Write-Log "  rtrt info"
+    Write-Log "  rtrt templates"
+}
+
+function Build-FromSource($SrcDir) {
+    Require-Cmd cargo
+    Invoke-Step "cargo build --release" {
+        Push-Location $SrcDir
+        try { cargo build --release --workspace } finally { Pop-Location }
+    }
+    if (-not (Test-Path $InstallDir)) {
+        Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
+    }
+    foreach ($bin in $Bins) {
+        $src = Join-Path $SrcDir "target\release\$bin"
+        $dst = Join-Path $InstallDir $bin
+        Invoke-Step "install $bin" { Copy-Item -Force $src $dst }
+    }
+    Show-InstallCheck
+}
+
+# ---------- -Source PATH (local copy) ----------
+if ($Source) {
+    if (-not (Test-Path $Source -PathType Container)) {
+        throw "-Source path is not a directory: $Source"
+    }
+    Write-Log "  source: $Source (local)"
+    Build-FromSource $Source
+    return
+}
+
+# ---------- -Ref / -Main (git clone) ----------
+if ($Ref) {
+    Require-Cmd git
+    Require-Cmd cargo
     $work = Join-Path $env:TEMP "rtrt-install-$(Get-Random)"
     Invoke-Step "create $work" { New-Item -ItemType Directory -Path $work | Out-Null }
+    Write-Log "  ref: $Ref (source build into $work)"
     try {
-        Invoke-Step "git clone main" { git clone --depth 1 "https://github.com/$Repo" $work }
-        Invoke-Step "cargo build --release" {
-            Push-Location $work
-            try { cargo build --release --workspace } finally { Pop-Location }
+        Invoke-Step "git clone $Ref" {
+            git clone --depth 1 --branch $Ref "https://github.com/$Repo" $work 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                git clone "https://github.com/$Repo" $work
+                Push-Location $work
+                try { git checkout $Ref } finally { Pop-Location }
+            }
         }
-        if (-not (Test-Path $InstallDir)) {
-            Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
-        }
-        foreach ($bin in $Bins) {
-            $src = Join-Path $work "target\release\$bin"
-            $dst = Join-Path $InstallDir $bin
-            Invoke-Step "install $bin" { Copy-Item -Force $src $dst }
-        }
+        Build-FromSource $work
     } finally {
         if (Test-Path $work) { Remove-Item -Recurse -Force $work }
     }
-    Show-InstallCheck
     return
 }
 
@@ -105,35 +168,24 @@ if (-not $Version) {
         $Version = $null
     }
     if (-not $Version) {
-        Write-Host "  no GitHub Release published yet — falling back to source build (-Main)."
+        Write-Warn "no GitHub Release published yet — falling back to source build from main."
+        Write-Warn "Pass -Version vX.Y.Z to pin a release once one is cut, or -Ref BRANCH to track a different branch."
         Write-Host ""
-        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            throw "cargo not found; install Rust (https://rustup.rs) and retry, or wait for a tagged release."
-        }
+        Require-Cmd git
+        Require-Cmd cargo
         $work = Join-Path $env:TEMP "rtrt-install-$(Get-Random)"
         Invoke-Step "create $work" { New-Item -ItemType Directory -Path $work | Out-Null }
+        Write-Log "  ref: main (auto-fallback into $work)"
         try {
             Invoke-Step "git clone main" { git clone --depth 1 "https://github.com/$Repo" $work }
-            Invoke-Step "cargo build --release" {
-                Push-Location $work
-                try { cargo build --release --workspace } finally { Pop-Location }
-            }
-            if (-not (Test-Path $InstallDir)) {
-                Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
-            }
-            foreach ($bin in $Bins) {
-                $src = Join-Path $work "target\release\$bin"
-                $dst = Join-Path $InstallDir $bin
-                Invoke-Step "install $bin" { Copy-Item -Force $src $dst }
-            }
+            Build-FromSource $work
         } finally {
             if (Test-Path $work) { Remove-Item -Recurse -Force $work }
         }
-        Show-InstallCheck
         return
     }
 }
-Write-Host "  version: $Version"
+Write-Log "  version: $Version"
 
 $versionBare = $Version.TrimStart('v')
 $asset = "rtrt-$versionBare-$TargetTriple.zip"
@@ -145,58 +197,34 @@ New-Item -ItemType Directory -Path $work | Out-Null
 try {
     $archivePath = Join-Path $work $asset
     Invoke-Step "downloading $url" { Invoke-WebRequest -Uri $url -OutFile $archivePath }
-
     if (-not $DryRun) {
         try {
-            $expectedRaw = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content
-            $expected = ($expectedRaw -split '\s+')[0]
+            $expected = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content.Trim().Split(' ')[0]
             if ($expected) {
-                $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
-                if ($actual -ne $expected.ToLowerInvariant()) {
-                    throw "checksum mismatch:`n  expected $expected`n  actual   $actual"
+                $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+                if ($actual -ne $expected.ToLower()) {
+                    throw "checksum mismatch: expected $expected actual $actual"
                 }
-                Write-Host "  checksum: ok"
+                Write-Log "  checksum: ok"
+            } else {
+                Write-Warn "  checksum: no SHA256 file at release; skipping verification"
             }
-        } catch [System.Net.WebException] {
-            Write-Host "  checksum: SHA256 file not yet attached; skipping verification"
+        } catch {
+            Write-Warn "  checksum: SHA256 file not yet attached; skipping verification"
         }
     }
-
-    Invoke-Step "expand archive" { Expand-Archive -Force -Path $archivePath -DestinationPath $work }
-
+    $extract = Join-Path $work "extracted"
+    Invoke-Step "extract" { Expand-Archive -Path $archivePath -DestinationPath $extract -Force }
     if (-not (Test-Path $InstallDir)) {
         Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
     }
     foreach ($bin in $Bins) {
-        $candidates = @(
-            (Join-Path $work $bin),
-            (Join-Path $work "$($asset -replace '\.zip$','')\$bin")
-        )
-        $src = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (-not $src) { throw "binary missing from archive: $bin" }
+        $src = Get-ChildItem -Path $extract -Recurse -Filter $bin | Select-Object -First 1
+        if (-not $src) { throw "binary missing from zip: $bin" }
         $dst = Join-Path $InstallDir $bin
-        Invoke-Step "install $bin" { Copy-Item -Force $src $dst }
+        Invoke-Step "install $bin" { Copy-Item -Force $src.FullName $dst }
     }
+    Show-InstallCheck
 } finally {
     if (Test-Path $work) { Remove-Item -Recurse -Force $work }
 }
-
-function Show-InstallCheck {
-    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($userPath -notlike "*$InstallDir*") {
-        Write-Host ""
-        Write-Host "WARNING: $InstallDir is not on PATH."
-        Write-Host "  Add it permanently with:"
-        Write-Host "    [Environment]::SetEnvironmentVariable('Path', `"$env:Path;$InstallDir`", 'User')"
-        Write-Host ""
-    }
-    Write-Host "rtrt installed:"
-    foreach ($bin in $Bins) { Write-Host "  $(Join-Path $InstallDir $bin)" }
-    Write-Host ""
-    Write-Host "Next:"
-    Write-Host "  rtrt --version"
-    Write-Host "  rtrt info"
-    Write-Host "  rtrt templates"
-}
-
-Show-InstallCheck

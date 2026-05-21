@@ -27,3 +27,13 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables BERTScore F1 quality measurement against the supplied compress
+# fixture. Requires an on-disk encoder ONNX model + matching tokenizer.json
+# — no auto-download, no model file shipped.
+bertscore = ["dep:ort", "dep:tokenizers", "dep:ndarray"]

@@ -20,6 +20,9 @@ use rtrt_core::CompressionLevel;
 use rtrt_memory::MemoryStore;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "bertscore")]
+pub mod bertscore;
+
 /// Smoke fixture shipped under `crates/rtrt-eval/fixtures/recall_smoke.json`.
 pub const RECALL_SMOKE: &str = include_str!("../fixtures/recall_smoke.json");
 

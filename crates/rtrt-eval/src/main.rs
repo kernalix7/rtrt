@@ -48,6 +48,26 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// BERTScore F1 between every fixture sample and its `Compressor::compress`
+    /// output. Requires `--features bertscore`, an ONNX encoder, and the
+    /// matching `tokenizer.json`.
+    #[cfg(feature = "bertscore")]
+    Bertscore {
+        /// ONNX encoder (BERT-base / DistilBERT / MiniLM, …) emitting
+        /// `[1, seq_len, hidden]` per-token embeddings.
+        #[arg(long, env = "RTRT_BERTSCORE_MODEL")]
+        model: PathBuf,
+        /// HuggingFace tokenizer.json matching the encoder.
+        #[arg(long, env = "RTRT_BERTSCORE_TOKENIZER")]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// Compression level to evaluate. Defaults to `full`.
+        #[arg(long, default_value = "full")]
+        level: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -77,6 +97,46 @@ fn main() -> Result<()> {
                         status, q.recall, q.reciprocal_rank, q.query, q.hits_top_k
                     );
                 }
+            }
+        }
+        #[cfg(feature = "bertscore")]
+        Cmd::Bertscore {
+            model,
+            tokenizer,
+            fixture,
+            level,
+            json,
+        } => {
+            let f = load_compress_fixture(fixture.as_deref())?;
+            let scorer = rtrt_eval::bertscore::BertScoreScorer::new(&model, &tokenizer)?;
+            let parsed = match level.as_str() {
+                "lite" => CompressionLevel::Lite,
+                "full" => CompressionLevel::Full,
+                "ultra" => CompressionLevel::Ultra,
+                other => anyhow::bail!("unknown level: {other}"),
+            };
+            let report = scorer.evaluate_fixture(&f, parsed)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "# bertscore fixture={} model={}",
+                    report.fixture, report.model
+                );
+                println!(
+                    "  {:<22}  {:>7}  {:>7}  {:>6}  {:>6}  {:>6}",
+                    "sample", "orig", "new", "P", "R", "F1"
+                );
+                for s in &report.samples {
+                    println!(
+                        "  {:<22}  {:>7}  {:>7}  {:>6.3}  {:>6.3}  {:>6.3}",
+                        s.id, s.original_chars, s.compressed_chars, s.precision, s.recall, s.f1
+                    );
+                }
+                println!(
+                    "  {:<22}  {:>7}  {:>7}  {:>6.3}  {:>6.3}  {:>6.3}",
+                    "(mean)", "", "", report.mean_precision, report.mean_recall, report.mean_f1
+                );
             }
         }
         Cmd::Compress {

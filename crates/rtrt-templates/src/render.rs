@@ -81,9 +81,18 @@ pub fn write(plan: &RenderPlan, overwrite: bool) -> Result<()> {
 /// per slot) round-trips through the engine unchanged; more advanced templates
 /// can also use Handlebars conditionals (`{{#if foo}}…{{/if}}`) and loops
 /// (`{{#each items}}…{{/each}}`).
-fn substitute(input: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+///
+/// Public so callers outside the template scaffolder (e.g. `rtrt-mcp`'s
+/// `prompts/get` handler) can render the same way without copying the
+/// engine config.
+pub fn render_str(input: &str, vars: &BTreeMap<String, String>) -> Result<String> {
     HBS.render_template(input, vars)
         .map_err(|e| Error::Config(format!("handlebars: {e}")))
+}
+
+/// Internal alias kept for the existing call sites in this module.
+fn substitute(input: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    render_str(input, vars)
 }
 
 static HBS: Lazy<Handlebars<'static>> = Lazy::new(|| {

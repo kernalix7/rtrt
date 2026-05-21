@@ -35,3 +35,4 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+uuid.workspace = true

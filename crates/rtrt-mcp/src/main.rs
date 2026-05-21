@@ -29,8 +29,10 @@ use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
 use rtrt_memory::MemoryStore;
 use rtrt_providers::{ChatMessage, ChatRequest, Gateway, Role};
+use rtrt_templates::PromptRegistry;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "rtrt-mcp", version, about = "RTRT MCP server (stdio + http)", long_about = None)]
@@ -77,6 +79,47 @@ struct RtrtMcp {
 struct RtrtState {
     memory: Mutex<MemoryStore>,
     gateway: Arc<Gateway>,
+    prompts: Option<Arc<PromptRegistry>>,
+    auto_capture: bool,
+    auto_redact: bool,
+    default_project: String,
+    session_id: String,
+    dedup_window_sec: i64,
+}
+
+impl RtrtState {
+    /// Best-effort capture mirroring the dashboard pipeline:
+    /// `redact_secrets` → SHA-256 dedup → save → tag(session, sha).
+    /// Skipped when `auto_capture` is off. Errors are swallowed so a memory
+    /// hiccup never breaks the tool call that triggered it.
+    async fn auto_capture(&self, kind: &str, project_override: Option<&str>, body: &str) {
+        if !self.auto_capture {
+            return;
+        }
+        let project = project_override.unwrap_or(self.default_project.as_str());
+        let filtered = if self.auto_redact {
+            rtrt_compress::redact_secrets(body)
+        } else {
+            body.to_string()
+        };
+        let sha = MemoryStore::body_sha(&filtered);
+        let store = self.memory.lock().await;
+        if self.dedup_window_sec > 0
+            && let Ok(Some(seen_at)) = store.body_seen_at(project, &sha)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now.saturating_sub(seen_at) < self.dedup_window_sec {
+                return;
+            }
+        }
+        let Ok(id) = store.save(project, kind, &filtered) else {
+            return;
+        };
+        let _ = store.tag_row(id, Some(&self.session_id), Some(&sha));
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -203,6 +246,17 @@ fn default_keep() -> u32 {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemorySessionsArgs {
+    project: String,
+    /// Optional `session_id`. When set, returns the rows in that session
+    /// instead of the per-session summary list.
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default = "default_timeline_limit")]
+    limit: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MemorySetBlockArgs {
     project: String,
     /// Block name. Typical: `persona`, `human`, `context`. Free-form slug.
@@ -266,7 +320,7 @@ impl RtrtMcp {
     #[tool(
         description = "Compress text via the RTRT caveman-style rewriter. Levels: lite, full, ultra."
     )]
-    fn compress(
+    async fn compress(
         &self,
         Parameters(args): Parameters<CompressArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -288,6 +342,7 @@ impl RtrtMcp {
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
+        self.state.auto_capture("compress", None, &out).await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -296,7 +351,7 @@ impl RtrtMcp {
     #[tool(
         description = "LLMLingua-style ML compression. Keeps roughly `ratio` of the input tokens by token-importance scoring (heuristic backend until real ONNX scorer lands)."
     )]
-    fn compress_ml(
+    async fn compress_ml(
         &self,
         Parameters(args): Parameters<CompressMlArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -310,6 +365,7 @@ impl RtrtMcp {
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
+        self.state.auto_capture("compress_ml", None, &out).await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -318,7 +374,10 @@ impl RtrtMcp {
     #[tool(
         description = "Filter command output via rtrt-proxy. Modes: `command` (matches the command label), `errors_only` (keeps error/warning lines + context), `ultra_compact` (collapses repeated lines)."
     )]
-    fn proxy(&self, Parameters(args): Parameters<ProxyArgs>) -> Result<CallToolResult, McpError> {
+    async fn proxy(
+        &self,
+        Parameters(args): Parameters<ProxyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let mode = args.mode.as_deref().unwrap_or("command");
         let context = args.context.unwrap_or(3) as usize;
         let original = args.raw.chars().count();
@@ -349,6 +408,7 @@ impl RtrtMcp {
             "filtered_len": filtered,
             "saved_chars": original.saturating_sub(filtered),
         });
+        self.state.auto_capture("proxy", None, &out).await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -528,6 +588,59 @@ impl RtrtMcp {
             "removed": removed,
             "kept": (before.saturating_sub(removed)),
         });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "List sessions for `project` (one row per `session_id` with count + first/last timestamps), or — if `session_id` is supplied — return the memory rows for that session newest-first."
+    )]
+    async fn memory_sessions(
+        &self,
+        Parameters(args): Parameters<MemorySessionsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let body = if let Some(sid) = args.session_id.as_deref() {
+            let rows = store
+                .session_records(&args.project, sid, args.limit as usize)
+                .map_err(|e| McpError::internal_error(format!("memory.sessions: {e}"), None))?;
+            let items: Vec<_> = rows
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "kind": r.kind,
+                        "body": r.body,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "project": args.project,
+                "session_id": sid,
+                "items": items,
+            })
+        } else {
+            let summaries = store
+                .sessions(&args.project)
+                .map_err(|e| McpError::internal_error(format!("memory.sessions: {e}"), None))?;
+            let items: Vec<_> = summaries
+                .into_iter()
+                .map(|(sid, n, first, last)| {
+                    serde_json::json!({
+                        "session_id": sid,
+                        "count": n,
+                        "first_ts": first,
+                        "last_ts": last,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "project": args.project,
+                "sessions": items,
+            })
+        };
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -735,6 +848,9 @@ impl RtrtMcp {
             "input_tokens": resp.usage.input_tokens,
             "output_tokens": resp.usage.output_tokens,
         });
+        self.state
+            .auto_capture("provider_chat", None, &resp.content)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -816,22 +932,253 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[tool_handler]
 impl ServerHandler for RtrtMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "RTRT MCP server. Memory tools: memory_save / memory_recall (BM25 + payload filter) / \
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::from_build_env())
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(
+            "RTRT MCP server. Memory tools: memory_save / memory_recall (BM25 + payload filter) / \
                  memory_timeline (paginated history) / memory_profile (per-project stats) / \
                  memory_smart_search (BM25 today, hybrid when embedder attached) / \
                  memory_relations (graph BFS from seed ids) / memory_export (JSONL) / \
                  memory_consolidate (archive oldest, keep most recent N) / \
+                 memory_sessions (group rows by session_id, or list rows in one session) / \
                  memory_set_block / memory_get_block / memory_list_blocks (persona / human / context slots). \
                  Token tools: compress (rule rewriter) / compress_ml (token-importance) / \
                  proxy (command output filters). \
                  Code tools: repo_map (tree-sitter signatures). \
                  Project tools: templates_list / templates_scaffold. \
-                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible).",
-            )
+                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible). \
+                 Prompts: every entry in the local PromptRegistry (~/.rtrt/prompts) is exposed via prompts/list + prompts/get with handlebars argument substitution. \
+                 Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block.",
+        )
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, McpError> {
+        let Some(registry) = self.state.prompts.as_ref() else {
+            return Ok(rmcp::model::ListPromptsResult::default());
+        };
+        let names = registry
+            .list_names()
+            .map_err(|e| McpError::internal_error(format!("prompts/list: {e}"), None))?;
+        let mut prompts = Vec::with_capacity(names.len());
+        for name in names {
+            let latest = registry
+                .latest(&name)
+                .map_err(|e| McpError::internal_error(format!("prompts/list latest: {e}"), None))?;
+            let description = latest
+                .as_ref()
+                .map(|p| format!("v{} ({} chars)", p.version, p.body.chars().count()));
+            prompts.push(rmcp::model::Prompt::new::<_, String>(
+                name,
+                description,
+                None,
+            ));
+        }
+        Ok(rmcp::model::ListPromptsResult {
+            next_cursor: None,
+            prompts,
+            meta: None,
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResult, McpError> {
+        let registry = self
+            .state
+            .prompts
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_params("prompt registry not configured", None))?;
+        let prompt = registry
+            .latest(&request.name)
+            .map_err(|e| McpError::internal_error(format!("prompts/get: {e}"), None))?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("unknown prompt: {}", request.name), None)
+            })?;
+        let mut vars: std::collections::BTreeMap<String, String> = Default::default();
+        if let Some(args) = request.arguments {
+            for (k, v) in args {
+                let stringified = match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                vars.insert(k, stringified);
+            }
+        }
+        let rendered = rtrt_templates::render::render_str(&prompt.body, &vars)
+            .map_err(|e| McpError::internal_error(format!("prompts/get render: {e}"), None))?;
+        let message =
+            rmcp::model::PromptMessage::new_text(rmcp::model::PromptMessageRole::User, rendered);
+        Ok(rmcp::model::GetPromptResult::new(vec![message])
+            .with_description(format!("{} v{}", prompt.name, prompt.version)))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        let store = self.state.memory.lock().await;
+        let projects = store
+            .projects()
+            .map_err(|e| McpError::internal_error(format!("resources/list: {e}"), None))?;
+        let mut resources = Vec::new();
+        for (project, count, _) in projects {
+            let uri = format!("memory://{project}/timeline");
+            let raw = rmcp::model::RawResource {
+                uri,
+                name: format!("{project} timeline"),
+                title: Some(format!("{project} — {count} rows")),
+                description: Some(format!(
+                    "Newest-first memory timeline for project `{project}`."
+                )),
+                mime_type: Some("application/json".into()),
+                size: None,
+                icons: None,
+                meta: None,
+            };
+            resources.push(rmcp::model::Annotated::new(raw, None));
+            let blocks = store.list_blocks(&project).map_err(|e| {
+                McpError::internal_error(format!("resources/list blocks: {e}"), None)
+            })?;
+            for block in blocks {
+                let block_name = block
+                    .kind
+                    .strip_prefix("block:")
+                    .unwrap_or(&block.kind)
+                    .to_string();
+                let uri = format!("memory://{project}/block/{block_name}");
+                let raw = rmcp::model::RawResource {
+                    uri,
+                    name: format!("{project}/{block_name}"),
+                    title: Some(format!("{project} block `{block_name}`")),
+                    description: Some(format!(
+                        "Letta-style memory block (project `{project}`, slot `{block_name}`)."
+                    )),
+                    mime_type: Some("text/plain".into()),
+                    size: Some(block.body.len() as u32),
+                    icons: None,
+                    meta: None,
+                };
+                resources.push(rmcp::model::Annotated::new(raw, None));
+            }
+        }
+        Ok(rmcp::model::ListResourcesResult {
+            next_cursor: None,
+            resources,
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        let uri = request.uri.clone();
+        let parsed = parse_memory_uri(&uri).ok_or_else(|| {
+            McpError::invalid_params(format!("unsupported resource URI: {uri}"), None)
+        })?;
+        let store = self.state.memory.lock().await;
+        let body = match parsed {
+            MemoryUri::Timeline { project, limit } => {
+                let rows = store
+                    .recent_paged(&project, limit, 0)
+                    .map_err(|e| McpError::internal_error(format!("read timeline: {e}"), None))?;
+                let items: Vec<_> = rows
+                    .into_iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "kind": r.kind,
+                            "body": r.body,
+                            "created_at": r.created_at,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "project": project,
+                    "items": items,
+                }))
+                .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?
+            }
+            MemoryUri::Block { project, name } => store
+                .get_block(&project, &name)
+                .map_err(|e| McpError::internal_error(format!("read block: {e}"), None))?
+                .map(|b| b.body)
+                .ok_or_else(|| {
+                    McpError::invalid_params(format!("block not found: {project}/{name}"), None)
+                })?,
+        };
+        let mime = match &uri {
+            u if u.contains("/timeline") => "application/json",
+            _ => "text/plain",
+        };
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::text(body, uri).with_mime_type(mime),
+        ]))
+    }
+}
+
+/// Memory URI parser. Two schemes are supported:
+///   `memory://<project>/timeline[?limit=N]`
+///   `memory://<project>/block/<name>`
+enum MemoryUri {
+    Timeline { project: String, limit: usize },
+    Block { project: String, name: String },
+}
+
+fn parse_memory_uri(uri: &str) -> Option<MemoryUri> {
+    let rest = uri.strip_prefix("memory://")?;
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let mut parts = path.splitn(3, '/');
+    let project = parts.next()?.to_string();
+    let kind = parts.next()?;
+    match kind {
+        "timeline" => {
+            let limit = query
+                .and_then(|q| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix("limit=").map(|v| v.to_string()))
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            Some(MemoryUri::Timeline { project, limit })
+        }
+        "block" => {
+            let name = parts.next()?.to_string();
+            Some(MemoryUri::Block { project, name })
+        }
+        _ => None,
+    }
+}
+
+fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
+    let root = std::env::var("RTRT_PROMPTS_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(rtrt_templates::prompts::default_dir)?;
+    match PromptRegistry::open(&root) {
+        Ok(r) => Some(Arc::new(r)),
+        Err(e) => {
+            tracing::warn!("prompt registry at {}: {e}", root.display());
+            None
+        }
     }
 }
 
@@ -845,9 +1192,36 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let memory = MemoryStore::open(&cli.memory)?;
     let gateway = Arc::new(Gateway::from_env());
+    let prompts = open_prompt_registry();
+    let auto_capture = std::env::var("RTRT_AUTO_CAPTURE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(true);
+    let auto_redact = std::env::var("RTRT_AUTO_REDACT")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
+    let dedup_window_sec = std::env::var("RTRT_AUTO_DEDUP_WINDOW_SEC")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(300);
+    let default_project = std::env::var("RTRT_DEFAULT_PROJECT")
+        .or_else(|_| {
+            std::env::current_dir().map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "default".to_string())
+            })
+        })
+        .unwrap_or_else(|_| "default".to_string());
+    let session_id = Uuid::new_v4().to_string();
     let shared_state = Arc::new(RtrtState {
         memory: Mutex::new(memory),
         gateway,
+        prompts,
+        auto_capture,
+        auto_redact,
+        default_project,
+        session_id,
+        dedup_window_sec,
     });
     match cli.transport {
         Transport::Stdio => {

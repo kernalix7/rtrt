@@ -1201,7 +1201,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <a class="nav active" data-page="overview"><span class="icon">🏠</span>대시보드</a>
     <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
     <div class="group">도구</div>
-    <a class="nav" data-page="compress"><span class="icon">🗜</span>압축</a>
+    <a class="nav" data-page="compress"><span class="icon">🗜</span>텍스트 압축</a>
+    <a class="nav" data-page="proxy"><span class="icon">🪒</span>명령 출력 필터</a>
     <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
     <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드 맵</a>
     <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
@@ -1241,10 +1242,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 메모리 -->
     <section id="page-memory" class="page" hidden>
-      <div class="section-head">
-        <h1>메모리</h1>
-        <div class="lede">프로젝트마다 따로 쌓이는 SQLite 저장소. 검색은 BM25, 옵션으로 필터.</div>
-      </div>
       <nav class="subtabs" id="memory-subtabs">
         <a class="active" data-sub="memquery">검색 + 저장</a>
         <a data-sub="memmap">맵</a>
@@ -1333,80 +1330,76 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 압축 -->
     <section id="page-compress" class="page" hidden>
-      <div class="section-head">
-        <h1>압축</h1>
-        <div class="lede">텍스트 또는 명령 출력을 줄여 토큰 사용량 절감.</div>
+      <div class="card">
+        <div class="head"><h2>텍스트 압축</h2><span class="hint">기본 full 레벨 룰 엔진</span></div>
+        <form id="compress-form">
+          <textarea id="compress-input" rows="6" placeholder="줄일 텍스트" required></textarea>
+          <div style="display:flex;gap:0.5rem;align-items:center;">
+            <button class="primary" type="submit">압축</button>
+            <a data-sample="compress" style="cursor:pointer;">예시 채우기</a>
+          </div>
+          <details><summary class="muted-summary">고급 옵션</summary>
+            <div class="adv">
+              <div class="row">
+                <select id="compress-mode">
+                  <option value="rules">룰 엔진</option>
+                  <option value="ml">ML 휴리스틱</option>
+                </select>
+                <select id="compress-level">
+                  <option value="lite">lite</option>
+                  <option value="full" selected>full</option>
+                  <option value="ultra">ultra</option>
+                  <option value="extreme">extreme</option>
+                </select>
+              </div>
+              <div class="row">
+                <select id="compress-format">
+                  <option value="plain" selected>plain</option>
+                  <option value="markdown">markdown</option>
+                  <option value="xml">xml</option>
+                  <option value="json">json</option>
+                </select>
+                <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ML ratio">
+              </div>
+            </div>
+          </details>
+        </form>
+        <div id="compress-summary" class="out-meta"></div>
+        <pre id="compress-output" hidden></pre>
       </div>
-        <div class="card">
-          <div class="head"><h2>텍스트 압축</h2><span class="hint">기본은 full 레벨 룰 엔진</span></div>
-          <form id="compress-form">
-            <textarea id="compress-input" rows="5" placeholder="줄일 텍스트를 붙여 넣으세요" required></textarea>
-            <div style="display:flex;gap:0.5rem;">
-              <button class="primary" type="submit">압축</button>
-              <button type="button" class="ghost" data-sample="compress">예시 채우기</button>
-            </div>
-            <details><summary class="muted-summary">고급 옵션</summary>
-              <div class="adv">
-                <div class="row">
-                  <select id="compress-mode">
-                    <option value="rules">룰 엔진 (정규식)</option>
-                    <option value="ml">ML 휴리스틱 (토큰 중요도)</option>
-                  </select>
-                  <select id="compress-level">
-                    <option value="lite">lite (약함)</option>
-                    <option value="full" selected>full (기본)</option>
-                    <option value="ultra">ultra (강함)</option>
-                    <option value="extreme">extreme (최강)</option>
-                  </select>
-                </div>
-                <div class="row">
-                  <select id="compress-format">
-                    <option value="plain" selected>plain</option>
-                    <option value="markdown">markdown</option>
-                    <option value="xml">xml</option>
-                    <option value="json">json</option>
-                  </select>
-                  <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ML 모드 비율">
-                </div>
+    </section>
+
+    <!-- 명령 출력 필터 -->
+    <section id="page-proxy" class="page" hidden>
+      <div class="card">
+        <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 정리</span></div>
+        <form id="proxy-form">
+          <input id="proxy-command" placeholder="명령 (예: git status)">
+          <textarea id="proxy-raw" rows="6" placeholder="원본 stdout / stderr" required></textarea>
+          <div style="display:flex;gap:0.5rem;align-items:center;">
+            <button class="primary" type="submit">필터링</button>
+            <a data-sample="proxy" style="cursor:pointer;">예시 채우기</a>
+          </div>
+          <details><summary class="muted-summary">고급 옵션</summary>
+            <div class="adv">
+              <div class="row">
+                <select id="proxy-mode">
+                  <option value="command">command 자동</option>
+                  <option value="errors_only">errors_only</option>
+                  <option value="ultra_compact">ultra_compact</option>
+                </select>
+                <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only 컨텍스트">
               </div>
-            </details>
-          </form>
-          <div id="compress-summary" class="out-meta"></div>
-          <pre id="compress-output" hidden></pre>
-        </div>
-        <div class="card">
-          <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 줄이기</span></div>
-          <form id="proxy-form">
-            <input id="proxy-command" placeholder="명령 (예: git status)">
-            <textarea id="proxy-raw" rows="5" placeholder="원본 stdout / stderr" required></textarea>
-            <div style="display:flex;gap:0.5rem;">
-              <button class="primary" type="submit">필터링</button>
-              <button type="button" class="ghost" data-sample="proxy">예시 채우기</button>
             </div>
-            <details><summary class="muted-summary">고급 옵션</summary>
-              <div class="adv">
-                <div class="row">
-                  <select id="proxy-mode">
-                    <option value="command">command — 명령 자동 감지</option>
-                    <option value="errors_only">errors_only — 에러 줄만</option>
-                    <option value="ultra_compact">ultra_compact — 반복 묶음</option>
-                  </select>
-                  <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only 컨텍스트 줄 수">
-                </div>
-              </div>
-            </details>
-          </form>
-          <div id="proxy-summary" class="out-meta"></div>
-          <pre id="proxy-output" hidden></pre>
-        </div>
+          </details>
+        </form>
+        <div id="proxy-summary" class="out-meta"></div>
+        <pre id="proxy-output" hidden></pre>
+      </div>
     </section>
 
     <!-- 진단 -->
     <section id="page-diagnose" class="page" hidden>
-      <div class="section-head">
-        <h1>진단</h1>
-        <div class="lede">빌드 / 테스트 실패 로그를 LLM 에게 던지고 한 줄 답을 받음.</div>
-      </div>
         <div class="card">
           <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄</span></div>
           <form id="diagnose-form">
@@ -1429,10 +1422,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 코드 맵 -->
     <section id="page-repomap" class="page" hidden>
-      <div class="section-head">
-        <h1>코드 맵</h1>
-        <div class="lede">소스 트리에서 함수 / 클래스 시그니처만 추출.</div>
-      </div>
         <div class="card">
           <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동</span></div>
           <form id="repomap-form">
@@ -1454,10 +1443,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 템플릿 -->
     <section id="page-templates" class="page" hidden>
-      <div class="section-head">
-        <h1>템플릿</h1>
-        <div class="lede">새 프로젝트 시작. 개발 / 디자인 / 설계 카테고리.</div>
-      </div>
         <div class="card">
           <div class="head"><h2>프로젝트 템플릿</h2><span class="hint">개발 · 디자인 · 설계 카테고리</span></div>
           <table id="tpl"><thead><tr><th>이름</th><th>카테고리</th><th>설명</th><th></th></tr></thead><tbody><tr><td colspan="4" class="empty">불러오는 중…</td></tr></tbody></table>
@@ -1482,10 +1467,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 프롬프트 -->
     <section id="page-prompts" class="page" hidden>
-      <div class="section-head">
-        <h1>프롬프트</h1>
-        <div class="lede">버전 관리되는 프롬프트 라이브러리.</div>
-      </div>
         <div class="card">
           <div class="head"><h2>버전 프롬프트</h2><span class="hint">$RTRT_PROMPTS_DIR (기본 ~/.rtrt/prompts)</span></div>
           <table id="prompts-tbl"><thead><tr><th>이름</th><th>최신</th><th>버전</th></tr></thead><tbody><tr><td colspan="3" class="empty">아직 저장된 프롬프트 없음. CLI <code>rtrt prompt save</code> 로 추가하세요.</td></tr></tbody></table>
@@ -1495,12 +1476,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 에이전트 연결 -->
     <section id="page-connect" class="page" hidden>
-      <div class="section-head">
-        <h1>에이전트 연결</h1>
-        <div class="lede">Claude Code / Cursor / Codex 의 MCP 설정 스니펫 생성. 디스크 미기록.</div>
-      </div>
         <div class="card">
-          <div class="head"><h2>MCP 설정 스니펫</h2></div>
+          <div class="head"><h2>MCP 설정 스니펫</h2><span class="hint">Claude Code / Cursor / Codex · 디스크 미기록</span></div>
           <form id="setup-form">
             <div class="row">
               <select id="setup-agent">
@@ -1519,12 +1496,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <!-- 환경 -->
     <section id="page-env" class="page" hidden>
-      <div class="section-head">
-        <h1>환경</h1>
-        <div class="lede">현재 대시보드 바인딩 / 인증 / 캐시 / 예산 한도.</div>
-      </div>
         <div class="card">
-          <div class="head"><h2>환경 정보</h2></div>
+          <div class="head"><h2>환경 정보</h2><span class="hint">현재 바인딩 / 인증 / 캐시 / 예산</span></div>
           <table id="env-tbl"><tbody>
             <tr><td>대시보드 바인드</td><td><code id="env-bind">—</code></td></tr>
             <tr><td>인증 토큰</td><td id="env-token">—</td></tr>

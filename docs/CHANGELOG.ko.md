@@ -10,16 +10,28 @@
 
 ### Highlights
 
-**INSPIRATION 백로그의 HIGH 12개를 한 번에 채택 — 메모리 계층 / 그래프 회수 / HNSW, gateway 예산 + 트레이스, 프롬프트 레지스트리, context7 doc fetcher, repo-map / signatures, `rtrt discover`, handlebars 템플릿, 규칙 확장 + LLM 압축 모드.**
+**두 번째 스윕: MCP Streamable HTTP 전송 + 베어러 토큰 가드, qdrant-style 페이로드 필터 DSL, LLMLingua-style ML 압축 스캐폴드, Helicone-style 응답 캐시, langfuse-style 프롬프트 API, Letta 블록, crewAI `agent-role` 템플릿, chroma 다중 출력 포맷, aider-style `rtrt diagnose`, tree-sitter Python + TypeScript, 메모리 export/import, 대시보드 인증 + 다크모드 + 스파크라인 + 10탭 (Proxy / Diagnose / RepoMap / Setup 포함).**
 
-자세한 항목은 [영문 CHANGELOG](../CHANGELOG.md#unreleased)를 참고하세요. 주요 라인업:
+- `rtrt-mcp`: rmcp Streamable HTTP 전송 + axum 라우터. 새 도구 `compress_ml`, `proxy`, `memory_set_block/get_block/list_blocks`. `memory_recall`에 qdrant DSL 필터 파라미터. `--http-token` 상수-시간 베어러 가드, `--allowed-origins` RFC 6454.
+- `rtrt-memory`: v3 마이그레이션 `metadata` 컬럼, `PayloadFilter` DSL (`source=claude,topic~^auth`), `recall_bm25_with_filter`, `save_with_metadata`, `export_jsonl` / `import_jsonl`.
+- `rtrt-providers`: `Gateway::with_cache(cap)` Helicone 응답 캐시 — 키 `(model, messages, max_tokens, temperature)`, 히트는 재시도/메트릭/예산 우회.
+- `rtrt-compress`: `MlCompressor` + `TokenImportance` 트레이트 + 휴리스틱 백엔드 (ONNX 백엔드 deferred), `compress_to(Plain/Markdown/Xml/Json)`, tree-sitter Python + TypeScript 그래머.
+- `rtrt-templates`: `agent-role` 빌트인 (crewAI role/goal/backstory 트리아드).
+- `rtrt-dashboard`: 10탭 (Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup), SVG 스파크라인, parent_id 그룹 트레이스, 다크/라이트 토글, 캐시 KPI. 신규 라우트 `/api/{prompts*, budget, memory/{recall,save,blocks,blocks/{name}}, compress, proxy, diagnose, repo-map, setup}`. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어.
+- `rtrt-cli`: `rtrt diagnose`, `rtrt mcp`, `rtrt benchmark`, `rtrt memory export/import`, `rtrt memory blocks {set,get,list}`. 기존 확장: `compress {--ml --ratio --format}`, `memory recall --filter`, `memory save --meta key=val`, `signatures --lang python|typescript`, `repo-map` 다중 언어 자동 감지.
 
-- `rtrt-providers`: `Gateway` + `Budget` + 요청별 `RequestMetric { id, parent_id, cost_usd, … }`; `Context7Client` 라이브러리 문서 페치.
-- `rtrt-memory`: 메모리 스코프(`MemoryScope`), `add_edge` + `recall_via_graph`, `with_embedder` 자동 임베드, `archive_overflow`, `hnsw` 피처(`HnswIndex`, `instant-distance`).
-- `rtrt-compress`: `Extreme` 레벨, 헤지/담화/메타 표현 규칙, `redact_secrets` 사전 검열, `LlmCompressor`(any Provider), Rust 시그니처 추출기.
-- `rtrt-templates`: handlebars 렌더링, 버저닝되는 `PromptRegistry`.
-- `rtrt-cli`: `compress --llm` / `memory {extract,compress}` / `prompt {save,get,list,versions}` / `signatures` / `repo-map` / `discover` / `docs` / `setup --agent` 전부 추가.
-- `rtrt-mcp`: 6번째 도구 `provider_chat` 추가.
+자세한 항목은 [영문 CHANGELOG](../CHANGELOG.md#unreleased) 참고.
+
+---
+
+**첫 번째 스윕 (트레이서빌리티용 유지) — INSPIRATION 백로그 HIGH 12개:**
+
+- `rtrt-providers`: `Gateway` + `Budget` + `RequestMetric { id, parent_id, cost_usd, … }`; `Context7Client`.
+- `rtrt-memory`: `MemoryScope`, `add_edge` + `recall_via_graph`, `with_embedder` 자동 임베드, `archive_overflow`, `hnsw` 피처.
+- `rtrt-compress`: `Extreme` 레벨, 헤지/담화/메타 표현 규칙, `redact_secrets`, `LlmCompressor`, Rust 시그니처 추출기.
+- `rtrt-templates`: handlebars 렌더링, `PromptRegistry`.
+- `rtrt-cli`: `compress --llm` / `memory {extract,compress}` / `prompt {save,get,list,versions}` / `signatures` / `repo-map` / `discover` / `docs` / `setup --agent`.
+- `rtrt-mcp`: 6번째 도구 `provider_chat`.
 
 <!--
 릴리스 절단 시 이 스탠자를 복사해 새 버전 섹션을 만드세요.

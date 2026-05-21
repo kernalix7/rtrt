@@ -608,7 +608,8 @@ struct RepoMapRequest {
 }
 
 fn default_ext() -> String {
-    ".rs".into()
+    // Empty = auto-detect via `Language::from_filename` (.rs / .py / .ts / .tsx).
+    String::new()
 }
 fn default_max_bytes() -> u64 {
     524_288
@@ -623,14 +624,18 @@ async fn repo_map(
             format!("root not found: {}", req.root.display()),
         ));
     }
-    let extractor = rtrt_compress::SignatureExtractor::new(rtrt_compress::Language::Rust);
     let mut entries = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut signature_chars: usize = 0;
+    let restrict_ext = req.ext.trim();
     for entry in walk_files(&req.root) {
-        if !entry.to_string_lossy().ends_with(&req.ext) {
+        let name = entry.to_string_lossy();
+        if !restrict_ext.is_empty() && !name.ends_with(restrict_ext) {
             continue;
         }
+        let Some(lang) = rtrt_compress::Language::from_filename(&name) else {
+            continue;
+        };
         let size = std::fs::metadata(&entry).map(|m| m.len()).unwrap_or(0);
         if size > req.max_bytes {
             continue;
@@ -638,6 +643,7 @@ async fn repo_map(
         let Ok(src) = std::fs::read_to_string(&entry) else {
             continue;
         };
+        let extractor = rtrt_compress::SignatureExtractor::new(lang);
         let Ok(sig) = extractor.extract(&src) else {
             continue;
         };
@@ -650,6 +656,7 @@ async fn repo_map(
             .to_string();
         entries.push(serde_json::json!({
             "path": rel,
+            "language": format!("{lang:?}"),
             "signatures": sig,
             "original_bytes": src.len(),
             "signature_bytes": sig.len(),
@@ -876,6 +883,7 @@ struct BudgetResponse {
     cap_usd: Option<f64>,
     spent_usd: f64,
     remaining_usd: Option<f64>,
+    cache_len: Option<usize>,
 }
 
 async fn budget(State(state): State<AppState>) -> Json<BudgetResponse> {
@@ -886,6 +894,7 @@ async fn budget(State(state): State<AppState>) -> Json<BudgetResponse> {
         cap_usd: cap,
         spent_usd: spent,
         remaining_usd: remaining,
+        cache_len: state.gateway.cache_len(),
     })
 }
 
@@ -1423,10 +1432,12 @@ async function loadStats() {
 function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
 async function loadBudget() {
   const b = await fetch('/api/budget').then(r => r.json());
+  const cache = b.cache_len === null || b.cache_len === undefined ? 'off' : b.cache_len;
   document.getElementById('budget-summary').innerHTML = `
     <span class="kpi">cap<br><b>${fmtUsd(b.cap_usd)}</b></span>
     <span class="kpi">spent<br><b>${fmtUsd(b.spent_usd)}</b></span>
     <span class="kpi">remaining<br><b>${fmtUsd(b.remaining_usd)}</b></span>
+    <span class="kpi">cache<br><b>${cache}</b></span>
   `;
 }
 async function loadPrompts() {

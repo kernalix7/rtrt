@@ -161,8 +161,9 @@ enum Cmd {
         /// Skip files larger than this many bytes.
         #[arg(long, default_value_t = 524_288)]
         max_bytes: u64,
-        /// Optional file-name suffix filter (default: `.rs`).
-        #[arg(long, default_value = ".rs")]
+        /// File-name suffix filter. Empty = auto-detect every supported
+        /// language (.rs / .py / .ts / .tsx). Set to e.g. `.rs` to restrict.
+        #[arg(long, default_value = "")]
         ext: String,
     },
     /// Build a compressed git-state context for the LLM.
@@ -240,6 +241,15 @@ enum MemoryCmd {
         body: Option<String>,
         #[arg(long, default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
+        /// Metadata pair `key=value` (repeatable) — wires into qdrant-style
+        /// payload filtering on recall.
+        #[arg(long = "meta", value_parser = parse_var)]
+        meta: Vec<(String, String)>,
+    },
+    /// Letta-style memory blocks (persona / human / context slots).
+    Blocks {
+        #[command(subcommand)]
+        cmd: BlockCmd,
     },
     /// Recall memories by BM25 (FTS5).
     Recall {
@@ -405,6 +415,34 @@ impl From<LevelArg> for CompressionLevel {
             LevelArg::Extreme => CompressionLevel::Extreme,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum BlockCmd {
+    /// Upsert a block (overwrites any existing slot with the same name).
+    Set {
+        #[arg(long)]
+        project: String,
+        name: String,
+        body: Option<String>,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
+    /// Print one block.
+    Get {
+        #[arg(long)]
+        project: String,
+        name: String,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
+    /// List every block in a project.
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        store: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -709,16 +747,19 @@ async fn main() -> Result<()> {
             max_bytes,
             ext,
         } => {
-            let lang = TsLanguage::Rust;
-            let extractor = SignatureExtractor::new(lang);
+            let restrict_ext = ext.trim();
             let mut entries: Vec<(PathBuf, String, usize, usize)> = Vec::new();
             for entry in walk_dir(&root) {
                 if !entry.is_file() {
                     continue;
                 }
-                if !entry.to_string_lossy().ends_with(&ext) {
+                let name = entry.to_string_lossy();
+                if !restrict_ext.is_empty() && !name.ends_with(restrict_ext) {
                     continue;
                 }
+                let Some(lang) = TsLanguage::from_filename(&name) else {
+                    continue;
+                };
                 let size = std::fs::metadata(&entry).map(|m| m.len()).unwrap_or(0);
                 if size > max_bytes {
                     continue;
@@ -727,6 +768,7 @@ async fn main() -> Result<()> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                let extractor = SignatureExtractor::new(lang);
                 let sig = match extractor.extract(&src) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -1058,12 +1100,54 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             kind,
             body,
             store,
+            meta,
         } => {
             let store = MemoryStore::open(&store)?;
             let body = read_body_or_stdin(body)?;
-            let id = store.save(&project, &kind, &body)?;
+            let id = if meta.is_empty() {
+                store.save(&project, &kind, &body)?
+            } else {
+                let map: std::collections::BTreeMap<String, String> = meta.into_iter().collect();
+                store.save_with_metadata(&project, &kind, &body, &map)?
+            };
             println!("saved id={id}");
         }
+        MemoryCmd::Blocks { cmd } => match cmd {
+            BlockCmd::Set {
+                project,
+                name,
+                body,
+                store,
+            } => {
+                let store = MemoryStore::open(&store)?;
+                let body = read_body_or_stdin(body)?;
+                let id = store.set_block(&project, &name, &body)?;
+                println!("block id={id}");
+            }
+            BlockCmd::Get {
+                project,
+                name,
+                store,
+            } => {
+                let store = MemoryStore::open(&store)?;
+                match store.get_block(&project, &name)? {
+                    Some(b) => println!("{}", b.body),
+                    None => anyhow::bail!("block not found: {name}"),
+                }
+            }
+            BlockCmd::List { project, store } => {
+                let store = MemoryStore::open(&store)?;
+                let blocks = store.list_blocks(&project)?;
+                if blocks.is_empty() {
+                    println!("(no blocks)");
+                } else {
+                    for b in blocks {
+                        let name = b.kind.trim_start_matches("block:");
+                        println!("- {name}: {}", b.body);
+                    }
+                }
+            }
+        },
         MemoryCmd::Recall {
             project,
             query,

@@ -108,7 +108,16 @@ async fn main() -> Result<()> {
         }))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!(
+                "address {bind} is already in use. Free the port (lsof -i :{port}) or set RTRT_DASHBOARD_BIND to another address (e.g. RTRT_DASHBOARD_BIND=127.0.0.1:3211 rtrt-dashboard).",
+                port = bind.rsplit(':').next().unwrap_or("3111"),
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
     tracing::info!("rtrt-dashboard listening on http://{bind}");
     axum::serve(listener, app).await?;
     Ok(())

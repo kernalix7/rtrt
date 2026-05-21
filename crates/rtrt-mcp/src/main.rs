@@ -714,7 +714,17 @@ async fn main() -> Result<()> {
                     let token = token.clone();
                     async move { bearer_guard(token, req, next).await }
                 }));
-            let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
+            let listener = match tokio::net::TcpListener::bind(&cli.bind).await {
+                Ok(l) => l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    let port = cli.bind.rsplit(':').next().unwrap_or("3112").to_string();
+                    anyhow::bail!(
+                        "address {bind} is already in use. Free the port (lsof -i :{port}) or pass --bind 127.0.0.1:<other> (or set --bind via env).",
+                        bind = cli.bind,
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            };
             axum::serve(listener, app).await?;
         }
     }

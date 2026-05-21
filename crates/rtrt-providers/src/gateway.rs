@@ -197,8 +197,13 @@ struct Registration {
 pub struct RetryPolicy {
     /// Number of attempts on the primary provider (including the first).
     pub max_attempts: u32,
-    /// Sleep between retries, in milliseconds. Constant backoff.
+    /// Sleep between retries, in milliseconds. With `backoff_factor == 1.0`
+    /// the wait is constant; higher factors apply geometric backoff (the wait
+    /// is `backoff_ms * backoff_factor.powi(attempt - 1)`).
     pub backoff_ms: u64,
+    /// Multiplier applied to `backoff_ms` per failed attempt. `1.0` keeps the
+    /// existing constant-backoff behaviour; `2.0` doubles the wait each retry.
+    pub backoff_factor: f32,
     /// When `true` and the primary provider keeps failing, the default
     /// fallback provider (set via [`Gateway::with_default_last`]) gets one
     /// last attempt before the error is surfaced.
@@ -210,6 +215,20 @@ impl Default for RetryPolicy {
         Self {
             max_attempts: 1,
             backoff_ms: 0,
+            backoff_factor: 1.0,
+            fallback_to_default: false,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Convenience builder for an exponential schedule. `factor < 1.0` is
+    /// clamped to 1.0 so the wait never shrinks across retries.
+    pub fn exponential(max_attempts: u32, backoff_ms: u64, factor: f32) -> Self {
+        Self {
+            max_attempts,
+            backoff_ms,
+            backoff_factor: factor.max(1.0),
             fallback_to_default: false,
         }
     }
@@ -484,7 +503,14 @@ impl Gateway {
         let key = cache_key(&req);
         for attempt in 0..attempts {
             if attempt > 0 && self.retry.backoff_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.retry.backoff_ms)).await;
+                let factor = self.retry.backoff_factor.max(1.0);
+                let wait = if (factor - 1.0).abs() < f32::EPSILON {
+                    self.retry.backoff_ms
+                } else {
+                    let scale = factor.powi(attempt as i32 - 1) as f64;
+                    ((self.retry.backoff_ms as f64) * scale) as u64
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
             }
             match self
                 .dispatch_once(primary_idx, req.clone(), parent_id)
@@ -862,6 +888,7 @@ mod tests {
             .with_retry(RetryPolicy {
                 max_attempts: 2,
                 backoff_ms: 0,
+                backoff_factor: 1.0,
                 fallback_to_default: true,
             });
         let resp = gw.chat(req("claude-haiku-4-5")).await.unwrap();
@@ -881,6 +908,7 @@ mod tests {
             .with_retry(RetryPolicy {
                 max_attempts: 3,
                 backoff_ms: 0,
+                backoff_factor: 1.0,
                 fallback_to_default: false,
             });
         let err = gw.chat(req("x-anything")).await.unwrap_err();

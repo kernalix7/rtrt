@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
         .route("/api/templates", get(list_templates))
         .route("/api/templates/{name}", get(get_template))
         .route("/api/templates/scaffold", post(scaffold))
+        .route("/api/templates/scaffold/preview", post(scaffold_preview))
         .route("/api/chat", post(chat))
         .route("/api/metrics", get(metrics))
         .route("/api/prompts", get(list_prompts))
@@ -179,6 +180,45 @@ struct ScaffoldResponse {
     files_written: usize,
     root: PathBuf,
     post_hooks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScaffoldPreviewResponse {
+    root: PathBuf,
+    files: Vec<ScaffoldPreviewFile>,
+    post_hooks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScaffoldPreviewFile {
+    path: PathBuf,
+    bytes: usize,
+    executable: bool,
+}
+
+async fn scaffold_preview(
+    Json(req): Json<ScaffoldRequest>,
+) -> std::result::Result<Json<ScaffoldPreviewResponse>, (StatusCode, String)> {
+    let tmpl = rtrt_templates::find(&req.template).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("template not found: {}", req.template),
+    ))?;
+    let plan = rtrt_templates::render::plan(&tmpl, &req.target, req.variables)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let files = plan
+        .files
+        .iter()
+        .map(|f| ScaffoldPreviewFile {
+            path: f.path.clone(),
+            bytes: f.content.len(),
+            executable: f.executable,
+        })
+        .collect();
+    Ok(Json(ScaffoldPreviewResponse {
+        root: plan.root,
+        files,
+        post_hooks: plan.post_hooks,
+    }))
 }
 
 async fn scaffold(

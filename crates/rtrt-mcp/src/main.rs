@@ -101,6 +101,19 @@ fn default_kind() -> String {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RepoMapArgs {
+    /// Root directory to walk.
+    root: PathBuf,
+    /// Skip files larger than this many bytes. Defaults to 524288.
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// Restrict to files ending with this suffix (e.g. `.rs`). Empty =
+    /// auto-detect every supported language.
+    #[serde(default)]
+    ext: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CompressMlArgs {
     /// Text to compress.
     text: String,
@@ -337,6 +350,71 @@ impl RtrtMcp {
         )]))
     }
 
+    #[tool(
+        description = "Walk a directory and emit a tree-sitter signature map of every supported source file (.rs / .py / .ts / .tsx). Bodies are stripped; the result is the API surface."
+    )]
+    fn repo_map(
+        &self,
+        Parameters(args): Parameters<RepoMapArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let max_bytes = args.max_bytes.unwrap_or(524_288);
+        let restrict_ext = args.ext.unwrap_or_default();
+        if !args.root.exists() {
+            return Err(McpError::invalid_params(
+                format!("root not found: {}", args.root.display()),
+                None,
+            ));
+        }
+        let mut files = 0usize;
+        let mut total_bytes: u64 = 0;
+        let mut signature_chars: usize = 0;
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        for entry in walk_files(&args.root) {
+            let name = entry.to_string_lossy();
+            if !restrict_ext.is_empty() && !name.ends_with(&restrict_ext) {
+                continue;
+            }
+            let Some(lang) = rtrt_compress::Language::from_filename(&name) else {
+                continue;
+            };
+            let size = std::fs::metadata(&entry).map(|m| m.len()).unwrap_or(0);
+            if size > max_bytes {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&entry) else {
+                continue;
+            };
+            let extractor = rtrt_compress::SignatureExtractor::new(lang);
+            let Ok(sig) = extractor.extract(&src) else {
+                continue;
+            };
+            total_bytes += src.len() as u64;
+            signature_chars += sig.chars().count();
+            files += 1;
+            let rel = entry
+                .strip_prefix(&args.root)
+                .unwrap_or(&entry)
+                .display()
+                .to_string();
+            entries.push(serde_json::json!({
+                "path": rel,
+                "language": format!("{lang:?}"),
+                "signatures": sig,
+                "original_bytes": src.len(),
+                "signature_bytes": sig.len(),
+            }));
+        }
+        let body = serde_json::json!({
+            "files": files,
+            "total_bytes": total_bytes,
+            "signature_chars": signature_chars,
+            "entries": entries,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
     #[tool(description = "List built-in and custom project templates.")]
     fn templates_list(&self) -> Result<CallToolResult, McpError> {
         let templates = rtrt_templates::list_all();
@@ -480,6 +558,33 @@ impl RtrtMcp {
     }
 }
 
+/// Walk a directory tree, skipping `target/` and dot-prefixed entries.
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    let name = entry.file_name();
+                    let nstr = name.to_string_lossy();
+                    if nstr == "target" || nstr.starts_with('.') {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if ft.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Bearer-token guard for the HTTP transport. When `expected` is `None` every
 /// request is admitted (the operator opted out by omitting `--http-token`).
 async fn bearer_guard(
@@ -535,6 +640,7 @@ impl ServerHandler for RtrtMcp {
                 "RTRT MCP server. Tools: compress (caveman-style rewriter), \
                  compress_ml (LLMLingua-style token-importance compression), \
                  proxy (rtrt-proxy command/errors_only/ultra_compact filters), \
+                 repo_map (tree-sitter signature index for .rs / .py / .ts / .tsx), \
                  memory_save / memory_recall (SQLite + FTS5 BM25; recall accepts a qdrant-style payload filter), \
                  memory_set_block / memory_get_block / memory_list_blocks (Letta-style blocks), \
                  templates_list / templates_scaffold (built-in project scaffolds), \

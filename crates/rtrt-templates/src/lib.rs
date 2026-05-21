@@ -6,7 +6,10 @@
 
 pub mod builtin;
 pub mod custom;
+pub mod prompts;
 pub mod render;
+
+pub use prompts::{Prompt, PromptRegistry};
 
 use std::collections::BTreeMap;
 

@@ -18,6 +18,7 @@ use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, OpenAICompatibleProvider,
     OpenAIProvider, Provider, Role,
 };
+use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
 
 #[derive(Debug, Parser)]
@@ -102,6 +103,11 @@ enum Cmd {
         #[arg(long, default_value = "rust")]
         lang: String,
     },
+    /// Versioned prompt registry (file-backed under ~/.rtrt/prompts/).
+    Prompt {
+        #[command(subcommand)]
+        cmd: PromptCmd,
+    },
     /// Walk a directory and emit a tree-sitter signature map of every Rust file.
     RepoMap {
         /// Root directory to walk.
@@ -179,6 +185,38 @@ enum MemoryCmd {
         base_url: Option<String>,
         #[arg(long, default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PromptCmd {
+    /// Save a new version of a named prompt. Body from arg or stdin.
+    Save {
+        name: String,
+        body: Option<String>,
+        #[arg(long = "meta", value_parser = parse_var)]
+        meta: Vec<(String, String)>,
+        #[arg(long, default_value = ".rtrt/prompts")]
+        registry: PathBuf,
+    },
+    /// Fetch a prompt (latest unless --version given).
+    Get {
+        name: String,
+        #[arg(long)]
+        version: Option<u32>,
+        #[arg(long, default_value = ".rtrt/prompts")]
+        registry: PathBuf,
+    },
+    /// List every registered prompt name.
+    List {
+        #[arg(long, default_value = ".rtrt/prompts")]
+        registry: PathBuf,
+    },
+    /// List every version of `name`.
+    Versions {
+        name: String,
+        #[arg(long, default_value = ".rtrt/prompts")]
+        registry: PathBuf,
     },
 }
 
@@ -319,6 +357,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
+        Cmd::Prompt { cmd } => run_prompt(cmd)?,
         Cmd::Setup {
             agent,
             apply,
@@ -563,6 +602,74 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
             "[usage] provider={} model={} input={} output={}",
             resp.provider, resp.model, resp.usage.input_tokens, resp.usage.output_tokens
         );
+    }
+    Ok(())
+}
+
+fn run_prompt(cmd: PromptCmd) -> Result<()> {
+    match cmd {
+        PromptCmd::Save {
+            name,
+            body,
+            meta,
+            registry,
+        } => {
+            let reg = PromptRegistry::open(&registry)?;
+            let body = read_body_or_stdin(body)?;
+            let mut metadata = std::collections::BTreeMap::new();
+            for (k, v) in meta {
+                metadata.insert(k, v);
+            }
+            let saved = reg.save(&name, &body, metadata)?;
+            println!(
+                "saved {} v{} ({} bytes)",
+                saved.name,
+                saved.version,
+                saved.body.len()
+            );
+        }
+        PromptCmd::Get {
+            name,
+            version,
+            registry,
+        } => {
+            let reg = PromptRegistry::open(&registry)?;
+            let prompt = match version {
+                Some(v) => reg.get(&name, v)?,
+                None => reg
+                    .latest(&name)?
+                    .ok_or_else(|| anyhow::anyhow!("no versions saved for {name}"))?,
+            };
+            println!("{}", prompt.body);
+            eprintln!(
+                "[prompt] {} v{} created_at={} parent={:?}",
+                prompt.name, prompt.version, prompt.created_at, prompt.parent_version
+            );
+        }
+        PromptCmd::List { registry } => {
+            let reg = PromptRegistry::open(&registry)?;
+            let names = reg.list_names()?;
+            if names.is_empty() {
+                println!("(no prompts saved)");
+            } else {
+                for name in names {
+                    let versions = reg.list_versions(&name)?;
+                    println!("{} ({} version(s))", name, versions.len());
+                }
+            }
+        }
+        PromptCmd::Versions { name, registry } => {
+            let reg = PromptRegistry::open(&registry)?;
+            for v in reg.list_versions(&name)? {
+                let p = reg.get(&name, v)?;
+                println!(
+                    "v{:>3}  parent={:?}  {} bytes",
+                    p.version,
+                    p.parent_version,
+                    p.body.len()
+                );
+            }
+        }
     }
     Ok(())
 }

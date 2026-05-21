@@ -1,15 +1,16 @@
-//! Multi-provider gateway + per-request metrics.
+//! Multi-provider gateway + per-request metrics + optional budget meter.
 //!
 //! Sits in front of an arbitrary number of [`Provider`] backends and dispatches
 //! [`ChatRequest`]s by model id. Records latency, token usage, and outcome for
-//! every call so dashboards / observability surfaces can read live counters.
+//! every call so dashboards / observability surfaces can read live counters
+//! and stitch multi-turn flows via [`RequestMetric::parent_id`].
 //!
 //! Routing model: a provider is registered with a name (`"anthropic"`,
 //! `"openai"`, `"ollama"`, …) and a set of model-id prefixes it owns. The
 //! first registered prefix that matches wins; unmatched models fall back to a
 //! default provider if one is configured.
 //!
-//! Metrics are kept in-memory only at v0.3 first cut. A trailing-window cap
+//! Metrics are kept in-memory only at first cut. A trailing-window cap
 //! prevents unbounded growth — old metrics roll off the back.
 
 use std::collections::HashMap;
@@ -24,6 +25,13 @@ use crate::{ChatRequest, ChatResponse, Provider, Usage};
 /// One observation per chat call. Cheap to clone (`Arc`-free, all owned data).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestMetric {
+    /// Monotonic per-gateway counter assigned in record order. Stable for the
+    /// lifetime of the gateway; downstream traces use this as the trace id.
+    pub id: u64,
+    /// Optional parent trace id for multi-turn flows. Set via
+    /// [`Gateway::chat_with_parent`].
+    #[serde(default)]
+    pub parent_id: Option<u64>,
     /// Provider name as registered with the gateway.
     pub provider: String,
     /// Model id the caller asked for.
@@ -34,6 +42,10 @@ pub struct RequestMetric {
     pub latency_ms: u64,
     /// Token usage. Zero when the call failed before a usage block was returned.
     pub usage: Usage,
+    /// Estimated USD cost based on the gateway's pricing table. `0.0` when no
+    /// budget is attached or the model has no pricing entry.
+    #[serde(default)]
+    pub cost_usd: f64,
     /// Whether the call succeeded.
     pub ok: bool,
     /// Truncated error message when `!ok`.
@@ -48,6 +60,8 @@ pub struct GatewaySummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_latency_ms: u64,
+    #[serde(default)]
+    pub total_cost_usd: f64,
 }
 
 impl GatewaySummary {
@@ -61,6 +75,7 @@ impl GatewaySummary {
         self.total_input_tokens += m.usage.input_tokens;
         self.total_output_tokens += m.usage.output_tokens;
         self.total_latency_ms += m.latency_ms;
+        self.total_cost_usd += m.cost_usd;
     }
 
     pub fn avg_latency_ms(&self) -> f64 {
@@ -69,6 +84,103 @@ impl GatewaySummary {
         } else {
             self.total_latency_ms as f64 / self.calls as f64
         }
+    }
+}
+
+/// USD pricing per million tokens for a model. Used by [`Budget`] to estimate
+/// per-call cost.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
+}
+
+/// Snapshot list-prices for common Anthropic and OpenAI models. Defaults for
+/// [`Budget::new`]; override per model id when they shift upstream.
+pub fn default_pricing() -> HashMap<String, ModelPricing> {
+    let mut m = HashMap::new();
+    m.insert(
+        "claude-opus-4-7".into(),
+        ModelPricing {
+            input_usd_per_mtok: 15.0,
+            output_usd_per_mtok: 75.0,
+        },
+    );
+    m.insert(
+        "claude-sonnet-4-6".into(),
+        ModelPricing {
+            input_usd_per_mtok: 3.0,
+            output_usd_per_mtok: 15.0,
+        },
+    );
+    m.insert(
+        "claude-haiku-4-5".into(),
+        ModelPricing {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 5.0,
+        },
+    );
+    m.insert(
+        "gpt-5.4".into(),
+        ModelPricing {
+            input_usd_per_mtok: 5.0,
+            output_usd_per_mtok: 15.0,
+        },
+    );
+    m.insert(
+        "gpt-5.4-mini".into(),
+        ModelPricing {
+            input_usd_per_mtok: 0.6,
+            output_usd_per_mtok: 2.4,
+        },
+    );
+    m.insert(
+        "gpt-5.3-codex-spark".into(),
+        ModelPricing {
+            input_usd_per_mtok: 0.5,
+            output_usd_per_mtok: 2.0,
+        },
+    );
+    m
+}
+
+/// Optional per-gateway spending limit. When attached, every chat call is
+/// priced against the model's [`ModelPricing`] entry and added to a running
+/// total. Once the total exceeds `cap_usd`, subsequent calls are rejected
+/// with `Error::Provider("gateway: budget exceeded …")` before they reach the
+/// upstream provider. Pricing for unknown models is treated as zero so the
+/// budget never blocks a local Ollama call by accident.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    pub cap_usd: f64,
+    pub pricing: HashMap<String, ModelPricing>,
+}
+
+impl Budget {
+    pub fn new(cap_usd: f64) -> Self {
+        Self {
+            cap_usd,
+            pricing: default_pricing(),
+        }
+    }
+    pub fn with_pricing(mut self, pricing: HashMap<String, ModelPricing>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+    pub fn upsert_model(mut self, model: impl Into<String>, p: ModelPricing) -> Self {
+        self.pricing.insert(model.into(), p);
+        self
+    }
+    /// USD cost estimate for a (model, usage) pair. Returns `0.0` when the
+    /// model has no pricing entry.
+    pub fn cost_for(&self, model: &str, usage: &Usage) -> f64 {
+        let p = match self.pricing.get(model) {
+            Some(p) => *p,
+            None => return 0.0,
+        };
+        let inp = usage.input_tokens as f64 / 1_000_000.0 * p.input_usd_per_mtok;
+        let out = usage.output_tokens as f64 / 1_000_000.0 * p.output_usd_per_mtok;
+        inp + out
     }
 }
 
@@ -84,6 +196,8 @@ pub struct Gateway {
     metrics: Arc<Mutex<MetricsBuffer>>,
     /// Cap on retained per-request metrics. Older entries roll off.
     pub metric_window: usize,
+    budget: Option<Arc<Budget>>,
+    next_metric_id: Arc<Mutex<u64>>,
 }
 
 pub struct MetricsBuffer {
@@ -101,12 +215,6 @@ impl Default for Gateway {
 impl Gateway {
     /// Constructs a gateway from environment variables. The intent is "spin up
     /// a usable gateway in one line" — primarily for the dashboard binary.
-    ///
-    /// Honours:
-    /// - `ANTHROPIC_API_KEY` — registers an Anthropic provider for `claude-*`.
-    /// - `OPENAI_API_KEY` — registers an OpenAI provider for `gpt-*` / `o*`.
-    /// - `RTRT_OPENAI_COMPAT_URL` (+ optional `RTRT_OPENAI_COMPAT_API_KEY`) —
-    ///   registers an OpenAI-compatible provider as the default fallback.
     pub fn from_env() -> Self {
         let mut gw = Gateway::new();
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -144,7 +252,16 @@ impl Gateway {
                 by_provider: HashMap::new(),
             })),
             metric_window: 1024,
+            budget: None,
+            next_metric_id: Arc::new(Mutex::new(1)),
         }
+    }
+
+    /// Attaches a spending limit. Once cumulative cost exceeds the cap,
+    /// subsequent `chat` calls return an error before reaching the provider.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = Some(Arc::new(budget));
+        self
     }
 
     /// Register a provider under `name`, owning any model id starting with one
@@ -193,6 +310,35 @@ impl Gateway {
     /// metric. The caller sees the [`ChatResponse`]; the metric is observable
     /// via [`Gateway::metrics`].
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
+        self.chat_inner(req, None).await
+    }
+
+    /// Per-call variant of [`chat`] that records a parent trace id, letting
+    /// callers stitch multi-turn flows into a single observable trace.
+    pub async fn chat_with_parent(
+        &self,
+        req: ChatRequest,
+        parent_id: Option<u64>,
+    ) -> Result<ChatResponse> {
+        self.chat_inner(req, parent_id).await
+    }
+
+    async fn chat_inner(&self, req: ChatRequest, parent_id: Option<u64>) -> Result<ChatResponse> {
+        // Budget gate: refuse before dispatch when over cap.
+        if let Some(b) = &self.budget {
+            let spent = self
+                .metrics
+                .lock()
+                .ok()
+                .map(|g| g.summary.total_cost_usd)
+                .unwrap_or(0.0);
+            if spent >= b.cap_usd {
+                return Err(Error::Provider(format!(
+                    "gateway: budget exceeded ({:.4} ≥ cap {:.4} USD)",
+                    spent, b.cap_usd
+                )));
+            }
+        }
         let Some((name, provider)) = self.lookup(&req.model) else {
             return Err(Error::Provider(format!(
                 "gateway: no provider registered for model '{}'",
@@ -207,25 +353,39 @@ impl Gateway {
         let model = req.model.clone();
         let result = provider.chat(req).await;
         let latency_ms = started.elapsed().as_millis() as u64;
-        let metric = match &result {
-            Ok(resp) => RequestMetric {
-                provider: name.to_string(),
-                model: model.clone(),
-                started_at,
-                latency_ms,
-                usage: resp.usage,
-                ok: true,
-                error: None,
-            },
-            Err(e) => RequestMetric {
-                provider: name.to_string(),
-                model: model.clone(),
-                started_at,
-                latency_ms,
-                usage: Usage::default(),
-                ok: false,
-                error: Some(truncate(&format!("{e}"), 256)),
-            },
+        let id = {
+            let mut guard = self
+                .next_metric_id
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let id = *guard;
+            *guard = guard.saturating_add(1);
+            id
+        };
+        let (usage, ok, err) = match &result {
+            Ok(resp) => (resp.usage, true, None),
+            Err(e) => (
+                Usage::default(),
+                false,
+                Some(truncate(&format!("{e}"), 256)),
+            ),
+        };
+        let cost = self
+            .budget
+            .as_ref()
+            .map(|b| b.cost_for(&model, &usage))
+            .unwrap_or(0.0);
+        let metric = RequestMetric {
+            id,
+            parent_id,
+            provider: name.to_string(),
+            model: model.clone(),
+            started_at,
+            latency_ms,
+            usage,
+            cost_usd: cost,
+            ok,
+            error: err,
         };
         self.push_metric(metric);
         result
@@ -384,6 +544,57 @@ mod tests {
         assert_eq!(s.total_input_tokens, 20);
         assert_eq!(s.total_output_tokens, 40);
         assert_eq!(view.recent(1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_blocks_when_exceeded() {
+        let pricing = {
+            let mut m = HashMap::new();
+            m.insert(
+                "x-expensive".to_string(),
+                ModelPricing {
+                    input_usd_per_mtok: 1_000_000.0,
+                    output_usd_per_mtok: 1_000_000.0,
+                },
+            );
+            m
+        };
+        let gw = Gateway::new()
+            .register(
+                "e",
+                Box::new(Echo {
+                    name: "e",
+                    tokens: (1, 1),
+                }),
+                ["x-"],
+            )
+            .with_budget(Budget::new(0.5).with_pricing(pricing));
+        // First call costs 2 USD, pushing the running total past the 0.5 cap.
+        gw.chat(req("x-expensive")).await.unwrap();
+        let err = gw.chat(req("x-expensive")).await.unwrap_err();
+        assert!(format!("{err}").contains("budget exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn chat_with_parent_records_link() {
+        let gw = Gateway::new().register(
+            "e",
+            Box::new(Echo {
+                name: "e",
+                tokens: (1, 1),
+            }),
+            ["x-"],
+        );
+        gw.chat(req("x-a")).await.unwrap();
+        gw.chat_with_parent(req("x-b"), Some(1)).await.unwrap();
+        let metrics = gw.metrics();
+        let guard = metrics.lock().unwrap();
+        let recent = guard.recent(2);
+        // recent() returns newest-first; latest call should have parent_id = Some(1)
+        assert_eq!(recent[0].parent_id, Some(1));
+        assert_eq!(recent[1].parent_id, None);
+        assert_eq!(recent[0].id, 2);
+        assert_eq!(recent[1].id, 1);
     }
 
     #[tokio::test]

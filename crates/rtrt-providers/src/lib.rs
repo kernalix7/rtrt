@@ -18,7 +18,9 @@ pub mod stream;
 pub mod usage;
 
 pub use anthropic::AnthropicProvider;
-pub use gateway::{Gateway, GatewaySummary, MetricsView, RequestMetric};
+pub use gateway::{
+    Budget, Gateway, GatewaySummary, MetricsView, ModelPricing, RequestMetric, default_pricing,
+};
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use usage::Usage;

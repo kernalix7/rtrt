@@ -168,6 +168,8 @@ async fn main() -> Result<()> {
         tracing::info!("auto-capture off (RTRT_AUTO_CAPTURE=0)");
     }
     let memory_for_daemon = memory.clone();
+    let memory_for_compress_daemon = memory.clone();
+    let gateway_for_compress_daemon = gateway.clone();
     let (events_tx, _) = broadcast::channel::<String>(256);
     let state = AppState {
         gateway,
@@ -181,6 +183,7 @@ async fn main() -> Result<()> {
         events: events_tx,
     };
     spawn_consolidation_daemon(memory_for_daemon);
+    spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
 
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
@@ -281,6 +284,140 @@ fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("consolidate {project}: {e}"),
+                }
+            }
+        }
+    });
+}
+
+/// Opt-in background worker — sweeps memory rows older than
+/// `RTRT_AUTO_COMPRESS_AGE_SEC` whose body is longer than
+/// `RTRT_AUTO_COMPRESS_MIN_CHARS`, asks the configured LLM model to
+/// compress each one, and writes the result back via `set_body`.
+/// Idempotent: every rewritten row is tagged `metadata.compressed_at`,
+/// and `compress_candidates` filters those out next sweep.
+///
+/// Disabled unless `RTRT_AUTO_COMPRESS_LLM=1`. Honours the same
+/// `RTRT_AUTO_COMPRESS_*` knobs documented in `docs/USAGE.md`.
+fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: Arc<Gateway>) {
+    let enabled = std::env::var("RTRT_AUTO_COMPRESS_LLM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if !enabled {
+        tracing::info!("auto-compress daemon off (set RTRT_AUTO_COMPRESS_LLM=1 to enable)");
+        return;
+    }
+    let Some(store) = memory else {
+        tracing::info!("auto-compress daemon off (no memory store)");
+        return;
+    };
+    let interval_sec: u64 = std::env::var("RTRT_AUTO_COMPRESS_INTERVAL_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800);
+    let age_sec: i64 = std::env::var("RTRT_AUTO_COMPRESS_AGE_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let min_chars: usize = std::env::var("RTRT_AUTO_COMPRESS_MIN_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let batch: usize = std::env::var("RTRT_AUTO_COMPRESS_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+    let max_tokens: u32 = std::env::var("RTRT_AUTO_COMPRESS_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    tracing::info!(
+        "auto-compress daemon on: model={model}, every {interval_sec}s, age>{age_sec}s, min_chars={min_chars}, batch={batch}"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_sec));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let cutoff = now - age_sec;
+            let projects = {
+                let guard = store.lock().await;
+                match guard.projects() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("auto-compress: list projects: {e}");
+                        continue;
+                    }
+                }
+            };
+            for (project, _, _) in projects {
+                let candidates = {
+                    let guard = store.lock().await;
+                    match guard.compress_candidates(&project, cutoff, min_chars, batch) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            tracing::warn!("auto-compress {project}: candidates: {e}");
+                            continue;
+                        }
+                    }
+                };
+                for (id, body) in candidates {
+                    let req = ChatRequest {
+                        model: model.clone(),
+                        messages: vec![
+                            ChatMessage {
+                                role: Role::System,
+                                content: "You are a lossless-meaning compressor. Rewrite the user message in the shortest form that preserves every fact, decision, file path, identifier, command, and number. Drop filler, hedging, headings, and greetings. Plain text only. No commentary, no preamble, no quotes — emit only the compressed text.".to_string(),
+                            },
+                            ChatMessage {
+                                role: Role::User,
+                                content: body.clone(),
+                            },
+                        ],
+                        max_tokens: Some(max_tokens),
+                        temperature: Some(0.0),
+                    };
+                    let resp = match gateway.chat(req).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("auto-compress {project}#{id}: {e}");
+                            continue;
+                        }
+                    };
+                    let new_body = resp.content.trim().to_string();
+                    if new_body.is_empty() || new_body.len() >= body.len() {
+                        // No win — skip but still mark so we don't retry.
+                        let guard = store.lock().await;
+                        let mut meta = guard.get_metadata(id).unwrap_or_default();
+                        meta.insert("compressed_at".into(), now.to_string());
+                        meta.insert("compressed_skip".into(), "no-shrink".into());
+                        let _ = guard.set_metadata(id, &meta);
+                        continue;
+                    }
+                    let guard = store.lock().await;
+                    if let Err(e) = guard.set_body(id, &new_body) {
+                        tracing::warn!("auto-compress {project}#{id}: set_body: {e}");
+                        continue;
+                    }
+                    let mut meta = guard.get_metadata(id).unwrap_or_default();
+                    meta.insert("compressed_at".into(), now.to_string());
+                    meta.insert("compressed_model".into(), model.clone());
+                    meta.insert("compressed_from_chars".into(), body.len().to_string());
+                    meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+                    let _ = guard.set_metadata(id, &meta);
+                    tracing::info!(
+                        project = %project,
+                        id,
+                        from = body.len(),
+                        to = new_body.len(),
+                        "auto-compressed"
+                    );
                 }
             }
         }
@@ -2677,12 +2814,61 @@ document.getElementById('setup-form').onsubmit = async (ev) => {
   pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
 };
 
+// Live activity stream via /api/stream. Each broadcast event nudges the
+// overview cards + appends a feed line. Falls back to 5s polling only if
+// the EventSource handshake fails (older browsers, proxies stripping SSE).
+function subscribeStream() {
+  if (typeof EventSource === 'undefined') {
+    setInterval(loadOverview, 5000);
+    return;
+  }
+  let es;
+  let pollTimer = null;
+  const startPolling = () => {
+    if (pollTimer) return;
+    pollTimer = setInterval(loadOverview, 5000);
+  };
+  const stopPolling = () => {
+    if (!pollTimer) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  };
+  const connect = () => {
+    es = new EventSource('/api/stream');
+    es.onopen = () => {
+      stopPolling();
+      pushActivity('SSE 연결됨 · 실시간 캡처 수신 중');
+    };
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === 'memory.save') {
+          pushActivity(`memory.save · ${d.kind || '?'} · ${d.project || '?'} (#${d.id})`);
+          loadOverview();
+        } else if (d.type === 'heartbeat') {
+          // keep-alive; ignore
+        } else {
+          pushActivity(`stream · ${d.type || 'event'}`);
+        }
+      } catch (e) {
+        pushActivity(`stream parse: ${e.message || e}`);
+      }
+    };
+    es.onerror = () => {
+      startPolling();
+      try { es.close(); } catch (_) { /* noop */ }
+      setTimeout(connect, 5000);
+    };
+  };
+  connect();
+}
+
 // Init
 document.getElementById('env-bind').textContent = window.location.host;
 loadOverview();
 loadTemplates();
 loadPrompts();
-setInterval(loadOverview, 5000);
+subscribeStream();
 document.getElementById('open-palette').onclick = openPalette;
 pushActivity('대시보드 부팅 완료. ⌘K 또는 Ctrl+K 로 빠르게 이동하세요.');
 </script>

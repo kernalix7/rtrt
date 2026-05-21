@@ -18,6 +18,8 @@
 //! - `/api/memory/blocks` — `GET` list / `POST` set Letta-style memory blocks.
 //! - `/api/memory/blocks/{name}` — `GET` a single block (project as query param).
 //! - `/api/compress`      — `POST` run the rule or ML compressor against arbitrary text.
+//! - `/api/proxy`         — `POST` rtrt-proxy filters (command / errors_only / ultra_compact).
+//! - `/api/diagnose`      — `POST` aider-style failure triage (errors_only + gateway chat).
 //!
 //! All `/api/*` routes are gated by a bearer-token middleware when the
 //! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the

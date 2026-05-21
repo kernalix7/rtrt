@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn save_get_latest_roundtrip() {
-        let tmp = tempdir();
+        let tmp = tempdir("roundtrip");
         let reg = PromptRegistry::open(&tmp).unwrap();
         reg.save("hello", "say hi", BTreeMap::new()).unwrap();
         let v2 = reg.save("hello", "say hi v2", BTreeMap::new()).unwrap();
@@ -186,16 +186,16 @@ mod tests {
 
     #[test]
     fn rejects_invalid_names() {
-        let tmp = tempdir();
+        let tmp = tempdir("invalid-names");
         let reg = PromptRegistry::open(&tmp).unwrap();
         assert!(reg.save("../escape", "x", BTreeMap::new()).is_err());
         assert!(reg.save("", "x", BTreeMap::new()).is_err());
         assert!(reg.save("with space", "x", BTreeMap::new()).is_err());
     }
 
-    fn tempdir() -> PathBuf {
+    fn tempdir(slug: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rtrt-prompts-{}", std::process::id()));
+        p.push(format!("rtrt-prompts-{}-{slug}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
     }

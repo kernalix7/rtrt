@@ -15,7 +15,13 @@
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
 //! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
+//! - `/api/memory/blocks` — `GET` list / `POST` set Letta-style memory blocks.
+//! - `/api/memory/blocks/{name}` — `GET` a single block (project as query param).
 //! - `/api/compress`      — `POST` run the rule or ML compressor against arbitrary text.
+//!
+//! All `/api/*` routes are gated by a bearer-token middleware when the
+//! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
+//! `/healthz` probe remain open so the UI can bootstrap.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -50,6 +56,16 @@ async fn main() -> Result<()> {
 
     let bind =
         std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3111".to_string());
+    let token = std::env::var("RTRT_DASHBOARD_TOKEN").ok();
+    if token.is_none()
+        && !bind.starts_with("127.")
+        && !bind.starts_with("[::1]")
+        && !bind.starts_with("localhost")
+    {
+        tracing::warn!(
+            "binding {bind} without RTRT_DASHBOARD_TOKEN is risky; non-loopback callers can hit the API without authentication."
+        );
+    }
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
     let memory = open_memory_store();
@@ -59,6 +75,7 @@ async fn main() -> Result<()> {
         memory,
     };
 
+    let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -74,7 +91,13 @@ async fn main() -> Result<()> {
         .route("/api/budget", get(budget))
         .route("/api/memory/recall", post(memory_recall))
         .route("/api/memory/save", post(memory_save))
+        .route("/api/memory/blocks", get(list_blocks).post(set_block))
+        .route("/api/memory/blocks/{name}", get(get_block))
         .route("/api/compress", post(compress))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let token = token_arc.clone();
+            async move { bearer_guard(token, req, next).await }
+        }))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -313,6 +336,125 @@ fn default_kind() -> String {
     "note".into()
 }
 
+async fn bearer_guard(
+    expected: Option<Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header::AUTHORIZATION};
+    let path = req.uri().path().to_string();
+    // Always allow the bundled HTML, health probe, and favicon so the UI can
+    // bootstrap; the API routes still require the token.
+    if matches!(path.as_str(), "/" | "/healthz" | "/favicon.ico") {
+        return next.run(req).await;
+    }
+    let Some(expected) = expected else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let ok = presented
+        .as_deref()
+        .is_some_and(|tok| constant_time_eq(tok.as_bytes(), expected.as_bytes()));
+    if ok {
+        return next.run(req).await;
+    }
+    let mut resp = axum::response::Response::new(axum::body::Body::from(
+        "unauthorized: bearer token missing or invalid",
+    ));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert(
+        "WWW-Authenticate",
+        HeaderValue::from_static("Bearer realm=\"rtrt-dashboard\""),
+    );
+    resp
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[derive(Debug, Deserialize)]
+struct SetBlockRequest {
+    project: String,
+    name: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListBlocksQuery {
+    project: String,
+}
+
+async fn list_blocks(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ListBlocksQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let blocks = guard
+        .list_blocks(&q.project)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "blocks": blocks })))
+}
+
+async fn set_block(
+    State(state): State<AppState>,
+    Json(req): Json<SetBlockRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let id = guard
+        .set_block(&req.project, &req.name, &req.body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+#[derive(Debug, Deserialize)]
+struct GetBlockQuery {
+    project: String,
+}
+
+async fn get_block(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<GetBlockQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let block = guard
+        .get_block(&q.project, &name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match block {
+        Some(b) => {
+            Ok(Json(serde_json::to_value(&b).map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?))
+        }
+        None => Err((StatusCode::NOT_FOUND, format!("block not found: {name}"))),
+    }
+}
+
 async fn memory_save(
     State(state): State<AppState>,
     Json(req): Json<MemorySaveRequest>,
@@ -506,20 +648,45 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <title>RTRT Dashboard</title>
 <style>
-  body { font: 14px/1.45 system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666666;
+    --border: #eeeeee;
+    --code-bg: #f3f3f3;
+    --pre-bg: #fafafa;
+    --accent: #2962FF;
+    --err: #c0392b;
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171a;
+    --fg: #e6e6e6;
+    --muted: #9aa0a6;
+    --border: #2a2d31;
+    --code-bg: #23272e;
+    --pre-bg: #1c1f23;
+    --accent: #6aa3ff;
+    --err: #ff6b6b;
+  }
+  body { font: 14px/1.45 system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
   h1 { margin-bottom: 0.25rem; }
-  .sub { color: #666; margin-bottom: 1.5rem; }
-  nav { margin-bottom: 1.5rem; }
-  nav a { margin-right: 1rem; cursor: pointer; color: #2962FF; text-decoration: none; }
+  .sub { color: var(--muted); margin-bottom: 1.5rem; }
+  nav { margin-bottom: 1.5rem; display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
+  nav a { cursor: pointer; color: var(--accent); text-decoration: none; }
   nav a.active { font-weight: 600; text-decoration: underline; }
+  nav .spacer { flex: 1; }
+  #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.9em; }
   section { display: none; margin-bottom: 2rem; }
   section.active { display: block; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
-  code { background: #f3f3f3; padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; }
+  th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  code { background: var(--code-bg); padding: 0 0.25rem; border-radius: 3px; font-family: ui-monospace, monospace; }
+  pre { background: var(--pre-bg); border: 1px solid var(--border); }
+  input, textarea, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 0.3rem 0.5rem; border-radius: 3px; font: inherit; }
+  button { cursor: pointer; }
   .kpi { display: inline-block; margin-right: 1.5rem; }
   .kpi b { font-size: 1.4rem; }
-  .err { color: #c0392b; }
+  .err { color: var(--err); }
 </style>
 </head>
 <body>
@@ -533,6 +700,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <a data-tab="memory">Memory</a>
   <a data-tab="templates">Templates</a>
   <a data-tab="stats">Compression</a>
+  <span class="spacer"></span>
+  <button id="theme-toggle" title="Toggle dark / light mode">🌗</button>
 </nav>
 
 <section id="metrics" class="active">
@@ -569,6 +738,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
   </form>
   <table id="recall-tbl" style="margin-top:1rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
 
+  <h3 style="margin-top:2rem;">Letta blocks</h3>
+  <form id="blocks-list-form" style="display:flex;gap:0.5rem;max-width:600px;align-items:center;">
+    <input id="blocks-project" placeholder="project" required>
+    <button type="submit">List</button>
+  </form>
+  <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>name</th><th>body</th></tr></thead><tbody></tbody></table>
+  <form id="blocks-set-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;margin-top:1rem;">
+    <input id="block-set-name" placeholder="name (persona / human / context)" required>
+    <input id="block-set-project" placeholder="project" required>
+    <textarea id="block-set-body" placeholder="body" required rows="3" style="grid-column:1 / span 2;"></textarea>
+    <button type="submit" style="grid-column:1 / span 2;">Set block</button>
+  </form>
+  <div id="block-set-result" style="margin-top:0.5rem;color:#666;"></div>
+
   <h3 style="margin-top:2rem;">Save memory</h3>
   <form id="save-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;">
     <input id="save-project" placeholder="project" required>
@@ -582,7 +765,17 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 <section id="templates">
   <h2>Project templates</h2>
-  <table id="tpl"><thead><tr><th>Name</th><th>Source</th><th>Description</th></tr></thead><tbody></tbody></table>
+  <table id="tpl"><thead><tr><th>Name</th><th>Source</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
+
+  <h3 style="margin-top:2rem;">Scaffold</h3>
+  <form id="scaffold-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <select id="scaffold-template" required></select>
+    <input id="scaffold-target" placeholder="target directory" required>
+    <div id="scaffold-vars" style="grid-column:1 / span 2;"></div>
+    <label style="grid-column:1 / span 2;"><input id="scaffold-overwrite" type="checkbox"> overwrite existing files</label>
+    <button type="submit" style="grid-column:1 / span 2;">Scaffold</button>
+  </form>
+  <div id="scaffold-result" style="margin-top:0.5rem;color:#666;"></div>
 </section>
 
 <section id="stats">
@@ -632,12 +825,104 @@ async function loadMetrics() {
     return `<tr><td>${t}</td><td>${r.provider}</td><td><code>${r.model}</code></td><td>${r.usage.input_tokens}</td><td>${r.usage.output_tokens}</td><td>${r.latency_ms} ms</td><td>${status}</td></tr>`;
   }).join('');
 }
+let LOADED_TEMPLATES = [];
 async function loadTemplates() {
   const tpls = await fetch('/api/templates').then(r => r.json());
+  LOADED_TEMPLATES = tpls;
   document.querySelector('#tpl tbody').innerHTML = tpls.map(t =>
-    `<tr><td><code>${t.name}</code></td><td>${t.source}</td><td>${t.description}</td></tr>`
+    `<tr><td><code>${t.name}</code></td><td>${t.source}</td><td>${t.description}</td>` +
+    `<td><a data-pick="${t.name}" style="cursor:pointer;color:#2962FF;">use</a></td></tr>`
   ).join('');
+  document.querySelectorAll('a[data-pick]').forEach(a => a.onclick = () => {
+    document.querySelector('[data-tab="templates"]').click();
+    document.getElementById('scaffold-template').value = a.dataset.pick;
+    renderScaffoldVars();
+  });
+  const sel = document.getElementById('scaffold-template');
+  sel.innerHTML = tpls.map(t => `<option value="${t.name}">${t.name}</option>`).join('');
+  sel.onchange = renderScaffoldVars;
+  renderScaffoldVars();
 }
+function renderScaffoldVars() {
+  const name = document.getElementById('scaffold-template').value;
+  const tpl = LOADED_TEMPLATES.find(t => t.name === name);
+  const wrap = document.getElementById('scaffold-vars');
+  if (!tpl) { wrap.innerHTML = ''; return; }
+  wrap.innerHTML = `<table style="margin-top:0.5rem;"><tbody>` +
+    tpl.variables.map(v =>
+      `<tr><td style="width:30%;"><code>${v.name}</code>${v.required ? ' *' : ''}</td>` +
+      `<td><input data-var="${v.name}" placeholder="${v.description || ''}"` +
+      ` value="${v.default || ''}" style="width:100%;"></td></tr>`
+    ).join('') + `</tbody></table>`;
+}
+document.getElementById('scaffold-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const variables = {};
+  document.querySelectorAll('#scaffold-vars [data-var]').forEach(inp => {
+    if (inp.value) variables[inp.dataset.var] = inp.value;
+  });
+  const body = {
+    template: document.getElementById('scaffold-template').value,
+    target: document.getElementById('scaffold-target').value,
+    variables,
+    overwrite: document.getElementById('scaffold-overwrite').checked,
+  };
+  const out = document.getElementById('scaffold-result');
+  out.textContent = 'scaffolding…';
+  const resp = await fetch('/api/templates/scaffold', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
+    return;
+  }
+  const d = await resp.json();
+  out.innerHTML = `wrote ${d.files_written} files into <code>${d.root}</code>` +
+    (d.post_hooks.length ? `<br>post-hooks: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}` : '');
+};
+document.getElementById('blocks-list-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const project = document.getElementById('blocks-project').value;
+  const tbody = document.querySelector('#blocks-tbl tbody');
+  tbody.innerHTML = `<tr><td colspan="2" style="color:#666;">loading…</td></tr>`;
+  const resp = await fetch(`/api/memory/blocks?project=${encodeURIComponent(project)}`);
+  if (!resp.ok) {
+    tbody.innerHTML = `<tr><td colspan="2" class="err">${resp.status}: ${await resp.text()}</td></tr>`;
+    return;
+  }
+  const d = await resp.json();
+  if (!d.blocks.length) {
+    tbody.innerHTML = `<tr><td colspan="2" style="color:#666;">no blocks</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = d.blocks.map(b => {
+    const name = b.kind.replace(/^block:/, '');
+    return `<tr><td><code>${name}</code></td><td>${b.body.replace(/</g, '&lt;')}</td></tr>`;
+  }).join('');
+};
+document.getElementById('blocks-set-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    project: document.getElementById('block-set-project').value,
+    name: document.getElementById('block-set-name').value,
+    body: document.getElementById('block-set-body').value,
+  };
+  const out = document.getElementById('block-set-result');
+  const resp = await fetch('/api/memory/blocks', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
+    return;
+  }
+  const d = await resp.json();
+  out.textContent = `set id=${d.id}`;
+};
+
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   let metadata = {};
@@ -733,6 +1018,18 @@ async function loadPrompts() {
     pre.textContent = `# ${body.name} v${body.version}\n\n${body.body}`;
   });
 }
+(function initTheme() {
+  const saved = localStorage.getItem('rtrt-theme');
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const theme = saved || (prefersDark ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-theme', theme);
+})();
+document.getElementById('theme-toggle').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme') || 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('rtrt-theme', next);
+};
 document.querySelectorAll('nav a').forEach(a => a.onclick = () => {
   document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('active'));

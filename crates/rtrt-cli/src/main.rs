@@ -92,6 +92,30 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Launch the bundled MCP server (passthrough to `rtrt-mcp`).
+    Mcp {
+        /// Transport. `stdio` (default) for agents; `http` for Streamable HTTP.
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// Bind address for `--transport http`.
+        #[arg(long, default_value = "127.0.0.1:3112")]
+        bind: String,
+        /// HTTP mount path for the MCP endpoint.
+        #[arg(long, default_value = "/mcp")]
+        path: String,
+        /// Path to the SQLite memory store.
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        memory: PathBuf,
+        /// Bearer token for HTTP transport. Reads from RTRT_MCP_HTTP_TOKEN by default.
+        #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
+        http_token: Option<String>,
+        /// Allowed Origins (comma-separated) for HTTP transport.
+        #[arg(long, env = "RTRT_MCP_ALLOWED_ORIGINS", value_delimiter = ',')]
+        allowed_origins: Vec<String>,
+        /// Override the discovered `rtrt-mcp` binary path.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
     /// Wire RTRT into a popular coding agent's MCP config.
     Setup {
         /// Target agent.
@@ -569,6 +593,41 @@ async fn main() -> Result<()> {
             let client = Context7Client::new().with_base_url(base_url);
             let out = client.get_library_docs(&library, topic.as_deref()).await?;
             print!("{out}");
+        }
+        Cmd::Mcp {
+            transport,
+            bind,
+            path,
+            memory,
+            http_token,
+            allowed_origins,
+            binary,
+        } => {
+            let binary = binary.unwrap_or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("rtrt-mcp")))
+                    .unwrap_or_else(|| PathBuf::from("rtrt-mcp"))
+            });
+            let mut cmd = std::process::Command::new(&binary);
+            cmd.arg("--memory").arg(&memory);
+            cmd.arg("--transport").arg(&transport);
+            if transport == "http" {
+                cmd.arg("--bind").arg(&bind);
+                cmd.arg("--path").arg(&path);
+                if let Some(tok) = http_token.as_deref() {
+                    cmd.env("RTRT_MCP_HTTP_TOKEN", tok);
+                }
+                if !allowed_origins.is_empty() {
+                    cmd.env("RTRT_MCP_ALLOWED_ORIGINS", allowed_origins.join(","));
+                }
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!("spawn {}: {e}", binary.display()))?;
+            if !status.success() {
+                anyhow::bail!("rtrt-mcp exited with status {status}");
+            }
         }
         Cmd::Setup {
             agent,

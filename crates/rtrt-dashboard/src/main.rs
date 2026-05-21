@@ -94,6 +94,8 @@ async fn main() -> Result<()> {
         .route("/api/memory/blocks", get(list_blocks).post(set_block))
         .route("/api/memory/blocks/{name}", get(get_block))
         .route("/api/compress", post(compress))
+        .route("/api/proxy", post(proxy_filter))
+        .route("/api/diagnose", post(diagnose))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -489,6 +491,109 @@ struct CompressRequest {
     format: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProxyRequest {
+    /// Optional command label (e.g. `git status`, `cargo build`).
+    #[serde(default)]
+    command: Option<String>,
+    /// Raw captured output to filter.
+    raw: String,
+    /// Filter mode: `command` (default — picks `filter_for(command)`),
+    /// `errors_only`, or `ultra_compact`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Context-line count for `errors_only` (default 3).
+    #[serde(default = "default_context")]
+    context: usize,
+}
+
+fn default_context() -> usize {
+    3
+}
+
+async fn proxy_filter(
+    Json(req): Json<ProxyRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mode = req.mode.as_deref().unwrap_or("command");
+    let original = req.raw.chars().count();
+    let out = match mode {
+        "command" => {
+            let cmd = req.command.as_deref().ok_or((
+                StatusCode::BAD_REQUEST,
+                "command required for command-mode".into(),
+            ))?;
+            match rtrt_proxy::filter_for(cmd) {
+                Some(f) => f.apply(&req.raw),
+                None => req.raw.clone(),
+            }
+        }
+        "errors_only" => rtrt_proxy::errors_only(&req.raw, req.context),
+        "ultra_compact" => rtrt_proxy::ultra_compact(&req.raw),
+        other => return Err((StatusCode::BAD_REQUEST, format!("unknown mode: {other}"))),
+    };
+    let filtered = out.chars().count();
+    Ok(Json(serde_json::json!({
+        "filtered": out,
+        "mode": mode,
+        "original_len": original,
+        "filtered_len": filtered,
+        "saved_chars": original.saturating_sub(filtered),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DiagnoseRequest {
+    /// Raw captured output (typically build/test failure).
+    raw: String,
+    /// Model id to send to the gateway.
+    model: String,
+    /// errors_only context-line count.
+    #[serde(default = "default_context")]
+    context: usize,
+    /// Optional system prompt override; defaults to the rtrt-cli triage prompt.
+    #[serde(default)]
+    system: Option<String>,
+}
+
+const DIAGNOSE_SYS: &str = "You are a senior engineer triaging a build / test failure. \
+Read the captured error output and respond with: (1) one-sentence root cause; \
+(2) the smallest concrete fix (file + change). No filler. Cite line numbers when present.";
+
+async fn diagnose(
+    State(state): State<AppState>,
+    Json(req): Json<DiagnoseRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let filtered = rtrt_proxy::errors_only(&req.raw, req.context);
+    let chat_req = ChatRequest {
+        model: req.model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: Role::System,
+                content: req.system.unwrap_or_else(|| DIAGNOSE_SYS.into()),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: filtered.clone(),
+            },
+        ],
+        max_tokens: Some(512),
+        temperature: Some(0.1),
+    };
+    let resp = state
+        .gateway
+        .chat(chat_req)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "diagnosis": resp.content,
+        "filtered": filtered,
+        "provider": resp.provider,
+        "model": resp.model,
+        "input_tokens": resp.usage.input_tokens,
+        "output_tokens": resp.usage.output_tokens,
+    })))
+}
+
 async fn compress(
     Json(req): Json<CompressRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -707,6 +812,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <section id="metrics" class="active">
   <h2>Gateway metrics</h2>
   <div id="metrics-summary">loading…</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">
+    <div>
+      <h3 style="margin-bottom:0.3rem;">Latency (ms)</h3>
+      <svg id="chart-latency" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none" style="border:1px solid var(--border);border-radius:4px;"></svg>
+    </div>
+    <div>
+      <h3 style="margin-bottom:0.3rem;">Tokens (in + out)</h3>
+      <svg id="chart-tokens" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none" style="border:1px solid var(--border);border-radius:4px;"></svg>
+    </div>
+  </div>
   <h3>Recent requests</h3>
   <table id="metrics-recent"><thead>
     <tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>latency</th><th>status</th></tr>
@@ -807,6 +922,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </section>
 
 <script>
+function sparkline(svgId, values, color) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  if (!values.length) {
+    svg.innerHTML = `<text x="50%" y="50%" text-anchor="middle" fill="var(--muted)">no data</text>`;
+    return;
+  }
+  const w = 400, h = 120, pad = 4;
+  const max = Math.max(1, ...values);
+  const step = values.length > 1 ? (w - pad * 2) / (values.length - 1) : 0;
+  const points = values.map((v, i) => {
+    const x = pad + i * step;
+    const y = h - pad - (v / max) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const fillPoints = `${pad},${h - pad} ${points} ${(pad + (values.length - 1) * step).toFixed(1)},${h - pad}`;
+  svg.innerHTML =
+    `<polygon points="${fillPoints}" fill="${color}" fill-opacity="0.15" stroke="none"/>` +
+    `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5"/>` +
+    `<text x="${w - pad}" y="12" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
+}
 async function loadMetrics() {
   const m = await fetch('/api/metrics').then(r => r.json());
   const s = m.summary;
@@ -818,6 +954,9 @@ async function loadMetrics() {
     <span class="kpi">output tokens<br><b>${s.total_output_tokens}</b></span>
     <span class="kpi">avg latency<br><b>${(s.total_latency_ms/Math.max(1,s.calls)).toFixed(0)} ms</b></span>
   `;
+  const series = m.recent.slice().reverse();
+  sparkline('chart-latency', series.map(r => r.latency_ms), 'var(--accent)');
+  sparkline('chart-tokens', series.map(r => (r.usage.input_tokens || 0) + (r.usage.output_tokens || 0)), '#2ecc71');
   const tbody = document.querySelector('#metrics-recent tbody');
   tbody.innerHTML = m.recent.map(r => {
     const t = new Date(r.started_at * 1000).toISOString().slice(11,19);

@@ -92,6 +92,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Run a Criterion benchmark from the workspace and summarise savings.
+    Benchmark {
+        /// Bench name (default: rtrt-compress `compress_bench`).
+        #[arg(long, default_value = "compress_bench")]
+        bench: String,
+        /// Cargo package to bench (default: rtrt-compress).
+        #[arg(long, default_value = "rtrt-compress")]
+        package: String,
+        /// Extra `cargo bench -- <args>` flags (e.g. `--quick`).
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        extra: Vec<String>,
+    },
     /// Launch the bundled MCP server (passthrough to `rtrt-mcp`).
     Mcp {
         /// Transport. `stdio` (default) for agents; `http` for Streamable HTTP.
@@ -593,6 +605,31 @@ async fn main() -> Result<()> {
             let client = Context7Client::new().with_base_url(base_url);
             let out = client.get_library_docs(&library, topic.as_deref()).await?;
             print!("{out}");
+        }
+        Cmd::Benchmark {
+            bench,
+            package,
+            extra,
+        } => {
+            let mut cmd = std::process::Command::new("cargo");
+            cmd.arg("bench")
+                .arg("-p")
+                .arg(&package)
+                .arg("--bench")
+                .arg(&bench);
+            if !extra.is_empty() {
+                cmd.arg("--");
+                cmd.args(&extra);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!("spawn cargo: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("cargo bench exited with {status}");
+            }
+            println!(
+                "[rtrt benchmark] full Criterion report under target/criterion/report/index.html"
+            );
         }
         Cmd::Mcp {
             transport,

@@ -16,6 +16,7 @@ path = "src/main.rs"
 rtrt-core.workspace = true
 rtrt-compress.workspace = true
 rtrt-memory.workspace = true
+rtrt-proxy.workspace = true
 rtrt-providers.workspace = true
 rtrt-templates.workspace = true
 rmcp = { workspace = true, features = [

@@ -110,6 +110,22 @@ struct CompressMlArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProxyArgs {
+    /// Raw output to filter.
+    raw: String,
+    /// Optional command (e.g. `git status`, `cargo build`) — picks a
+    /// command-specific filter from `rtrt-proxy::FILTERS`.
+    #[serde(default)]
+    command: Option<String>,
+    /// Mode override: `command` (default), `errors_only`, `ultra_compact`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Context-line count for `errors_only` (default 3).
+    #[serde(default)]
+    context: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MemoryRecallArgs {
     project: String,
     query: String,
@@ -231,6 +247,45 @@ impl RtrtMcp {
             "scorer": compressor.scorer_name(),
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Filter command output via rtrt-proxy. Modes: `command` (matches the command label), `errors_only` (keeps error/warning lines + context), `ultra_compact` (collapses repeated lines)."
+    )]
+    fn proxy(&self, Parameters(args): Parameters<ProxyArgs>) -> Result<CallToolResult, McpError> {
+        let mode = args.mode.as_deref().unwrap_or("command");
+        let context = args.context.unwrap_or(3) as usize;
+        let original = args.raw.chars().count();
+        let out = match mode {
+            "command" => {
+                let cmd = args.command.as_deref().ok_or_else(|| {
+                    McpError::invalid_params("command required for command-mode", None)
+                })?;
+                match rtrt_proxy::filter_for(cmd) {
+                    Some(f) => f.apply(&args.raw),
+                    None => args.raw.clone(),
+                }
+            }
+            "errors_only" => rtrt_proxy::errors_only(&args.raw, context),
+            "ultra_compact" => rtrt_proxy::ultra_compact(&args.raw),
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("unknown proxy mode: {other}"),
+                    None,
+                ));
+            }
+        };
+        let filtered = out.chars().count();
+        let body = serde_json::json!({
+            "filtered": out,
+            "mode": mode,
+            "original_len": original,
+            "filtered_len": filtered,
+            "saved_chars": original.saturating_sub(filtered),
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -479,6 +534,7 @@ impl ServerHandler for RtrtMcp {
             .with_instructions(
                 "RTRT MCP server. Tools: compress (caveman-style rewriter), \
                  compress_ml (LLMLingua-style token-importance compression), \
+                 proxy (rtrt-proxy command/errors_only/ultra_compact filters), \
                  memory_save / memory_recall (SQLite + FTS5 BM25; recall accepts a qdrant-style payload filter), \
                  memory_set_block / memory_get_block / memory_list_blocks (Letta-style blocks), \
                  templates_list / templates_scaffold (built-in project scaffolds), \

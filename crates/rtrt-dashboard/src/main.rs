@@ -42,6 +42,7 @@ use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetr
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 struct AppState {
@@ -53,6 +54,11 @@ struct AppState {
     default_project: String,
     session_id: String,
     dedup_window_sec: i64,
+    events: broadcast::Sender<String>,
+}
+
+fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
+    let _ = tx.send(payload.to_string());
 }
 
 impl AppState {
@@ -104,6 +110,16 @@ impl AppState {
                 if let Err(e) = guard.tag_row(id, Some(&session), Some(&sha)) {
                     tracing::warn!("auto-capture tag {kind}: {e}");
                 }
+                broadcast_event(
+                    &self.events,
+                    serde_json::json!({
+                        "type": "memory.save",
+                        "id": id,
+                        "kind": kind,
+                        "project": project,
+                        "session": session,
+                    }),
+                );
             }
             Err(e) => tracing::warn!("auto-capture {kind}: {e}"),
         }
@@ -152,6 +168,7 @@ async fn main() -> Result<()> {
         tracing::info!("auto-capture off (RTRT_AUTO_CAPTURE=0)");
     }
     let memory_for_daemon = memory.clone();
+    let (events_tx, _) = broadcast::channel::<String>(256);
     let state = AppState {
         gateway,
         prompts,
@@ -161,6 +178,7 @@ async fn main() -> Result<()> {
         default_project,
         session_id,
         dedup_window_sec,
+        events: events_tx,
     };
     spawn_consolidation_daemon(memory_for_daemon);
 
@@ -192,6 +210,8 @@ async fn main() -> Result<()> {
         .route("/api/diagnose", post(diagnose))
         .route("/api/repo-map", post(repo_map))
         .route("/api/setup", post(setup_snippet))
+        .route("/api/stream", get(sse_stream))
+        .route("/api/tokens/summary", get(tokens_summary))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -1262,6 +1282,70 @@ struct BudgetResponse {
     spent_usd: f64,
     remaining_usd: Option<f64>,
     cache_len: Option<usize>,
+}
+
+async fn sse_stream(
+    State(state): State<AppState>,
+) -> axum::response::sse::Sse<
+    impl futures_util::Stream<
+        Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    let rx = state.events.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
+        match msg {
+            Ok(line) => Some(Ok::<_, std::convert::Infallible>(
+                Event::default().data(line),
+            )),
+            Err(_lag) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn tokens_summary(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let buf = state.gateway.metrics();
+    let guard = buf.lock().unwrap_or_else(|p| p.into_inner());
+    use rtrt_providers::MetricsView;
+    let view = MetricsView::new(&guard);
+    let summary = view.summary();
+    let by_provider = view.by_provider();
+    let recent = view.recent(usize::MAX);
+    // Bucket by hour (Unix epoch / 3600). Stable across timezones.
+    let mut hourly: std::collections::BTreeMap<u64, (u64, u64, u64)> = Default::default();
+    let mut daily: std::collections::BTreeMap<u64, (u64, u64, u64)> = Default::default();
+    for m in &recent {
+        let h: u64 = m.started_at / 3600;
+        let d: u64 = m.started_at / 86400;
+        let e = hourly.entry(h).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += m.usage.input_tokens;
+        e.2 += m.usage.output_tokens;
+        let e = daily.entry(d).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += m.usage.input_tokens;
+        e.2 += m.usage.output_tokens;
+    }
+    let hourly: Vec<_> = hourly
+        .into_iter()
+        .map(|(h, (c, i, o))| {
+            serde_json::json!({"hour_ts": h*3600, "calls": c, "input_tokens": i, "output_tokens": o})
+        })
+        .collect();
+    let daily: Vec<_> = daily
+        .into_iter()
+        .map(|(d, (c, i, o))| {
+            serde_json::json!({"day_ts": d*86400, "calls": c, "input_tokens": i, "output_tokens": o})
+        })
+        .collect();
+    Json(serde_json::json!({
+        "summary": summary,
+        "by_provider": by_provider,
+        "hourly": hourly,
+        "daily": daily,
+    }))
 }
 
 async fn budget(State(state): State<AppState>) -> Json<BudgetResponse> {

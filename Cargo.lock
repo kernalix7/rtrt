@@ -3148,6 +3148,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "rtrt-compress",
  "rtrt-core",
  "rtrt-memory",
@@ -3157,6 +3158,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tracing",
@@ -3960,6 +3962,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

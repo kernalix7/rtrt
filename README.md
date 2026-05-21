@@ -44,6 +44,24 @@ cargo install --path crates/rtrt-cli</code></pre>
 
 RTRT consolidates four token-reduction techniques behind one CLI, one MCP server, and one web dashboard. It is written entirely in Rust, edition 2024, with zero unsafe in the core crates. Reference projects are reimplemented in Rust rather than vendored.
 
+## Quick install + uninstall
+
+```bash
+# Install — Linux / macOS / WSL
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+
+# Install — Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+
+# Uninstall — binaries only (Linux/macOS/WSL)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
+
+# Uninstall — full purge (Linux/macOS/WSL)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
+```
+
+See [docs/INSTALL.md](docs/INSTALL.md) for the source-build path, `--main` source-build fallback, and the PowerShell uninstall counterpart.
+
 ## Quick install
 
 From source (recommended while pre-release):

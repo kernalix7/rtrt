@@ -2,7 +2,42 @@
 
 **English** | [한국어](INSTALL.ko.md)
 
-RTRT is in alpha. The supported install path today is **from source via `cargo`**. Pre-built binaries, crates.io publishes, and one-line install scripts are listed below as planned.
+RTRT is in alpha. Two install paths are supported today: **one-line script** (fetches the binary or builds from `main` if no release matches) and **from source via `cargo`**. Pre-built binary releases land with `v0.2.0` — until then the one-liner falls back to `--main` automatically when invoked with that flag.
+
+## One-liner (recommended)
+
+```bash
+# Linux / macOS / WSL — latest release, falls back to `--main` if no release yet
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+
+# Build straight from main (until pre-built binaries ship)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh -s -- --main
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+```
+
+The installers detect OS + arch, download the matching tarball / zip from the latest GitHub Release, verify the SHA256, and drop `rtrt` / `rtrt-mcp` / `rtrt-dashboard` into `~/.local/bin/` (Linux/macOS) or `%LOCALAPPDATA%\Programs\rtrt\` (Windows).
+
+### Uninstall (one-liner)
+
+```bash
+# Linux / macOS / WSL — binaries only (state under ~/.rtrt left intact)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
+
+# Full purge — binaries + ~/.rtrt + fastembed model cache
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
+```
+
+Both `uninstall.sh` and `uninstall.ps1` also run interactively when executed locally without `--confirm` / `-Confirm` — they ask before each step. `install.sh --uninstall` / `install.ps1 -Uninstall` stay as compatibility shims that delete the binaries without touching state.
 
 ## From source (current)
 
@@ -30,20 +65,6 @@ cargo install --path crates/rtrt-cli
 ```
 
 Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP server and dashboard binaries globally available.
-
-## One-liner (planned)
-
-```bash
-# macOS / Linux / WSL
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-```
-
-```powershell
-# Windows
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
-```
-
-The installers will pick the matching pre-built binary from the latest GitHub release and place it in a user-local path (`~/.local/bin/` or `%LOCALAPPDATA%\Programs\rtrt\`). Not yet wired — track [#1](https://github.com/kernalix7/rtrt/issues).
 
 ## crates.io (planned)
 
@@ -77,18 +98,21 @@ rtrt templates
 
 `rtrt info` should print the version + crate manifest. `rtrt templates` should list six built-in templates.
 
-## Uninstall
+## Uninstall (manual)
 
-Remove the cargo-installed binaries:
+If you installed from source via `cargo install`, remove the binaries with:
 
 ```bash
 cargo uninstall rtrt-cli rtrt-mcp rtrt-dashboard
 ```
 
-Remove on-disk state (memory store, custom templates):
+For the curl-installer flow, prefer the one-liners under [Uninstall (one-liner)](#uninstall-one-liner) above. They live as standalone scripts (`uninstall.sh` / `uninstall.ps1`) and accept `--confirm` (binaries only) or `--purge` (binaries + `~/.rtrt` + fastembed model cache).
+
+Manual state cleanup:
 
 ```bash
-rm -rf ~/.rtrt/
+rm -rf ~/.rtrt/                       # memory store, prompt registry, custom templates
+rm -rf ~/.cache/fastembed/             # ONNX model cache (only present if `embeddings` feature ran)
 ```
 
 Remove the repo clone if you no longer need it.

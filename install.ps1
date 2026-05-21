@@ -1,16 +1,17 @@
 # RTRT installer — Windows PowerShell.
 #
-# Usage:
+# One-liner install (latest release):
 #   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1))) -Version v0.2.0
-#   ... -Main
-#   ... -Uninstall
+#
+# One-liner uninstall:
+#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
+#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
 #
 # Flags:
 #   -Version vX.Y.Z   pin a specific release (default: latest)
-#   -Main             ignore releases; clone main and `cargo install`
+#   -Main             ignore releases; clone main and `cargo build --release`
 #   -InstallDir <p>   install dir (default: $env:LOCALAPPDATA\Programs\rtrt)
-#   -Uninstall        remove rtrt.exe, rtrt-mcp.exe, rtrt-dashboard.exe
+#   -Uninstall        compatibility shim — defers to uninstall.ps1 logic
 #   -DryRun           print intended actions without writing anything
 
 [CmdletBinding()]
@@ -35,9 +36,14 @@ function Invoke-Step($Action, $Script) {
     }
 }
 
-# ---------- uninstall ----------
+# ---------- uninstall (compat shim) ----------
+# Canonical uninstaller is uninstall.ps1 (interactive + -Confirm + -Purge).
+# This branch keeps `install.ps1 -Uninstall` working for users who memorised it.
 if ($Uninstall) {
-    Write-Host "== rtrt uninstall =="
+    Write-Host "== rtrt uninstall (compat shim) =="
+    Write-Host "For interactive / purge flow, use uninstall.ps1 instead:"
+    Write-Host "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex -Args '-Confirm'"
+    Write-Host ""
     foreach ($bin in $Bins) {
         $target = Join-Path $InstallDir $bin
         if (Test-Path $target) {

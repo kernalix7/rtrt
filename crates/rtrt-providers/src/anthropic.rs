@@ -18,6 +18,10 @@ pub struct AnthropicProvider {
     pub api_key: String,
     pub base_url: String,
     pub http: reqwest::Client,
+    /// When the joined system prompt is at least this many characters, the
+    /// adapter attaches `cache_control: { type: "ephemeral" }` so Anthropic
+    /// reuses the cached prefix across requests. `0` disables the heuristic.
+    pub cache_threshold: usize,
 }
 
 impl AnthropicProvider {
@@ -26,6 +30,10 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             http: reqwest::Client::new(),
+            // 1024 chars is well above Anthropic's 1024-token minimum for
+            // prompt caching once compression is applied; raise this if the
+            // workload always sends short system prompts.
+            cache_threshold: 1024,
         }
     }
 
@@ -36,6 +44,13 @@ impl AnthropicProvider {
 
     pub fn with_http(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Override the system-prompt length at which `cache_control: ephemeral`
+    /// is attached. Set to `0` to disable prompt caching.
+    pub fn with_cache_threshold(mut self, chars: usize) -> Self {
+        self.cache_threshold = chars;
         self
     }
 
@@ -51,7 +66,21 @@ impl AnthropicProvider {
             body["temperature"] = json!(t);
         }
         if !system.is_empty() {
-            body["system"] = json!(system);
+            // Anthropic's prompt cache wants the system field as an array of
+            // content blocks with an optional `cache_control` marker. Long
+            // system prompts (compressed agent context, multi-page rules) are
+            // the typical caching target, so we gate on a configurable length.
+            if self.cache_threshold > 0 && system.chars().count() >= self.cache_threshold {
+                body["system"] = json!([
+                    {
+                        "type": "text",
+                        "text": system,
+                        "cache_control": { "type": "ephemeral" },
+                    }
+                ]);
+            } else {
+                body["system"] = json!(system);
+            }
         }
         body
     }

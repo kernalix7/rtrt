@@ -36,23 +36,23 @@ cargo install --path crates/rtrt-cli</code></pre>
 
 RTRT는 네 가지 토큰 절감 기법을 하나의 CLI · MCP 서버 · 웹 대시보드로 통합합니다. 전체가 러스트(edition 2024)로 작성되었고, 핵심 크레이트에는 `unsafe`가 없습니다. 참조 프로젝트의 코드를 벤더링하지 않고 러스트로 재구현합니다.
 
-## 빠른 설치
-
-소스 빌드(현재 권장):
+## 빠른 설치 + 제거
 
 ```bash
-git clone https://github.com/kernalix7/rtrt
-cd rtrt
-cargo install --path crates/rtrt-cli
-```
-
-원라이너 설치는 예정입니다(아직 미연결):
-
-```bash
+# 설치 — Linux / macOS / WSL
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+
+# 설치 — Windows PowerShell
+irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+
+# 제거 — 바이너리만 (~/.rtrt 유지)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
+
+# 제거 — 완전 (바이너리 + ~/.rtrt + fastembed 캐시)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
 ```
 
-자세한 설치 경로는 [INSTALL.ko.md](INSTALL.ko.md)를 참고하세요.
+릴리스가 없으면 `--main` 플래그로 main 브랜치를 소스 빌드합니다. 자세한 경로는 [INSTALL.ko.md](INSTALL.ko.md) 참고.
 
 ## 실행
 

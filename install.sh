@@ -1,17 +1,20 @@
 #!/usr/bin/env sh
 # RTRT installer — Linux / macOS / WSL.
 #
-# Usage:
+# One-liner install (latest release):
 #   curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --version v0.2.0
-#   curl -fsSL .../install.sh | sh -s -- --main        # build from source
-#   curl -fsSL .../install.sh | sh -s -- --uninstall
+#
+# One-liner uninstall:
+#   curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh \
+#       | bash -s -- --confirm        # binaries only
+#   curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh \
+#       | bash -s -- --purge          # binaries + ~/.rtrt + caches
 #
 # Flags:
 #   --version vX.Y.Z   pin a specific release (default: latest)
-#   --main             ignore releases; clone main and `cargo install`
+#   --main             ignore releases; clone main and `cargo build --release`
 #   --dir <path>       install dir (default: $HOME/.local/bin)
-#   --uninstall        remove rtrt, rtrt-mcp, rtrt-dashboard from --dir
+#   --uninstall        compatibility shim — defers to uninstall.sh logic
 #   --dry-run          print intended actions without writing anything
 
 set -eu
@@ -49,8 +52,13 @@ run() {
 }
 
 # ---------- uninstall path ----------
+# Compatibility shim — the canonical uninstaller lives in uninstall.sh
+# (interactive + --confirm + --purge modes). The branch below keeps
+# `install.sh --uninstall` working for users who memorised it.
 if [ "$UNINSTALL" -eq 1 ]; then
-    printf '== rtrt uninstall ==\n'
+    printf '== rtrt uninstall (compat shim) ==\n'
+    printf 'For an interactive / purge flow, use uninstall.sh instead:\n'
+    printf '  curl -fsSL https://raw.githubusercontent.com/%s/main/uninstall.sh | bash -s -- --confirm\n\n' "$REPO"
     for bin in $BINS; do
         target="$INSTALL_DIR/$bin"
         if [ -f "$target" ]; then

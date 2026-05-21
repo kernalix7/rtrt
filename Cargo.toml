@@ -59,6 +59,7 @@ rmcp = "1"
 schemars = "0.8"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
+instant-distance = "0.6"
 
 [profile.release]
 opt-level = 3

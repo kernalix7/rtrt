@@ -18,6 +18,7 @@ tracing.workspace = true
 async-trait.workspace = true
 fastembed = { workspace = true, optional = true }
 rtrt-providers = { workspace = true, optional = true }
+instant-distance = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -30,3 +31,8 @@ embeddings = ["dep:fastembed"]
 # extraction and compression. The trait shape is always available so callers
 # can plug in their own backend.
 llm = ["dep:rtrt-providers"]
+# Enables `HnswIndex` for sub-linear approximate-nearest-neighbour recall.
+# Without it `recall_vector` falls back to a project-scoped O(n) cosine sweep
+# which is fine for a few thousand memories but starts costing real time
+# beyond ~50k.
+hnsw = ["dep:instant-distance"]

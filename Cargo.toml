@@ -11,6 +11,9 @@ members = [
     "crates/rtrt-cli",
     "crates/rtrt-templates",
 ]
+# `fuzz/` is a cargo-fuzz crate that depends on libfuzzer-sys; keep it out of
+# the workspace so a default `cargo build` doesn't drag nightly-only deps in.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

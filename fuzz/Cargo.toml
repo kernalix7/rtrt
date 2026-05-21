@@ -1,0 +1,33 @@
+[package]
+name = "rtrt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# cargo-fuzz expects this crate to live in `fuzz/` as a sibling member that
+# the workspace excludes (see the root Cargo.toml `[workspace.exclude]` list).
+# Run with:
+#     cargo +nightly fuzz run compress -- -max_total_time=60
+#     cargo +nightly fuzz run redact   -- -max_total_time=60
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rtrt-compress = { path = "../crates/rtrt-compress" }
+rtrt-core = { path = "../crates/rtrt-core" }
+
+[[bin]]
+name = "compress"
+path = "fuzz_targets/compress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact"
+path = "fuzz_targets/redact.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,33 @@
+name: bench
+
+# Runs the compress criterion harness on a schedule so we notice perf drift
+# (or savings regressions on the fixture corpus) without lengthening every PR
+# build. Not blocking; artefact-only.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '47 6 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench (compress)
+        run: cargo bench -p rtrt-compress --bench compress_bench -- --warm-up-time 1 --measurement-time 5
+      - name: Savings table
+        run: bash scripts/bench.sh --table-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion
+          if-no-files-found: warn

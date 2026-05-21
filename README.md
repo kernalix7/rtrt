@@ -8,13 +8,13 @@
 multi-provider routing, and standardized project scaffolds — under one CLI,<br>
 one MCP server, one web dashboard.</p>
 
-<pre><code># Install — Linux / macOS / WSL
+<pre><code># Latest stable release (default; falls back to --main if none yet)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 
-# Install — Windows PowerShell
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
+# Latest main HEAD (development; may be unstable)
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh -s -- --main
 
-# Uninstall (binaries only · use --purge to wipe ~/.rtrt too)
+# Uninstall (keeps ~/.rtrt; pass --purge to wipe everything)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm</code></pre>
 
 [![Alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge)](#status-alpha)
@@ -50,7 +50,7 @@ RTRT consolidates four token-reduction techniques behind one CLI, one MCP server
 One-liner (Linux / macOS / WSL):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | bash
 ```
 
 Windows PowerShell:
@@ -59,44 +59,20 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 ```
 
-Common variants — the installer accepts the same flags whether you pipe it through `sh` (`sh -s -- <flags>`) or run it locally:
+Or pick a build channel:
 
 ```bash
-# Pin a release once one is published
-curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+# Latest main HEAD
+curl -fsSL .../install.sh | bash -s -- --main
 
-# Build from main HEAD (default fallback when no release exists)
-curl -fsSL .../install.sh | sh -s -- --main
+# Specific tag / branch / commit
+curl -fsSL .../install.sh | bash -s -- --ref my-feature
 
-# Track a specific tag / branch / commit
-curl -fsSL .../install.sh | sh -s -- --ref my-feature
-RTRT_REF=my-feature curl -fsSL .../install.sh | sh
-
-# Install from a local clone (offline / air-gapped)
-curl -fsSL .../install.sh | sh -s -- --source /path/to/rtrt
-RTRT_SOURCE=/path/to/rtrt sh install.sh
-
-# Drop binaries somewhere other than ~/.local/bin
-curl -fsSL .../install.sh | sh -s -- --dir /opt/rtrt/bin
-
-# Dry-run (print actions, write nothing)
-curl -fsSL .../install.sh | sh -s -- --ref main --dry-run
+# Local clone (offline / air-gapped)
+sh install.sh --source ~/code/rtrt
 ```
 
-Uninstall:
-
-```bash
-# Binaries only (state under ~/.rtrt left intact)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
-
-# Full purge (binaries + ~/.rtrt + fastembed model cache)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
-
-# Windows PowerShell counterpart
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
-```
-
-See [docs/INSTALL.md](docs/INSTALL.md) for source-build details, environment-variable equivalents (`RTRT_REF` / `RTRT_SOURCE` / `RTRT_SKIP_DEPS`), and the PowerShell uninstall counterpart.
+See [docs/INSTALL.md](docs/INSTALL.md) for the full flag matrix, environment-variable equivalents (`RTRT_REF` / `RTRT_SOURCE` / `RTRT_SKIP_DEPS`), source builds, version pinning, and uninstall.
 
 ## Launch
 

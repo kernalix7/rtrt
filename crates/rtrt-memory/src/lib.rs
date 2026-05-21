@@ -198,6 +198,33 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Returns every `(src_id, dst_id, relation)` edge whose endpoints are
+    /// inside `project`. Used by the dashboard graph view; intentionally
+    /// scoped to one project so a global view doesn't degrade with growth.
+    pub fn project_edges(&self, project: &str) -> Result<Vec<(i64, i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.src_id, e.dst_id, e.relation \
+                   FROM edges e \
+                   JOIN memories ms ON ms.id = e.src_id \
+                   JOIN memories md ON md.id = e.dst_id \
+                  WHERE ms.project = ?1 AND md.project = ?1",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
     /// Iterates every memory row in `project`, emitting one JSON Line per
     /// record (`{ id, project, kind, body, scope, created_at, metadata }`).
     /// Pair with [`import_jsonl`] for portable backups across machines.

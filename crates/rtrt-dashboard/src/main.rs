@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         .route("/api/prompts/{name}/{version}", get(get_prompt))
         .route("/api/budget", get(budget))
         .route("/api/memory/recall", post(memory_recall))
+        .route("/api/memory/graph", get(memory_graph))
         .route("/api/memory/export", get(memory_export))
         .route("/api/memory/save", post(memory_save))
         .route("/api/memory/blocks", get(list_blocks).post(set_block))
@@ -378,6 +379,54 @@ async fn memory_recall(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
     Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryGraphQuery {
+    project: String,
+    #[serde(default = "default_graph_limit")]
+    limit: usize,
+}
+
+fn default_graph_limit() -> usize {
+    200
+}
+
+async fn memory_graph(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryGraphQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let records = guard
+        .list_by_project(&q.project, q.limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let edges = guard
+        .project_edges(&q.project)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let nodes: Vec<serde_json::Value> = records
+        .into_iter()
+        .map(|r| {
+            let preview: String = r.body.chars().take(60).collect();
+            serde_json::json!({
+                "id": r.id,
+                "kind": r.kind,
+                "scope": r.scope,
+                "preview": preview,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = edges
+        .into_iter()
+        .map(|(s, d, rel)| serde_json::json!({"src": s, "dst": d, "relation": rel}))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "nodes": nodes,
+        "edges": edges,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1105,6 +1154,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
   /* Count-up animation */
   .countup { display: inline-block; transition: opacity .2s; }
 
+  /* Progressive disclosure */
+  details > summary.muted-summary { cursor: pointer; color: var(--muted); font-size: 0.85em; padding: 0.35rem 0; list-style: none; user-select: none; }
+  details > summary.muted-summary::-webkit-details-marker { display: none; }
+  details > summary.muted-summary::before { content: '⇲ '; font-size: 0.9em; }
+  details[open] > summary.muted-summary::before { content: '⇱ '; }
+  details > .adv { padding-top: 0.5rem; display: grid; gap: 0.5rem; }
+
+  /* Graph canvas */
+  #graph-canvas { cursor: grab; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -1167,55 +1226,89 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <h1>메모리</h1>
         <div class="lede">프로젝트마다 따로 쌓이는 SQLite 저장소. 검색은 BM25, 옵션으로 필터.</div>
       </div>
-      <div class="card">
-        <div class="head"><h2>검색</h2><span class="hint">필터 예: <code>source=claude,topic~^auth</code></span></div>
-        <form id="recall-form">
-          <div class="row">
+      <nav class="subtabs" id="memory-subtabs">
+        <a class="active" data-sub="memquery">검색 + 저장</a>
+        <a data-sub="memmap">맵</a>
+        <a data-sub="memblocks">블록</a>
+        <a data-sub="membackup">백업</a>
+      </nav>
+
+      <div id="sub-memquery" class="subpage">
+        <div class="card">
+          <div class="head"><h2>검색</h2></div>
+          <form id="recall-form">
             <input id="recall-project" placeholder="project (예: rtrt)" required>
-            <input id="recall-limit" type="number" min="1" max="50" value="10">
-          </div>
-          <input id="recall-query" placeholder="검색어" required>
-          <input id="recall-filter" placeholder="payload 필터 (선택)">
-          <button class="primary" type="submit">검색</button>
-        </form>
-        <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>내용</th></tr></thead><tbody><tr><td colspan="4" class="empty">검색하면 결과가 여기에 나옵니다.</td></tr></tbody></table>
-      </div>
-      <div class="card">
-        <div class="head"><h2>새 메모리</h2><span class="hint">metadata는 JSON 객체로</span></div>
-        <form id="save-form">
-          <div class="row">
+            <input id="recall-query" placeholder="검색어" required>
+            <button class="primary" type="submit">검색</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <input id="recall-limit" type="number" min="1" max="50" value="10" title="최대 결과 수">
+                  <input id="recall-filter" placeholder="payload 필터 (예: source=claude)">
+                </div>
+              </div>
+            </details>
+          </form>
+          <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>내용</th></tr></thead><tbody><tr><td colspan="3" class="empty">검색하면 결과가 여기에 나옵니다.</td></tr></tbody></table>
+        </div>
+        <div class="card">
+          <div class="head"><h2>새 메모리 저장</h2></div>
+          <form id="save-form">
             <input id="save-project" placeholder="project" required>
-            <input id="save-kind" placeholder="kind (기본 note)" value="note">
-          </div>
-          <textarea id="save-body" rows="3" placeholder="내용" required></textarea>
-          <input id="save-metadata" placeholder='{"source":"claude","topic":"auth"}'>
-          <button class="primary" type="submit">저장</button>
-        </form>
-        <div id="save-result" class="out-meta"></div>
+            <textarea id="save-body" rows="3" placeholder="저장할 내용" required></textarea>
+            <button class="primary" type="submit">저장</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <input id="save-kind" placeholder="kind (기본 note)" value="note">
+                  <input id="save-metadata" placeholder='메타: {"source":"claude"}'>
+                </div>
+              </div>
+            </details>
+          </form>
+          <div id="save-result" class="out-meta"></div>
+        </div>
       </div>
-      <div class="card">
-        <div class="head"><h2>블록</h2><span class="hint">persona / human / context 같은 영속 슬롯</span></div>
-        <form id="blocks-list-form" style="grid-template-columns:1fr auto;">
-          <input id="blocks-project" placeholder="project" required>
-          <button type="submit">목록</button>
-        </form>
-        <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody><tr><td colspan="2" class="empty">project를 입력하고 목록을 눌러보세요.</td></tr></tbody></table>
-        <form id="blocks-set-form" style="margin-top:0.75rem;">
-          <div class="row">
-            <input id="block-set-name" placeholder="이름 (persona / human / context)" required>
+
+      <div id="sub-memmap" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>지식 맵</h2><span class="hint">노드 = 메모리, 선 = 연결</span></div>
+          <form id="graph-form" style="grid-template-columns:1fr auto;">
+            <input id="graph-project" placeholder="project" required>
+            <button class="primary" type="submit">맵 보기</button>
+          </form>
+          <div id="graph-meta" class="out-meta"></div>
+          <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
+          <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+        </div>
+      </div>
+
+      <div id="sub-memblocks" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>블록</h2><span class="hint">persona / human / context 같은 영속 슬롯</span></div>
+          <form id="blocks-list-form" style="grid-template-columns:1fr auto;">
+            <input id="blocks-project" placeholder="project" required>
+            <button type="submit">목록</button>
+          </form>
+          <table id="blocks-tbl" style="margin-top:0.5rem;"><thead><tr><th>이름</th><th>내용</th></tr></thead><tbody><tr><td colspan="2" class="empty">project를 입력하고 목록을 눌러보세요.</td></tr></tbody></table>
+          <form id="blocks-set-form" style="margin-top:0.75rem;">
             <input id="block-set-project" placeholder="project" required>
-          </div>
-          <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
-          <button class="primary" type="submit">덮어쓰기</button>
-        </form>
-        <div id="block-set-result" class="out-meta"></div>
+            <input id="block-set-name" placeholder="이름 (persona / human / context)" required>
+            <textarea id="block-set-body" rows="2" placeholder="블록 내용" required></textarea>
+            <button class="primary" type="submit">저장 / 덮어쓰기</button>
+          </form>
+          <div id="block-set-result" class="out-meta"></div>
+        </div>
       </div>
-      <div class="card">
-        <div class="head"><h2>백업</h2><span class="hint">JSON Lines로 내려받기</span></div>
-        <form id="export-form" style="grid-template-columns:1fr auto;">
-          <input id="export-project" placeholder="project" required>
-          <button type="submit">다운로드</button>
-        </form>
+
+      <div id="sub-membackup" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>백업</h2><span class="hint">JSON Lines로 내려받기</span></div>
+          <form id="export-form" style="grid-template-columns:1fr auto;">
+            <input id="export-project" placeholder="project" required>
+            <button class="primary" type="submit">다운로드</button>
+          </form>
+        </div>
       </div>
     </section>
 
@@ -1235,49 +1328,57 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       <div id="sub-compress" class="subpage">
         <div class="card">
-          <div class="head"><h2>텍스트 압축</h2><span class="hint">룰 엔진 또는 ML 휴리스틱</span></div>
+          <div class="head"><h2>텍스트 압축</h2><span class="hint">기본은 full 레벨 룰 엔진</span></div>
           <form id="compress-form">
-            <div class="row">
-              <select id="compress-mode">
-                <option value="rules">룰 엔진 (정규식)</option>
-                <option value="ml">ML 휴리스틱 (토큰 중요도)</option>
-              </select>
-              <select id="compress-level">
-                <option value="lite">lite (약함)</option>
-                <option value="full" selected>full (기본)</option>
-                <option value="ultra">ultra (강함)</option>
-                <option value="extreme">extreme (최강)</option>
-              </select>
-            </div>
-            <div class="row">
-              <select id="compress-format">
-                <option value="plain" selected>plain</option>
-                <option value="markdown">markdown</option>
-                <option value="xml">xml</option>
-                <option value="json">json</option>
-              </select>
-              <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
-            </div>
             <textarea id="compress-input" rows="5" placeholder="줄일 텍스트를 붙여 넣으세요" required></textarea>
             <button class="primary" type="submit">압축</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <select id="compress-mode">
+                    <option value="rules">룰 엔진 (정규식)</option>
+                    <option value="ml">ML 휴리스틱 (토큰 중요도)</option>
+                  </select>
+                  <select id="compress-level">
+                    <option value="lite">lite (약함)</option>
+                    <option value="full" selected>full (기본)</option>
+                    <option value="ultra">ultra (강함)</option>
+                    <option value="extreme">extreme (최강)</option>
+                  </select>
+                </div>
+                <div class="row">
+                  <select id="compress-format">
+                    <option value="plain" selected>plain</option>
+                    <option value="markdown">markdown</option>
+                    <option value="xml">xml</option>
+                    <option value="json">json</option>
+                  </select>
+                  <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ML 모드 비율">
+                </div>
+              </div>
+            </details>
           </form>
           <div id="compress-summary" class="out-meta"></div>
           <pre id="compress-output" hidden></pre>
         </div>
         <div class="card">
-          <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 같은 노이즈 줄이기</span></div>
+          <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 줄이기</span></div>
           <form id="proxy-form">
-            <div class="row">
-              <select id="proxy-mode">
-                <option value="command">command — 명령으로 자동 감지</option>
-                <option value="errors_only">errors_only — 에러 줄만</option>
-                <option value="ultra_compact">ultra_compact — 반복 묶음</option>
-              </select>
-              <input id="proxy-command" placeholder="명령 (예: git status)">
-            </div>
-            <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
-            <textarea id="proxy-raw" rows="5" placeholder="원본 stdout / stderr 붙여넣기" required></textarea>
+            <input id="proxy-command" placeholder="명령 (예: git status)">
+            <textarea id="proxy-raw" rows="5" placeholder="원본 stdout / stderr" required></textarea>
             <button class="primary" type="submit">필터링</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <select id="proxy-mode">
+                    <option value="command">command — 명령 자동 감지</option>
+                    <option value="errors_only">errors_only — 에러 줄만</option>
+                    <option value="ultra_compact">ultra_compact — 반복 묶음</option>
+                  </select>
+                  <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only 컨텍스트 줄 수">
+                </div>
+              </div>
+            </details>
           </form>
           <div id="proxy-summary" class="out-meta"></div>
           <pre id="proxy-output" hidden></pre>
@@ -1286,14 +1387,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       <div id="sub-diagnose" class="subpage" hidden>
         <div class="card">
-          <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄로 답</span></div>
+          <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄</span></div>
           <form id="diagnose-form">
-            <div class="row">
-              <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
-              <input id="diagnose-context" type="number" min="0" max="20" value="3" title="context lines">
-            </div>
+            <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
             <textarea id="diagnose-raw" rows="8" placeholder="빌드 / 테스트 실패 로그" required></textarea>
             <button class="primary" type="submit">진단 요청</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <input id="diagnose-context" type="number" min="0" max="20" value="3" title="컨텍스트 줄 수">
+              </div>
+            </details>
           </form>
           <div id="diagnose-meta" class="out-meta"></div>
           <pre id="diagnose-output" hidden></pre>
@@ -1302,14 +1405,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       <div id="sub-repomap" class="subpage" hidden>
         <div class="card">
-          <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동 감지</span></div>
+          <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동</span></div>
           <form id="repomap-form">
             <input id="repomap-root" placeholder="프로젝트 경로 (예: /home/user/projects/foo)" required>
-            <div class="row">
-              <input id="repomap-ext" placeholder="확장자 (비우면 자동: .rs/.py/.ts)">
-              <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
-            </div>
             <button class="primary" type="submit">맵 생성</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <input id="repomap-ext" placeholder="확장자 (비우면 자동)">
+                  <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
+                </div>
+              </div>
+            </details>
           </form>
           <div id="repomap-summary" class="out-meta"></div>
           <pre id="repomap-output" style="max-height:420px;overflow:auto;" hidden></pre>
@@ -1430,6 +1537,24 @@ function wireSubtabs(navId) {
 }
 wireSubtabs('tool-subtabs');
 wireSubtabs('setting-subtabs');
+wireSubtabs('memory-subtabs');
+
+// Project name memory — last-used value persists across reloads so the user
+// doesn't have to retype it every time.
+const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
+function syncProject(value) {
+  if (!value) return;
+  localStorage.setItem('rtrt-project', value);
+  PROJECT_INPUTS.forEach(id => { const el = document.getElementById(id); if (el && !el.value) el.value = value; });
+}
+const savedProject = localStorage.getItem('rtrt-project');
+if (savedProject) {
+  PROJECT_INPUTS.forEach(id => { const el = document.getElementById(id); if (el) el.value = savedProject; });
+}
+PROJECT_INPUTS.forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => syncProject(el.value));
+});
 
 // Activity feed
 const FEED = [];
@@ -1603,6 +1728,140 @@ document.getElementById('export-form').onsubmit = (ev) => {
   const project = document.getElementById('export-project').value;
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
+};
+
+// Memory graph — force-directed canvas layout
+let graphState = null;
+function initGraph(data) {
+  const canvas = document.getElementById('graph-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth; const h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2962FF';
+  const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#666';
+  const fg = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim() || '#000';
+
+  // Initialise nodes with random positions; edges reference node ids.
+  const idIdx = new Map();
+  const nodes = data.nodes.map((n, i) => {
+    idIdx.set(n.id, i);
+    return { ...n, x: w/2 + (Math.random()-0.5)*w*0.6, y: h/2 + (Math.random()-0.5)*h*0.6, vx: 0, vy: 0 };
+  });
+  const edges = data.edges
+    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), rel: e.relation }))
+    .filter(e => e.s !== undefined && e.d !== undefined);
+
+  let hover = -1;
+  let drag = -1;
+  let mouseX = 0, mouseY = 0;
+  function getXY(ev) {
+    const rect = canvas.getBoundingClientRect();
+    return [ev.clientX - rect.left, ev.clientY - rect.top];
+  }
+  function pick(x, y) {
+    for (let i = nodes.length-1; i >= 0; i--) {
+      const n = nodes[i];
+      const dx = x - n.x; const dy = y - n.y;
+      if (dx*dx + dy*dy < 100) return i;
+    }
+    return -1;
+  }
+  canvas.onmousemove = (ev) => {
+    const [x, y] = getXY(ev);
+    mouseX = x; mouseY = y;
+    if (drag >= 0) { nodes[drag].x = x; nodes[drag].y = y; nodes[drag].vx = 0; nodes[drag].vy = 0; }
+    const h2 = pick(x, y);
+    if (h2 !== hover) {
+      hover = h2;
+      const tip = document.getElementById('graph-tip');
+      if (hover >= 0) {
+        const n = nodes[hover];
+        tip.innerHTML = `<code>#${n.id}</code> ${n.kind} — ${(n.preview || '').replace(/</g,'&lt;')}`;
+      } else {
+        tip.textContent = '노드 위에 마우스를 올리면 내용 미리보기.';
+      }
+    }
+  };
+  canvas.onmousedown = (ev) => { const [x, y] = getXY(ev); drag = pick(x, y); canvas.style.cursor = drag >= 0 ? 'grabbing' : 'grab'; };
+  canvas.onmouseup = () => { drag = -1; canvas.style.cursor = 'grab'; };
+  canvas.onmouseleave = () => { drag = -1; hover = -1; };
+
+  function step() {
+    // Spring-electric layout: edges pull, nodes repel.
+    const w = canvas.clientWidth; const h = canvas.clientHeight;
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i+1; j < nodes.length; j++) {
+        const b = nodes[j];
+        const dx = b.x - a.x; const dy = b.y - a.y;
+        const d2 = dx*dx + dy*dy + 0.01;
+        const f = 1200 / d2;
+        const fx = (dx / Math.sqrt(d2)) * f;
+        const fy = (dy / Math.sqrt(d2)) * f;
+        a.vx -= fx; a.vy -= fy;
+        b.vx += fx; b.vy += fy;
+      }
+    }
+    for (const e of edges) {
+      const a = nodes[e.s]; const b = nodes[e.d];
+      const dx = b.x - a.x; const dy = b.y - a.y;
+      const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
+      const f = (d - 100) * 0.02;
+      const fx = (dx/d) * f; const fy = (dy/d) * f;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (i === drag) continue;
+      n.vx *= 0.82; n.vy *= 0.82;
+      n.x += n.vx * 0.5; n.y += n.vy * 0.5;
+      // Centre attractor + bounds.
+      n.vx += (w/2 - n.x) * 0.0008;
+      n.vy += (h/2 - n.y) * 0.0008;
+      n.x = Math.max(12, Math.min(w-12, n.x));
+      n.y = Math.max(12, Math.min(h-12, n.y));
+    }
+
+    ctx.clearRect(0, 0, w, h);
+    // Edges.
+    ctx.strokeStyle = muted; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+    for (const e of edges) {
+      const a = nodes[e.s]; const b = nodes[e.d];
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // Nodes.
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      const isBlock = (n.kind || '').startsWith('block:');
+      const r = isBlock ? 8 : 6;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = isBlock ? '#7c3aed' : accent;
+      ctx.fill();
+      if (i === hover) {
+        ctx.strokeStyle = fg; ctx.lineWidth = 2; ctx.stroke();
+      }
+    }
+  }
+  if (graphState && graphState.raf) cancelAnimationFrame(graphState.raf);
+  graphState = { canvas, nodes, edges };
+  function loop() { step(); graphState.raf = requestAnimationFrame(loop); }
+  loop();
+}
+document.getElementById('graph-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const project = document.getElementById('graph-project').value;
+  const meta = document.getElementById('graph-meta');
+  meta.textContent = '불러오는 중…';
+  const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
+  if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  const d = await r.json();
+  meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
+  if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
+  initGraph(d);
 };
 
 // Tools — compress

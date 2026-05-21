@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
             }
             // Sort by compressed size descending (rough "centrality" proxy —
             // bigger signature surface means more API).
-            entries.sort_by(|a, b| b.3.cmp(&a.3));
+            entries.sort_by_key(|e| std::cmp::Reverse(e.3));
             let total_before: usize = entries.iter().map(|(_, _, b, _)| b).sum();
             let total_after: usize = entries.iter().map(|(_, _, _, a)| a).sum();
             for (path, sig, before, after) in &entries {
@@ -444,11 +444,11 @@ async fn main() -> Result<()> {
                 );
                 println!("{}", sig);
             }
-            let pct = if total_before == 0 {
-                0
-            } else {
-                (total_before - total_after) * 100 / total_before
-            };
+            let pct = total_before
+                .checked_sub(total_after)
+                .and_then(|saved| saved.checked_mul(100))
+                .and_then(|n| n.checked_div(total_before))
+                .unwrap_or(0);
             eprintln!(
                 "[repo-map] {} files, {} → {} bytes ({}% saved)",
                 entries.len(),
@@ -482,7 +482,7 @@ async fn main() -> Result<()> {
                 }
             }
             let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             sorted.truncate(limit);
             if sorted.is_empty() {
                 println!("no proxy-eligible commands found in {}.", path.display());

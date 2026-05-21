@@ -48,6 +48,15 @@ struct Cli {
     /// HTTP mount path for the MCP endpoint.
     #[arg(long, default_value = "/mcp")]
     path: String,
+    /// Required bearer token for `--transport http`. Without it the server
+    /// rejects every request with 401. Reading from the environment keeps
+    /// the secret out of the process listing.
+    #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
+    http_token: Option<String>,
+    /// Allowed browser Origins (comma-separated) for `--transport http`.
+    /// Empty disables Origin validation; non-empty enables it per RFC 6454.
+    #[arg(long, env = "RTRT_MCP_ALLOWED_ORIGINS", value_delimiter = ',')]
+    allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -416,6 +425,51 @@ impl RtrtMcp {
     }
 }
 
+/// Bearer-token guard for the HTTP transport. When `expected` is `None` every
+/// request is admitted (the operator opted out by omitting `--http-token`).
+async fn bearer_guard(
+    expected: Option<Arc<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
+    let Some(expected) = expected else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let ok = presented
+        .as_deref()
+        .is_some_and(|tok| constant_time_eq(tok.as_bytes(), expected.as_bytes()));
+    if ok {
+        return next.run(req).await;
+    }
+    let mut resp = axum::response::Response::new(axum::body::Body::from(
+        "unauthorized: bearer token missing or invalid",
+    ));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert(
+        "WWW-Authenticate",
+        HeaderValue::from_static("Bearer realm=\"rtrt-mcp\""),
+    );
+    resp
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[tool_handler]
 impl ServerHandler for RtrtMcp {
     fn get_info(&self) -> ServerInfo {
@@ -458,21 +512,62 @@ async fn main() -> Result<()> {
         }
         Transport::Http => {
             tracing::info!(
-                "rtrt-mcp starting on http://{}{}; memory={}",
+                "rtrt-mcp starting on http://{}{}; memory={}; auth={}; origins={}",
                 cli.bind,
                 cli.path,
-                cli.memory.display()
+                cli.memory.display(),
+                if cli.http_token.is_some() {
+                    "bearer"
+                } else {
+                    "open"
+                },
+                if cli.allowed_origins.is_empty() {
+                    "*".into()
+                } else {
+                    cli.allowed_origins.join(",")
+                },
             );
+            if cli.http_token.is_none()
+                && !cli.bind.starts_with("127.")
+                && !cli.bind.starts_with("[::1]")
+                && !cli.bind.starts_with("localhost")
+            {
+                tracing::warn!(
+                    "binding {} without --http-token is risky; non-loopback callers can hit the MCP endpoint without authentication.",
+                    cli.bind
+                );
+            }
             let factory_state = shared_state.clone();
+            let mut config = StreamableHttpServerConfig::default();
+            config.allowed_origins = cli.allowed_origins.clone();
             let mcp_service = StreamableHttpService::new(
                 move || Ok(RtrtMcp::with_state(factory_state.clone())),
                 Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig::default(),
+                config,
             );
-            let app = axum::Router::new().route_service(&cli.path, mcp_service);
+            let token = cli.http_token.clone().map(Arc::new);
+            let app = axum::Router::new()
+                .route_service(&cli.path, mcp_service)
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    let token = token.clone();
+                    async move { bearer_guard(token, req, next).await }
+                }));
             let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
             axum::serve(listener, app).await?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_basic_cases() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
 }

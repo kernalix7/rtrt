@@ -14,6 +14,8 @@
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
+//! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
+//! - `/api/compress`      — `POST` run the rule or ML compressor against arbitrary text.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -71,6 +73,8 @@ async fn main() -> Result<()> {
         .route("/api/prompts/{name}/{version}", get(get_prompt))
         .route("/api/budget", get(budget))
         .route("/api/memory/recall", post(memory_recall))
+        .route("/api/memory/save", post(memory_save))
+        .route("/api/compress", post(compress))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -295,6 +299,94 @@ async fn memory_recall(
     Ok(Json(serde_json::json!({ "hits": hits })))
 }
 
+#[derive(Debug, Deserialize)]
+struct MemorySaveRequest {
+    project: String,
+    #[serde(default = "default_kind")]
+    kind: String,
+    body: String,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+fn default_kind() -> String {
+    "note".into()
+}
+
+async fn memory_save(
+    State(state): State<AppState>,
+    Json(req): Json<MemorySaveRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let id = if req.metadata.is_empty() {
+        guard
+            .save(&req.project, &req.kind, &req.body)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        guard
+            .save_with_metadata(&req.project, &req.kind, &req.body, &req.metadata)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CompressRequest {
+    text: String,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    ml: bool,
+    #[serde(default)]
+    ratio: Option<f32>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+async fn compress(
+    Json(req): Json<CompressRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use rtrt_core::CompressionLevel;
+    let original = req.text.chars().count();
+    let (out, mode, scorer) = if req.ml {
+        let target = rtrt_compress::CompressionTarget::new(req.ratio.unwrap_or(0.5))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let c = rtrt_compress::MlCompressor::heuristic();
+        let scorer = c.scorer_name().to_string();
+        (c.compress(&req.text, target), "ml", Some(scorer))
+    } else {
+        let level = match req.level.as_deref().unwrap_or("full") {
+            "lite" => CompressionLevel::Lite,
+            "full" => CompressionLevel::Full,
+            "ultra" => CompressionLevel::Ultra,
+            "extreme" => CompressionLevel::Extreme,
+            other => {
+                return Err((StatusCode::BAD_REQUEST, format!("unknown level: {other}")));
+            }
+        };
+        let compressor = rtrt_compress::Compressor::new(level);
+        let format = req
+            .format
+            .as_deref()
+            .and_then(rtrt_compress::OutputFormat::parse)
+            .unwrap_or(rtrt_compress::OutputFormat::Plain);
+        (compressor.compress_to(&req.text, format), "rules", None)
+    };
+    let compressed = out.chars().count();
+    Ok(Json(serde_json::json!({
+        "compressed": out,
+        "mode": mode,
+        "scorer": scorer,
+        "original_len": original,
+        "compressed_len": compressed,
+        "saved_chars": original.saturating_sub(compressed),
+    })))
+}
+
 fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
     let root = match std::env::var("RTRT_PROMPTS_DIR") {
         Ok(p) => PathBuf::from(p),
@@ -476,6 +568,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <button type="submit" style="grid-column:1 / span 2;">Recall</button>
   </form>
   <table id="recall-tbl" style="margin-top:1rem;"><thead><tr><th>id</th><th>kind</th><th>scope</th><th>body</th></tr></thead><tbody></tbody></table>
+
+  <h3 style="margin-top:2rem;">Save memory</h3>
+  <form id="save-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:600px;">
+    <input id="save-project" placeholder="project" required>
+    <input id="save-kind" placeholder="kind (default: note)" value="note">
+    <textarea id="save-body" placeholder="body" required rows="3" style="grid-column:1 / span 2;"></textarea>
+    <input id="save-metadata" placeholder="metadata JSON (e.g. {\"source\":\"claude\"})" style="grid-column:1 / span 2;">
+    <button type="submit" style="grid-column:1 / span 2;">Save</button>
+  </form>
+  <div id="save-result" style="margin-top:0.5rem;color:#666;"></div>
 </section>
 
 <section id="templates">
@@ -484,8 +586,31 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </section>
 
 <section id="stats">
-  <h2>Compression savings</h2>
-  <div id="stats-body">loading…</div>
+  <h2>Compression</h2>
+  <p style="color:#666;">Run the rule engine (level: lite/full/ultra/extreme) or the LLMLingua-style ML compressor against arbitrary text.</p>
+  <form id="compress-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <select id="compress-mode">
+      <option value="rules">rules</option>
+      <option value="ml">ml (heuristic)</option>
+    </select>
+    <select id="compress-level">
+      <option value="lite">lite</option>
+      <option value="full" selected>full</option>
+      <option value="ultra">ultra</option>
+      <option value="extreme">extreme</option>
+    </select>
+    <select id="compress-format">
+      <option value="plain" selected>plain</option>
+      <option value="markdown">markdown</option>
+      <option value="xml">xml</option>
+      <option value="json">json</option>
+    </select>
+    <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ml ratio">
+    <textarea id="compress-input" rows="6" placeholder="paste text to compress" required style="grid-column:1 / span 2;"></textarea>
+    <button type="submit" style="grid-column:1 / span 2;">Compress</button>
+  </form>
+  <div id="compress-summary" style="margin-top:0.75rem;color:#666;"></div>
+  <pre id="compress-output" style="white-space:pre-wrap;background:#fafafa;border:1px solid #eee;padding:0.75rem;border-radius:4px;display:none;"></pre>
 </section>
 
 <script>
@@ -513,10 +638,70 @@ async function loadTemplates() {
     `<tr><td><code>${t.name}</code></td><td>${t.source}</td><td>${t.description}</td></tr>`
   ).join('');
 }
+document.getElementById('save-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  let metadata = {};
+  const rawMeta = document.getElementById('save-metadata').value.trim();
+  if (rawMeta) {
+    try { metadata = JSON.parse(rawMeta); }
+    catch (e) {
+      document.getElementById('save-result').innerHTML = `<span class="err">metadata JSON: ${e}</span>`;
+      return;
+    }
+  }
+  const body = {
+    project: document.getElementById('save-project').value,
+    kind: document.getElementById('save-kind').value || 'note',
+    body: document.getElementById('save-body').value,
+    metadata,
+  };
+  const out = document.getElementById('save-result');
+  const resp = await fetch('/api/memory/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    out.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
+    return;
+  }
+  const data = await resp.json();
+  out.textContent = `saved id=${data.id}`;
+};
+
+document.getElementById('compress-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const mode = document.getElementById('compress-mode').value;
+  const body = {
+    text: document.getElementById('compress-input').value,
+    ml: mode === 'ml',
+    level: document.getElementById('compress-level').value,
+    format: document.getElementById('compress-format').value,
+    ratio: Number(document.getElementById('compress-ratio').value),
+  };
+  const summary = document.getElementById('compress-summary');
+  const pre = document.getElementById('compress-output');
+  summary.textContent = 'compressing…';
+  pre.style.display = 'none';
+  const resp = await fetch('/api/compress', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    summary.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`;
+    return;
+  }
+  const d = await resp.json();
+  const ratio = d.original_len ? ((d.compressed_len / d.original_len) * 100).toFixed(1) : '0';
+  summary.textContent = `mode=${d.mode}${d.scorer ? ` scorer=${d.scorer}` : ''} · ${d.original_len} → ${d.compressed_len} chars (${ratio}%) · saved ${d.saved_chars}`;
+  pre.style.display = 'block';
+  pre.textContent = d.compressed;
+};
 async function loadStats() {
-  const s = await fetch('/api/stats').then(r => r.json());
-  document.getElementById('stats-body').textContent =
-    `input saved: ${s.input_saved}   ·   output saved: ${s.output_saved}`;
+  // legacy stats endpoint kept for backwards compat; compression UI handles
+  // the real interaction now.
+  return;
 }
 function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
 async function loadBudget() {

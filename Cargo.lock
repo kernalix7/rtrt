@@ -3146,6 +3146,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "rtrt-compress",
  "rtrt-core",
  "rtrt-memory",
  "rtrt-providers",

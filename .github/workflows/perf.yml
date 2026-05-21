@@ -1,0 +1,71 @@
+name: perf
+
+# Performance regression gate for `rtrt-memory` recall + paging.
+#
+# Strategy: on a PR, bench the main branch with `--save-baseline base`, switch
+# to the PR head, bench with `--baseline base`. Criterion writes both runs'
+# `estimates.json` into `target/criterion/`. `scripts/perf-gate.sh` parses
+# them and refuses the merge if any p50 regressed beyond the 10% budget
+# documented in `docs/PERF.md`.
+#
+# This is a separate workflow from `bench.yml` (which is artefact-only and
+# runs on a schedule for trend tracking).
+
+on:
+  pull_request:
+    paths:
+      - 'crates/rtrt-memory/**'
+      - 'crates/rtrt-compress/**'
+      - 'crates/rtrt-proxy/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/perf.yml'
+      - 'scripts/perf-gate.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 10% above the baseline p50 fails the run.
+  PERF_REGRESSION_THRESHOLD: '0.10'
+
+jobs:
+  memory-recall:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head with full history (for base ref)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bench against `${{ github.base_ref }}` (baseline)
+        run: |
+          set -eux
+          git fetch origin "${{ github.base_ref }}":__perf_base
+          git checkout __perf_base
+          cargo bench -p rtrt-memory --bench recall_bench -- \
+            --save-baseline base \
+            --warm-up-time 1 --measurement-time 5
+
+      - name: Bench against PR head
+        run: |
+          set -eux
+          git checkout "${{ github.sha }}"
+          cargo bench -p rtrt-memory --bench recall_bench -- \
+            --baseline base \
+            --warm-up-time 1 --measurement-time 5
+
+      - name: Run regression gate
+        run: bash scripts/perf-gate.sh "$PERF_REGRESSION_THRESHOLD"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-perf-report
+          path: target/criterion
+          if-no-files-found: warn

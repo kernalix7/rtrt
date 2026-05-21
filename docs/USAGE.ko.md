@@ -2,7 +2,16 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 v0.1.0 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
+이 문서는 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 최신 사용법입니다.
+
+## 빠른 차림표
+
+- 룰 기반 압축: `rtrt compress -l ultra` (LLM 불필요)
+- ML 압축: `rtrt compress --ml --ratio 0.4`
+- LLM 압축: `rtrt compress --llm --provider openai-compat --model llama3.2`
+- 메모리 리콜: `rtrt memory recall --project rtrt --query auth --filter "source=claude"`
+- MCP HTTP: `rtrt mcp --transport http --http-token "$TOKEN"`
+- 벤치: `rtrt benchmark`
 
 ## CLI
 
@@ -92,6 +101,10 @@ rtrt new rust-cli ./hello \
 ```bash
 # stdio (기본; Claude Code / Codex / Cursor / Windsurf가 사용)
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
+
+# Streamable HTTP (MCP 2025-06-18) — axum 라우터
+RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
+  rtrt-mcp --transport http --bind 127.0.0.1:3112 --path /mcp
 ```
 
 공식 Rust MCP SDK [`rmcp`](https://crates.io/crates/rmcp) 기반. 현재 제공하는 도구:
@@ -99,10 +112,20 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 | 도구 | 래핑 | 비고 |
 |------|------|------|
 | `compress` | `Compressor::compress` | `level = lite \| full \| ultra` (기본 `full`) |
-| `memory_save` | `MemoryStore::save` | FTS5 + BM25 인덱스에 삽입 |
-| `memory_recall` | `MemoryStore::recall_bm25` | 프로젝트 스코프, BM25 랭킹 |
-| `templates_list` | `rtrt_templates::list_all` | 빌트인 + 커스텀 템플릿 |
-| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | 템플릿 스캐폴드 |
+| `compress_ml` | `MlCompressor::compress` | LLMLingua-style 토큰 중요도 압축, `ratio` ∈ (0.05, 1.0] |
+| `proxy` | `rtrt_proxy::{filter_for, errors_only, ultra_compact}` | mode = `command \| errors_only \| ultra_compact` |
+| `memory_save` | `MemoryStore::save` | FTS5 + BM25 |
+| `memory_recall` | `MemoryStore::recall_bm25[_with_filter]` | qdrant-style 페이로드 필터 옵션 (`source=claude,topic~^auth`) |
+| `memory_set_block` / `memory_get_block` / `memory_list_blocks` | `MemoryStore::*_block` | Letta-style persona / human / context 블록 |
+| `templates_list` | `rtrt_templates::list_all` | 빌트인 + 커스텀 |
+| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | 스캐폴드 |
+| `provider_chat` | `Gateway::chat` | 멀티-프로바이더 라우팅 |
+
+HTTP 전송 옵션:
+
+- `--http-token <T>` / `RTRT_MCP_HTTP_TOKEN` — 필수 베어러 토큰; 누락/오류 시 401 + `WWW-Authenticate`. 상수-시간 비교.
+- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — `StreamableHttpServerConfig.allowed_origins`에 매핑 (RFC 6454).
+- 비-루프백 바인드 + 토큰 미설정 시 시작 시 경고.
 
 `~/.claude.json` (또는 에이전트의 MCP 설정)에 등록:
 
@@ -117,24 +140,37 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 }
 ```
 
-HTTP/SSE 전송, `provider_chat`, LLM 기반 `memory_extract` / `memory_compress` 도구는 예정.
+`rtrt mcp`는 `rtrt-mcp` 바이너리에 `--transport / --bind / --path / --http-token / --allowed-origins`를 그대로 넘기는 CLI 패스스루입니다.
 
 ## 대시보드 (`rtrt-dashboard`)
 
 ```text
-RTRT_DASHBOARD_BIND=127.0.0.1:3111 rtrt-dashboard
+RTRT_DASHBOARD_BIND=127.0.0.1:3111 \
+  RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
+  rtrt-dashboard
 ```
 
 | 경로 | 메서드 | 용도 |
 |------|--------|------|
-| `/` | `GET` | HTML 인덱스 — 토큰 절감 통계 + 템플릿 갤러리 |
+| `/` | `GET` | HTML 인덱스 — Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup 탭 |
 | `/healthz` | `GET` | 라이브니스(`ok`) |
-| `/api/stats` | `GET` | JSON: 입출력 절감 토큰, 활성 프로바이더 |
-| `/api/templates` | `GET` | JSON: 템플릿 목록(빌트인 + 커스텀) |
-| `/api/templates/{name}` | `GET` | JSON: 템플릿 매니페스트 |
-| `/api/templates/scaffold` | `POST` | 스캐폴드 실행 — `{ template, target, variables, overwrite }` |
+| `/api/metrics` | `GET` | 게이트웨이 요약 + 최근 메트릭 (SVG 스파크라인 데이터원) |
+| `/api/budget` | `GET` | `{ cap_usd, spent_usd, remaining_usd }` |
+| `/api/prompts` / `/api/prompts/{name}` / `/api/prompts/{name}/{version}` | `GET` | langfuse-style 버전 프롬프트 |
+| `/api/templates` / `/api/templates/{name}` | `GET` | 템플릿 |
+| `/api/templates/scaffold` | `POST` | 스캐폴드 |
+| `/api/chat` | `POST` | 게이트웨이 chat |
+| `/api/compress` | `POST` | 룰 또는 ML 압축 |
+| `/api/proxy` | `POST` | rtrt-proxy 필터 |
+| `/api/diagnose` | `POST` | aider-style 진단 (errors_only + LLM) |
+| `/api/memory/save` | `POST` | 메타데이터 옵션 |
+| `/api/memory/recall` | `POST` | BM25 + 페이로드 필터 |
+| `/api/memory/blocks` | `GET` / `POST` | Letta 블록 |
+| `/api/memory/blocks/{name}` | `GET` | 단일 블록 |
+| `/api/repo-map` | `POST` | tree-sitter 시그니처 맵 |
+| `/api/setup` | `POST` | 에이전트 MCP 설정 스니펫 (dry-run) |
 
-기본 바인딩은 `127.0.0.1`. `RTRT_DASHBOARD_BIND`로 변경 가능합니다.
+`RTRT_DASHBOARD_TOKEN` 환경변수 설정 시 `/api/*`는 베어러 토큰 미들웨어로 보호; `/`와 `/healthz`는 부트스트랩용으로 항상 통과. 비-루프백 바인드 + 토큰 미설정 시 경고.
 
 ## 설정 파일
 

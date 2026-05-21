@@ -90,8 +90,10 @@ rtrt prompt save greet "say hi" --meta env=dev
 rtrt prompt get greet
 rtrt docs facebook/react --topic hooks          # context7 library docs
 rtrt provider chat --model claude-haiku-4-5 "ping"
-rtrt-dashboard                                  # http://127.0.0.1:3111 (tabs: metrics / templates / stats)
-rtrt-mcp --memory ~/.rtrt/memory.sqlite         # stdio MCP server, 6 tools
+rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
+rtrt benchmark                                  # cargo bench wrapper
+rtrt-dashboard                                  # http://127.0.0.1:3111 (10 tabs incl. Memory / Proxy / Diagnose / RepoMap / Setup, dark-mode)
+rtrt-mcp --transport http --bind 127.0.0.1:3112 # stdio or Streamable HTTP, 11 tools, bearer-token guard
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.
@@ -152,8 +154,9 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 </td><td width="50%">
 
 **MCP server + dashboard**
-- `rtrt-mcp` (rmcp 1.x, stdio) ships 6 tools: `compress`, `memory_save`, `memory_recall`, `templates_list`, `templates_scaffold`, `provider_chat`
-- `rtrt-dashboard` (axum) tabs: gateway metrics (live KPI + per-request table), templates, savings; endpoints: `/api/chat`, `/api/metrics`, `/api/templates*`, `/api/stats`
+- `rtrt-mcp` (rmcp 1.x) ships 11 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`
+- HTTP transport hardens with `--http-token` (constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
+- `rtrt-dashboard` (axum) — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle. Routes: `/api/{metrics,budget,prompts,memory/*,templates*,compress,proxy,diagnose,repo-map,setup,chat,stats}`. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
 - `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf
 - Versioned prompt registry under `~/.rtrt/prompts/<name>/<NNNN>.toml` (`rtrt prompt {save,get,list,versions}`)
 - [Details →](docs/FEATURES.md#mcp-and-dashboard)
@@ -187,7 +190,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | `rtrt-memory` | SQLite + FTS5 BM25 + vector + graph + HNSW + LLM-driven extract/compress |
 | `rtrt-providers` | Multi-provider chat trait + Gateway + Budget + Context7 doc fetcher |
 | `rtrt-templates` | Built-in + custom scaffolds + handlebars rendering + `PromptRegistry` |
-| `rtrt-mcp` | rmcp 1.x stdio MCP server (6 tools) |
+| `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 11 tools, bearer-token guard |
 | `rtrt-dashboard` | Axum web dashboard + REST API (`/api/{chat,metrics,templates,stats}`) |
 | `rtrt-cli` | `rtrt` command-line entry point |
 
@@ -211,15 +214,17 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] `rtrt-memory` LLM-driven extract / compress / archival via any provider (local Ollama OK)
 - [x] `rtrt-templates` 6 built-ins + custom loader + handlebars + versioned `PromptRegistry`
 - [x] `rtrt-providers` real Anthropic / OpenAI / OpenAI-compatible HTTP + streaming + Gateway + Budget + Context7 docs
-- [x] `rtrt-mcp` rmcp stdio transport with 6 tools (`compress`, `memory_*`, `templates_*`, `provider_chat`)
-- [x] `rtrt-dashboard` axum UI with tabs (metrics / templates / stats) + `/api/chat` gateway endpoint
+- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 11 tools (compress / compress_ml / proxy / memory_* / templates_* / provider_chat), bearer-token + RFC 6454 Origin guards
+- [x] `rtrt-dashboard` axum UI — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
 - [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
 - [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf
-- [x] criterion benchmark harness + per-fixture savings table
-- [ ] MCP HTTP / SSE transport (stdio is shipped)
-- [ ] `caveman-shrink`-style MCP tool-description compression middleware
-- [ ] `recall_via_graph` driven by LLM entity extraction (mem0 entity linking)
-- [ ] Helicone-style retry / fallback routing across providers
+- [x] criterion benchmark harness + per-fixture savings table + `rtrt benchmark` wrapper
+- [x] qdrant-style payload filter DSL (`source=claude,topic~^auth`) on `recall_bm25_with_filter`
+- [x] LLMLingua-style `MlCompressor` scaffold (heuristic backend; ONNX backend deferred)
+- [x] `recall_via_graph` driven by LLM entity extraction (mem0 entity linking)
+- [x] Helicone-style retry / fallback routing across providers
+- [ ] Real LLMLingua-2 ONNX backend behind the `MlCompressor` interface
+- [ ] crewAI-style multi-agent Rust runtime
 - [ ] First tagged release (`v0.2.0-rc1`)
 
 ## Inspired by

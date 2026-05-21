@@ -98,6 +98,8 @@ async fn main() -> Result<()> {
         .route("/api/compress", post(compress))
         .route("/api/proxy", post(proxy_filter))
         .route("/api/diagnose", post(diagnose))
+        .route("/api/repo-map", post(repo_map))
+        .route("/api/setup", post(setup_snippet))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -596,6 +598,160 @@ async fn diagnose(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct RepoMapRequest {
+    root: PathBuf,
+    #[serde(default = "default_ext")]
+    ext: String,
+    #[serde(default = "default_max_bytes")]
+    max_bytes: u64,
+}
+
+fn default_ext() -> String {
+    ".rs".into()
+}
+fn default_max_bytes() -> u64 {
+    524_288
+}
+
+async fn repo_map(
+    Json(req): Json<RepoMapRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !req.root.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("root not found: {}", req.root.display()),
+        ));
+    }
+    let extractor = rtrt_compress::SignatureExtractor::new(rtrt_compress::Language::Rust);
+    let mut entries = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut signature_chars: usize = 0;
+    for entry in walk_files(&req.root) {
+        if !entry.to_string_lossy().ends_with(&req.ext) {
+            continue;
+        }
+        let size = std::fs::metadata(&entry).map(|m| m.len()).unwrap_or(0);
+        if size > req.max_bytes {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&entry) else {
+            continue;
+        };
+        let Ok(sig) = extractor.extract(&src) else {
+            continue;
+        };
+        total_bytes += src.len() as u64;
+        signature_chars += sig.chars().count();
+        let rel = entry
+            .strip_prefix(&req.root)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
+        entries.push(serde_json::json!({
+            "path": rel,
+            "signatures": sig,
+            "original_bytes": src.len(),
+            "signature_bytes": sig.len(),
+        }));
+    }
+    Ok(Json(serde_json::json!({
+        "files": entries.len(),
+        "total_bytes": total_bytes,
+        "signature_chars": signature_chars,
+        "entries": entries,
+    })))
+}
+
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    let name = entry.file_name();
+                    let nstr = name.to_string_lossy();
+                    if nstr == "target" || nstr.starts_with('.') {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if ft.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupRequest {
+    agent: String,
+    #[serde(default)]
+    memory: Option<String>,
+    #[serde(default)]
+    binary: Option<String>,
+}
+
+async fn setup_snippet(
+    Json(req): Json<SetupRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let binary = req.binary.clone().unwrap_or_else(|| "rtrt-mcp".to_string());
+    let memory = req
+        .memory
+        .clone()
+        .unwrap_or_else(|| ".rtrt/memory.sqlite".to_string());
+    let (target_path, snippet) = match req.agent.as_str() {
+        "claude-code" => (
+            "~/.claude/mcp.json".to_string(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "rtrt": {
+                        "command": binary,
+                        "args": ["--memory", memory]
+                    }
+                }
+            }))
+            .unwrap(),
+        ),
+        "cursor" => (
+            "~/.cursor/mcp.json".to_string(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "rtrt": {
+                        "command": binary,
+                        "args": ["--memory", memory]
+                    }
+                }
+            }))
+            .unwrap(),
+        ),
+        "codex" => (
+            "~/.codex/config.toml".to_string(),
+            format!(
+                "[mcp.rtrt]\ncommand = \"{}\"\nargs = [\"--memory\", \"{}\"]\n",
+                binary, memory
+            ),
+        ),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown agent: {other} (try claude-code / cursor / codex)"),
+            ));
+        }
+    };
+    Ok(Json(serde_json::json!({
+        "agent": req.agent,
+        "target_path": target_path,
+        "snippet": snippet,
+    })))
+}
+
 async fn compress(
     Json(req): Json<CompressRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -807,6 +963,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <a data-tab="memory">Memory</a>
   <a data-tab="templates">Templates</a>
   <a data-tab="stats">Compression</a>
+  <a data-tab="proxy">Proxy</a>
+  <a data-tab="diagnose">Diagnose</a>
+  <a data-tab="repomap">RepoMap</a>
+  <a data-tab="setup">Setup</a>
   <span class="spacer"></span>
   <button id="theme-toggle" title="Toggle dark / light mode">🌗</button>
 </nav>
@@ -893,6 +1053,66 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <button type="submit" style="grid-column:1 / span 2;">Scaffold</button>
   </form>
   <div id="scaffold-result" style="margin-top:0.5rem;color:#666;"></div>
+</section>
+
+<section id="proxy">
+  <h2>Proxy filter</h2>
+  <p style="color:var(--muted);">Run rtrt-proxy filters against captured stdout/stderr.</p>
+  <form id="proxy-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <select id="proxy-mode">
+      <option value="command">command (auto-detect by label)</option>
+      <option value="errors_only">errors_only</option>
+      <option value="ultra_compact">ultra_compact</option>
+    </select>
+    <input id="proxy-command" placeholder="command (e.g. git status)">
+    <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
+    <textarea id="proxy-raw" rows="8" placeholder="paste raw output" required style="grid-column:1 / span 2;"></textarea>
+    <button type="submit" style="grid-column:1 / span 2;">Filter</button>
+  </form>
+  <div id="proxy-summary" style="margin-top:0.75rem;color:var(--muted);"></div>
+  <pre id="proxy-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;"></pre>
+</section>
+
+<section id="diagnose">
+  <h2>Diagnose</h2>
+  <p style="color:var(--muted);">Pipe build/test failure to a provider for one-shot triage. Uses gateway routing.</p>
+  <form id="diagnose-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <input id="diagnose-model" placeholder="model (e.g. claude-haiku-4-5)" required>
+    <input id="diagnose-context" type="number" min="0" max="20" value="3" title="errors_only context lines">
+    <textarea id="diagnose-raw" rows="8" placeholder="paste failing build/test output" required style="grid-column:1 / span 2;"></textarea>
+    <button type="submit" style="grid-column:1 / span 2;">Diagnose</button>
+  </form>
+  <div id="diagnose-meta" style="margin-top:0.75rem;color:var(--muted);"></div>
+  <pre id="diagnose-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;"></pre>
+</section>
+
+<section id="repomap">
+  <h2>RepoMap</h2>
+  <p style="color:var(--muted);">tree-sitter signature index of a Rust project — bodies stripped.</p>
+  <form id="repomap-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <input id="repomap-root" placeholder="root path" required>
+    <input id="repomap-ext" placeholder="ext (default .rs)" value=".rs">
+    <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="max bytes per file">
+    <button type="submit" style="grid-column:1 / span 2;">Map</button>
+  </form>
+  <div id="repomap-summary" style="margin-top:0.75rem;color:var(--muted);"></div>
+  <pre id="repomap-output" style="white-space:pre-wrap;display:none;padding:0.75rem;border-radius:4px;max-height:480px;overflow:auto;"></pre>
+</section>
+
+<section id="setup">
+  <h2>Agent setup</h2>
+  <p style="color:var(--muted);">Generate an MCP config snippet for popular coding agents (dry-run only — never writes).</p>
+  <form id="setup-form" style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;max-width:720px;">
+    <select id="setup-agent">
+      <option value="claude-code">claude-code</option>
+      <option value="cursor">cursor</option>
+      <option value="codex">codex</option>
+    </select>
+    <input id="setup-memory" placeholder="memory path (default .rtrt/memory.sqlite)" value=".rtrt/memory.sqlite">
+    <input id="setup-binary" placeholder="rtrt-mcp binary path (optional)" style="grid-column:1 / span 2;">
+    <button type="submit" style="grid-column:1 / span 2;">Render</button>
+  </form>
+  <pre id="setup-output" style="white-space:pre-wrap;display:none;margin-top:0.75rem;padding:0.75rem;border-radius:4px;"></pre>
 </section>
 
 <section id="stats">
@@ -1095,6 +1315,77 @@ document.getElementById('save-form').onsubmit = async (ev) => {
   out.textContent = `saved id=${data.id}`;
 };
 
+document.getElementById('proxy-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    mode: document.getElementById('proxy-mode').value,
+    command: document.getElementById('proxy-command').value || null,
+    raw: document.getElementById('proxy-raw').value,
+    context: Number(document.getElementById('proxy-context').value) || 3,
+  };
+  const sum = document.getElementById('proxy-summary');
+  const pre = document.getElementById('proxy-output');
+  sum.textContent = 'filtering…';
+  pre.style.display = 'none';
+  const resp = await fetch('/api/proxy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!resp.ok) { sum.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
+  const d = await resp.json();
+  const ratio = d.original_len ? ((d.filtered_len / d.original_len) * 100).toFixed(1) : '0';
+  sum.textContent = `mode=${d.mode} · ${d.original_len} → ${d.filtered_len} chars (${ratio}%) · saved ${d.saved_chars}`;
+  pre.style.display = 'block';
+  pre.textContent = d.filtered;
+};
+document.getElementById('diagnose-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    model: document.getElementById('diagnose-model').value,
+    raw: document.getElementById('diagnose-raw').value,
+    context: Number(document.getElementById('diagnose-context').value) || 3,
+  };
+  const meta = document.getElementById('diagnose-meta');
+  const pre = document.getElementById('diagnose-output');
+  meta.textContent = 'diagnosing…';
+  pre.style.display = 'none';
+  const resp = await fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!resp.ok) { meta.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
+  const d = await resp.json();
+  meta.textContent = `${d.provider}/${d.model} · in ${d.input_tokens} · out ${d.output_tokens}`;
+  pre.style.display = 'block';
+  pre.textContent = d.diagnosis;
+};
+document.getElementById('repomap-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    root: document.getElementById('repomap-root').value,
+    ext: document.getElementById('repomap-ext').value || '.rs',
+    max_bytes: Number(document.getElementById('repomap-max').value) || 524288,
+  };
+  const sum = document.getElementById('repomap-summary');
+  const pre = document.getElementById('repomap-output');
+  sum.textContent = 'walking…';
+  pre.style.display = 'none';
+  const resp = await fetch('/api/repo-map', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!resp.ok) { sum.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
+  const d = await resp.json();
+  sum.textContent = `${d.files} files · ${d.total_bytes} bytes scanned · ${d.signature_chars} chars of signatures`;
+  pre.style.display = 'block';
+  pre.textContent = d.entries.map(e => `// ${e.path}\n${e.signatures}\n`).join('\n');
+};
+document.getElementById('setup-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const body = {
+    agent: document.getElementById('setup-agent').value,
+    memory: document.getElementById('setup-memory').value || null,
+    binary: document.getElementById('setup-binary').value || null,
+  };
+  const pre = document.getElementById('setup-output');
+  pre.style.display = 'none';
+  const resp = await fetch('/api/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!resp.ok) { pre.style.display = 'block'; pre.innerHTML = `<span class="err">${resp.status}: ${await resp.text()}</span>`; return; }
+  const d = await resp.json();
+  pre.style.display = 'block';
+  pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
+};
 document.getElementById('compress-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const mode = document.getElementById('compress-mode').value;

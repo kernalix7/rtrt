@@ -27,6 +27,8 @@ echo "I think the bug is, perhaps, in the parser..." | rtrt compress --llm \
 Flags:
 
 - `-l, --level <lite|full|ultra|extreme>` — compression intensity. Default `full`.
+- `--ml` — use the LLMLingua-style token-importance compressor instead of the rule pass; mutually exclusive with `--llm`. Pair with `--ratio <0.05..=1.0>` (default `0.5`).
+- `--format <plain|markdown|xml|json>` — chroma-style framing for the rule output. Default `plain`.
 
 Rules per level (cumulative):
 
@@ -98,22 +100,77 @@ If `--var project_name` is omitted, the target directory's name is used.
 
 Print the version and the workspace crate list.
 
+### `rtrt memory`
+
+SQLite-backed memory store (BM25 + optional vector + optional graph).
+
+```bash
+echo "claude flagged auth flow as risky" \
+  | rtrt memory save --project rtrt --kind note
+rtrt memory recall --project rtrt --query auth --limit 10 \
+  --filter "source=claude,topic~^auth"
+```
+
+The `--filter` flag takes the qdrant-style payload DSL (`key=val`, `key!=val`, `key~regex`, comma-AND).
+
+### `rtrt diagnose`
+
+Run a command, apply `errors_only`, then hand the failure to an LLM for a one-shot root-cause + fix suggestion.
+
+```bash
+rtrt diagnose --provider anthropic --model claude-haiku-4-5 \
+  -- cargo test -p rtrt-memory
+```
+
+### `rtrt mcp`
+
+Launch the bundled MCP server without remembering the binary name.
+
+```bash
+rtrt mcp --transport http --bind 127.0.0.1:3112 \
+  --http-token "$RTRT_MCP_HTTP_TOKEN" \
+  --allowed-origins https://app.example.com
+```
+
+### `rtrt benchmark`
+
+Wrap `cargo bench` so the published 60%+ savings claim is one command away.
+
+```bash
+rtrt benchmark                    # cargo bench -p rtrt-compress --bench compress_bench
+rtrt benchmark --extra '--quick'
+```
+
 ## MCP server (`rtrt-mcp`)
 
 ```bash
 # stdio (default; what Claude Code / Codex / Cursor / Windsurf use)
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
+
+# Streamable HTTP (MCP 2025-06-18) behind axum
+RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
+  rtrt-mcp --transport http --bind 127.0.0.1:3112 --path /mcp
 ```
 
 Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP SDK. Tools currently shipped:
 
 | Tool | Wraps | Notes |
 |------|-------|-------|
-| `compress` | `Compressor::compress` | accepts `level = lite \| full \| ultra` (default `full`) |
-| `memory_save` | `MemoryStore::save` | inserts into FTS5 and the BM25 index |
-| `memory_recall` | `MemoryStore::recall_bm25` | project-scoped, BM25 ranking |
-| `templates_list` | `rtrt_templates::list_all` | enumerates built-in + custom templates |
-| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | scaffolds from a template |
+| `compress` | `Compressor::compress` | `level = lite \| full \| ultra` (default `full`) |
+| `compress_ml` | `MlCompressor::compress` | LLMLingua-style token-importance pruning; `ratio` ∈ (0.05, 1.0] |
+| `proxy` | `rtrt_proxy::{filter_for, errors_only, ultra_compact}` | mode = `command \| errors_only \| ultra_compact` |
+| `memory_save` | `MemoryStore::save` | FTS5 + BM25 index |
+| `memory_recall` | `MemoryStore::recall_bm25[_with_filter]` | optional qdrant-style payload filter `source=claude,topic~^auth` |
+| `memory_set_block` / `memory_get_block` / `memory_list_blocks` | `MemoryStore::*_block` | Letta-style persona / human / context slots |
+| `templates_list` | `rtrt_templates::list_all` | built-in + custom templates |
+| `templates_scaffold` | `rtrt_templates::render::{plan,write}` | scaffold from a template |
+| `provider_chat` | `Gateway::chat` | multi-provider routing through the bundled gateway |
+
+HTTP transport flags:
+
+- `--http-token <T>` / `RTRT_MCP_HTTP_TOKEN` — required bearer token; 401 + `WWW-Authenticate` on miss. Constant-time comparison.
+- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — pluck into `StreamableHttpServerConfig.allowed_origins` for RFC 6454 Origin validation.
+- Non-loopback bind without a token logs a startup warning.
 
 Wire it up in `~/.claude.json` (or your agent's MCP config):
 
@@ -128,26 +185,39 @@ Wire it up in `~/.claude.json` (or your agent's MCP config):
 }
 ```
 
-HTTP/SSE transport and LLM-backed `memory_extract` / `memory_compress` tools remain on the roadmap.
+`rtrt mcp` is a CLI passthrough that forwards `--transport / --bind / --path / --http-token / --allowed-origins` to the bundled `rtrt-mcp` binary.
 
 ## Dashboard (`rtrt-dashboard`)
 
 ```text
-RTRT_DASHBOARD_BIND=127.0.0.1:3111 rtrt-dashboard
+RTRT_DASHBOARD_BIND=127.0.0.1:3111 \
+  RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
+  rtrt-dashboard
 ```
 
 The dashboard serves:
 
 | Path | Method | Purpose |
 |------|--------|---------|
-| `/` | `GET` | Minimal HTML index — token-savings stats + template gallery |
+| `/` | `GET` | Bundled HTML index — Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup tabs |
 | `/healthz` | `GET` | Liveness probe (`ok`) |
-| `/api/stats` | `GET` | JSON: input / output tokens saved, active provider |
-| `/api/templates` | `GET` | JSON: list of templates (built-in + custom) |
-| `/api/templates/{name}` | `GET` | JSON: full template manifest |
-| `/api/templates/scaffold` | `POST` | Scaffold a project — JSON body `{ template, target, variables, overwrite }` |
+| `/api/metrics` | `GET` | Gateway summary + recent metrics (drives the SVG sparklines) |
+| `/api/budget` | `GET` | `{ cap_usd, spent_usd, remaining_usd }` from the gateway budget meter |
+| `/api/prompts` / `/api/prompts/{name}` / `/api/prompts/{name}/{version}` | `GET` | langfuse-style versioned prompts |
+| `/api/templates` / `/api/templates/{name}` | `GET` | built-in + custom templates |
+| `/api/templates/scaffold` | `POST` | scaffold a project |
+| `/api/chat` | `POST` | gateway chat dispatch |
+| `/api/compress` | `POST` | rule or ML compressor |
+| `/api/proxy` | `POST` | rtrt-proxy filters |
+| `/api/diagnose` | `POST` | aider-style failure triage (errors_only + LLM) |
+| `/api/memory/save` | `POST` | save memory row with optional metadata |
+| `/api/memory/recall` | `POST` | BM25 recall + optional payload filter |
+| `/api/memory/blocks` | `GET` / `POST` | Letta blocks listing + upsert |
+| `/api/memory/blocks/{name}` | `GET` | single Letta block (project as query param) |
+| `/api/repo-map` | `POST` | walk a Rust tree, emit tree-sitter signature map |
+| `/api/setup` | `POST` | render an agent MCP config snippet (dry-run only) |
 
-The dashboard binds `127.0.0.1` by default. Override with `RTRT_DASHBOARD_BIND`.
+All `/api/*` routes are gated by a bearer-token middleware when `RTRT_DASHBOARD_TOKEN` is set; the bundled HTML index and `/healthz` stay open. Non-loopback bind without a token logs a startup warning.
 
 ## Configuration file
 

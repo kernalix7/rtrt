@@ -86,7 +86,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - **영구 메모리** — SQLite + FTS5 BM25 + 벡터 + 그래프 + HNSW + LLM extract/compress; 메모리 스코프(user/agent/session/project).
 - **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환(Ollama, llama.cpp 등); `Gateway` + 예산 + 트레이스; `Context7Client` 라이브러리 문서 페치.
 - **프로젝트 스캐폴드 + 프롬프트** — 빌트인 6종 + 커스텀 + handlebars 렌더링; 버저닝되는 `PromptRegistry`.
-- **MCP + 대시보드** — `rtrt-mcp` rmcp stdio 6 도구; `rtrt-dashboard` axum (metrics / templates / stats 탭).
+- **MCP + 대시보드** — `rtrt-mcp` rmcp stdio + Streamable HTTP, 11 도구 (compress / compress_ml / proxy / memory_*(letta blocks 포함) / templates_* / provider_chat), `--http-token` 베어러 가드 + RFC 6454 Origin 검증. `rtrt-dashboard` axum 10탭 (Metrics SVG 스파크라인 / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup), 다크모드, `RTRT_DASHBOARD_TOKEN` 미들웨어.
 - **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/aider --apply`.
 - **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`(셸 히스토리 스캔).
 

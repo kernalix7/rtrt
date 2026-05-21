@@ -1,12 +1,7 @@
-//! Built-in templates — three big-category starters, no per-language splits.
+//! Built-in templates — programmatic definitions, no external files at compile time.
 //!
-//! One scaffold per category:
-//!
-//! - `개발` — code project skeleton (README, .gitignore, LICENSE, src/ stub).
-//! - `디자인` — design kit (voice / palette / wireframe screens).
-//! - `설계` — planning doc bundle (PRD + ADR template + roadmap).
-//!
-//! Each uses `{{project_name}}` and `{{author}}` as the shared variables.
+//! Each template uses `{{project_name}}`, `{{author}}`, `{{license}}` (default MIT) as
+//! shared variables; specific templates may add more.
 
 use once_cell::sync::Lazy;
 
@@ -16,47 +11,71 @@ fn common_vars() -> Vec<TemplateVariable> {
     vec![
         TemplateVariable {
             name: "project_name".into(),
-            description: Some("프로젝트 / 이니셔티브 이름".into()),
+            description: Some("Project / crate / package name".into()),
             default: None,
             required: true,
         },
         TemplateVariable {
             name: "author".into(),
-            description: Some("작성자 / 팀".into()),
+            description: Some("Author display name".into()),
             default: Some("Unknown".into()),
+            required: false,
+        },
+        TemplateVariable {
+            name: "license".into(),
+            description: Some("SPDX license identifier".into()),
+            default: Some("MIT".into()),
             required: false,
         },
     ]
 }
 
-pub static ALL: Lazy<Vec<Template>> = Lazy::new(|| vec![dev(), design(), plan()]);
+pub static ALL: Lazy<Vec<Template>> = Lazy::new(|| {
+    vec![
+        // 개발 (Development) — code projects.
+        rust_cli(),
+        rust_lib(),
+        rust_axum(),
+        node_typescript(),
+        python_uv(),
+        go_cli(),
+        // 디자인 (Design) — UI / brand assets.
+        brand_kit(),
+        wireframe(),
+        // 설계 (Planning) — specs, decisions, roadmaps, agent definitions.
+        prd_spec(),
+        adr_decision(),
+        roadmap(),
+        agent_role(),
+    ]
+});
 
-fn dev() -> Template {
+fn rust_cli() -> Template {
     Template {
-        name: "dev".into(),
-        description: "개발 — 코드 프로젝트 스타터 (README + LICENSE + .gitignore + src/)".into(),
+        name: "rust-cli".into(),
+        description: "Rust binary crate with clap + anyhow + tracing".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
+                path: "Cargo.toml".into(),
+                content: RUST_CLI_CARGO.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/main.rs".into(),
+                content: RUST_CLI_MAIN.into(),
+                executable: false,
+            },
+            TemplateFile {
                 path: "README.md".into(),
-                content: DEV_README.into(),
+                content: COMMON_README.into(),
                 executable: false,
             },
             TemplateFile {
                 path: ".gitignore".into(),
-                content: COMMON_GITIGNORE.into(),
-                executable: false,
-            },
-            TemplateFile {
-                path: "LICENSE".into(),
-                content: LICENSE_PLACEHOLDER.into(),
-                executable: false,
-            },
-            TemplateFile {
-                path: "src/.gitkeep".into(),
-                content: "".into(),
+                content: RUST_GITIGNORE.into(),
                 executable: false,
             },
         ],
@@ -64,32 +83,247 @@ fn dev() -> Template {
     }
 }
 
-fn design() -> Template {
+fn rust_lib() -> Template {
     Template {
-        name: "design".into(),
-        description: "디자인 — 브랜드 보이스 + 토큰 + 와이어프레임 스크린 폴더".into(),
+        name: "rust-lib".into(),
+        description: "Rust library crate with criterion benches".into(),
         source: TemplateSource::BuiltIn,
-        category: TemplateCategory::Design,
+        category: TemplateCategory::Development,
         variables: common_vars(),
         files: vec![
             TemplateFile {
+                path: "Cargo.toml".into(),
+                content: RUST_LIB_CARGO.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/lib.rs".into(),
+                content: RUST_LIB_LIB.into(),
+                executable: false,
+            },
+            TemplateFile {
                 path: "README.md".into(),
-                content: DESIGN_README.into(),
+                content: COMMON_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".gitignore".into(),
+                content: RUST_GITIGNORE.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec!["git init".into()],
+    }
+}
+
+fn rust_axum() -> Template {
+    Template {
+        name: "rust-axum".into(),
+        description: "Rust HTTP service with axum + tokio + tracing".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
+        variables: common_vars(),
+        files: vec![
+            TemplateFile {
+                path: "Cargo.toml".into(),
+                content: RUST_AXUM_CARGO.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/main.rs".into(),
+                content: RUST_AXUM_MAIN.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "README.md".into(),
+                content: COMMON_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".gitignore".into(),
+                content: RUST_GITIGNORE.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec!["git init".into()],
+    }
+}
+
+fn node_typescript() -> Template {
+    Template {
+        name: "node-typescript".into(),
+        description: "Node.js TypeScript project (ESM, tsx runner)".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
+        variables: common_vars(),
+        files: vec![
+            TemplateFile {
+                path: "package.json".into(),
+                content: NODE_TS_PACKAGE.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "tsconfig.json".into(),
+                content: NODE_TS_TSCONFIG.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/index.ts".into(),
+                content: NODE_TS_INDEX.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".gitignore".into(),
+                content: NODE_GITIGNORE.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "README.md".into(),
+                content: COMMON_README.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec!["git init".into(), "npm install".into()],
+    }
+}
+
+fn python_uv() -> Template {
+    Template {
+        name: "python-uv".into(),
+        description: "Python project managed with uv (pyproject.toml)".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
+        variables: common_vars(),
+        files: vec![
+            TemplateFile {
+                path: "pyproject.toml".into(),
+                content: PY_UV_PYPROJECT.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/{{project_name}}/__init__.py".into(),
+                content: PY_UV_INIT.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "src/{{project_name}}/__main__.py".into(),
+                content: PY_UV_MAIN.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "README.md".into(),
+                content: COMMON_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".gitignore".into(),
+                content: PY_GITIGNORE.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec!["git init".into(), "uv sync".into()],
+    }
+}
+
+fn go_cli() -> Template {
+    Template {
+        name: "go-cli".into(),
+        description: "Go CLI with cobra + standard layout".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Development,
+        variables: common_vars(),
+        files: vec![
+            TemplateFile {
+                path: "go.mod".into(),
+                content: GO_MOD.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "main.go".into(),
+                content: GO_MAIN.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "README.md".into(),
+                content: COMMON_README.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".gitignore".into(),
+                content: GO_GITIGNORE.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec!["git init".into(), "go mod tidy".into()],
+    }
+}
+
+fn project_meta_vars() -> Vec<TemplateVariable> {
+    vec![
+        TemplateVariable {
+            name: "project_name".into(),
+            description: Some("Project / initiative name".into()),
+            default: None,
+            required: true,
+        },
+        TemplateVariable {
+            name: "author".into(),
+            description: Some("Author or team".into()),
+            default: Some("Unknown".into()),
+            required: false,
+        },
+    ]
+}
+
+fn brand_kit() -> Template {
+    Template {
+        name: "brand-kit".into(),
+        description: "Brand guide skeleton — voice / tokens / logo placeholders".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Design,
+        variables: project_meta_vars(),
+        files: vec![
+            TemplateFile {
+                path: "README.md".into(),
+                content: BRAND_KIT_README.into(),
                 executable: false,
             },
             TemplateFile {
                 path: "tokens.css".into(),
-                content: DESIGN_TOKENS.into(),
+                content: BRAND_KIT_TOKENS.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: "logo/README.md".into(),
+                content: BRAND_KIT_LOGO_README.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec![],
+    }
+}
+
+fn wireframe() -> Template {
+    Template {
+        name: "wireframe".into(),
+        description: "Wireframe + screen-flow notebook (Markdown + ASCII frames)".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Design,
+        variables: project_meta_vars(),
+        files: vec![
+            TemplateFile {
+                path: "README.md".into(),
+                content: WIREFRAME_README.into(),
                 executable: false,
             },
             TemplateFile {
                 path: "screens/01-home.md".into(),
-                content: DESIGN_HOME.into(),
+                content: WIREFRAME_HOME.into(),
                 executable: false,
             },
             TemplateFile {
-                path: "logo/.gitkeep".into(),
-                content: "".into(),
+                path: "screens/02-detail.md".into(),
+                content: WIREFRAME_DETAIL.into(),
                 executable: false,
             },
         ],
@@ -97,27 +331,122 @@ fn design() -> Template {
     }
 }
 
-fn plan() -> Template {
+fn prd_spec() -> Template {
     Template {
-        name: "plan".into(),
-        description: "설계 — PRD + ADR 템플릿 + 로드맵 (필요한 만큼만 채우세요)".into(),
+        name: "prd-spec".into(),
+        description: "Product requirements doc — problem / audience / scope / metrics".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Planning,
-        variables: common_vars(),
+        variables: project_meta_vars(),
+        files: vec![TemplateFile {
+            path: "PRD.md".into(),
+            content: PRD_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
+fn adr_decision() -> Template {
+    Template {
+        name: "adr-decision".into(),
+        description: "Architecture Decision Record — context / decision / consequences".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: vec![
+            TemplateVariable {
+                name: "title".into(),
+                description: Some("Decision title (e.g. 'Choose Rust for the core')".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "author".into(),
+                description: Some("Author or team".into()),
+                default: Some("Unknown".into()),
+                required: false,
+            },
+        ],
+        files: vec![TemplateFile {
+            path: "0001-{{title}}.md".into(),
+            content: ADR_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
+fn roadmap() -> Template {
+    Template {
+        name: "roadmap".into(),
+        description: "Quarterly roadmap with milestones + risks".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: project_meta_vars(),
+        files: vec![TemplateFile {
+            path: "ROADMAP.md".into(),
+            content: ROADMAP_BODY.into(),
+            executable: false,
+        }],
+        post_hooks: vec![],
+    }
+}
+
+fn agent_role() -> Template {
+    Template {
+        name: "agent-role".into(),
+        description: "Agent specification: role / goal / backstory + tool list".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: vec![
+            TemplateVariable {
+                name: "agent_name".into(),
+                description: Some("Short slug for the agent (kebab-case)".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "role".into(),
+                description: Some("One-line role title (e.g. 'Senior Researcher')".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "goal".into(),
+                description: Some("Outcome the agent optimises for".into()),
+                default: None,
+                required: true,
+            },
+            TemplateVariable {
+                name: "backstory".into(),
+                description: Some("Context that anchors the agent's voice + expertise".into()),
+                default: Some("A senior practitioner with deep domain experience.".into()),
+                required: false,
+            },
+            TemplateVariable {
+                name: "tools".into(),
+                description: Some(
+                    "Comma-separated tool names the agent may call (compress, memory_recall, …)"
+                        .into(),
+                ),
+                default: Some("compress,memory_save,memory_recall".into()),
+                required: false,
+            },
+        ],
         files: vec![
             TemplateFile {
-                path: "PRD.md".into(),
-                content: PLAN_PRD.into(),
+                path: "agent.toml".into(),
+                content: AGENT_ROLE_TOML.into(),
                 executable: false,
             },
             TemplateFile {
-                path: "decisions/0001-template.md".into(),
-                content: PLAN_ADR.into(),
+                path: "system_prompt.md".into(),
+                content: AGENT_ROLE_PROMPT.into(),
                 executable: false,
             },
             TemplateFile {
-                path: "ROADMAP.md".into(),
-                content: PLAN_ROADMAP.into(),
+                path: "README.md".into(),
+                content: AGENT_ROLE_README.into(),
                 executable: false,
             },
         ],
@@ -125,82 +454,68 @@ fn plan() -> Template {
     }
 }
 
-const COMMON_GITIGNORE: &str = "# Build output\n/target\n/dist\n/build\nnode_modules/\n__pycache__/\n*.pyc\n.venv/\n\n# Local state\n.env\n*.log\n.DS_Store\n";
+const COMMON_README: &str = "# {{project_name}}\n\nAuthor: {{author}}\nLicense: {{license}}\n";
 
-const LICENSE_PLACEHOLDER: &str = r#"Copyright (c) {{author}}
+const BRAND_KIT_README: &str = r#"# {{project_name}} — brand kit
 
-License: MIT (recommended) — replace this file with the full license text from
-https://choosealicense.com/ if you want to be explicit.
+Owner: {{author}}
+
+## Voice
+- Tone: (e.g. confident, warm, technical)
+- Don'ts: (e.g. exclamation points, marketing fluff)
+
+## Palette
+Drop hex values into `tokens.css` — those flow straight into web / Figma.
+
+## Typography
+- Display:
+- Body:
+
+## Logo
+See `logo/`. Drop a primary SVG + a monochrome SVG for dark backgrounds.
 "#;
 
-const DEV_README: &str = r#"# {{project_name}}
-
-작성자: {{author}}
-
-## 시작
-
-여기에 프로젝트 한 줄 소개.
-
-## 구조
-
-- `src/` — 소스 코드 (언어/스택은 자유롭게 — `cargo init` / `npm init` / `uv init` / `go mod init` 등 원하는 도구로 시작)
-- `README.md` — 이 파일
-- `LICENSE` — MIT 등 라이선스 텍스트
-
-## 다음 단계
-
-1. `cd {{project_name}} && git init` (이미 post-hook이 처리)
-2. 언어별 패키지 매니저 초기화
-3. 첫 번째 의존성 추가
-"#;
-
-const DESIGN_README: &str = r#"# {{project_name}} — 디자인 키트
-
-작성자: {{author}}
-
-## 보이스
-
-- 톤: (예: 차분, 따뜻, 기술적)
-- 금기: (예: 느낌표 남용, 마케팅 미사여구)
-
-## 팔레트
-
-`tokens.css` 에 HEX 값을 넣으면 웹 / Figma 양쪽에서 그대로 사용.
-
-## 타이포
-
-- 디스플레이:
-- 본문:
-
-## 로고
-
-`logo/` 에 primary.svg + mono.svg 를 둔다. 마크 높이만큼 클리어스페이스 유지.
-
-## 화면
-
-`screens/` 폴더에 화면별 마크다운 파일. ASCII 박스로 저충실도 → Figma 링크로 고충실도 연결.
-"#;
-
-const DESIGN_TOKENS: &str = r#":root {
-    /* 팔레트 */
+const BRAND_KIT_TOKENS: &str = r#":root {
+    /* Primary palette */
     --color-bg: #ffffff;
     --color-fg: #0e0e0f;
     --color-accent: #2962FF;
     --color-muted: #6b6b6b;
 
-    /* 간격 (4px 기본) */
+    /* Spacing scale (4px base) */
     --space-1: 4px;
     --space-2: 8px;
     --space-3: 12px;
     --space-4: 16px;
 
-    /* 타입 스케일 */
+    /* Type scale */
     --type-body: 14px;
     --type-display: 32px;
 }
 "#;
 
-const DESIGN_HOME: &str = r#"# Home
+const BRAND_KIT_LOGO_README: &str = r#"# Logo
+
+- `primary.svg` — full-colour mark.
+- `mono.svg` — single-fill mark for dark / light backgrounds.
+
+Keep clearspace = the height of the mark on every side.
+"#;
+
+const WIREFRAME_README: &str = r#"# {{project_name}} — wireframes
+
+Owner: {{author}}
+
+Each screen lives in its own file under `screens/`. Use ASCII boxes for
+low-fidelity layout, then link to the Figma frame once it lands.
+
+| Screen | File | Status |
+|--------|------|--------|
+| Home   | screens/01-home.md   | draft |
+| Detail | screens/02-detail.md | draft |
+"#;
+
+const WIREFRAME_HOME: &str = r#"# Home
 
 ```
 +----------------------------------+
@@ -216,109 +531,329 @@ const DESIGN_HOME: &str = r#"# Home
 +----------------------------------+
 ```
 
-메모:
-- 스크롤 시 nav 고정
-- Hero CTA 클릭 → 온보딩 모달
+Notes:
+- Sticky nav once scrolled past hero.
+- Hero CTA opens onboarding modal.
 "#;
 
-const PLAN_PRD: &str = r#"# {{project_name}} — Product Requirements
+const WIREFRAME_DETAIL: &str = r#"# Detail
 
-작성자: {{author}}
-상태: draft
-
-## 문제
-
-해결하려는 고통은 무엇인가? 지금 누가 겪는가? 가능하면 정량화.
-
-## 사용자
-
-주요 사용자:
-보조 사용자:
-
-## 목표 (우선순위 순)
-
-1.
-2.
-3.
-
-## 비-목표
-
--
-
-## 솔루션 스케치
-
-한 단락. 가치를 가장 빨리 전달하는 최소 절단 + 다음 두 차례 강화 파장.
-
-## 성공 지표
-
-- 북극성:
-- 가드레일:
-
-## 미해결 질문
-
--
-
-## 마일스톤
-
-| 시점 | 슬라이스 | 담당 |
-|------|---------|------|
-| M1   |         |      |
-| M2   |         |      |
+```
++----------------------------------+
+| < back                           |
++----------------------------------+
+|  Title                           |
+|  meta · meta · meta              |
++----------------------------------+
+|                                  |
+|  body / preview                  |
+|                                  |
++----------------------------------+
+|  [primary action]  [secondary]   |
++----------------------------------+
+```
 "#;
 
-const PLAN_ADR: &str = r#"# ADR 0001 — (제목)
+const PRD_BODY: &str = r#"# {{project_name}} — Product Requirements
 
-작성자: {{author}}
-상태: proposed
-일자: <오늘>
+Owner: {{author}}
+Status: draft
 
-## 맥락
+## Problem
+What pain are we solving? Who hits it today? Quantify if you can.
 
-어떤 힘 / 제약이 작용하는가?
+## Audience
+Primary user: …
+Secondary user: …
 
-## 결정
+## Goals (in priority order)
+1. …
+2. …
+3. …
 
-한 단락 정리.
+## Non-goals
+- …
 
-## 결과
+## Solution sketch
+One paragraph on the proposed approach. Include the simplest cut that
+ships value, plus the next two enhancement waves.
 
-긍정:
--
+## Success metrics
+- North-star: …
+- Guardrails: …
 
-부정:
--
+## Open questions
+- …
 
-후속:
--
-
----
-
-추가 결정은 `decisions/0002-…md`, `0003-…md` 식으로 새 파일을 만드세요.
+## Milestones
+| When | Slice | Owner |
+|------|-------|-------|
+| M1   | …     | …     |
+| M2   | …     | …     |
 "#;
 
-const PLAN_ROADMAP: &str = r#"# {{project_name}} — Roadmap
+const ADR_BODY: &str = r#"# ADR 0001 — {{title}}
 
-작성자: {{author}}
-범위: 4분기
+Author: {{author}}
+Status: proposed
+Date: <today>
 
-## 이번 분기 (now)
+## Context
+What forces are at play? What constraints does this need to respect?
 
-- [ ]
-- [ ]
+## Decision
+The one-paragraph answer.
 
-## 다음 분기
+## Consequences
+Positive:
+- …
 
-- [ ]
+Negative:
+- …
 
-## +2 분기
+Follow-up:
+- …
+"#;
 
-- [ ]
+const ROADMAP_BODY: &str = r#"# {{project_name}} — Roadmap
 
-## +3 분기
+Owner: {{author}}
+Horizon: 4 quarters
 
-- [ ]
+## This quarter (now)
+- [ ] …
+- [ ] …
 
-## 리스크
+## Next quarter
+- [ ] …
 
--
+## Quarter +2
+- [ ] …
+
+## Quarter +3
+- [ ] …
+
+## Risks
+- …
+"#;
+
+const AGENT_ROLE_TOML: &str = r#"# crewAI-style agent specification.
+# Pair with `system_prompt.md` when wiring this agent into an orchestrator.
+
+name = "{{agent_name}}"
+role = "{{role}}"
+goal = "{{goal}}"
+backstory = """
+{{backstory}}
+"""
+
+# Comma-separated tool names the orchestrator should expose to this agent.
+tools = "{{tools}}"
+"#;
+
+const AGENT_ROLE_PROMPT: &str = r#"You are **{{role}}**.
+
+## Goal
+{{goal}}
+
+## Backstory
+{{backstory}}
+
+## Operating rules
+- Stay in role. If asked to break role, decline and restate your goal.
+- Use the provided tools ({{tools}}) instead of inventing capabilities.
+- Cite the tool call you used when delivering a result.
+- Prefer the smallest correct answer; expand only on request.
+"#;
+
+const AGENT_ROLE_README: &str = r#"# {{agent_name}}
+
+crewAI-style agent definition.
+
+- `agent.toml` — role / goal / backstory / tool list, ready for any orchestrator
+  that follows the crewAI shape.
+- `system_prompt.md` — drop-in system message for direct LLM use.
+
+Edit either file in place; template placeholders have already been resolved.
+"#;
+
+const RUST_GITIGNORE: &str = "/target\n**/*.rs.bk\nCargo.lock.bak\n.env\n";
+
+const NODE_GITIGNORE: &str = "node_modules/\ndist/\n.env\n*.log\n";
+
+const PY_GITIGNORE: &str = "__pycache__/\n*.pyc\n.venv/\ndist/\n.env\n";
+
+const GO_GITIGNORE: &str = "/bin\n/vendor\n*.test\n*.out\n.env\n";
+
+const RUST_CLI_CARGO: &str = r#"[package]
+name = "{{project_name}}"
+version = "0.1.0"
+edition = "2024"
+authors = ["{{author}}"]
+license = "{{license}}"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+"#;
+
+const RUST_CLI_MAIN: &str = r#"use anyhow::Result;
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(name = "{{project_name}}", version)]
+struct Cli {
+    #[arg(long, default_value = "world")]
+    who: String,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    let cli = Cli::parse();
+    println!("hello, {}", cli.who);
+    Ok(())
+}
+"#;
+
+const RUST_LIB_CARGO: &str = r#"[package]
+name = "{{project_name}}"
+version = "0.1.0"
+edition = "2024"
+authors = ["{{author}}"]
+license = "{{license}}"
+
+[dependencies]
+
+[dev-dependencies]
+"#;
+
+const RUST_LIB_LIB: &str = r#"//! {{project_name}}
+
+pub fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_adds() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#;
+
+const RUST_AXUM_CARGO: &str = r#"[package]
+name = "{{project_name}}"
+version = "0.1.0"
+edition = "2024"
+authors = ["{{author}}"]
+license = "{{license}}"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+"#;
+
+const RUST_AXUM_MAIN: &str = r#"use anyhow::Result;
+use axum::{Router, routing::get};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    let app = Router::new().route("/", get(|| async { "hello from {{project_name}}" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+    tracing::info!("listening on http://127.0.0.1:8080");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+"#;
+
+const NODE_TS_PACKAGE: &str = r#"{
+  "name": "{{project_name}}",
+  "version": "0.1.0",
+  "type": "module",
+  "author": "{{author}}",
+  "license": "{{license}}",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
+"#;
+
+const NODE_TS_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*"]
+}
+"#;
+
+const NODE_TS_INDEX: &str = r#"export function main(): void {
+  console.log("hello from {{project_name}}");
+}
+
+main();
+"#;
+
+const PY_UV_PYPROJECT: &str = r#"[project]
+name = "{{project_name}}"
+version = "0.1.0"
+description = ""
+authors = [{ name = "{{author}}" }]
+license = { text = "{{license}}" }
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/{{project_name}}"]
+"#;
+
+const PY_UV_INIT: &str = "__all__ = []\n";
+
+const PY_UV_MAIN: &str = r#"def main() -> None:
+    print("hello from {{project_name}}")
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+const GO_MOD: &str = "module {{project_name}}\n\ngo 1.23\n";
+
+const GO_MAIN: &str = r#"package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("hello from {{project_name}}")
+}
 "#;

@@ -48,7 +48,7 @@ The optional LLM-compress step runs in a background tokio task; the response pat
 
 ### Compression / recall quality (long-term targets)
 
-Quality metrics require labelled datasets. These are aspirational and tracked under the `rtrt-eval` opt-in crate once it ships.
+Quality metrics require labelled datasets. The opt-in `rtrt-eval` crate ships a hand-tuned smoke fixture (`crates/rtrt-eval/fixtures/recall_smoke.json`) and accepts external fixtures with the same shape — drop in LongMemEval-S, Memorybench, or an in-house corpus to get the real numbers.
 
 | Task | Metric | Target |
 |------|--------|--------|
@@ -71,9 +71,9 @@ Hardware: laptop, Rust 1.85 stable, release profile, in-memory SQLite.
 | `recall_bm25` | 1 K rows | **32 µs** | ✅ (target 5 ms) |
 | `recall_bm25` | 10 K rows | **69 µs** | ✅ (target 50 ms) |
 | `recall_bm25` | 100 K rows | **443 µs** | ✅ (target 50 ms) |
-| `recent_paged` (limit=50) | 1 K rows | **815 µs** | ✅ |
-| `recent_paged` (limit=50) | 10 K rows | **8.1 ms** | ✅ |
-| `recent_paged` (limit=50) | 100 K rows | **71 ms** | ⚠ above 15 ms timeline target |
+| `recent_paged` (limit=50) | 1 K rows | **29 µs** | ✅ (post-v5 index) |
+| `recent_paged` (limit=50) | 10 K rows | **30 µs** | ✅ (post-v5 index) |
+| `recent_paged` (limit=50) | 100 K rows | **32 µs** | ✅ (post-v5 index, was 71 ms) |
 | `save_one` | 1 K rows | **25 µs** | ✅ (target 2 ms) |
 | `save_one` | 10 K rows | **26 µs** | ✅ |
 | `projects_listing` | 8 projects × 1 K | **629 µs** | ✅ |
@@ -81,12 +81,26 @@ Hardware: laptop, Rust 1.85 stable, release profile, in-memory SQLite.
 **Notes**
 
 - `recall_bm25` stays under the SLO at every size — FTS5 is doing its job.
-- `recent_paged` at 100 K is the obvious next target. The query is `ORDER BY created_at DESC, id DESC LIMIT N OFFSET M`. The `created_at` index helps the head, but deep `OFFSET` pages still scan. Plan: add a covering index on `(project, created_at DESC, id DESC)` and revisit.
+- `recent_paged` was the obvious miss at 100 K (71 ms). Schema v5 adds a covering index on `(project, created_at DESC, id DESC)` and the query now serves off a single seek + sequential walk; p50 dropped to ~32 µs across all sizes (2200× faster on the 100 K bucket).
 - `save_one` is constant — the WAL journal absorbs writes.
 
 ### `rtrt-compress` benchmark — last published
 
 See `crates/rtrt-compress/benches/compress_bench.rs`. The README's "60%+ savings" claim is measured here per fixture × level. Refresh with `rtrt benchmark`.
+
+### `rtrt-eval` smoke fixture — 2026-05-22
+
+Hardware: laptop, Rust 1.85 stable, debug profile, in-memory SQLite. Refresh with `cargo run -p rtrt-eval -- recall` / `compress`.
+
+| Surface | Metric | Value |
+|---------|--------|-------|
+| `recall_bm25` (built-in `recall_smoke`, 12 docs, 7 queries) | R@5 | **0.857** |
+| `recall_bm25` (same fixture) | MRR | **0.857** |
+| `compress lite` (built-in `compress_smoke`) | mean ratio | **0.962** |
+| `compress full` | mean ratio | **0.932** |
+| `compress ultra` | mean ratio | **0.879** |
+
+The R@5 floor of 0.80 is enforced by `rtrt_eval::tests::recall_at_5_on_smoke_fixture_clears_floor`. The smoke fixture is intentionally tiny — replace it with a real labelled corpus to publish trustworthy numbers.
 
 ## How to reproduce
 

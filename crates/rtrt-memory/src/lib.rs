@@ -212,6 +212,23 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v5: add a covering index for the timeline pager. The earlier
+        // `idx_memories_project` only covered the WHERE clause; the
+        // `ORDER BY created_at DESC, id DESC LIMIT … OFFSET …` had to scan
+        // the full project slice for deep pages. With this composite index
+        // SQLite can serve recent_paged off a single seek + sequential walk
+        // even at 100k rows per project.
+        if v < 5 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    CREATE INDEX IF NOT EXISTS idx_memories_timeline
+                        ON memories(project, created_at DESC, id DESC);
+                    PRAGMA user_version = 5;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -303,6 +320,75 @@ impl MemoryStore {
         let rows = stmt
             .query_map(
                 rusqlite::params![project, limit as i64, offset as i64],
+                |row| {
+                    let scope: String = row.get(5)?;
+                    Ok(MemoryRecord {
+                        id: row.get(0)?,
+                        project: row.get(1)?,
+                        kind: row.get(2)?,
+                        body: row.get(3)?,
+                        created_at: row.get(4)?,
+                        scope: MemoryScope::parse(&scope),
+                    })
+                },
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// One summary row per `session_id` for a project. Returns
+    /// `(session_id, count, first_ts, last_ts)` ordered by `last_ts DESC`.
+    /// Rows with a NULL `session_id` (legacy v1–v3 captures) are folded into
+    /// a single synthetic bucket keyed by the empty string so they remain
+    /// listable in the UI.
+    pub fn sessions(&self, project: &str) -> Result<Vec<(String, usize, i64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(session_id, '') AS sid, \
+                        COUNT(*) AS n, \
+                        MIN(created_at) AS first_ts, \
+                        MAX(created_at) AS last_ts \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  GROUP BY sid \
+                  ORDER BY last_ts DESC",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// All memory rows tagged with `session_id` inside `project`, newest
+    /// first. Useful for replaying or exporting one agent session.
+    pub fn session_records(
+        &self,
+        project: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, created_at, scope FROM memories \
+                  WHERE project = ?1 AND COALESCE(session_id, '') = ?2 \
+                  ORDER BY created_at DESC, id DESC LIMIT ?3",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![project, session_id, limit as i64],
                 |row| {
                     let scope: String = row.get(5)?;
                     Ok(MemoryRecord {
@@ -472,6 +558,82 @@ impl MemoryStore {
             return Ok(Default::default());
         }
         serde_json::from_str(&raw).map_err(|e| Error::Memory(format!("metadata decode: {e}")))
+    }
+
+    /// Overwrites the body of an existing memory row. Keeps the FTS5 index
+    /// in sync so later `recall_bm25` calls see the rewritten content. Used
+    /// by the optional LLM auto-compress background worker.
+    ///
+    /// Note: any embedding row for `id` is left untouched. The auto-compress
+    /// worker treats embeddings as a lossy summary that doesn't need to be
+    /// regenerated for shorter rewrites; full re-embedding remains explicit.
+    pub fn set_body(&self, id: i64, new_body: &str) -> Result<()> {
+        // Fetch the old body so we can pass it to the FTS5 'delete' command —
+        // external-content FTS doesn't track row contents itself.
+        let old_body: String = self
+            .conn
+            .query_row(
+                "SELECT body FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.conn
+            .execute(
+                "UPDATE memories SET body = ?1 WHERE id = ?2",
+                rusqlite::params![new_body, id],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO memories_fts(memories_fts, rowid, body) VALUES ('delete', ?1, ?2)",
+                rusqlite::params![id, old_body],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO memories_fts(rowid, body) VALUES (?1, ?2)",
+                rusqlite::params![id, new_body],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Returns up to `limit` rows in `project` that are eligible for LLM
+    /// auto-compression:
+    ///   - `created_at < older_than_ts` (cool-off window passed),
+    ///   - `LENGTH(body) >= min_chars` (worth the LLM round-trip),
+    ///   - metadata does not already contain `compressed_at` (idempotent).
+    ///
+    /// The metadata check is a `LIKE '%compressed_at%'` on the serialised
+    /// JSON blob — false positives on a literal user-written key are
+    /// possible but harmless because the worker re-writes idempotently.
+    pub fn compress_candidates(
+        &self,
+        project: &str,
+        older_than_ts: i64,
+        min_chars: usize,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, body FROM memories \
+                  WHERE project = ?1 \
+                    AND created_at < ?2 \
+                    AND LENGTH(body) >= ?3 \
+                    AND (metadata IS NULL OR metadata NOT LIKE '%compressed_at%') \
+                  ORDER BY created_at ASC LIMIT ?4",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![project, older_than_ts, min_chars as i64, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
     }
 
     /// Stores `metadata` against an existing memory row.
@@ -1507,5 +1669,146 @@ mod tests {
         let hits = store.recall_hybrid("p1", "rust", 3, &embedder).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].record.body.contains("rust"), "{:?}", hits);
+    }
+
+    /// Regression test for the auto-capture pipeline primitives that the
+    /// dashboard and rtrt-mcp both depend on.
+    ///
+    /// Verifies:
+    /// 1. `body_sha` is deterministic and changes with content.
+    /// 2. `save` returns a fresh id; `tag_row` writes session + sha.
+    /// 3. `body_seen_at` returns the most recent timestamp for that sha
+    ///    inside the same project, and `None` for unseen shas.
+    /// 4. `sessions` groups rows by session id with correct counts.
+    /// 5. `archive_overflow_no_llm` keeps the N newest rows.
+    #[test]
+    fn auto_capture_pipeline_primitives() {
+        let store = MemoryStore::open_in_memory().unwrap();
+
+        // 1. body_sha
+        let sha_a = MemoryStore::body_sha("alpha");
+        let sha_a2 = MemoryStore::body_sha("alpha");
+        let sha_b = MemoryStore::body_sha("beta");
+        assert_eq!(sha_a, sha_a2);
+        assert_ne!(sha_a, sha_b);
+        assert_eq!(sha_a.len(), 64, "sha-256 hex should be 64 chars");
+
+        // 2. save + tag_row
+        let id_a = store.save("p1", "note", "alpha").unwrap();
+        store
+            .tag_row(id_a, Some("session-x"), Some(&sha_a))
+            .unwrap();
+        let id_b = store.save("p1", "note", "beta").unwrap();
+        store
+            .tag_row(id_b, Some("session-y"), Some(&sha_b))
+            .unwrap();
+        assert_ne!(id_a, id_b);
+
+        // 3. body_seen_at
+        let seen_a = store.body_seen_at("p1", &sha_a).unwrap();
+        assert!(seen_a.is_some(), "tagged sha should be discoverable");
+        let unseen = store
+            .body_seen_at("p1", &MemoryStore::body_sha("never-saved"))
+            .unwrap();
+        assert!(unseen.is_none(), "unseen sha must return None");
+        let wrong_project = store.body_seen_at("p2", &sha_a).unwrap();
+        assert!(wrong_project.is_none(), "dedup is scoped per project");
+
+        // 4. sessions grouping
+        let summary = store.sessions("p1").unwrap();
+        let by_id: std::collections::BTreeMap<_, _> = summary
+            .iter()
+            .map(|(sid, n, _, _)| (sid.as_str(), *n))
+            .collect();
+        assert_eq!(by_id.get("session-x"), Some(&1));
+        assert_eq!(by_id.get("session-y"), Some(&1));
+        let session_x_rows = store.session_records("p1", "session-x", 10).unwrap();
+        assert_eq!(session_x_rows.len(), 1);
+        assert_eq!(session_x_rows[0].body, "alpha");
+
+        // 5. archive_overflow_no_llm keeps the N newest
+        for i in 0..5 {
+            let body = format!("extra-{i}");
+            let id = store.save("p1", "note", &body).unwrap();
+            store
+                .tag_row(id, Some("session-x"), Some(&MemoryStore::body_sha(&body)))
+                .unwrap();
+        }
+        let total_before = store.count_by_project("p1").unwrap();
+        assert_eq!(total_before, 7); // 2 originals + 5 extras
+        let removed = store.archive_overflow_no_llm("p1", 3).unwrap();
+        assert_eq!(removed, 4, "should drop the 4 oldest rows");
+        let total_after = store.count_by_project("p1").unwrap();
+        assert_eq!(total_after, 3);
+    }
+
+    /// Building blocks for the LLM auto-compress background worker.
+    ///
+    /// Verifies:
+    /// 1. `set_body` overwrites the row and keeps `recall_bm25` in sync —
+    ///    the old token disappears from FTS, the new one becomes findable.
+    /// 2. `compress_candidates` honours the age, min-chars, and
+    ///    "not-yet-compressed" filters, and excludes rows once
+    ///    `metadata.compressed_at` is set.
+    #[test]
+    fn auto_compress_primitives() {
+        use std::collections::BTreeMap;
+        let store = MemoryStore::open_in_memory().unwrap();
+
+        // long body, fresh — should not be a candidate (age filter)
+        let long_fresh_body = "alpha ".repeat(200);
+        store.save("p1", "note", &long_fresh_body).unwrap();
+
+        // short body — should not be a candidate (min_chars filter)
+        let short_id = store.save("p1", "note", "tiny").unwrap();
+
+        // long + old — candidate; we forge `created_at` directly.
+        let long_old_body = "beta ".repeat(200);
+        let long_old_id = store.save("p1", "note", &long_old_body).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET created_at = 1000 WHERE id = ?1",
+                rusqlite::params![long_old_id],
+            )
+            .unwrap();
+
+        // already-compressed row — must be excluded.
+        let already = store.save("p1", "note", &"gamma ".repeat(200)).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET created_at = 1000 WHERE id = ?1",
+                rusqlite::params![already],
+            )
+            .unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("compressed_at".into(), "1234".into());
+        store.set_metadata(already, &meta).unwrap();
+
+        let candidates = store.compress_candidates("p1", 5000, 100, 10).unwrap();
+        assert!(
+            candidates.iter().any(|(id, _)| *id == long_old_id),
+            "old long row should be a candidate"
+        );
+        assert!(
+            !candidates.iter().any(|(id, _)| *id == short_id),
+            "short row should not be a candidate"
+        );
+        assert!(
+            !candidates.iter().any(|(id, _)| *id == already),
+            "already-compressed row should be excluded"
+        );
+
+        // 2. set_body keeps the FTS5 index in sync.
+        let target_id = store.save("p2", "note", "rust cargo workspace").unwrap();
+        let hits = store.recall_bm25("p2", "rust", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        store.set_body(target_id, "go module replace").unwrap();
+        let rust_hits = store.recall_bm25("p2", "rust", 5).unwrap();
+        assert!(rust_hits.is_empty(), "old token must drop out of FTS");
+        let go_hits = store.recall_bm25("p2", "module", 5).unwrap();
+        assert_eq!(go_hits.len(), 1);
+        assert!(go_hits[0].body.contains("module"));
     }
 }

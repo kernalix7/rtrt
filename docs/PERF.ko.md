@@ -48,7 +48,7 @@
 
 ### 정확도 (장기 목표)
 
-라벨링된 데이터셋 필요. `rtrt-eval` 옵션 크레이트로 추후.
+라벨링된 데이터셋 필요. 옵트인 `rtrt-eval` 크레이트가 손-튜닝 smoke fixture (`crates/rtrt-eval/fixtures/recall_smoke.json`) 동봉. 동일 스키마 외부 fixture 받음 — LongMemEval-S / Memorybench / 인하우스 코퍼스 드랍하면 실수치 측정.
 
 | 작업 | 메트릭 | 목표 |
 |------|--------|------|
@@ -69,9 +69,9 @@
 | `recall_bm25` | 1 K | **32 µs** | ✅ (목표 5 ms) |
 | `recall_bm25` | 10 K | **69 µs** | ✅ (목표 50 ms) |
 | `recall_bm25` | 100 K | **443 µs** | ✅ (목표 50 ms) |
-| `recent_paged` (limit=50) | 1 K | **815 µs** | ✅ |
-| `recent_paged` (limit=50) | 10 K | **8.1 ms** | ✅ |
-| `recent_paged` (limit=50) | 100 K | **71 ms** | ⚠ 타임라인 목표 15 ms 초과 |
+| `recent_paged` (limit=50) | 1 K | **29 µs** | ✅ (v5 인덱스 적용 후) |
+| `recent_paged` (limit=50) | 10 K | **30 µs** | ✅ (v5 인덱스 적용 후) |
+| `recent_paged` (limit=50) | 100 K | **32 µs** | ✅ (v5 인덱스 적용 후, 이전 71 ms) |
 | `save_one` | 1 K | **25 µs** | ✅ (목표 2 ms) |
 | `save_one` | 10 K | **26 µs** | ✅ |
 | `projects_listing` | 8 프로젝트 × 1 K | **629 µs** | ✅ |
@@ -79,12 +79,26 @@
 **메모**
 
 - `recall_bm25` 모든 크기에서 SLO 내 — FTS5 효율 확인.
-- `recent_paged` 100 K가 다음 최적화 대상. 깊은 `OFFSET` 페이지는 스캔 발생. 계획: `(project, created_at DESC, id DESC)` 커버링 인덱스 추가.
+- `recent_paged` 100 K가 명백한 미스였음 (71 ms). 스키마 v5가 `(project, created_at DESC, id DESC)` 커버링 인덱스를 추가, 쿼리는 이제 단일 seek + 순차 walk로 응답. p50 모든 크기에서 ~32 µs (100 K에서 2200× 가속).
 - `save_one` 상수 시간 — WAL이 쓰기 흡수.
 
 ### `rtrt-compress` 벤치
 
 `crates/rtrt-compress/benches/compress_bench.rs`. README의 "60%+ 절감" 주장은 여기서 픽스처 × 레벨로 측정. `rtrt benchmark`로 갱신.
+
+### `rtrt-eval` 스모크 픽스처 — 2026-05-22
+
+환경: 노트북, Rust 1.85 stable, debug 프로필, 인메모리 SQLite. `cargo run -p rtrt-eval -- recall` / `compress`로 갱신.
+
+| 표면 | 메트릭 | 값 |
+|------|--------|-----|
+| `recall_bm25` (내장 `recall_smoke`, 12 docs, 7 queries) | R@5 | **0.857** |
+| `recall_bm25` (동일 fixture) | MRR | **0.857** |
+| `compress lite` (내장 `compress_smoke`) | 평균 ratio | **0.962** |
+| `compress full` | 평균 ratio | **0.932** |
+| `compress ultra` | 평균 ratio | **0.879** |
+
+R@5 0.80 floor는 `rtrt_eval::tests::recall_at_5_on_smoke_fixture_clears_floor`로 강제. 스모크 fixture는 의도적으로 작음 — 실수치 게시는 진짜 라벨링 코퍼스로 교체 후.
 
 ## 재현
 

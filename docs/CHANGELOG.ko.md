@@ -8,9 +8,24 @@
 
 ## [Unreleased]
 
-### Highlights
+### Highlights — 방향성 정리
 
-**두 번째 스윕: MCP Streamable HTTP 전송 + 베어러 토큰 가드, qdrant-style 페이로드 필터 DSL, LLMLingua-style ML 압축 스캐폴드, Helicone-style 응답 캐시, langfuse-style 프롬프트 API, Letta 블록, crewAI `agent-role` 템플릿, chroma 다중 출력 포맷, aider-style `rtrt diagnose`, tree-sitter Python + TypeScript, 메모리 export/import, 대시보드 인증 + 다크모드 + 스파크라인 + 10탭 (Proxy / Diagnose / RepoMap / Setup 포함).**
+**RTRT는 Unix 도구 모음 방향으로 정식 commit. 최상위 `DESIGN.md`가 10개 원칙 문서화, `docs/PERF.md`가 SLO 표 + 첫 측정값 게시. 자동 캡처는 옵션이 아닌 기본 동작 — 모든 dashboard `/api/*` 호출과 모든 Claude Code 훅 발화가 SHA-256 dedup + privacy 필터 + 세션 태깅 파이프라인을 거쳐 SQLite에 도달. 시간당 콘솔리데이션 데몬이 프로젝트별 row 캡 유지. 새 메모리 MCP 도구 6개 (timeline / profile / relations / smart_search / export / consolidate) + SSE 라이브 스트림 + 토큰 집계 엔드포인트로 표면 보강.**
+
+- 신규 `DESIGN.md` + `docs/DESIGN.ko.md`: 10개 원칙 — 프레임워크 아닌 도구, 안정된 substrate, 3 기둥만, 자동 캡처 기본, 옵션 크레이트로 확장, 측정값 성능, 로컬 우선, 발행 인터페이스 영원, 작게 천천히 깊게.
+- 신규 `docs/PERF.md` + `docs/PERF.ko.md`: SLO 표 + `recall_bench` 첫 측정값. 10% 이상 회귀는 릴리스 차단.
+- `rtrt-memory` v4 스키마: `session_id` + `body_sha` 컬럼 + 인덱스. `body_sha()` / `body_seen_at()` / `tag_row()` / `archive_overflow_no_llm()` 헬퍼.
+- `rtrt-dashboard` 자동 캡처 파이프라인: `/api/{chat,compress,diagnose,proxy}` 성공마다 `redact_secrets` → SHA-256 dedup (기본 5분) → 저장 → 세션 태깅. 환경 변수: `RTRT_AUTO_CAPTURE` / `RTRT_AUTO_REDACT` / `RTRT_AUTO_DEDUP_WINDOW_SEC` / `RTRT_DEFAULT_PROJECT`. 저장마다 `/api/stream` (SSE) JSON 이벤트 브로드캐스트.
+- 시간당 콘솔리데이션 데몬 — `archive_overflow_no_llm`로 프로젝트별 `RTRT_CONSOLIDATE_KEEP` (기본 1000) 최신 row 유지. 주기 `RTRT_CONSOLIDATE_INTERVAL_SEC` (기본 3600, 0 비활성).
+- `GET /api/memory/projects` + `GET /api/memory/timeline?project=X&limit=N&offset=M` — 대시보드 프로젝트 픽커 + 페이지네이션 히스토리.
+- `GET /api/tokens/summary` — 게이트웨이 요청 이력 시간/일 단위 집계.
+- `GET /api/stream` SSE + 256-슬롯 tokio broadcast — 캡처마다 `{type, id, kind, project, session}` 이벤트.
+- 새 MCP 메모리 도구 6개: `memory_timeline` / `memory_profile` / `memory_relations` / `memory_smart_search` / `memory_export` / `memory_consolidate`. MCP 서버 총 17개 도구.
+- `plugins/claude-code/rtrt/` — Claude Code 플러그인 스캐폴드, 훅 스크립트 6개. `rtrt` CLI 우선, `POST /api/memory/save` 폴백. Best-effort: 캡처 실패해도 에이전트 안 멈춤.
+- `crates/rtrt-memory/benches/recall_bench.rs` — criterion 벤치 (1K / 10K / 100K). 첫 측정값 `docs/PERF.md`.
+- 워크스페이스 의존성: `sha2` (dedup), `uuid` (세션), `tokio-stream` (SSE).
+
+### Highlights — 같은 브랜치 이전 묶음
 
 - `rtrt-mcp`: rmcp Streamable HTTP 전송 + axum 라우터. 새 도구 `compress_ml`, `proxy`, `memory_set_block/get_block/list_blocks`. `memory_recall`에 qdrant DSL 필터 파라미터. `--http-token` 상수-시간 베어러 가드, `--allowed-origins` RFC 6454.
 - `rtrt-memory`: v3 마이그레이션 `metadata` 컬럼, `PayloadFilter` DSL (`source=claude,topic~^auth`), `recall_bm25_with_filter`, `save_with_metadata`, `export_jsonl` / `import_jsonl`.

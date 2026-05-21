@@ -9,9 +9,24 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
-### Highlights
+### Highlights — Direction refresh
 
-**Second sweep across the toolkit: MCP Streamable HTTP transport with bearer-token guard, qdrant-style payload filter on `memory_recall`, LLMLingua-style ML compressor scaffold, Helicone-style response cache, langfuse-style prompt API on the dashboard, Letta blocks, agent-role template, chroma multi-format output, aider-style `rtrt diagnose`, tree-sitter Python + TypeScript, memory export/import, dashboard auth + dark mode + sparklines + 10 tabs covering proxy / diagnose / repo-map / setup.**
+**RTRT formally commits to a Unix-philosophy toolkit. New top-level `DESIGN.md` documents the ten principles; new `docs/PERF.md` publishes the SLO table and the first measured numbers. Auto-capture is no longer optional ceremony — every dashboard `/api/*` call and every Claude Code hook fire runs through a SHA-256 dedup + privacy filter + session tag pipeline before landing in SQLite. An hourly consolidation daemon keeps each project under a row cap. Six new memory MCP tools (timeline / profile / relations / smart_search / export / consolidate) plus a Server-Sent Events live stream + a tokens aggregator close the gap with broader memory platforms while staying narrow.**
+
+- New `DESIGN.md` + `docs/DESIGN.ko.md`: ten short principles — tools-not-frameworks, stable substrates, three pillars only, auto-capture by default, optional crates instead of scope creep, measured performance, local-first, frozen public interfaces, slow + deep growth. Re-read before adding a top-level feature.
+- New `docs/PERF.md` + `docs/PERF.ko.md`: SLO table + last-measured numbers from `recall_bench`. Regression beyond 10% blocks a release.
+- `rtrt-memory` schema v4 lands `session_id` + `body_sha` columns + their indexes. `body_sha()` / `body_seen_at()` / `tag_row()` / `archive_overflow_no_llm()` round out the auto-capture pipeline.
+- `rtrt-dashboard` auto-capture pipeline: every successful `/api/{chat,compress,diagnose,proxy}` now runs `redact_secrets` → SHA-256 dedup (5-minute default window) → save → session id tag. Env knobs: `RTRT_AUTO_CAPTURE` / `RTRT_AUTO_REDACT` / `RTRT_AUTO_DEDUP_WINDOW_SEC` / `RTRT_DEFAULT_PROJECT`. Each save broadcasts a JSON event over `/api/stream` (SSE) so clients can subscribe instead of polling.
+- Hourly consolidation daemon — `spawn_consolidation_daemon` runs `archive_overflow_no_llm` per project, keeps `RTRT_CONSOLIDATE_KEEP` (default 1000) most recent rows. Cadence via `RTRT_CONSOLIDATE_INTERVAL_SEC` (default 3600, 0 disables).
+- `GET /api/memory/projects` + `GET /api/memory/timeline?project=X&limit=N&offset=M` power the dashboard project picker and paginated history.
+- `GET /api/tokens/summary` aggregates the gateway's request history into hourly + daily buckets.
+- `GET /api/stream` SSE channel + 256-slot tokio broadcast — `{type: "memory.save", id, kind, project, session}` events fire on every capture.
+- Six new MCP memory tools: `memory_timeline` (paginated history), `memory_profile` (per-project stats), `memory_relations` (graph BFS), `memory_smart_search` (BM25 today, hybrid when an embedder is attached), `memory_export` (JSONL), `memory_consolidate` (LLM-free archive). MCP server now ships 17 tools across memory / token / code / project / LLM domains.
+- `plugins/claude-code/rtrt/` — Claude Code plugin scaffold with six hook scripts (PreToolUse / PostToolUse / UserPromptSubmit / Stop / SessionStart / SessionEnd). Writes via `rtrt` CLI when available, falls back to `POST /api/memory/save` against a running dashboard. Best-effort: never blocks the agent on capture failure.
+- `crates/rtrt-memory/benches/recall_bench.rs` — criterion bench across `recall_bm25` / `recent_paged` / `save_one` / `projects_listing` at 1 K / 10 K / 100 K rows. First published numbers in `docs/PERF.md`.
+- Workspace deps: `sha2` (memory dedup), `uuid` (session ids), `tokio-stream` (SSE BroadcastStream).
+
+### Highlights — Earlier in this branch
 
 - `rtrt-mcp` adds a Streamable HTTP transport (MCP 2025-06-18) via `rmcp::StreamableHttpService` behind an axum router. New tools: `compress_ml` (LLMLingua-style token-importance compression), `proxy` (rtrt-proxy filters), `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta-style persona / human / context slots), and a `filter` parameter on `memory_recall` for qdrant-style payload DSL. `--http-token` / `RTRT_MCP_HTTP_TOKEN` enforces a constant-time bearer guard with `WWW-Authenticate`; `--allowed-origins` plumbs into `StreamableHttpServerConfig.allowed_origins` for RFC 6454 Origin validation. Non-loopback bind without a token logs a warning. (inspired by [letta](https://github.com/letta-ai/letta), [Helicone](https://github.com/Helicone/helicone))
 - `rtrt-memory` gains a `metadata` column (v3 migration) and a qdrant-style payload filter DSL: `source=claude,topic~^auth` (key=val, key!=val, key~regex, comma-AND). `recall_bm25_with_filter`, `save_with_metadata`, `get_metadata` / `set_metadata` round out the API. `export_jsonl` / `import_jsonl` provide a portable backup format keyed off the public schema. (inspired by [qdrant](https://github.com/qdrant/qdrant))

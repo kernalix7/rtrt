@@ -2,11 +2,12 @@
 
 # RTRT
 
-### Cut tokens. Keep meaning. One Rust toolkit.
+### A Unix toolkit for AI agents — cut tokens, keep memory.
 
-<p>Output simplification, command-output filtering, persistent project memory,<br>
-multi-provider routing, and standardized project scaffolds — under one CLI,<br>
-one MCP server, one web dashboard.</p>
+<p>Single-purpose binaries: <code>compress</code>, <code>memory</code>,<br>
+<code>signatures</code>, plus a stdio / Streamable HTTP MCP server.<br>
+Auto-captures every event your agent fires. SQLite-backed, local-first,<br>
+no daemon, no cloud, no framework.</p>
 
 <pre><code># Latest stable release (default; falls back to --main if none yet)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
@@ -34,16 +35,24 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 [![Windows](https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows/)
 [![WSL](https://img.shields.io/badge/WSL-4D4D4D?style=flat-square&logo=windows&logoColor=white)](https://learn.microsoft.com/windows/wsl/)
 
-<sub>**English** &nbsp;·&nbsp; [한국어](docs/README.ko.md) &nbsp;·&nbsp; [Install](docs/INSTALL.md) &nbsp;·&nbsp; [Usage](docs/USAGE.md) &nbsp;·&nbsp; [Features](docs/FEATURES.md) &nbsp;·&nbsp; [Architecture](docs/ARCHITECTURE.md) &nbsp;·&nbsp; [Comparison](docs/COMPARISON.md)</sub>
+<sub>**English** &nbsp;·&nbsp; [한국어](docs/README.ko.md) &nbsp;·&nbsp; [Design](DESIGN.md) &nbsp;·&nbsp; [Install](docs/INSTALL.md) &nbsp;·&nbsp; [Usage](docs/USAGE.md) &nbsp;·&nbsp; [Performance](docs/PERF.md) &nbsp;·&nbsp; [Features](docs/FEATURES.md) &nbsp;·&nbsp; [Architecture](docs/ARCHITECTURE.md) &nbsp;·&nbsp; [Comparison](docs/COMPARISON.md)</sub>
 
 </div>
 
 ---
 
 > ### Status: Alpha
-> RTRT is early. **v0.1.0** is the active development line aimed at a `v0.2.0-rc1` cut: every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible), vector + BM25 + graph + HNSW memory, the 10-tab axum dashboard, and curl-pipe install + uninstall — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. The tag is held back until live API smoke tests pass in the user environment. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. **v0.1.0** is the active development line. Every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible / Ollama via OAI-compat), BM25 + vector + graph + HNSW memory, auto-capture pipeline (SHA-256 dedup + secret redaction + session id + hourly consolidation), curl-pipe install / uninstall, criterion benchmarks — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. The tag is held back until live-key smoke tests pass in the user environment. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
-RTRT consolidates four token-reduction techniques behind one CLI, one MCP server, and one web dashboard. It is written entirely in Rust, edition 2024, with zero unsafe in the core crates. Reference projects are reimplemented in Rust rather than vendored.
+## What RTRT is
+
+A **Unix-philosophy toolkit** for AI agents. Three pillars:
+
+1. **Cut tokens.** Rule + ML compressors, tree-sitter signature extractor, command-output filter, secret redactor.
+2. **Remember everything.** Auto-capture every event into a local SQLite store. SHA-256 dedup, privacy filter, session id, hourly consolidation — none of it manual.
+3. **Route to any LLM, prefer local.** Anthropic / OpenAI / Ollama / vLLM / LM Studio behind one trait. Response cache, budget meter, retry + fallback.
+
+The design is documented in [`DESIGN.md`](DESIGN.md) and the perf SLOs in [`docs/PERF.md`](docs/PERF.md). The repo follows ten short principles: tools-not-frameworks, stable substrates, three pillars only, auto-capture by default, optional crates instead of scope creep, measured performance, local-first, frozen public interfaces, slow / deep growth.
 
 ## Quick install
 

@@ -219,6 +219,74 @@ The dashboard serves:
 
 All `/api/*` routes are gated by a bearer-token middleware when `RTRT_DASHBOARD_TOKEN` is set; the bundled HTML index and `/healthz` stay open. Non-loopback bind without a token logs a startup warning.
 
+## Auto-capture pipeline
+
+The dashboard auto-saves every successful `/api/chat`, `/api/compress`, `/api/diagnose`, and `/api/proxy` request into the memory store. The Claude Code plugin under [`plugins/claude-code/rtrt/`](../plugins/claude-code/rtrt/) does the same for every hook fire (PreToolUse / PostToolUse / UserPromptSubmit / Stop / SessionStart / SessionEnd).
+
+Every captured event runs through this pipeline:
+
+```
+event fires
+  ├─ 1. SHA-256 dedup       (5-minute window, configurable)
+  ├─ 2. Privacy filter      (AWS / GitHub / OpenAI / Anthropic / Slack /
+  │                          Bearer / private-key / api_key=… redacted)
+  ├─ 3. Raw save to SQLite  (FTS5 + BM25 auto-indexed)
+  ├─ 4. Session id tag      (one UUID per process)
+  └─ 5. Optional LLM compress in a background task (off by default)
+```
+
+### Configuration
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `RTRT_AUTO_CAPTURE` | `1` | Master switch for the dashboard auto-capture pipeline |
+| `RTRT_AUTO_REDACT` | `1` | Run `redact_secrets` before saving |
+| `RTRT_AUTO_DEDUP_WINDOW_SEC` | `300` | Skip duplicate body hashes seen within N seconds |
+| `RTRT_DEFAULT_PROJECT` | `default` | Project bucket for dashboard captures |
+| `RTRT_CONSOLIDATE_INTERVAL_SEC` | `3600` | Hourly archive sweep cadence (0 disables) |
+| `RTRT_CONSOLIDATE_KEEP` | `1000` | Rows kept per project after each sweep |
+
+### Plugin install
+
+```bash
+# Copy the plugin into Claude Code's plugin cache.
+mkdir -p ~/.claude/plugins/cache/rtrt
+cp -R plugins/claude-code/rtrt/* ~/.claude/plugins/cache/rtrt/
+chmod +x ~/.claude/plugins/cache/rtrt/hooks/*.sh
+
+# Enable in your Claude Code settings.json:
+#   "plugins": ["rtrt"]
+```
+
+The hooks write via `rtrt` CLI when it is on `PATH` (`RTRT_BIN` overrides), or fall back to `POST /api/memory/save` when `RTRT_DASHBOARD_URL` is set (with `RTRT_DASHBOARD_TOKEN` for the bearer header).
+
+### Live activity stream
+
+`GET /api/stream` is a Server-Sent Events endpoint. Every successful auto-capture pushes a JSON event:
+
+```json
+{"type":"memory.save","id":42,"kind":"post-tool-use","project":"rtrt","session":"..."}
+```
+
+Subscribe with any SSE client (curl `--no-buffer` works) to drive a live feed without polling `/api/metrics`.
+
+### Token usage
+
+`GET /api/tokens/summary` aggregates the gateway's request history into hourly and daily buckets — `{hour_ts, calls, input_tokens, output_tokens}` and the daily equivalent. Use it to plot spend or to set alarms.
+
+### Consolidation
+
+The hourly daemon runs `archive_overflow_no_llm` on every project that exceeds `RTRT_CONSOLIDATE_KEEP`. Oldest rows are dropped, newer rows stay. Manual control:
+
+```bash
+# CLI: keep last 20 rows, drop the rest (writes a single summary row).
+rtrt memory compress --project rtrt --keep 20 --provider openai-compat \
+   --base-url http://127.0.0.1:11434/v1 --model llama3.2
+
+# MCP: same operation, LLM-free.
+# memory_consolidate { project: "rtrt", keep: 20 }
+```
+
 ## Configuration file
 
 Planned (`~/.rtrt/config.toml`). See `crates/rtrt-core/src/config.rs` for the schema; `Config::default()` is the only currently-supported loader.

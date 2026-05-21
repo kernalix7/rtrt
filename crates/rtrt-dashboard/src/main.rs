@@ -49,12 +49,17 @@ struct AppState {
     prompts: Option<Arc<PromptRegistry>>,
     memory: Option<Arc<Mutex<MemoryStore>>>,
     auto_capture: bool,
+    auto_redact: bool,
     default_project: String,
+    session_id: String,
+    dedup_window_sec: i64,
 }
 
 impl AppState {
-    /// Best-effort auto-save into the memory store. Failures are logged and
-    /// swallowed so the calling handler still returns the user-visible result.
+    /// Best-effort auto-save into the memory store. Pipeline:
+    /// 1. Privacy filter (`redact_secrets`) when `auto_redact` is true.
+    /// 2. SHA-256 dedup against the last `dedup_window_sec` seconds.
+    /// 3. Insert raw row, then tag it with session_id + body_sha.
     async fn capture(
         &self,
         kind: &str,
@@ -65,18 +70,42 @@ impl AppState {
             return;
         }
         let Some(store) = &self.memory else { return };
+        let filtered = if self.auto_redact {
+            rtrt_compress::redact_secrets(body)
+        } else {
+            body.to_string()
+        };
         let project = self.default_project.clone();
-        let body = body.to_string();
         let kind = kind.to_string();
         let metadata = metadata.clone();
+        let session = self.session_id.clone();
+        let window = self.dedup_window_sec;
         let guard = store.lock().await;
+        let sha = rtrt_memory::MemoryStore::body_sha(&filtered);
+        if window > 0
+            && let Ok(Some(last_ts)) = guard.body_seen_at(&project, &sha)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now.saturating_sub(last_ts) < window {
+                tracing::debug!(kind = %kind, "auto-capture deduped within {window}s window");
+                return;
+            }
+        }
         let result = if metadata.is_empty() {
-            guard.save(&project, &kind, &body)
+            guard.save(&project, &kind, &filtered)
         } else {
-            guard.save_with_metadata(&project, &kind, &body, &metadata)
+            guard.save_with_metadata(&project, &kind, &filtered, &metadata)
         };
-        if let Err(e) = result {
-            tracing::warn!("auto-capture {kind}: {e}");
+        match result {
+            Ok(id) => {
+                if let Err(e) = guard.tag_row(id, Some(&session), Some(&sha)) {
+                    tracing::warn!("auto-capture tag {kind}: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("auto-capture {kind}: {e}"),
         }
     }
 }
@@ -105,22 +134,35 @@ async fn main() -> Result<()> {
     let auto_capture = std::env::var("RTRT_AUTO_CAPTURE")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(true);
+    let auto_redact = std::env::var("RTRT_AUTO_REDACT")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let dedup_window_sec: i64 = std::env::var("RTRT_AUTO_DEDUP_WINDOW_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     let default_project =
         std::env::var("RTRT_DEFAULT_PROJECT").unwrap_or_else(|_| "default".into());
+    let session_id = uuid::Uuid::new_v4().to_string();
     if auto_capture {
         tracing::info!(
-            "auto-capture on (project={default_project}, kinds=chat/compress/diagnose/proxy)"
+            "auto-capture on (project={default_project}, redact={auto_redact}, dedup_window={dedup_window_sec}s, session={session_id})"
         );
     } else {
         tracing::info!("auto-capture off (RTRT_AUTO_CAPTURE=0)");
     }
+    let memory_for_daemon = memory.clone();
     let state = AppState {
         gateway,
         prompts,
         memory,
         auto_capture,
+        auto_redact,
         default_project,
+        session_id,
+        dedup_window_sec,
     };
+    spawn_consolidation_daemon(memory_for_daemon);
 
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
@@ -169,6 +211,60 @@ async fn main() -> Result<()> {
     tracing::info!("rtrt-dashboard listening on http://{bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Hourly background sweep — keeps each project's row count under
+/// `RTRT_CONSOLIDATE_KEEP` (default 1000) using the LLM-free archive path.
+/// Disabled when `RTRT_CONSOLIDATE_INTERVAL_SEC=0`.
+fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
+    let interval_sec: u64 = std::env::var("RTRT_CONSOLIDATE_INTERVAL_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    if interval_sec == 0 {
+        tracing::info!("consolidation daemon off (RTRT_CONSOLIDATE_INTERVAL_SEC=0)");
+        return;
+    }
+    let keep: usize = std::env::var("RTRT_CONSOLIDATE_KEEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let Some(store) = memory else {
+        tracing::info!("consolidation daemon off (no memory store)");
+        return;
+    };
+    tracing::info!(
+        "consolidation daemon every {interval_sec}s, keep {keep} most-recent rows per project"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_sec));
+        // The first tick fires immediately — skip it so the daemon doesn't
+        // sweep on startup before any rows have accumulated.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let guard = store.lock().await;
+            let projects = match guard.projects() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("consolidate: list projects: {e}");
+                    continue;
+                }
+            };
+            for (project, count, _) in projects {
+                if count <= keep {
+                    continue;
+                }
+                match guard.archive_overflow_no_llm(&project, keep) {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(project = %project, removed, kept = keep, "consolidated");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("consolidate {project}: {e}"),
+                }
+            }
+        }
+    });
 }
 
 async fn index() -> Html<&'static str> {

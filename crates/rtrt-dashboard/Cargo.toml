@@ -19,6 +19,7 @@ rtrt-memory.workspace = true
 rtrt-proxy.workspace = true
 rtrt-templates.workspace = true
 rtrt-providers.workspace = true
+uuid.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

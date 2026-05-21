@@ -195,6 +195,63 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v4: add `session_id` and `body_sha` columns for the auto-capture
+        // pipeline. session_id groups every event fired during one agent
+        // session; body_sha indexes the SHA-256 of the body so the dedup
+        // path can answer "have I seen this in the last 5 minutes?" in O(1).
+        if v < 4 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    ALTER TABLE memories ADD COLUMN session_id TEXT;
+                    ALTER TABLE memories ADD COLUMN body_sha   TEXT;
+                    CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
+                    CREATE INDEX IF NOT EXISTS idx_memories_body_sha ON memories(body_sha, created_at);
+                    PRAGMA user_version = 4;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Compute a hex SHA-256 of `body`. Stable across machines, used by the
+    /// dedup index.
+    pub fn body_sha(body: &str) -> String {
+        let mut h = sha2::Sha256::new();
+        use sha2::Digest;
+        h.update(body.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// Returns the most recent created_at for a body hash, or None when this
+    /// hash hasn't been seen. Used by the auto-capture pipeline to decide
+    /// whether to skip a save inside the dedup window.
+    pub fn body_seen_at(&self, project: &str, sha: &str) -> Result<Option<i64>> {
+        let row: rusqlite::Result<i64> = self.conn.query_row(
+            "SELECT created_at FROM memories WHERE project = ?1 AND body_sha = ?2 \
+             ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![project, sha],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(ts) => Ok(Some(ts)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(Error::Memory(e.to_string())),
+        }
+    }
+
+    /// Tag the most recently inserted row (or a specific id) with a session
+    /// and / or body_sha. Best-effort: skipped on error.
+    pub fn tag_row(&self, id: i64, session_id: Option<&str>, body_sha: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memories SET session_id = COALESCE(?2, session_id), \
+                                       body_sha   = COALESCE(?3, body_sha) \
+                 WHERE id = ?1",
+                rusqlite::params![id, session_id, body_sha],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
     }
 

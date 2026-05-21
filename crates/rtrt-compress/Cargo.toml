@@ -20,6 +20,9 @@ tree-sitter = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -37,6 +40,11 @@ treesitter = [
     "dep:tree-sitter-python",
     "dep:tree-sitter-typescript",
 ]
+# Enables `OnnxImportance` — real LLMLingua-2-style token-importance scoring
+# via an ONNX-runtime session + HuggingFace tokenizer. Requires the user to
+# provide both files on disk (no model auto-download). Uses `ort`'s
+# `load-dynamic` so the ONNX Runtime shared library is resolved at runtime.
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [dev-dependencies]
 criterion = { workspace = true }

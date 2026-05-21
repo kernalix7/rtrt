@@ -18,6 +18,8 @@ use regex::Regex;
 use rtrt_core::CompressionLevel;
 
 pub mod ml;
+#[cfg(feature = "onnx")]
+pub mod ml_onnx;
 pub mod secrets;
 
 #[cfg(feature = "llm-compress")]

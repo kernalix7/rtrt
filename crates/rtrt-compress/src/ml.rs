@@ -79,6 +79,19 @@ impl MlCompressor {
         Self::new(Box::new(HeuristicImportance))
     }
 
+    /// Construct a compressor backed by an on-disk ONNX model + tokenizer.
+    /// The caller is responsible for placing the two files on disk — no
+    /// auto-download is performed. See `OnnxImportance` for the model
+    /// contract (input names, output shape).
+    #[cfg(feature = "onnx")]
+    pub fn onnx(
+        model_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let scorer = crate::ml_onnx::OnnxImportance::new(model_path, tokenizer_path)?;
+        Ok(Self::new(Box::new(scorer)))
+    }
+
     pub fn scorer_name(&self) -> &'static str {
         self.scorer.name()
     }

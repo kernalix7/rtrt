@@ -58,6 +58,14 @@ enum Cmd {
         /// Target ratio for --ml (fraction of input tokens to keep). Default 0.5.
         #[arg(long, default_value_t = 0.5)]
         ratio: f32,
+        /// ONNX model path for `--ml` (requires `--features onnx` build). When
+        /// set, the LLMLingua-style token-importance backend runs the model
+        /// instead of the heuristic scorer.
+        #[arg(long, env = "RTRT_ONNX_MODEL")]
+        onnx_model: Option<PathBuf>,
+        /// HuggingFace `tokenizer.json` path that matches `--onnx-model`.
+        #[arg(long, env = "RTRT_ONNX_TOKENIZER")]
+        onnx_tokenizer: Option<PathBuf>,
     },
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
@@ -494,6 +502,8 @@ async fn main() -> Result<()> {
             format,
             ml,
             ratio,
+            onnx_model,
+            onnx_tokenizer,
         } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -506,7 +516,18 @@ async fn main() -> Result<()> {
                 print!("{out}");
             } else if ml {
                 let target = rtrt_compress::CompressionTarget::new(ratio)?;
-                let compressor = rtrt_compress::MlCompressor::heuristic();
+                let compressor = match (&onnx_model, &onnx_tokenizer) {
+                    #[cfg(feature = "onnx")]
+                    (Some(m), Some(t)) => rtrt_compress::MlCompressor::onnx(m, t)?,
+                    #[cfg(not(feature = "onnx"))]
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "--onnx-model requires the `onnx` cargo feature; rebuild with `cargo build --features onnx`"
+                    ),
+                    (Some(_), None) | (None, Some(_)) => {
+                        anyhow::bail!("--onnx-model and --onnx-tokenizer must be set together")
+                    }
+                    (None, None) => rtrt_compress::MlCompressor::heuristic(),
+                };
                 print!("{}", compressor.compress(&buf, target));
             } else {
                 let compressor = Compressor::new(level.into());

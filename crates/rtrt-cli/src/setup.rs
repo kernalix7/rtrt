@@ -116,7 +116,18 @@ const PLUGIN_FILES: &[(&str, &str, bool)] = &[
 
 pub fn run(plan: SetupPlan) -> Result<()> {
     let binary = plan.binary.to_string_lossy().to_string();
-    let memory_path = plan.memory_path.clone();
+    // Default to ~/.rtrt/memory.sqlite (absolute) so the MCP server, the
+    // plugin hooks (via `_common.sh`'s same default), and any ad-hoc CLI
+    // invocation all read and write the same SQLite file. Without this the
+    // MCP server falls back to a cwd-relative path and ends up on a
+    // different store than the rest of the toolchain.
+    let memory_path = Some(plan.memory_path.clone().unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join(".rtrt").join("memory.sqlite")
+    }));
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
     }

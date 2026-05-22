@@ -136,6 +136,20 @@ enum Cmd {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+    /// Reverse a previous `rtrt setup`. Drops the `rtrt` MCP entry from the
+    /// agent's config; with `--plugin`, also removes the bundled plugin
+    /// tree + un-enables it in `~/.claude/settings.json`. Dry-run by
+    /// default; pass `--apply` to actually delete.
+    Uninstall {
+        #[arg(short, long, value_enum)]
+        agent: AgentKind,
+        #[arg(long)]
+        apply: bool,
+        /// Also remove the Claude Code hook plugin (only with
+        /// `--agent claude`).
+        #[arg(long)]
+        plugin: bool,
+    },
     /// Wire RTRT into a popular coding agent's MCP config.
     Setup {
         /// Target agent.
@@ -150,6 +164,12 @@ enum Cmd {
         /// Override the discovered `rtrt-mcp` binary path.
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Also install the Claude Code hook plugin (only valid with
+        /// `--agent claude`). Writes the embedded plugin tree to
+        /// `~/.claude/plugins/cache/rtrt/` and adds `"rtrt"` to the
+        /// `plugins` array in `~/.claude/settings.json`.
+        #[arg(long)]
+        plugin: bool,
     },
     /// Extract top-level signatures from source via tree-sitter (drops bodies).
     Signatures {
@@ -763,11 +783,25 @@ async fn main() -> Result<()> {
                 anyhow::bail!("rtrt-mcp exited with status {status}");
             }
         }
+        Cmd::Uninstall {
+            agent,
+            apply,
+            plugin,
+        } => {
+            if plugin && !matches!(agent, setup::AgentKind::Claude) {
+                anyhow::bail!("--plugin is only valid with --agent claude");
+            }
+            setup::uninstall_agent(agent, apply)?;
+            if plugin {
+                setup::uninstall_claude_plugin(apply)?;
+            }
+        }
         Cmd::Setup {
             agent,
             apply,
             memory,
             binary,
+            plugin,
         } => {
             let binary = binary.unwrap_or_else(|| {
                 // Best-effort: assume `rtrt-mcp` is on PATH at the same prefix as the running CLI.
@@ -781,6 +815,7 @@ async fn main() -> Result<()> {
                 apply,
                 memory_path: memory,
                 binary,
+                plugin,
             })?;
         }
         Cmd::RepoMap {

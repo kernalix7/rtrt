@@ -247,7 +247,7 @@ enum MemoryCmd {
         #[arg(long, default_value = "note")]
         kind: String,
         body: Option<String>,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
         /// Metadata pair `key=value` (repeatable) — wires into qdrant-style
         /// payload filtering on recall.
@@ -267,7 +267,7 @@ enum MemoryCmd {
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
         /// qdrant-style payload filter (e.g. `source=claude,topic~^auth`).
         #[arg(long)]
@@ -277,7 +277,7 @@ enum MemoryCmd {
     Export {
         #[arg(long)]
         project: String,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
         /// Destination file. `-` (or omit) writes to stdout.
         #[arg(long)]
@@ -285,7 +285,7 @@ enum MemoryCmd {
     },
     /// Import JSON Lines emitted by `rtrt memory export` (stdin if `--in` omitted).
     Import {
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
         /// Source file. `-` (or omit) reads from stdin.
         #[arg(long = "in")]
@@ -304,7 +304,7 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
     },
     /// Compress old memories — keep the most recent N, summarise the rest.
@@ -319,7 +319,7 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
     },
 }
@@ -433,7 +433,7 @@ enum BlockCmd {
         project: String,
         name: String,
         body: Option<String>,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
     },
     /// Print one block.
@@ -441,14 +441,14 @@ enum BlockCmd {
         #[arg(long)]
         project: String,
         name: String,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
     },
     /// List every block in a project.
     List {
         #[arg(long)]
         project: String,
-        #[arg(long, default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
         store: PathBuf,
     },
 }

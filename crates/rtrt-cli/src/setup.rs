@@ -32,86 +32,23 @@ pub struct SetupPlan {
     pub plugin: bool,
 }
 
-/// Files that make up the bundled Claude Code plugin. Each entry is
-/// `(relative_path, contents, executable)`. Sourced at compile time from
-/// `plugins/claude-code/rtrt/` via `include_str!` so the binary needs no
-/// network or repo checkout to install the plugin.
-const PLUGIN_FILES: &[(&str, &str, bool)] = &[
-    (
-        ".claude-plugin/plugin.json",
-        include_str!("../../../plugins/claude-code/rtrt/.claude-plugin/plugin.json"),
-        false,
-    ),
-    (
-        "README.md",
-        include_str!("../../../plugins/claude-code/rtrt/README.md"),
-        false,
-    ),
-    (
-        "hooks/_common.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/_common.sh"),
-        true,
-    ),
-    (
-        "hooks/pre_tool_use.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/pre_tool_use.sh"),
-        true,
-    ),
-    (
-        "hooks/post_tool_use.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/post_tool_use.sh"),
-        true,
-    ),
-    (
-        "hooks/post_tool_use_failure.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/post_tool_use_failure.sh"),
-        true,
-    ),
-    (
-        "hooks/pre_compact.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/pre_compact.sh"),
-        true,
-    ),
-    (
-        "hooks/user_prompt_submit.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/user_prompt_submit.sh"),
-        true,
-    ),
-    (
-        "hooks/post_user_prompt_submit.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/post_user_prompt_submit.sh"),
-        true,
-    ),
-    (
-        "hooks/notification.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/notification.sh"),
-        true,
-    ),
-    (
-        "hooks/stop.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/stop.sh"),
-        true,
-    ),
-    (
-        "hooks/subagent_start.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/subagent_start.sh"),
-        true,
-    ),
-    (
-        "hooks/subagent_stop.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/subagent_stop.sh"),
-        true,
-    ),
-    (
-        "hooks/session_start.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/session_start.sh"),
-        true,
-    ),
-    (
-        "hooks/session_end.sh",
-        include_str!("../../../plugins/claude-code/rtrt/hooks/session_end.sh"),
-        true,
-    ),
+/// Events that Claude Code's hook engine recognises today. Each one becomes
+/// a `~/.claude/settings.json` entry calling `rtrt hook capture <kind>`.
+/// The `kind` slug stays kebab-case so it surfaces nicely in
+/// `memory_timeline` / `memory_smart_search`.
+const HOOK_EVENTS: &[(&str, &str)] = &[
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("PostToolUseFailure", "post-tool-use-failure"),
+    ("PreCompact", "pre-compact"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("PostUserPromptSubmit", "post-user-prompt-submit"),
+    ("Notification", "notification"),
+    ("Stop", "stop"),
+    ("SubagentStart", "subagent-start"),
+    ("SubagentStop", "subagent-stop"),
+    ("SessionStart", "session-start"),
+    ("SessionEnd", "session-end"),
 ];
 
 pub fn run(plan: SetupPlan) -> Result<()> {
@@ -292,41 +229,24 @@ fn dirs_home() -> Result<PathBuf> {
     bail!("cannot resolve home dir: neither HOME nor USERPROFILE is set")
 }
 
-/// Materialises the bundled Claude Code plugin under
-/// `~/.claude/plugins/cache/rtrt/` and adds `"rtrt"` to the `plugins`
-/// array in `~/.claude/settings.json`. Dry-run prints the targets;
-/// `--apply` does the writes.
+/// Merges twelve rtrt hook entries into `~/.claude/settings.json`. Each
+/// entry shells out to `rtrt hook capture <kind>` so the binary itself
+/// owns the redact / dedup / save pipeline; no auxiliary shell scripts
+/// are required on disk. This replaces the earlier "drop files into
+/// `~/.claude/plugins/cache/rtrt/`" approach — Claude Code's plugin
+/// loader expects a marketplace layout that an out-of-band copy can't
+/// satisfy, but its `settings.json` hooks engine is well-documented and
+/// stable.
 fn install_claude_plugin(apply: bool) -> Result<()> {
-    let plugin_dir = expand_home("~/.claude/plugins/cache/rtrt")?;
     let settings = expand_home("~/.claude/settings.json")?;
+    let rtrt_cmd = locate_rtrt_binary();
     if !apply {
-        println!("[dry-run] plugin dir:   {}", plugin_dir.display());
-        println!("[dry-run] settings:     {}", settings.display());
-        println!("[dry-run] files:        {} entries", PLUGIN_FILES.len());
-        println!("Re-run with --apply to write the plugin tree + enable it.");
+        println!("[dry-run] target:      {}", settings.display());
+        println!("[dry-run] command:     {rtrt_cmd} hook capture <kind>");
+        println!("[dry-run] hook events: {} entries", HOOK_EVENTS.len());
+        println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
     }
-    std::fs::create_dir_all(&plugin_dir)
-        .with_context(|| format!("mkdir {}", plugin_dir.display()))?;
-    for (rel, contents, executable) in PLUGIN_FILES {
-        let target = plugin_dir.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir {}", parent.display()))?;
-        }
-        std::fs::write(&target, contents).with_context(|| format!("write {}", target.display()))?;
-        #[cfg(unix)]
-        if *executable {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&target, perms)
-                .with_context(|| format!("chmod {}", target.display()))?;
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
-    }
-    println!("plugin written to {}", plugin_dir.display());
-
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -346,71 +266,132 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
     if !root.is_object() {
         bail!("{}: root is not a JSON object", settings.display());
     }
-    let obj = root.as_object_mut().unwrap();
-    let plugins = obj
-        .entry("plugins")
-        .or_insert_with(|| serde_json::json!([]));
-    if !plugins.is_array() {
-        bail!("{}: plugins exists but is not an array", settings.display());
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        bail!("{}: hooks exists but is not an object", settings.display());
     }
-    let arr = plugins.as_array_mut().unwrap();
-    let already = arr.iter().any(|v| v.as_str() == Some("rtrt"));
-    if !already {
-        arr.push(serde_json::Value::String("rtrt".into()));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+    for (event, kind) in HOOK_EVENTS {
+        let command = format!("{rtrt_cmd} hook capture {kind}");
+        let entry = serde_json::json!({
+            "matcher": "rtrt",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 5
+                }
+            ]
+        });
+        let arr = hooks_obj
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !arr.is_array() {
+            bail!(
+                "{}: hooks.{event} exists but is not an array",
+                settings.display()
+            );
+        }
+        let arr_mut = arr.as_array_mut().unwrap();
+        // Drop any prior rtrt entry so re-running setup is idempotent.
+        arr_mut.retain(|item| item.get("matcher").and_then(|v| v.as_str()) != Some("rtrt"));
+        arr_mut.push(entry);
     }
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
-    if already {
-        println!("settings already lists `rtrt` in plugins; left as-is");
+    println!(
+        "merged {} hook entries into {}",
+        HOOK_EVENTS.len(),
+        settings.display()
+    );
+    Ok(())
+}
+
+/// Reverse of `install_claude_plugin`. Removes every rtrt-tagged hook
+/// from `~/.claude/settings.json`. Older installs also dropped the
+/// plugin cache directory + a `plugins` array entry — those are cleared
+/// here too so an upgrade-in-place is clean.
+pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
+    let settings = expand_home("~/.claude/settings.json")?;
+    let legacy_plugin_dir = expand_home("~/.claude/plugins/cache/rtrt")?;
+    if !apply {
+        println!(
+            "[dry-run] would unset rtrt hook entries in {}",
+            settings.display()
+        );
+        if legacy_plugin_dir.exists() {
+            println!(
+                "[dry-run] would remove legacy dir {}",
+                legacy_plugin_dir.display()
+            );
+        }
+        return Ok(());
+    }
+    if legacy_plugin_dir.exists() {
+        std::fs::remove_dir_all(&legacy_plugin_dir)
+            .with_context(|| format!("rm -rf {}", legacy_plugin_dir.display()))?;
+        println!("removed legacy {}", legacy_plugin_dir.display());
+    }
+    if !settings.exists() {
+        println!("{}: not present; nothing to drop", settings.display());
+        return Ok(());
+    }
+    backup_if_needed(&settings)?;
+    let raw = std::fs::read_to_string(&settings)
+        .with_context(|| format!("read {}", settings.display()))?;
+    if raw.trim().is_empty() {
+        println!("{}: empty; nothing to drop", settings.display());
+        return Ok(());
+    }
+    let mut root: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{}: not valid JSON", settings.display()))?;
+    let mut touched = false;
+    if let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) {
+        for entries in hooks.values_mut() {
+            if let Some(arr) = entries.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|item| item.get("matcher").and_then(|v| v.as_str()) != Some("rtrt"));
+                if arr.len() != before {
+                    touched = true;
+                }
+            }
+        }
+    }
+    if let Some(arr) = root.get_mut("plugins").and_then(|v| v.as_array_mut()) {
+        let before = arr.len();
+        arr.retain(|v| v.as_str() != Some("rtrt"));
+        if arr.len() != before {
+            touched = true;
+        }
+    }
+    if touched {
+        let rendered = serde_json::to_string_pretty(&root)?;
+        std::fs::write(&settings, rendered)
+            .with_context(|| format!("write {}", settings.display()))?;
+        println!("dropped rtrt hook entries from {}", settings.display());
     } else {
-        println!("enabled in {}", settings.display());
+        println!("{}: no rtrt entries to drop", settings.display());
     }
     Ok(())
 }
 
-/// Reverse of `install_claude_plugin`. Removes the embedded plugin tree
-/// and drops `"rtrt"` from the settings.json `plugins` array. Best-effort:
-/// missing pieces are reported but not fatal.
-pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
-    let plugin_dir = expand_home("~/.claude/plugins/cache/rtrt")?;
-    let settings = expand_home("~/.claude/settings.json")?;
-    if !apply {
-        println!("[dry-run] would remove dir: {}", plugin_dir.display());
-        println!("[dry-run] would unset `rtrt` in {}", settings.display());
-        println!("Re-run with --apply to remove.");
-        return Ok(());
-    }
-    if plugin_dir.exists() {
-        std::fs::remove_dir_all(&plugin_dir)
-            .with_context(|| format!("rm -rf {}", plugin_dir.display()))?;
-        println!("removed {}", plugin_dir.display());
-    } else {
-        println!("plugin dir not present: {}", plugin_dir.display());
-    }
-    if settings.exists() {
-        backup_if_needed(&settings)?;
-        let raw = std::fs::read_to_string(&settings)
-            .with_context(|| format!("read {}", settings.display()))?;
-        if raw.trim().is_empty() {
-            println!("{}: empty; nothing to drop", settings.display());
-            return Ok(());
-        }
-        let mut root: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("{}: not valid JSON", settings.display()))?;
-        if let Some(arr) = root.get_mut("plugins").and_then(|v| v.as_array_mut()) {
-            let before = arr.len();
-            arr.retain(|v| v.as_str() != Some("rtrt"));
-            if arr.len() != before {
-                let rendered = serde_json::to_string_pretty(&root)?;
-                std::fs::write(&settings, rendered)
-                    .with_context(|| format!("write {}", settings.display()))?;
-                println!("dropped `rtrt` from {}", settings.display());
-            } else {
-                println!("{}: `rtrt` was not listed", settings.display());
+/// Pick the `rtrt` command to embed in the hook line. Prefers the binary
+/// next to the running CLI; falls back to the bare `rtrt` symbol so
+/// `PATH` lookup still works on machines without `~/.local/bin` quoting.
+fn locate_rtrt_binary() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("rtrt");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
             }
         }
     }
-    Ok(())
+    "rtrt".to_string()
 }
 
 /// Reverse of `apply_json` / `apply_codex_toml`. Removes the `rtrt` MCP

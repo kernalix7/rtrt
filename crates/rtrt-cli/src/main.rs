@@ -137,20 +137,32 @@ enum Cmd {
         binary: Option<PathBuf>,
     },
     /// Reverse a previous `rtrt setup`. Drops the `rtrt` MCP entry from the
-    /// agent's config; with `--plugin`, also removes the bundled plugin
-    /// tree + un-enables it in `~/.claude/settings.json`. Dry-run by
-    /// default; pass `--apply` to actually delete.
+    /// agent's config; with `--plugin`, also removes the twelve rtrt
+    /// hook entries from `~/.claude/settings.json`. Dry-run by default;
+    /// pass `--apply` to actually delete.
     Uninstall {
         #[arg(short, long, value_enum)]
         agent: AgentKind,
         #[arg(long)]
         apply: bool,
-        /// Also remove the Claude Code hook plugin (only with
+        /// Also remove the Claude Code hook entries (only with
         /// `--agent claude`).
         #[arg(long)]
         plugin: bool,
     },
-    /// Wire RTRT into a popular coding agent's MCP config.
+    /// Capture a hook payload — used by the `~/.claude/settings.json`
+    /// entries that `rtrt setup --plugin --apply` installs. Reads the
+    /// payload on stdin, strips control bytes, applies `redact_secrets`,
+    /// and writes a memory row with the supplied kind. Exits 0 even on
+    /// error so a hook never blocks the host agent.
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
+    },
+    /// Wire RTRT into a popular coding agent's MCP config. `--plugin`
+    /// (Claude only) also merges twelve hook entries into
+    /// `~/.claude/settings.json` so every PreToolUse / PostToolUse /
+    /// SessionStart etc. auto-captures into the memory store.
     Setup {
         /// Target agent.
         #[arg(short, long, value_enum)]
@@ -256,6 +268,25 @@ enum Cmd {
     },
     /// Show RTRT version + crate manifest.
     Info,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCmd {
+    /// Save the stdin payload as a memory row tagged with `kind`. Intended
+    /// to be the entry point for `~/.claude/settings.json` hook commands.
+    Capture {
+        /// Memory `kind` to tag the row with — e.g. `pre-tool-use`,
+        /// `post-tool-use`, `session-start`. Free-form.
+        kind: String,
+        /// Project bucket. Defaults to `$RTRT_PROJECT` or the basename of
+        /// the current working directory.
+        #[arg(long)]
+        project: Option<String>,
+        /// Memory store path. Defaults to `~/.rtrt/memory.sqlite` so every
+        /// hook fire lands in the same SQLite file as the MCP server.
+        #[arg(long, env = "RTRT_MEMORY_PATH")]
+        store: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -796,6 +827,13 @@ async fn main() -> Result<()> {
                 setup::uninstall_claude_plugin(apply)?;
             }
         }
+        Cmd::Hook { cmd } => {
+            // Hook entry points must never bubble an error up to the host
+            // agent, so any failure here is logged to stderr and swallowed.
+            if let Err(e) = run_hook_capture(cmd) {
+                eprintln!("rtrt hook: {e}");
+            }
+        }
         Cmd::Setup {
             agent,
             apply,
@@ -1164,6 +1202,57 @@ fn run_prompt(cmd: PromptCmd) -> Result<()> {
                     p.body.len()
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn default_memory_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rtrt")
+        .join("memory.sqlite")
+}
+
+fn run_hook_capture(cmd: HookCmd) -> Result<()> {
+    match cmd {
+        HookCmd::Capture {
+            kind,
+            project,
+            store,
+        } => {
+            let mut body = String::new();
+            std::io::stdin().read_to_string(&mut body).ok();
+            // Strip control bytes (ANSI escapes etc.) and clip to 4 KB to
+            // keep a noisy tool result from bloating the row.
+            let cleaned: String = body
+                .chars()
+                .filter(|c| !c.is_control() || matches!(*c, '\n' | '\r' | '\t'))
+                .take(4096)
+                .collect();
+            if cleaned.trim().is_empty() {
+                return Ok(());
+            }
+            let redacted = rtrt_compress::redact_secrets(&cleaned);
+            let project = project
+                .or_else(|| std::env::var("RTRT_PROJECT").ok())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                        .unwrap_or_else(|| "default".to_string())
+                });
+            let store_path = store.unwrap_or_else(default_memory_path);
+            if let Some(parent) = store_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let memory = MemoryStore::open(&store_path)
+                .with_context(|| format!("open memory store {}", store_path.display()))?;
+            let mut meta: BTreeMap<String, String> = BTreeMap::new();
+            meta.insert("source".into(), "claude-code".into());
+            memory.save_with_metadata(&project, &kind, &redacted, &meta)?;
         }
     }
     Ok(())

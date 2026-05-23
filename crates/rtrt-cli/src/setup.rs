@@ -363,6 +363,18 @@ pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
                 }
             }
         }
+        // Drop any hook event keys that we left empty after stripping rtrt
+        // — Claude Code's settings parser warns on event names that are
+        // either unrecognised or carry no matchers, so an empty array is
+        // worse than the missing key.
+        let empty_keys: Vec<String> = hooks
+            .iter()
+            .filter_map(|(k, v)| v.as_array().filter(|arr| arr.is_empty()).map(|_| k.clone()))
+            .collect();
+        for k in empty_keys {
+            hooks.remove(&k);
+            touched = true;
+        }
     }
     if let Some(arr) = root.get_mut("plugins").and_then(|v| v.as_array_mut()) {
         let before = arr.len();

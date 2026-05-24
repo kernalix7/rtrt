@@ -1645,6 +1645,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .hist-item .when { color: var(--muted); font-size: 0.82em; min-width: 72px; font-variant-numeric: tabular-nums; }
   .hist-item .kind { color: var(--accent); font-size: 0.78em; min-width: 60px; }
   .hist-item .body { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .hist-item .body-json { margin: 0; padding: 0.5rem 0.6rem; background: var(--code-bg, rgba(127,127,127,0.1)); border-radius: 6px; font-family: ui-monospace, monospace; font-size: 0.8em; max-height: 16rem; overflow: auto; white-space: pre; }
   .pager { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.85rem; justify-content: center; }
   .pager button:disabled { opacity: 0.4; cursor: default; }
 
@@ -2146,6 +2147,27 @@ function openProject(name) {
 const HISTORY_PAGE_SIZE = 50;
 let HISTORY_OFFSET = 0;
 let HISTORY_TOTAL = 0;
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Render a memory body. Legacy rows (and provider_chat captures) may hold a
+// raw JSON payload; pretty-print those in a monospace block. Plain-text
+// summaries (the current hook-capture format) render inline escaped.
+function renderBody(body) {
+  const t = (body || '').trim();
+  if (t.startsWith('{') || t.startsWith('[')) {
+    try {
+      const pretty = JSON.stringify(JSON.parse(t), null, 2);
+      return `<pre class="body-json">${escapeHtml(pretty)}</pre>`;
+    } catch (_) { /* not valid JSON — fall through */ }
+  }
+  return escapeHtml(t);
+}
+
 async function loadHistory(name, offset) {
   if (offset === undefined) offset = 0;
   HISTORY_OFFSET = offset;
@@ -2165,7 +2187,7 @@ async function loadHistory(name, offset) {
     `<div class="hist-item">
        <span class="when">${relativeTime(i.created_at)}</span>
        <span class="kind">${i.kind}</span>
-       <span class="body">${i.body.replace(/</g, '&lt;')}</span>
+       <span class="body">${renderBody(i.body)}</span>
      </div>`
   ).join('');
   const pager = document.getElementById('history-pager');

@@ -1223,11 +1223,20 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
             project,
             store,
         } => {
-            let mut body = String::new();
-            std::io::stdin().read_to_string(&mut body).ok();
-            // Strip control bytes (ANSI escapes etc.) and clip to 4 KB to
-            // keep a noisy tool result from bloating the row.
-            let cleaned: String = body
+            let mut raw = String::new();
+            std::io::stdin().read_to_string(&mut raw).ok();
+            if raw.trim().is_empty() {
+                return Ok(());
+            }
+            // Extract a human-readable summary from the Claude Code hook
+            // payload (JSON). Falls back to the raw text when the payload
+            // isn't JSON. Returns None for low-signal events we choose to
+            // skip (e.g. an empty prompt or a tool with no useful input).
+            let Some(summary) = summarize_hook_payload(&kind, &raw) else {
+                return Ok(());
+            };
+            // Strip control bytes and clip to 4 KB.
+            let cleaned: String = summary
                 .chars()
                 .filter(|c| !c.is_control() || matches!(*c, '\n' | '\r' | '\t'))
                 .take(4096)
@@ -1250,12 +1259,106 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
             }
             let memory = MemoryStore::open(&store_path)
                 .with_context(|| format!("open memory store {}", store_path.display()))?;
+            // Dedup: skip if an identical body landed in this project within
+            // the window. Kills the repeated near-identical PostToolBatch /
+            // PostToolUse rows a busy session produces.
+            let window: i64 = std::env::var("RTRT_AUTO_DEDUP_WINDOW_SEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            let sha = MemoryStore::body_sha(&redacted);
+            if window > 0 {
+                if let Ok(Some(seen_at)) = memory.body_seen_at(&project, &sha) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if now.saturating_sub(seen_at) < window {
+                        return Ok(());
+                    }
+                }
+            }
             let mut meta: BTreeMap<String, String> = BTreeMap::new();
             meta.insert("source".into(), "claude-code".into());
-            memory.save_with_metadata(&project, &kind, &redacted, &meta)?;
+            let id = memory.save_with_metadata(&project, &kind, &redacted, &meta)?;
+            let session = std::env::var("RTRT_SESSION_ID")
+                .ok()
+                .or_else(|| extract_json_str(&raw, "session_id"));
+            let _ = memory.tag_row(id, session.as_deref(), Some(&sha));
         }
     }
     Ok(())
+}
+
+/// Pull a top-level string field out of a JSON object without a full
+/// typed deserialize. Returns None when the input isn't an object or the
+/// key is absent / non-string.
+fn extract_json_str(raw: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    v.get(key)?.as_str().map(|s| s.to_string())
+}
+
+/// Turn a Claude Code hook payload into a concise, readable one-liner (or
+/// short block) keyed off the event `kind`. The payloads are JSON objects
+/// with an envelope (`session_id`, `cwd`, `hook_event_name`) plus
+/// event-specific fields. When the body isn't JSON we keep the raw text so
+/// nothing is silently lost.
+///
+/// Returns None to skip a capture entirely — used for events that carry no
+/// useful signal (blank prompt, tool call with no input).
+fn summarize_hook_payload(kind: &str, raw: &str) -> Option<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Not JSON — treat the whole thing as the body.
+        return Some(raw.trim().to_string());
+    };
+    let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let summary = match kind {
+        "pre-tool-use" | "post-tool-use" | "post-tool-use-failure" => {
+            let tool = get("tool_name");
+            let input = v
+                .get("tool_input")
+                .map(compact_json_value)
+                .unwrap_or_default();
+            let result = if kind == "post-tool-use" {
+                v.get("tool_response").map(|_| " → ok").unwrap_or("")
+            } else if kind == "post-tool-use-failure" {
+                " → failed"
+            } else {
+                ""
+            };
+            let head = if tool.is_empty() { kind } else { tool };
+            format!("{head}: {input}{result}").trim().to_string()
+        }
+        "user-prompt-submit" | "user-prompt-expansion" => get("prompt").trim().to_string(),
+        "notification" => get("message").trim().to_string(),
+        "pre-compact" | "post-compact" => {
+            let trigger = get("trigger");
+            format!("compact ({kind}) trigger={trigger}")
+                .trim()
+                .to_string()
+        }
+        "session-start" => format!("session start: {}", get("source")),
+        "session-end" => format!("session end: {}", get("reason")),
+        // Stop / SubagentStart / SubagentStop / PostToolBatch and anything
+        // else: keep a terse marker rather than the JSON envelope.
+        _ => kind.replace('-', " "),
+    };
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Render a JSON value as a compact single-line string, clipped so a giant
+/// tool input doesn't dominate the row. Strings are unquoted for brevity.
+fn compact_json_value(v: &serde_json::Value) -> String {
+    let s = match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    one_line.chars().take(200).collect()
 }
 
 async fn run_memory(cmd: MemoryCmd) -> Result<()> {

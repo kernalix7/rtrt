@@ -319,6 +319,22 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                 ]
             }));
         }
+        // On SessionEnd, run an LLM compression sweep over old rows. No-op
+        // unless RTRT_AUTO_COMPRESS_LLM=1, so it costs nothing until the
+        // user opts in — but then it runs without a dashboard daemon.
+        // Longer timeout: an LLM round-trip per row.
+        if *event == "SessionEnd" {
+            arr_mut.push(serde_json::json!({
+                "matcher": "rtrt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{rtrt_cmd} hook compress"),
+                        "timeout": 120
+                    }
+                ]
+            }));
+        }
     }
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;

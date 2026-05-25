@@ -300,6 +300,16 @@ enum HookCmd {
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
+    /// Compress old memory rows for the project via the configured LLM,
+    /// in place. Wired onto `SessionEnd` so compression runs automatically
+    /// without a long-lived dashboard daemon. No-op unless
+    /// `RTRT_AUTO_COMPRESS_LLM=1` and a provider is reachable.
+    Compress {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, env = "RTRT_MEMORY_PATH")]
+        store: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -849,6 +859,7 @@ async fn main() -> Result<()> {
                     store,
                     limit,
                 } => run_hook_recall(project, store, limit),
+                HookCmd::Compress { project, store } => run_hook_compress(project, store).await,
                 other => run_hook_capture(other),
             };
             if let Err(e) = result {
@@ -1237,9 +1248,104 @@ fn default_memory_path() -> PathBuf {
         .join("memory.sqlite")
 }
 
+/// SessionEnd compression sweep. Mirrors the dashboard's auto-compress
+/// daemon but as a one-shot CLI pass so users without a long-lived
+/// dashboard still get automatic compression. No-op unless
+/// `RTRT_AUTO_COMPRESS_LLM=1`; honours the same `RTRT_AUTO_COMPRESS_*`
+/// knobs as the daemon.
+async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> Result<()> {
+    let enabled = std::env::var("RTRT_AUTO_COMPRESS_LLM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    let project = project
+        .or_else(|| std::env::var("RTRT_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "default".to_string())
+        });
+    let store_path = store.unwrap_or_else(default_memory_path);
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let age_sec: i64 = std::env::var("RTRT_AUTO_COMPRESS_AGE_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let min_chars: usize = std::env::var("RTRT_AUTO_COMPRESS_MIN_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let batch: usize = std::env::var("RTRT_AUTO_COMPRESS_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL")
+        .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+    let max_tokens: u32 = std::env::var("RTRT_AUTO_COMPRESS_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let memory = MemoryStore::open(&store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let candidates = memory.compress_candidates(&project, now - age_sec, min_chars, batch)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let gateway = rtrt_providers::Gateway::from_env();
+    let mut compressed = 0usize;
+    for (id, body) in candidates {
+        let req = ChatRequest {
+            model: model.clone(),
+            messages: vec![
+                ChatMessage {
+                    role: Role::System,
+                    content: "You are a lossless-meaning compressor. Rewrite the user message in the shortest form that preserves every fact, decision, file path, identifier, command, and number. Drop filler, hedging, headings, and greetings. Plain text only. No commentary.".to_string(),
+                },
+                ChatMessage {
+                    role: Role::User,
+                    content: body.clone(),
+                },
+            ],
+            max_tokens: Some(max_tokens),
+            temperature: Some(0.0),
+        };
+        let Ok(resp) = gateway.chat(req).await else {
+            continue;
+        };
+        let new_body = resp.content.trim().to_string();
+        let mut meta = memory.get_metadata(id).unwrap_or_default();
+        meta.insert("compressed_at".into(), now.to_string());
+        if new_body.is_empty() || new_body.len() >= body.len() {
+            meta.insert("compressed_skip".into(), "no-shrink".into());
+            let _ = memory.set_metadata(id, &meta);
+            continue;
+        }
+        if memory.set_body(id, &new_body).is_err() {
+            continue;
+        }
+        meta.insert("compressed_model".into(), model.clone());
+        meta.insert("compressed_from_chars".into(), body.len().to_string());
+        meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+        let _ = memory.set_metadata(id, &meta);
+        compressed += 1;
+    }
+    if compressed > 0 {
+        eprintln!("rtrt hook compress: {compressed} rows compressed in {project}");
+    }
+    Ok(())
+}
+
 fn run_hook_capture(cmd: HookCmd) -> Result<()> {
     match cmd {
-        HookCmd::Recall { .. } => {}
+        HookCmd::Recall { .. } | HookCmd::Compress { .. } => {}
         HookCmd::Capture {
             kind,
             project,

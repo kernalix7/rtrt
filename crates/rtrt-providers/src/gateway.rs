@@ -338,7 +338,13 @@ impl Gateway {
                 ["gpt-", "o1-", "o3-", "o4-"],
             );
         }
-        if let Ok(url) = std::env::var("RTRT_OPENAI_COMPAT_URL") {
+        // Accept either the gateway-specific var or the same
+        // `RTRT_PROVIDER_BASE_URL` the `rtrt provider chat` CLI uses, so a
+        // single env var configures the local/OpenAI-compatible backend
+        // everywhere (CLI, dashboard daemon, SessionEnd compress hook).
+        if let Ok(url) = std::env::var("RTRT_OPENAI_COMPAT_URL")
+            .or_else(|_| std::env::var("RTRT_PROVIDER_BASE_URL"))
+        {
             let mut p = crate::OpenAICompatibleProvider::new("openai-compat", url);
             if let Ok(key) = std::env::var("RTRT_OPENAI_COMPAT_API_KEY") {
                 p = p.with_api_key(key);

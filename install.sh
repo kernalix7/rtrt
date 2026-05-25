@@ -23,6 +23,9 @@
 #   --skip-deps         Skip the toolchain check. Fail early if cargo / git
 #                       aren't already present.
 #                       (env: RTRT_SKIP_DEPS=1)
+#   --no-setup          Don't auto-refresh the Claude Code MCP config + hooks
+#                       even when a prior `rtrt setup` is detected.
+#                       (env: RTRT_NO_SETUP=1)
 #
 # Compat shims:
 #   --uninstall         Defers to uninstall.sh logic; deletes the three
@@ -46,6 +49,10 @@ INSTALL_DIR="${HOME}/.local/bin"
 SKIP_DEPS=0
 UNINSTALL=0
 DRY_RUN=0
+# Auto-reconfigure: when a prior `rtrt setup` is detected, refresh the
+# Claude Code MCP config + hooks against the just-installed binary.
+# `--no-setup` / RTRT_NO_SETUP=1 disables.
+NO_SETUP="${RTRT_NO_SETUP:-0}"
 
 # ---------- colour logger ----------
 if [ -t 1 ]; then
@@ -68,6 +75,7 @@ while [ $# -gt 0 ]; do
     --dir)           INSTALL_DIR="${2:?--dir needs a path}"; shift 2 ;;
     --skip-deps)     SKIP_DEPS=1; shift ;;
     --uninstall)     UNINSTALL=1; shift ;;
+    --no-setup)      NO_SETUP=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
     *)
@@ -159,11 +167,44 @@ install_check() {
     for bin in $BINS; do
         log "  $INSTALL_DIR/$bin"
     done
+    reconfigure_if_present
     echo
     log "Next:"
     log "  rtrt --version"
     log "  rtrt info"
     log "  rtrt templates"
+}
+
+# When a prior `rtrt setup --agent claude` is detected, refresh the MCP
+# config + hooks against the just-installed binary. This keeps the
+# wiring in lockstep with binary upgrades so the user never has to run
+# uninstall / setup by hand after an install. Skipped on --no-setup, in
+# --dry-run, and when no prior setup is found (a first-time install
+# stays non-invasive — the user opts in by running `rtrt setup`).
+reconfigure_if_present() {
+    [ "$NO_SETUP" -eq 1 ] && return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    rtrt_bin="$INSTALL_DIR/rtrt"
+    [ -x "$rtrt_bin" ] || return 0
+    claude_json="${HOME}/.claude.json"
+    settings_json="${HOME}/.claude/settings.json"
+    found=0
+    if [ -f "$claude_json" ] && grep -q '"rtrt"' "$claude_json" 2>/dev/null; then
+        found=1
+    fi
+    if [ -f "$settings_json" ] && grep -q 'rtrt hook' "$settings_json" 2>/dev/null; then
+        found=1
+    fi
+    [ "$found" -eq 0 ] && return 0
+    echo
+    log "existing Claude Code setup detected — refreshing against new binary"
+    "$rtrt_bin" uninstall --agent claude --plugin --apply >/dev/null 2>&1 || true
+    if "$rtrt_bin" setup --agent claude --plugin --apply >/dev/null 2>&1; then
+        log "  re-applied MCP config + hooks (~/.claude.json, ~/.claude/settings.json)"
+    else
+        warn "  setup refresh failed — run: rtrt setup --agent claude --plugin --apply"
+    fi
+    warn "  restart Claude Code to load the refreshed MCP server + hooks"
 }
 
 # ---------- source build helper ----------

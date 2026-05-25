@@ -287,6 +287,19 @@ enum HookCmd {
         #[arg(long, env = "RTRT_MEMORY_PATH")]
         store: Option<PathBuf>,
     },
+    /// Recall memory relevant to the stdin prompt and print it to stdout as
+    /// a context block. Wired onto `UserPromptSubmit` so Claude Code injects
+    /// the project's relevant history into the model's context automatically
+    /// — no manual `memory_recall` call needed.
+    Recall {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, env = "RTRT_MEMORY_PATH")]
+        store: Option<PathBuf>,
+        /// Max memories to inject.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -830,7 +843,15 @@ async fn main() -> Result<()> {
         Cmd::Hook { cmd } => {
             // Hook entry points must never bubble an error up to the host
             // agent, so any failure here is logged to stderr and swallowed.
-            if let Err(e) = run_hook_capture(cmd) {
+            let result = match cmd {
+                HookCmd::Recall {
+                    project,
+                    store,
+                    limit,
+                } => run_hook_recall(project, store, limit),
+                other => run_hook_capture(other),
+            };
+            if let Err(e) = result {
                 eprintln!("rtrt hook: {e}");
             }
         }
@@ -1218,6 +1239,7 @@ fn default_memory_path() -> PathBuf {
 
 fn run_hook_capture(cmd: HookCmd) -> Result<()> {
     match cmd {
+        HookCmd::Recall { .. } => {}
         HookCmd::Capture {
             kind,
             project,
@@ -1286,6 +1308,66 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 .or_else(|| extract_json_str(&raw, "session_id"));
             let _ = memory.tag_row(id, session.as_deref(), Some(&sha));
         }
+    }
+    Ok(())
+}
+
+fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize) -> Result<()> {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok();
+    // The prompt text is either the `prompt` field of a JSON payload or the
+    // whole stdin when it isn't JSON.
+    let prompt = extract_json_str(&raw, "prompt").unwrap_or_else(|| raw.trim().to_string());
+    if prompt.trim().is_empty() {
+        return Ok(());
+    }
+    let project = project
+        .or_else(|| std::env::var("RTRT_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "default".to_string())
+        });
+    let store_path = store.unwrap_or_else(default_memory_path);
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let memory = MemoryStore::open(&store_path)?;
+    // Build an FTS5 OR query: a natural-language prompt joined with spaces
+    // is treated as implicit AND by FTS5, which almost never matches a
+    // terse memory row. OR-joining the content words ranks any row sharing
+    // a term, which is what we want for context injection. Stopwords and
+    // sub-3-char tokens are dropped to cut noise.
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "this", "that", "how", "does", "what", "why", "you", "are",
+        "was", "were", "can", "should", "would", "could", "from", "into", "have", "has",
+    ];
+    let terms: Vec<String> = prompt
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 3 && !STOP.contains(&w.as_str()))
+        .take(32)
+        .collect();
+    if terms.is_empty() {
+        return Ok(());
+    }
+    let query = terms.join(" OR ");
+    let hits = memory
+        .recall_bm25(&project, &query, limit)
+        .unwrap_or_default();
+    if hits.is_empty() {
+        return Ok(());
+    }
+    // stdout of a UserPromptSubmit hook is injected into the model context.
+    println!("## Relevant project memory ({project})");
+    for h in hits {
+        let body = h.body.replace('\n', " ");
+        let clipped: String = body.chars().take(240).collect();
+        println!("- [{}] {}", h.kind, clipped);
     }
     Ok(())
 }

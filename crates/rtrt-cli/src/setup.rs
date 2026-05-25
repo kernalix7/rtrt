@@ -303,11 +303,27 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         // Drop any prior rtrt entry so re-running setup is idempotent.
         arr_mut.retain(|item| item.get("matcher").and_then(|v| v.as_str()) != Some("rtrt"));
         arr_mut.push(entry);
+        // On UserPromptSubmit, also inject relevant memory back into the
+        // model's context. The capture entry above saves the prompt; this
+        // one recalls the project's related history so the agent doesn't
+        // have to call memory_recall by hand.
+        if *event == "UserPromptSubmit" {
+            arr_mut.push(serde_json::json!({
+                "matcher": "rtrt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{rtrt_cmd} hook recall"),
+                        "timeout": 5
+                    }
+                ]
+            }));
+        }
     }
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
     println!(
-        "merged {} hook entries into {}",
+        "merged {} hook entries (+ auto-recall on UserPromptSubmit) into {}",
         HOOK_EVENTS.len(),
         settings.display()
     );

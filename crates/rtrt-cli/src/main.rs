@@ -1564,6 +1564,43 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
     Ok(())
 }
 
+/// Read a Claude Code transcript JSONL and return the text of the most
+/// recent assistant turn — the agent's own output for the turn that just
+/// ended. Concatenates the `text` blocks of the last `type:"assistant"`
+/// entry that has any (skipping pure tool-use turns). Returns None when the
+/// path is empty/unreadable or no assistant text is found.
+fn last_assistant_text(transcript_path: &str) -> Option<String> {
+    if transcript_path.is_empty() {
+        return None;
+    }
+    let content = std::fs::read_to_string(transcript_path).ok()?;
+    // Walk lines bottom-up; first assistant entry with text wins.
+    for line in content.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let blocks = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array());
+        let Some(blocks) = blocks else { continue };
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
 /// Pull a top-level string field out of a JSON object without a full
 /// typed deserialize. Returns None when the input isn't an object or the
 /// key is absent / non-string.
@@ -1613,9 +1650,34 @@ fn summarize_hook_payload(kind: &str, raw: &str) -> Option<String> {
         }
         "session-start" => format!("session start: {}", get("source")),
         "session-end" => format!("session end: {}", get("reason")),
-        // Stop / SubagentStart / SubagentStop / PostToolBatch and anything
-        // else: keep a terse marker rather than the JSON envelope.
-        _ => kind.replace('-', " "),
+        // Stop / SubagentStop fire when the agent finishes a turn. The Stop
+        // payload carries no content, but it does carry `transcript_path` —
+        // so pull the agent's own last text response from the transcript.
+        // This is what actually captures the agent's output (its reasoning,
+        // decisions, summaries) into memory, which tool/prompt hooks miss.
+        "stop" | "subagent-stop" => last_assistant_text(get("transcript_path"))?,
+        // PostToolBatch carries a list of tool uses; surface the tool names
+        // instead of a bare marker.
+        "post-tool-batch" => {
+            let names = v
+                .get("tool_uses")
+                .or_else(|| v.get("tools"))
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.get("tool_name").or_else(|| t.get("name")))
+                        .filter_map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                return None; // nothing useful in the batch envelope
+            }
+            format!("tool batch: {names}")
+        }
+        // SubagentStart and anything else: terse marker, low value.
+        _ => return None,
     };
     let trimmed = summary.trim();
     if trimmed.is_empty() {

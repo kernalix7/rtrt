@@ -274,6 +274,8 @@ event fires
 
 Rows the LLM compress daemon rewrites get tagged with `metadata.compressed_at`, `compressed_model`, `compressed_from_chars`, and `compressed_to_chars`. If the LLM's output is empty or no shorter than the input, the row is left untouched but `compressed_skip=no-shrink` is recorded so the daemon does not keep retrying it. Embeddings are intentionally not regenerated — recall stays serviceable off the BM25 index that `set_body` updates in lockstep.
 
+**Local model choice.** The default `claude-haiku-4-5` targets a cloud key. For a fully local setup against Ollama / an OpenAI-compatible endpoint, set `RTRT_AUTO_COMPRESS_MODEL=gemma3:4b` — it's the best local compressor in our sweep (robust across every length, fits a modest GPU). See the model comparison table in [`docs/PERF.md`](PERF.md#llm-auto-compress--local-model-sweep--2026-05-26). Avoid `granite4.1:8b` for this (fails on very long captures) and `llama3.1:8b` (corrupts facts).
+
 ## ONNX token-importance backend (opt-in)
 
 Build with `--features onnx` to swap the heuristic `MlCompressor` for a real LLMLingua-2-style scorer:

@@ -9,6 +9,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — local LLM compress model sweep
+
+- `docs/PERF.md` + `docs/PERF.ko.md` publish a length-tiered comparison of local Ollama models on the LLM auto-compress path (20 realistic captures per tier × six tiers, XS ~16 chars to XXL ~6000). Headline: compression ratio is driven by input length far more than the model — short rows barely compress (so `RTRT_AUTO_COMPRESS_MIN_CHARS=512` correctly skips them), dense mid-length sits at ~25-30%, long verbose captures reach 40%+.
+- Recommended local default is `gemma3:4b`: robust across every length (XXL 42%), 4.3 GB so it fits 100% on a modest GPU, safely skips short rows. `granite4.1:8b` is flagged unfit for very long captures (returned all 6000-char samples unchanged), `llama3.1:8b` corrupts facts, `qwen3.5:9b` (thinking model) returns input verbatim.
+- `docs/USAGE.md` + `docs/USAGE.ko.md` note the `RTRT_AUTO_COMPRESS_MODEL=gemma3:4b` local override; the code default stays `claude-haiku-4-5` for cloud-key users.
+
 ### Highlights — MCP Prompts/Resources + ONNX backend + BERTScore
 
 **Three remaining roadmap items land in one sweep. MCP server now exposes the full handler triad (tools / prompts / resources); the heuristic `MlCompressor` graduates with an optional real ONNX-runtime backend matching the LLMLingua-2 contract; `rtrt-eval` gains a BERTScore evaluator behind the same encoder-loading machinery. All new code is feature-gated and ships zero model files.**

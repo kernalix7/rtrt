@@ -102,6 +102,27 @@ Hardware: laptop, Rust 1.85 stable, debug profile, in-memory SQLite. Refresh wit
 
 The R@5 floor of 0.80 is enforced by `rtrt_eval::tests::recall_at_5_on_smoke_fixture_clears_floor`. The smoke fixture is intentionally tiny — replace it with a real labelled corpus to publish trustworthy numbers.
 
+### LLM auto-compress — local model sweep — 2026-05-26
+
+Char reduction of the SessionEnd / dashboard LLM compress path, measured against an Ollama backend over 20 realistic captures per length tier (commands, logs, stack traces, prose, diffs, decisions). `skip` = rows left unchanged because the model produced no shrink (the `compressed_skip=no-shrink` guard). Reduction is `1 - out_chars/in_chars`.
+
+| Tier (chars) | gemma3:4b | gemma3:12b | granite4.1:8b |
+|--------------|-----------|------------|---------------|
+| XS (~16)     | 2.8% (18 skip) | 8.6% (15 skip) | 1.2% (19 skip) |
+| S  (~90)     | 9.0% (8 skip)  | 31.3%          | 8.2% (8 skip)  |
+| M  (~330)    | 29.6%          | 25.1%          | 29.1%          |
+| L  (~1000)   | 23.1%          | 27.2%          | 29.6%          |
+| XL (~2600)   | 25.5%          | 27.5%          | 25.0% (6 skip) |
+| XXL (~6000)  | **42.0%**      | **42.8%**      | **0% (20 skip)** |
+
+Reading the table:
+
+- **Length drives ratio far more than the model.** Short captures (≤90 chars) barely compress — they're already dense — so the default `RTRT_AUTO_COMPRESS_MIN_CHARS=512` correctly skips them. Dense mid-length content sits at ~25-30%; long verbose captures (the bulk of the token weight in real use) reach 40%+.
+- **`granite4.1:8b` collapses on very long input** — every 6000-char sample came back no-shorter, so the guard skipped all 20. Fine for mid-length, unfit for the long captures that matter most.
+- **Other models disqualified earlier:** `llama3.1:8b` had the highest raw ratio but corrupted facts (changed a 60% to 40%, invented detail); `qwen3.5:9b` is a thinking model and returned every input verbatim (0% across the board); `gemma4:e4b`/`e2b` were weak and injected markdown/LaTeX noise.
+
+**Recommendation: `gemma3:4b` as the local default** — robust across every length (XXL 42%, mid 23-30%), 4.3 GB so it fits 100% on a modest GPU, and it safely skips the short rows. Step up to `gemma3:12b` (10 GB, partial CPU offload) only when you want the marginal quality edge. The code default stays `claude-haiku-4-5` for users with a cloud key; `gemma3:4b` is the recommended local override.
+
 ## How to reproduce
 
 ```bash

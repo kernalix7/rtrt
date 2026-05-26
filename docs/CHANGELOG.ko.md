@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+### Highlights — 로컬 LLM 압축 모델 비교
+
+- `docs/PERF.md` + `docs/PERF.ko.md`에 LLM 자동 압축 경로의 로컬 Ollama 모델 길이별 비교 게시 (티어당 현실 캡처 20개 × 6티어, XS ~16자 ~ XXL ~6000자). 결론: 압축률은 모델보다 입력 길이가 좌우 — 짧은 행은 거의 안 줄어 `RTRT_AUTO_COMPRESS_MIN_CHARS=512`가 올바르게 스킵, dense 중간 길이 ~25-30%, 긴 장황한 캡처 40%+.
+- 로컬 권장 기본 `gemma3:4b`: 전 길이 견고(XXL 42%), 4.3GB로 GPU 100% 적재, 짧은 행 안전 스킵. `granite4.1:8b`는 초장문 부적합(6000자 전부 미압축), `llama3.1:8b`는 사실 조작, `qwen3.5:9b`(thinking)는 verbatim 반환.
+- `docs/USAGE.md` + `docs/USAGE.ko.md`에 `RTRT_AUTO_COMPRESS_MODEL=gemma3:4b` 로컬 오버라이드 명시; 코드 기본값은 클라우드 키 사용자 위해 `claude-haiku-4-5` 유지.
+
 ### Highlights — MCP Prompts/Resources + ONNX 백엔드 + BERTScore
 
 **남은 로드맵 3개 항목 한 묶음에 착륙. MCP 서버는 핸들러 트라이어드 (tools / prompts / resources) 완전 노출; 휴리스틱 `MlCompressor`는 옵션 실 ONNX-runtime 백엔드 (LLMLingua-2 계약 일치)로 졸업; `rtrt-eval`은 동일 인코더 로딩 머신을 공유하는 BERTScore 평가기 추가. 신규 코드 전부 피처 게이트, 모델 파일은 무동봉.**

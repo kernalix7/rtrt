@@ -227,6 +227,8 @@ RTRT_DASHBOARD_BIND=127.0.0.1:7311 \
 
 LLM 압축 데몬이 다시 쓴 row는 `metadata.compressed_at`, `compressed_model`, `compressed_from_chars`, `compressed_to_chars`로 태깅. LLM 출력이 비었거나 원본보다 짧지 않으면 본문은 그대로 두고 `compressed_skip=no-shrink`만 기록 — 데몬이 재시도하지 않음. 임베딩은 의도적으로 재생성하지 않음. `set_body`가 BM25 인덱스를 동기화하므로 recall은 그대로 작동.
 
+**로컬 모델 선택.** 기본 `claude-haiku-4-5`는 클라우드 키 대상. Ollama / OpenAI 호환 엔드포인트로 완전 로컬 구성 시 `RTRT_AUTO_COMPRESS_MODEL=gemma3:4b` 권장 — 비교 테스트에서 최고 로컬 압축기(전 길이 견고, 작은 GPU에 적재). 모델 비교 표는 [`docs/PERF.ko.md`](PERF.ko.md#llm-자동-압축--로컬-모델-비교--2026-05-26) 참고. `granite4.1:8b`(초장문 실패) / `llama3.1:8b`(사실 조작)는 피할 것.
+
 ## ONNX token-importance 백엔드 (옵트인)
 
 `--features onnx`로 빌드 시 휴리스틱 `MlCompressor`가 진짜 LLMLingua-2 스타일 스코어러로 교체됨:

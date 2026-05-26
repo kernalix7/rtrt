@@ -215,6 +215,9 @@ async fn main() -> Result<()> {
         .route("/api/setup", post(setup_snippet))
         .route("/api/stream", get(sse_stream))
         .route("/api/tokens/summary", get(tokens_summary))
+        .route("/api/config", get(get_config).post(post_config))
+        .route("/api/models", get(get_models))
+        .route("/api/memory/compress", post(memory_compress))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -1518,6 +1521,281 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         by_provider,
         recent: view.recent(50),
     })
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ConfigResponse {
+    capture: rtrt_core::config::CaptureConfig,
+    auto_compress: rtrt_core::config::AutoCompressConfig,
+    path: String,
+}
+
+async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, String)> {
+    let cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let path = rtrt_core::Config::default_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(Json(ConfigResponse {
+        capture: cfg.capture,
+        auto_compress: cfg.auto_compress,
+        path,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ConfigWriteRequest {
+    capture: rtrt_core::config::CaptureConfig,
+    auto_compress: rtrt_core::config::AutoCompressConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigWriteResponse {
+    ok: bool,
+    path: String,
+}
+
+async fn post_config(
+    Json(req): Json<ConfigWriteRequest>,
+) -> std::result::Result<Json<ConfigWriteResponse>, (StatusCode, String)> {
+    // Build an updated Config preserving any non-exposed fields from disk.
+    let mut cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    cfg.capture = req.capture;
+    cfg.auto_compress = req.auto_compress;
+
+    let path = rtrt_core::Config::default_path().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cannot determine config path".into(),
+    ))?;
+
+    // Create parent directory if needed.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create dir {}: {e}", parent.display()),
+            )
+        })?;
+    }
+
+    // Back up the existing file before overwriting.
+    if path.exists() {
+        let bak = path.with_extension("toml.bak");
+        std::fs::copy(&path, &bak).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("backup {}: {e}", path.display()),
+            )
+        })?;
+    }
+
+    let toml_str = toml::to_string_pretty(&cfg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(&path, toml_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+
+    Ok(Json(ConfigWriteResponse {
+        ok: true,
+        path: path.to_string_lossy().into_owned(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/models
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ModelEntry {
+    id: String,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelsResponse {
+    models: Vec<ModelEntry>,
+}
+
+async fn get_models() -> Json<ModelsResponse> {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    // Derive the Ollama host root: strip a trailing `/v1` (OpenAI-compat
+    // path prefix) and any trailing slash so `/api/tags` lands at the right
+    // place regardless of how base_url was configured.
+    let ollama_host = cfg
+        .auto_compress
+        .base_url
+        .as_deref()
+        .unwrap_or("http://127.0.0.1:11434")
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string();
+
+    let mut models: Vec<ModelEntry> = Vec::new();
+
+    // Attempt to list Ollama models; any failure is silently ignored.
+    let ollama_url = format!("{ollama_host}/api/tags");
+    if let Ok(resp) = reqwest::Client::new()
+        .get(&ollama_url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        if let Ok(body) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+                for m in arr {
+                    if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
+                        models.push(ModelEntry {
+                            id: name.to_string(),
+                            source: "ollama",
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Always append the cloud defaults.
+    models.push(ModelEntry {
+        id: "claude-haiku-4-5".to_string(),
+        source: "cloud",
+    });
+    models.push(ModelEntry {
+        id: "gpt-5.4-mini".to_string(),
+        source: "cloud",
+    });
+
+    Json(ModelsResponse { models })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/memory/compress
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct MemoryCompressRequest {
+    project: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryCompressResponse {
+    compressed: usize,
+    skipped: usize,
+}
+
+async fn memory_compress(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryCompressRequest>,
+) -> std::result::Result<Json<MemoryCompressResponse>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+
+    let cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ac = &cfg.auto_compress;
+
+    let age_sec: i64 = ac.age_sec;
+    let min_chars: usize = ac.min_chars;
+    let batch: usize = ac.batch;
+    let max_tokens: u32 = ac.max_tokens;
+    let model = req.model.clone().unwrap_or_else(|| ac.model.clone());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - age_sec;
+
+    let candidates = {
+        let guard = store.lock().await;
+        guard
+            .compress_candidates(&req.project, cutoff, min_chars, batch)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    let mut compressed_count = 0usize;
+    let mut skipped_count = 0usize;
+
+    for (id, body) in candidates {
+        let chat_req = ChatRequest {
+            model: model.clone(),
+            messages: vec![
+                ChatMessage {
+                    role: Role::System,
+                    content: "You are a lossless-meaning compressor. Rewrite the user message in the shortest form that preserves every fact, decision, file path, identifier, command, and number. Drop filler, hedging, headings, and greetings. Plain text only. No commentary, no preamble, no quotes — emit only the compressed text.".to_string(),
+                },
+                ChatMessage {
+                    role: Role::User,
+                    content: body.clone(),
+                },
+            ],
+            max_tokens: Some(max_tokens),
+            temperature: Some(0.0),
+        };
+        let resp = match state.gateway.chat(chat_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("memory_compress {project}#{id}: {e}", project = req.project);
+                skipped_count += 1;
+                continue;
+            }
+        };
+        let new_body = resp.content.trim().to_string();
+        if new_body.is_empty() || new_body.len() >= body.len() {
+            // No compression win; mark so the next sweep skips this row.
+            let guard = store.lock().await;
+            let mut meta = guard.get_metadata(id).unwrap_or_default();
+            meta.insert("compressed_at".into(), now.to_string());
+            meta.insert("compressed_skip".into(), "no-shrink".into());
+            let _ = guard.set_metadata(id, &meta);
+            skipped_count += 1;
+            continue;
+        }
+        let guard = store.lock().await;
+        if let Err(e) = guard.compress_in_place(id, &new_body) {
+            tracing::warn!(
+                "memory_compress {project}#{id}: compress_in_place: {e}",
+                project = req.project
+            );
+            skipped_count += 1;
+            continue;
+        }
+        let mut meta = guard.get_metadata(id).unwrap_or_default();
+        meta.insert("compressed_at".into(), now.to_string());
+        meta.insert("compressed_model".into(), model.clone());
+        meta.insert("compressed_from_chars".into(), body.len().to_string());
+        meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+        let _ = guard.set_metadata(id, &meta);
+        compressed_count += 1;
+        tracing::info!(
+            project = %req.project,
+            id,
+            from = body.len(),
+            to = new_body.len(),
+            "manual compress sweep"
+        );
+    }
+
+    Ok(Json(MemoryCompressResponse {
+        compressed: compressed_count,
+        skipped: skipped_count,
+    }))
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");

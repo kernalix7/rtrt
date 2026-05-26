@@ -268,6 +268,24 @@ enum Cmd {
     },
     /// Show RTRT version + crate manifest.
     Info,
+    /// Manage the global config file (`~/.rtrt/config.toml`).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Write a commented starter config to `~/.rtrt/config.toml`
+    /// (or `$RTRT_CONFIG`). Refuses to clobber an existing file unless
+    /// `--force`.
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the resolved config path and whether it exists.
+    Path,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1013,6 +1031,64 @@ async fn main() -> Result<()> {
                 "crates: core, compress, proxy, memory, providers, templates, mcp, dashboard, cli"
             );
         }
+        Cmd::Config { cmd } => run_config(cmd)?,
+    }
+    Ok(())
+}
+
+const CONFIG_TEMPLATE: &str = r#"# rtrt config — ~/.rtrt/config.toml
+# Every value here is a fallback: a matching RTRT_* environment variable
+# always wins, so a one-off `RTRT_AUTO_COMPRESS_LLM=0 rtrt ...` still works.
+
+[capture]
+# Auto-capture pipeline (dashboard /api/* + Claude Code hooks).
+enabled = true            # RTRT_AUTO_CAPTURE
+redact = true             # RTRT_AUTO_REDACT — run redact_secrets before saving
+dedup_window_sec = 300    # RTRT_AUTO_DEDUP_WINDOW_SEC
+# project = "myproject"   # RTRT_DEFAULT_PROJECT (default: cwd basename)
+
+[auto_compress]
+# LLM compression of old memory rows (SessionEnd hook + dashboard daemon).
+enabled = false           # RTRT_AUTO_COMPRESS_LLM — set true to turn on
+model = "claude-haiku-4-5"  # RTRT_AUTO_COMPRESS_MODEL
+# For a local Ollama setup, the benched recommendation is:
+#   model = "gemma3:4b"
+#   base_url = "http://127.0.0.1:11434/v1"
+# base_url = "http://127.0.0.1:11434/v1"   # RTRT_PROVIDER_BASE_URL
+interval_sec = 1800       # dashboard daemon cadence
+age_sec = 3600            # RTRT_AUTO_COMPRESS_AGE_SEC — only rows older than this
+min_chars = 512           # RTRT_AUTO_COMPRESS_MIN_CHARS — skip shorter rows
+batch = 20                # RTRT_AUTO_COMPRESS_BATCH — max rows per sweep
+max_tokens = 512          # RTRT_AUTO_COMPRESS_MAX_TOKENS
+"#;
+
+fn run_config(cmd: ConfigCmd) -> Result<()> {
+    let path = rtrt_core::Config::default_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve config path (no HOME?)"))?;
+    match cmd {
+        ConfigCmd::Path => {
+            println!(
+                "{} ({})",
+                path.display(),
+                if path.exists() { "exists" } else { "absent" }
+            );
+        }
+        ConfigCmd::Init { force } => {
+            if path.exists() && !force {
+                anyhow::bail!(
+                    "{} already exists; pass --force to overwrite",
+                    path.display()
+                );
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, CONFIG_TEMPLATE)?;
+            println!("wrote {}", path.display());
+            // Validate it parses so a shipped template can't be broken.
+            rtrt_core::Config::load()?;
+            println!("ok — edit it, then `rtrt config path` to confirm");
+        }
     }
     Ok(())
 }
@@ -1248,15 +1324,29 @@ fn default_memory_path() -> PathBuf {
         .join("memory.sqlite")
 }
 
+/// Parse an env var into `T`, falling back to `default` when unset or
+/// unparseable. Used by the hook commands to layer env over config.
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 /// SessionEnd compression sweep. Mirrors the dashboard's auto-compress
 /// daemon but as a one-shot CLI pass so users without a long-lived
 /// dashboard still get automatic compression. No-op unless
 /// `RTRT_AUTO_COMPRESS_LLM=1`; honours the same `RTRT_AUTO_COMPRESS_*`
 /// knobs as the daemon.
 async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> Result<()> {
-    let enabled = std::env::var("RTRT_AUTO_COMPRESS_LLM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
+    // Resolution order for every knob: env var > ~/.rtrt/config.toml >
+    // built-in default. The config file lets users keep their local model
+    // choice out of ~/.claude/settings.json.
+    let cfg = rtrt_core::Config::load().unwrap_or_default().auto_compress;
+    let enabled = match std::env::var("RTRT_AUTO_COMPRESS_LLM") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
+        Err(_) => cfg.enabled,
+    };
     if !enabled {
         return Ok(());
     }
@@ -1272,24 +1362,20 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     if !store_path.exists() {
         return Ok(());
     }
-    let age_sec: i64 = std::env::var("RTRT_AUTO_COMPRESS_AGE_SEC")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
-    let min_chars: usize = std::env::var("RTRT_AUTO_COMPRESS_MIN_CHARS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
-    let batch: usize = std::env::var("RTRT_AUTO_COMPRESS_BATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
-    let max_tokens: u32 = std::env::var("RTRT_AUTO_COMPRESS_MAX_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
+    let age_sec: i64 = env_or("RTRT_AUTO_COMPRESS_AGE_SEC", cfg.age_sec);
+    let min_chars: usize = env_or("RTRT_AUTO_COMPRESS_MIN_CHARS", cfg.min_chars);
+    let batch: usize = env_or("RTRT_AUTO_COMPRESS_BATCH", cfg.batch);
+    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL").unwrap_or_else(|_| cfg.model.clone());
+    let max_tokens: u32 = env_or("RTRT_AUTO_COMPRESS_MAX_TOKENS", cfg.max_tokens);
+    // Feed the config's base_url to Gateway::from_env when the env var is
+    // unset, so a fully-file-driven local setup still routes to Ollama.
+    if std::env::var_os("RTRT_PROVIDER_BASE_URL").is_none()
+        && std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_none()
+        && let Some(url) = cfg.base_url.as_deref()
+    {
+        // SAFETY: hook process is single-threaded at this point.
+        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", url) };
+    }
     let memory = MemoryStore::open(&store_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

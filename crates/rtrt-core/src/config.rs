@@ -14,6 +14,98 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub capture: CaptureConfig,
+    #[serde(default)]
+    pub auto_compress: AutoCompressConfig,
+}
+
+/// Auto-capture pipeline knobs. Mirror the `RTRT_AUTO_*` env vars; env
+/// always wins over the file so a one-off `RTRT_AUTO_CAPTURE=0 rtrt …`
+/// still works.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub redact: bool,
+    #[serde(default = "default_dedup_window")]
+    pub dedup_window_sec: i64,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            redact: true,
+            dedup_window_sec: default_dedup_window(),
+            project: None,
+        }
+    }
+}
+
+fn default_dedup_window() -> i64 {
+    300
+}
+
+/// LLM auto-compress knobs (SessionEnd hook + dashboard daemon). Mirror the
+/// `RTRT_AUTO_COMPRESS_*` env vars.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCompressConfig {
+    /// Off by default; set true (or `RTRT_AUTO_COMPRESS_LLM=1`) to enable.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_compress_model")]
+    pub model: String,
+    /// OpenAI-compatible base URL (e.g. a local Ollama endpoint).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_compress_interval")]
+    pub interval_sec: u64,
+    #[serde(default = "default_compress_age")]
+    pub age_sec: i64,
+    #[serde(default = "default_compress_min_chars")]
+    pub min_chars: usize,
+    #[serde(default = "default_compress_batch")]
+    pub batch: usize,
+    #[serde(default = "default_compress_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for AutoCompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_compress_model(),
+            base_url: None,
+            interval_sec: default_compress_interval(),
+            age_sec: default_compress_age(),
+            min_chars: default_compress_min_chars(),
+            batch: default_compress_batch(),
+            max_tokens: default_compress_max_tokens(),
+        }
+    }
+}
+
+fn default_compress_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+fn default_compress_interval() -> u64 {
+    1800
+}
+fn default_compress_age() -> i64 {
+    3600
+}
+fn default_compress_min_chars() -> usize {
+    512
+}
+fn default_compress_batch() -> usize {
+    20
+}
+fn default_compress_max_tokens() -> u32 {
+    512
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,17 +180,74 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        toml_lite::from_str(s).map_err(|e| Error::Config(e.to_string()))
+        toml::from_str(s).map_err(|e| Error::Config(format!("config TOML: {e}")))
+    }
+
+    /// Resolve the config file path: `$RTRT_CONFIG` if set, else
+    /// `~/.rtrt/config.toml`.
+    pub fn default_path() -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("RTRT_CONFIG") {
+            return Some(PathBuf::from(p));
+        }
+        dirs::home_dir().map(|h| h.join(".rtrt").join("config.toml"))
+    }
+
+    /// Load from the default path. Returns `Config::default()` when the file
+    /// is absent; surfaces an error only on a malformed file so a typo
+    /// doesn't silently fall back to defaults.
+    pub fn load() -> Result<Self> {
+        match Self::default_path() {
+            Some(p) if p.exists() => {
+                let raw = std::fs::read_to_string(&p)
+                    .map_err(|e| Error::Config(format!("read {}: {e}", p.display())))?;
+                Self::from_toml_str(&raw)
+            }
+            _ => Ok(Self::default()),
+        }
     }
 }
 
-mod toml_lite {
-    //! Tiny JSON-over-TOML adapter so we don't pull a full TOML crate in scaffold.
-    //! Replaced by `toml` crate once parsing is actually needed.
-    use serde::de::DeserializeOwned;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn from_str<T: DeserializeOwned>(s: &str) -> Result<T, String> {
-        let _ = s;
-        Err("TOML config parsing not wired yet; use defaults via Config::default()".into())
+    #[test]
+    fn empty_toml_is_all_defaults() {
+        let c = Config::from_toml_str("").unwrap();
+        assert!(c.capture.enabled);
+        assert_eq!(c.capture.dedup_window_sec, 300);
+        assert!(!c.auto_compress.enabled);
+        assert_eq!(c.auto_compress.model, "claude-haiku-4-5");
+        assert_eq!(c.auto_compress.min_chars, 512);
+    }
+
+    #[test]
+    fn partial_toml_overrides_only_named_fields() {
+        let c = Config::from_toml_str(
+            r#"
+            [auto_compress]
+            enabled = true
+            model = "gemma3:4b"
+            base_url = "http://127.0.0.1:11434/v1"
+            min_chars = 256
+            "#,
+        )
+        .unwrap();
+        assert!(c.auto_compress.enabled);
+        assert_eq!(c.auto_compress.model, "gemma3:4b");
+        assert_eq!(
+            c.auto_compress.base_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+        assert_eq!(c.auto_compress.min_chars, 256);
+        // unset field keeps its default
+        assert_eq!(c.auto_compress.age_sec, 3600);
+        // unrelated section still defaults
+        assert!(c.capture.enabled);
+    }
+
+    #[test]
+    fn malformed_toml_errors() {
+        assert!(Config::from_toml_str("[auto_compress\nmodel =").is_err());
     }
 }

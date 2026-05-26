@@ -401,7 +401,7 @@ fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: 
                         continue;
                     }
                     let guard = store.lock().await;
-                    if let Err(e) = guard.set_body(id, &new_body) {
+                    if let Err(e) = guard.compress_in_place(id, &new_body) {
                         tracing::warn!("auto-compress {project}#{id}: set_body: {e}");
                         continue;
                     }
@@ -739,11 +739,18 @@ async fn memory_timeline(
     let items: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
+            // `body_full` is the preserved pre-compression original (None
+            // when the row was never compressed). `body` is what recall
+            // uses (terse when compressed).
+            let full = guard.full_body(r.id).ok().flatten();
+            let compressed = full.is_some();
             serde_json::json!({
                 "id": r.id,
                 "kind": r.kind,
                 "scope": r.scope,
                 "body": r.body,
+                "body_full": full,
+                "compressed": compressed,
                 "created_at": r.created_at,
             })
         })
@@ -1646,6 +1653,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .hist-item .kind { color: var(--accent); font-size: 0.78em; min-width: 60px; }
   .hist-item .body { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
   .hist-item .body-json { margin: 0; padding: 0.5rem 0.6rem; background: var(--code-bg, rgba(127,127,127,0.1)); border-radius: 6px; font-family: ui-monospace, monospace; font-size: 0.8em; max-height: 16rem; overflow: auto; white-space: pre; }
+  .hist-item .orig { margin-top: 0.4rem; font-size: 0.85em; }
+  .hist-item .orig summary { cursor: pointer; color: var(--muted); user-select: none; }
+  .hist-item .orig[open] summary { margin-bottom: 0.3rem; }
   .pager { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.85rem; justify-content: center; }
   .pager button:disabled { opacity: 0.4; cursor: default; }
 
@@ -2183,13 +2193,21 @@ async function loadHistory(name, offset) {
     document.getElementById('history-meta').textContent = '전부 영구 저장 · 페이지 단위 50건';
     return;
   }
-  list.innerHTML = d.items.map(i =>
-    `<div class="hist-item">
+  list.innerHTML = d.items.map(i => {
+    // Compressed rows: show the terse body (what recall uses) + a badge
+    // with the savings, and an expandable original (body_full).
+    let badge = '', orig = '';
+    if (i.compressed && i.body_full) {
+      const saved = Math.round((1 - i.body.length / i.body_full.length) * 100);
+      badge = `<span class="kind" style="color:var(--ok)" title="압축됨 — recall은 이 압축본 참조">⊟ ${saved}%</span>`;
+      orig = `<details class="orig"><summary>원본 ${i.body_full.length}자</summary>${renderBody(i.body_full)}</details>`;
+    }
+    return `<div class="hist-item">
        <span class="when">${relativeTime(i.created_at)}</span>
-       <span class="kind">${i.kind}</span>
-       <span class="body">${renderBody(i.body)}</span>
-     </div>`
-  ).join('');
+       <span class="kind">${i.kind}</span>${badge}
+       <span class="body">${renderBody(i.body)}${orig}</span>
+     </div>`;
+  }).join('');
   const pager = document.getElementById('history-pager');
   const totalPages = Math.max(1, Math.ceil(HISTORY_TOTAL / HISTORY_PAGE_SIZE));
   const currentPage = Math.floor(offset / HISTORY_PAGE_SIZE) + 1;

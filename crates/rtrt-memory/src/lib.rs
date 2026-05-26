@@ -229,6 +229,21 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v6: `body_full` preserves the pre-compression original. NULL means
+        // the row was never compressed (so `body` IS the original). The LLM
+        // compress path writes the original here once, then overwrites
+        // `body` with the compressed text — recall reads `body` (terse), the
+        // original stays available for reference / audit.
+        if v < 6 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    ALTER TABLE memories ADD COLUMN body_full TEXT;
+                    PRAGMA user_version = 6;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -597,6 +612,46 @@ impl MemoryStore {
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Compress a row in place while preserving the original. On first
+    /// compression the current `body` is copied into `body_full` (kept for
+    /// reference); `body` then holds `compressed` and the FTS index is
+    /// re-synced to it so recall returns the terse text. Re-compressing an
+    /// already-compressed row leaves `body_full` as the true original.
+    pub fn compress_in_place(&self, id: i64, compressed: &str) -> Result<()> {
+        let (old_body, has_full): (String, bool) = self
+            .conn
+            .query_row(
+                "SELECT body, body_full IS NOT NULL FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        if !has_full {
+            self.conn
+                .execute(
+                    "UPDATE memories SET body_full = body WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
+        self.set_body(id, compressed)?;
+        let _ = old_body;
+        Ok(())
+    }
+
+    /// Returns the preserved pre-compression original for `id`, or `None`
+    /// when the row was never compressed (its `body` is already the full
+    /// text).
+    pub fn full_body(&self, id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT body_full FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))
     }
 
     /// Returns up to `limit` rows in `project` that are eligible for LLM

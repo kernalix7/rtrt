@@ -1414,7 +1414,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
             let _ = memory.set_metadata(id, &meta);
             continue;
         }
-        if memory.set_body(id, &new_body).is_err() {
+        if memory.compress_in_place(id, &new_body).is_err() {
             continue;
         }
         meta.insert("compressed_model".into(), model.clone());

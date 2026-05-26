@@ -107,6 +107,32 @@
   /* Count-up animation */
   .countup { display: inline-block; transition: opacity .2s; }
 
+  /* Compress page — labeled control grid */
+  .ctrl-grid { display: grid; gap: 0.65rem; }
+  .ctrl-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+  .ctrl-field { display: flex; flex-direction: column; gap: 0.2rem; }
+  .ctrl-field label { font-size: 0.79em; color: var(--muted); letter-spacing: 0.02em; }
+  .ctrl-field select, .ctrl-field input[type="number"] { width: 100%; }
+
+  /* Compress result side-by-side view */
+  .compress-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-top: 0.75rem; }
+  .compress-compare .pane-label { font-size: 0.78em; color: var(--muted); margin-bottom: 0.3rem; }
+  .compress-compare pre { margin: 0; max-height: 260px; overflow-y: auto; }
+  .savings-badge { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.2rem 0.65rem; border-radius: 999px; font-size: 0.85em; font-weight: 600; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+
+  /* Memory stats bars */
+  .stat-bar-wrap { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.5rem; }
+  .stat-bar-row { display: grid; grid-template-columns: 80px 1fr 40px; align-items: center; gap: 0.5rem; font-size: 0.85em; }
+  .stat-bar-bg { background: var(--border); border-radius: 999px; height: 8px; overflow: hidden; }
+  .stat-bar-fill { height: 100%; border-radius: 999px; background: var(--accent); transition: width .4s ease; }
+  .stat-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.65rem; margin-bottom: 1rem; }
+
+  /* Memory recall cards */
+  .recall-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 0.75rem 0.9rem; margin-bottom: 0.5rem; }
+  .recall-card .rc-meta { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.45rem; flex-wrap: wrap; }
+  .recall-card .rc-body { font-size: 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .recall-card .rc-orig { margin-top: 0.4rem; }
+
   /* Progressive disclosure */
   details > summary.muted-summary { cursor: pointer; color: var(--muted); font-size: 0.85em; padding: 0.35rem 0; list-style: none; user-select: none; }
   details > summary.muted-summary::-webkit-details-marker { display: none; }
@@ -266,6 +292,7 @@
         <nav class="subtabs" id="memory-subtabs">
           <a class="active" data-sub="memhistory">히스토리</a>
           <a data-sub="memquery">검색</a>
+          <a data-sub="memstats">통계</a>
           <a data-sub="memmap">맵</a>
           <a data-sub="memblocks">블록</a>
           <a data-sub="membackup">백업</a>
@@ -311,17 +338,65 @@
             <form id="recall-form">
               <input id="recall-project" type="hidden">
               <input id="recall-query" placeholder="검색어" required>
-              <button class="primary" type="submit">검색</button>
+              <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+                <button class="primary" type="submit">검색</button>
+                <!-- kind 필터 -->
+                <div class="ctrl-field" style="min-width:130px;">
+                  <label for="recall-kind" style="font-size:0.79em;color:var(--muted);">kind</label>
+                  <select id="recall-kind">
+                    <option value="">전체</option>
+                    <option value="note">note</option>
+                    <option value="feedback">feedback</option>
+                    <option value="project">project</option>
+                    <option value="reference">reference</option>
+                    <option value="user">user</option>
+                    <option value="block">block</option>
+                  </select>
+                </div>
+                <!-- 압축된 것만 -->
+                <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.85em;cursor:pointer;white-space:nowrap;">
+                  <input id="recall-compressed-only" type="checkbox"> 압축된 것만
+                </label>
+              </div>
               <details><summary class="muted-summary">고급 옵션</summary>
                 <div class="adv">
                   <div class="row">
-                    <input id="recall-limit" type="number" min="1" max="50" value="10" title="최대 결과 수">
-                    <input id="recall-filter" placeholder="payload 필터 (예: source=claude)">
+                    <div class="ctrl-field">
+                      <label for="recall-limit">최대 결과</label>
+                      <input id="recall-limit" type="number" min="1" max="50" value="10">
+                    </div>
+                    <div class="ctrl-field">
+                      <label for="recall-filter">payload 필터</label>
+                      <input id="recall-filter" placeholder="예: source=claude">
+                    </div>
                   </div>
                 </div>
               </details>
             </form>
-            <table id="recall-tbl" style="margin-top:0.75rem;"><thead><tr><th>id</th><th>kind</th><th>내용</th></tr></thead><tbody><tr><td colspan="3" class="empty">검색어를 입력하세요.</td></tr></tbody></table>
+            <div id="recall-results" style="margin-top:0.75rem;">
+              <div class="empty">검색어를 입력하세요.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 통계 서브탭 -->
+        <div id="sub-memstats" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>메모리 통계</h2><a id="memstats-refresh" style="cursor:pointer;font-size:0.88em;">새로고침</a></div>
+            <div id="memstats-loading" class="empty">프로젝트를 선택하면 자동으로 로드됩니다.</div>
+            <div id="memstats-body" hidden>
+              <div class="stat-kpis" id="memstats-kpis"></div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;flex-wrap:wrap;">
+                <div>
+                  <div class="hint" style="margin-bottom:0.4rem;">kind별 분포</div>
+                  <div id="memstats-bars" class="stat-bar-wrap"></div>
+                </div>
+                <div>
+                  <div class="hint" style="margin-bottom:0.4rem;">일별 저장 추이</div>
+                  <svg id="memstats-spark" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -379,33 +454,61 @@
             <a data-sample="compress" style="cursor:pointer;">예시 채우기</a>
           </div>
           <details><summary class="muted-summary">고급 옵션</summary>
-            <div class="adv">
-              <div class="row">
-                <select id="compress-mode">
-                  <option value="rules">룰 엔진</option>
-                  <option value="ml">ML 휴리스틱</option>
-                </select>
-                <select id="compress-level">
-                  <option value="lite">lite</option>
-                  <option value="full" selected>full</option>
-                  <option value="ultra">ultra</option>
-                  <option value="extreme">extreme</option>
-                </select>
+            <div class="adv ctrl-grid">
+              <div class="ctrl-row">
+                <div class="ctrl-field">
+                  <label for="compress-mode">엔진</label>
+                  <select id="compress-mode">
+                    <option value="rules">rules — 룰 엔진</option>
+                    <option value="ml">ml — ML 휴리스틱</option>
+                    <option value="llm">llm — LLM 요약</option>
+                  </select>
+                </div>
+                <div class="ctrl-field">
+                  <label for="compress-level">레벨</label>
+                  <select id="compress-level">
+                    <option value="lite">lite</option>
+                    <option value="full" selected>full</option>
+                    <option value="ultra">ultra</option>
+                    <option value="extreme">extreme</option>
+                  </select>
+                </div>
               </div>
-              <div class="row">
-                <select id="compress-format">
-                  <option value="plain" selected>plain</option>
-                  <option value="markdown">markdown</option>
-                  <option value="xml">xml</option>
-                  <option value="json">json</option>
-                </select>
-                <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5" title="ML ratio">
+              <div class="ctrl-row">
+                <div class="ctrl-field">
+                  <label for="compress-format">출력형식</label>
+                  <select id="compress-format">
+                    <option value="plain" selected>plain</option>
+                    <option value="markdown">markdown</option>
+                    <option value="xml">xml</option>
+                    <option value="json">json</option>
+                  </select>
+                </div>
+                <div class="ctrl-field">
+                  <label for="compress-ratio">비율 (ML)</label>
+                  <input id="compress-ratio" type="number" step="0.05" min="0.1" max="1" value="0.5">
+                </div>
+              </div>
+              <!-- LLM 엔진 선택 시에만 표시 -->
+              <div id="compress-llm-row" class="ctrl-field" style="display:none;">
+                <label for="compress-llm-model">모델</label>
+                <select id="compress-llm-model"><option value="">모델 선택…</option></select>
               </div>
             </div>
           </details>
         </form>
         <div id="compress-summary" class="out-meta"></div>
-        <pre id="compress-output" hidden></pre>
+        <!-- 압축 전/후 나란히 보기 (결과 있을 때만 표시) -->
+        <div id="compress-compare" class="compress-compare" hidden>
+          <div>
+            <div class="pane-label">원본</div>
+            <pre id="compress-before"></pre>
+          </div>
+          <div>
+            <div class="pane-label">압축 결과</div>
+            <pre id="compress-output"></pre>
+          </div>
+        </div>
       </div>
       <div class="card">
         <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 정리</span></div>
@@ -660,8 +763,8 @@ document.getElementById('theme-toggle').onclick = () => {
 // Sidebar nav
 document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate(a.dataset.page));
 
-// Sub-tabs (도구, 설정)
-function wireSubtabs(navId) {
+// Sub-tabs (도구, 설정). Optional onActivate(subName) callback.
+function wireSubtabs(navId, onActivate) {
   const nav = document.getElementById(navId);
   if (!nav) return;
   nav.querySelectorAll('a').forEach(a => a.onclick = () => {
@@ -670,9 +773,13 @@ function wireSubtabs(navId) {
     const parent = nav.parentElement;
     parent.querySelectorAll('.subpage').forEach(x => x.hidden = true);
     document.getElementById('sub-' + a.dataset.sub).hidden = false;
+    if (onActivate) onActivate(a.dataset.sub);
   });
 }
-wireSubtabs('memory-subtabs');
+wireSubtabs('memory-subtabs', (sub) => {
+  // Auto-load stats when the stats tab is activated.
+  if (sub === 'memstats' && CURRENT_PROJECT) loadMemStats(CURRENT_PROJECT);
+});
 
 // Memory: project picker + drill-in
 function relativeTime(ts) {
@@ -1096,20 +1203,48 @@ document.getElementById('overview-refresh').onclick = () => { loadOverview(); pu
 // Memory
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  const kindVal = document.getElementById('recall-kind').value;
+  const compressedOnly = document.getElementById('recall-compressed-only').checked;
   const body = {
     project: document.getElementById('recall-project').value,
     query: document.getElementById('recall-query').value,
     limit: Number(document.getElementById('recall-limit').value) || 10,
     filter: document.getElementById('recall-filter').value || null,
+    kind: kindVal || null,
+    compressed_only: compressedOnly || null,
   };
-  const tbody = document.querySelector('#recall-tbl tbody');
-  tbody.innerHTML = `<tr><td colspan="4" class="empty">검색 중…</td></tr>`;
+  const results = document.getElementById('recall-results');
+  results.innerHTML = `<div class="empty">검색 중…</div>`;
   const r = await fetch('/api/memory/recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="4" class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</td></tr>`; return; }
+  if (!r.ok) { results.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</div>`; return; }
   const d = await r.json();
-  tbody.innerHTML = d.hits.length
-    ? d.hits.map(h => `<tr><td>${h.id}</td><td><code>${h.kind}</code></td><td>${h.scope}</td><td>${h.body.replace(/</g,'&lt;')}</td></tr>`).join('')
-    : `<tr><td colspan="4" class="empty">결과 없음. 다른 검색어를 시도해보세요.</td></tr>`;
+  if (!d.hits.length) {
+    results.innerHTML = `<div class="empty">결과 없음. 다른 검색어나 필터를 시도해보세요.</div>`;
+    pushActivity(`recall ${body.project} · 0건`);
+    return;
+  }
+  results.innerHTML = d.hits.map(h => {
+    const isCompressed = h.compressed;
+    const compBadge = isCompressed
+      ? `<span class="badge ok" title="압축됨">⊟ 압축</span>`
+      : '';
+    const origBlock = isCompressed && h.body_full
+      ? `<details class="recall-card rc-orig"><summary style="cursor:pointer;color:var(--muted);font-size:0.82em;">원본 보기 (${h.body_full.length}자)</summary>
+           <div style="margin-top:0.4rem;font-size:0.85em;white-space:pre-wrap;overflow-wrap:anywhere;">${escapeHtml(h.body_full)}</div>
+         </details>`
+      : '';
+    return `<div class="recall-card">
+      <div class="rc-meta">
+        <span class="badge">#${h.id}</span>
+        <code style="font-size:0.82em;">${escapeHtml(h.kind || '?')}</code>
+        ${compBadge}
+        ${h.scope ? `<span style="font-size:0.8em;color:var(--muted);">${escapeHtml(h.scope)}</span>` : ''}
+        ${h.score !== undefined ? `<span style="font-size:0.78em;color:var(--muted);margin-left:auto;">score ${Number(h.score).toFixed(2)}</span>` : ''}
+      </div>
+      <div class="rc-body">${escapeHtml(h.body || '')}</div>
+      ${origBlock}
+    </div>`;
+  }).join('');
   pushActivity(`recall ${body.project} · ${d.hits.length}건`);
 };
 document.getElementById('save-form').onsubmit = async (ev) => {
@@ -1160,6 +1295,57 @@ document.getElementById('export-form').onsubmit = (ev) => {
   const project = document.getElementById('export-project').value;
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
+};
+
+// Memory stats subtab — calls GET /api/memory/stats?project=
+async function loadMemStats(project) {
+  if (!project) return;
+  const loading = document.getElementById('memstats-loading');
+  const body = document.getElementById('memstats-body');
+  loading.textContent = '통계 로드 중…';
+  loading.hidden = false;
+  body.hidden = true;
+  let d;
+  try {
+    const r = await fetch(`/api/memory/stats?project=${encodeURIComponent(project)}`);
+    if (!r.ok) { loading.textContent = `오류 ${r.status}: ${await r.text()}`; return; }
+    d = await r.json();
+  } catch (e) {
+    loading.textContent = `네트워크 오류: ${e.message || e}`;
+    return;
+  }
+  loading.hidden = true;
+  body.hidden = false;
+
+  // KPI tiles: total, compressed count, saved chars, compression ratio
+  const ratio = d.total ? ((d.compressed_count || 0) / d.total * 100).toFixed(1) : '0';
+  const savedK = d.saved_chars >= 1000 ? `${(d.saved_chars / 1000).toFixed(1)}K` : String(d.saved_chars || 0);
+  document.getElementById('memstats-kpis').innerHTML = `
+    <div class="kpi accent"><div class="label">전체 메모리</div><div class="value">${(d.total || 0).toLocaleString()}</div><div class="sub">건</div></div>
+    <div class="kpi"><div class="label">압축됨</div><div class="value">${(d.compressed_count || 0).toLocaleString()}</div><div class="sub">${ratio}%</div></div>
+    <div class="kpi"><div class="label">절감 글자</div><div class="value">${savedK}</div><div class="sub">chars</div></div>
+  `;
+
+  // Kind bars
+  const byKind = d.by_kind || [];
+  const maxCount = Math.max(1, ...byKind.map(k => k.count));
+  document.getElementById('memstats-bars').innerHTML = byKind.length
+    ? byKind.map(k => `
+        <div class="stat-bar-row">
+          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.82em;">${escapeHtml(k.kind)}</span>
+          <div class="stat-bar-bg"><div class="stat-bar-fill" style="width:${(k.count / maxCount * 100).toFixed(1)}%"></div></div>
+          <span style="text-align:right;font-size:0.82em;font-variant-numeric:tabular-nums;">${k.count}</span>
+        </div>`)
+        .join('')
+    : '<div class="empty">kind 데이터 없음</div>';
+
+  // Day trend sparkline — reuse existing spark() helper
+  const byDay = d.by_day || [];
+  spark('memstats-spark', byDay.map(x => x.count), 'var(--accent)');
+}
+
+document.getElementById('memstats-refresh').onclick = () => {
+  if (CURRENT_PROJECT) loadMemStats(CURRENT_PROJECT);
 };
 
 // Memory graph — force-directed canvas layout
@@ -1296,26 +1482,54 @@ document.getElementById('graph-form').onsubmit = async (ev) => {
   initGraph(d);
 };
 
+// Show/hide LLM model dropdown when engine switches.
+document.getElementById('compress-mode').addEventListener('change', function () {
+  const llmRow = document.getElementById('compress-llm-row');
+  const isLlm = this.value === 'llm';
+  llmRow.style.display = isLlm ? '' : 'none';
+  if (isLlm && !document.getElementById('compress-llm-model').options.length) {
+    // Populate from cache in case it wasn't there at page-load time.
+    document.getElementById('compress-llm-model').innerHTML = buildModelOptions('');
+  }
+});
+
 // Tools — compress
 document.getElementById('compress-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  const engine = document.getElementById('compress-mode').value;
+  const inputText = document.getElementById('compress-input').value;
   const body = {
-    text: document.getElementById('compress-input').value,
-    ml: document.getElementById('compress-mode').value === 'ml',
+    text: inputText,
+    engine,
     level: document.getElementById('compress-level').value,
     format: document.getElementById('compress-format').value,
     ratio: Number(document.getElementById('compress-ratio').value),
   };
+  if (engine === 'llm') {
+    const m = document.getElementById('compress-llm-model').value;
+    if (m) body.model = m;
+  }
   const sum = document.getElementById('compress-summary');
+  const compare = document.getElementById('compress-compare');
   const pre = document.getElementById('compress-output');
-  sum.textContent = '압축 중…'; pre.hidden = true;
+  const before = document.getElementById('compress-before');
+  sum.textContent = '압축 중…';
+  compare.hidden = true;
   const r = await fetch('/api/compress', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  const ratio = d.original_len ? ((d.compressed_len / d.original_len) * 100).toFixed(1) : '0';
-  sum.innerHTML = `<span class="badge ok">✓ ${d.original_len} → ${d.compressed_len} (${ratio}%)</span> <span style="margin-left:0.5rem;">절감 ${d.saved_chars}자 · mode=${d.mode}${d.scorer ? ` · ${d.scorer}` : ''}</span>`;
-  pre.hidden = false; pre.textContent = d.compressed;
-  pushActivity(`compress · -${d.saved_chars}자`);
+  const origLen = d.original_len ?? inputText.length;
+  const compLen = d.compressed_len ?? (d.compressed || '').length;
+  const savedChars = d.saved ?? d.saved_chars ?? (origLen - compLen);
+  const savePct = origLen ? (100 - (compLen / origLen) * 100).toFixed(1) : '0';
+  const modelNote = d.model ? ` · model=${d.model}` : '';
+  sum.innerHTML =
+    `<span class="savings-badge">↓ ${savePct}% 절감</span>` +
+    ` <span style="margin-left:0.5rem;color:var(--muted);">${origLen}자 → ${compLen}자 · mode=${d.mode || engine}${modelNote}</span>`;
+  before.textContent = inputText;
+  pre.textContent = d.compressed;
+  compare.hidden = false;
+  pushActivity(`compress · -${savedChars}자`);
 };
 document.getElementById('proxy-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1488,7 +1702,7 @@ async function loadModels() {
 // Called after fetch and again whenever the settings page is opened.
 function populateModelSelects() {
   const opts = buildModelOptions('');
-  ['cfg-ac-model', 'compress-now-model'].forEach(id => {
+  ['cfg-ac-model', 'compress-now-model', 'compress-llm-model'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel) return;
     const current = sel.value;

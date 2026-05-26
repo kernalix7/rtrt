@@ -14,10 +14,11 @@
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
+//! - `/api/memory/stats`  — `GET` aggregate stats for a project (total, by_kind, compressed).
 //! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
 //! - `/api/memory/blocks` — `GET` list / `POST` set Letta-style memory blocks.
 //! - `/api/memory/blocks/{name}` — `GET` a single block (project as query param).
-//! - `/api/compress`      — `POST` run the rule or ML compressor against arbitrary text.
+//! - `/api/compress`      — `POST` run the rule, ML, or LLM compressor against arbitrary text.
 //! - `/api/proxy`         — `POST` rtrt-proxy filters (command / errors_only / ultra_compact).
 //! - `/api/diagnose`      — `POST` aider-style failure triage (errors_only + gateway chat).
 //!
@@ -144,6 +145,19 @@ async fn main() -> Result<()> {
             "binding {bind} without RTRT_DASHBOARD_TOKEN is risky; non-loopback callers can hit the API without authentication."
         );
     }
+    // Feed the config's auto_compress.base_url into the env before building
+    // the gateway, so `Gateway::from_env` registers the local/OpenAI-compat
+    // provider even when only ~/.rtrt/config.toml (not an env var) sets it.
+    // Without this, the LLM compress engine + auto-compress daemon can't
+    // route a local model like gemma3:4b.
+    if std::env::var_os("RTRT_PROVIDER_BASE_URL").is_none()
+        && std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_none()
+        && let Ok(cfg) = rtrt_core::Config::load()
+        && let Some(url) = cfg.auto_compress.base_url.as_deref()
+    {
+        // SAFETY: set during single-threaded startup before any task spawns.
+        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", url) };
+    }
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
     let memory = open_memory_store();
@@ -218,6 +232,7 @@ async fn main() -> Result<()> {
         .route("/api/config", get(get_config).post(post_config))
         .route("/api/models", get(get_models))
         .route("/api/memory/compress", post(memory_compress))
+        .route("/api/memory/stats", get(memory_stats))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -1009,6 +1024,13 @@ struct CompressRequest {
     ratio: Option<f32>,
     #[serde(default)]
     format: Option<String>,
+    /// Engine selector: "rules" (default), "ml", or "llm".
+    /// When "llm", `model` must be set; the gateway's configured base URL is used.
+    #[serde(default)]
+    engine: Option<String>,
+    /// Model id passed to the gateway when `engine = "llm"`.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1292,56 +1314,167 @@ async fn setup_snippet(
     })))
 }
 
+const LLM_COMPRESS_SYS: &str = "You are a lossless-meaning compressor. Rewrite the user message \
+in the shortest form that preserves every fact, decision, file path, identifier, command, and \
+number. Drop filler, hedging, headings, and greetings. Plain text only. No commentary, no \
+preamble, no quotes — emit only the compressed text.";
+
 async fn compress(
     State(state): State<AppState>,
     Json(req): Json<CompressRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     use rtrt_core::CompressionLevel;
     let original = req.text.chars().count();
-    let (out, mode, scorer) = if req.ml {
-        let target = rtrt_compress::CompressionTarget::new(req.ratio.unwrap_or(0.5))
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        let c = rtrt_compress::MlCompressor::heuristic();
-        let scorer = c.scorer_name().to_string();
-        (c.compress(&req.text, target), "ml", Some(scorer))
-    } else {
-        let level = match req.level.as_deref().unwrap_or("full") {
-            "lite" => CompressionLevel::Lite,
-            "full" => CompressionLevel::Full,
-            "ultra" => CompressionLevel::Ultra,
-            "extreme" => CompressionLevel::Extreme,
-            other => {
-                return Err((StatusCode::BAD_REQUEST, format!("unknown level: {other}")));
-            }
-        };
-        let compressor = rtrt_compress::Compressor::new(level);
-        let format = req
-            .format
-            .as_deref()
-            .and_then(rtrt_compress::OutputFormat::parse)
-            .unwrap_or(rtrt_compress::OutputFormat::Plain);
-        (compressor.compress_to(&req.text, format), "rules", None)
-    };
-    let compressed = out.chars().count();
-    let mut meta = BTreeMap::new();
-    meta.insert("source".into(), "compress".into());
-    meta.insert("mode".into(), mode.to_string());
-    if let Some(s) = scorer.as_deref() {
-        meta.insert("scorer".into(), s.to_string());
+
+    // Resolve the effective engine: explicit `engine` field wins; fall back to
+    // the legacy `ml: true` boolean for backward compat.
+    let engine = req
+        .engine
+        .as_deref()
+        .unwrap_or(if req.ml { "ml" } else { "rules" });
+
+    match engine {
+        "llm" => {
+            let model = req.model.clone().ok_or((
+                StatusCode::BAD_REQUEST,
+                "llm engine requires a `model` field".into(),
+            ))?;
+            // Build a request-scoped gateway that honours Config::auto_compress.base_url
+            // when neither RTRT_PROVIDER_BASE_URL nor RTRT_OPENAI_COMPAT_URL is set —
+            // the same resolution order used by run_hook_compress in rtrt-cli. state.gateway
+            // was constructed at startup before config base_url was available, so we rebuild
+            // here. When the env vars are absent we temporarily set RTRT_PROVIDER_BASE_URL
+            // from config so Gateway::from_env registers the openai-compat provider.
+            let llm_gateway = {
+                let env_has_url = std::env::var_os("RTRT_PROVIDER_BASE_URL").is_some()
+                    || std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_some();
+                if env_has_url {
+                    rtrt_providers::Gateway::from_env()
+                } else {
+                    let cfg_url = rtrt_core::Config::load()
+                        .ok()
+                        .and_then(|c| c.auto_compress.base_url);
+                    if let Some(url) = cfg_url {
+                        // SAFETY: no await between set_var and remove_var; the var was
+                        // absent before this block so concurrent handlers that reach this
+                        // branch independently each set-and-remove their own value.
+                        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", &url) };
+                        let gw = rtrt_providers::Gateway::from_env();
+                        unsafe { std::env::remove_var("RTRT_PROVIDER_BASE_URL") };
+                        gw
+                    } else {
+                        rtrt_providers::Gateway::from_env()
+                    }
+                }
+            };
+            let chat_req = ChatRequest {
+                model: model.clone(),
+                messages: vec![
+                    ChatMessage {
+                        role: Role::System,
+                        content: LLM_COMPRESS_SYS.to_string(),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: req.text.clone(),
+                    },
+                ],
+                max_tokens: Some(
+                    // Cap at 4× the original char count but at least 128 tokens.
+                    (original as u32).saturating_mul(4).clamp(128, 4096),
+                ),
+                temperature: Some(0.0),
+            };
+            let resp = llm_gateway
+                .chat(chat_req)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            let out = resp.content.trim().to_string();
+            let compressed = out.chars().count();
+            let mut meta = BTreeMap::new();
+            meta.insert("source".into(), "compress".into());
+            meta.insert("mode".into(), "llm".into());
+            meta.insert("model".into(), model.clone());
+            meta.insert(
+                "saved_chars".into(),
+                original.saturating_sub(compressed).to_string(),
+            );
+            state.capture("compress", &out, &meta).await;
+            Ok(Json(serde_json::json!({
+                "compressed": out,
+                "mode": "llm",
+                "model": model,
+                "original_len": original,
+                "compressed_len": compressed,
+                "saved": original.saturating_sub(compressed),
+                "saved_chars": original.saturating_sub(compressed),
+            })))
+        }
+
+        "ml" => {
+            let target = rtrt_compress::CompressionTarget::new(req.ratio.unwrap_or(0.5))
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            let c = rtrt_compress::MlCompressor::heuristic();
+            let scorer = c.scorer_name().to_string();
+            let out = c.compress(&req.text, target);
+            let compressed = out.chars().count();
+            let mut meta = BTreeMap::new();
+            meta.insert("source".into(), "compress".into());
+            meta.insert("mode".into(), "ml".into());
+            meta.insert("scorer".into(), scorer.clone());
+            meta.insert(
+                "saved_chars".into(),
+                original.saturating_sub(compressed).to_string(),
+            );
+            state.capture("compress", &out, &meta).await;
+            Ok(Json(serde_json::json!({
+                "compressed": out,
+                "mode": "ml",
+                "scorer": scorer,
+                "original_len": original,
+                "compressed_len": compressed,
+                "saved": original.saturating_sub(compressed),
+                "saved_chars": original.saturating_sub(compressed),
+            })))
+        }
+
+        // "rules" or any unrecognised value — run the rule-based compressor.
+        _ => {
+            let level = match req.level.as_deref().unwrap_or("full") {
+                "lite" => CompressionLevel::Lite,
+                "full" => CompressionLevel::Full,
+                "ultra" => CompressionLevel::Ultra,
+                "extreme" => CompressionLevel::Extreme,
+                other => {
+                    return Err((StatusCode::BAD_REQUEST, format!("unknown level: {other}")));
+                }
+            };
+            let compressor = rtrt_compress::Compressor::new(level);
+            let format = req
+                .format
+                .as_deref()
+                .and_then(rtrt_compress::OutputFormat::parse)
+                .unwrap_or(rtrt_compress::OutputFormat::Plain);
+            let out = compressor.compress_to(&req.text, format);
+            let compressed = out.chars().count();
+            let mut meta = BTreeMap::new();
+            meta.insert("source".into(), "compress".into());
+            meta.insert("mode".into(), "rules".into());
+            meta.insert(
+                "saved_chars".into(),
+                original.saturating_sub(compressed).to_string(),
+            );
+            state.capture("compress", &out, &meta).await;
+            Ok(Json(serde_json::json!({
+                "compressed": out,
+                "mode": "rules",
+                "original_len": original,
+                "compressed_len": compressed,
+                "saved": original.saturating_sub(compressed),
+                "saved_chars": original.saturating_sub(compressed),
+            })))
+        }
     }
-    meta.insert(
-        "saved_chars".into(),
-        original.saturating_sub(compressed).to_string(),
-    );
-    state.capture("compress", &out, &meta).await;
-    Ok(Json(serde_json::json!({
-        "compressed": out,
-        "mode": mode,
-        "scorer": scorer,
-        "original_len": original,
-        "compressed_len": compressed,
-        "saved_chars": original.saturating_sub(compressed),
-    })))
 }
 
 fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
@@ -1795,6 +1928,143 @@ async fn memory_compress(
     Ok(Json(MemoryCompressResponse {
         compressed: compressed_count,
         skipped: skipped_count,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/memory/stats?project=X
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct MemoryStatsQuery {
+    project: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KindCount {
+    kind: String,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DayCount {
+    day: String,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryStatsResponse {
+    total: i64,
+    by_kind: Vec<KindCount>,
+    compressed_count: i64,
+    saved_chars: i64,
+    by_day: Vec<DayCount>,
+}
+
+async fn memory_stats(
+    axum::extract::Query(q): axum::extract::Query<MemoryStatsQuery>,
+) -> std::result::Result<Json<MemoryStatsResponse>, (StatusCode, String)> {
+    // Open a direct rusqlite connection to the same path used by open_memory_store().
+    let path = std::env::var("RTRT_MEMORY_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+
+    let conn = rusqlite::Connection::open(&path).map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("memory store: {e}"),
+        )
+    })?;
+
+    // Total row count for the project.
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE project = ?1",
+            rusqlite::params![q.project],
+            |row| row.get(0),
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Per-kind breakdown.
+    let by_kind = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, COUNT(*) AS cnt FROM memories WHERE project = ?1 GROUP BY kind ORDER BY cnt DESC",
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![q.project], |row| {
+                Ok(KindCount {
+                    kind: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // compressed_count = rows whose metadata JSON contains "compressed_at".
+    // saved_chars = sum of (compressed_from_chars - compressed_to_chars) parsed from metadata.
+    // The metadata column stores a JSON object; we query all rows with metadata and filter in Rust
+    // to stay compatible with any SQLite version (no JSON1 dependency assumed).
+    let (compressed_count, saved_chars) = {
+        let mut stmt = conn
+            .prepare("SELECT metadata FROM memories WHERE project = ?1 AND metadata IS NOT NULL")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![q.project], |row| row.get::<_, String>(0))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut count: i64 = 0;
+        let mut saved: i64 = 0;
+        for meta_str in rows.flatten() {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                if obj.get("compressed_at").is_some() {
+                    count += 1;
+                    let from: i64 = obj
+                        .get("compressed_from_chars")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let to: i64 = obj
+                        .get("compressed_to_chars")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    saved += (from - to).max(0);
+                }
+            }
+        }
+        (count, saved)
+    };
+
+    // by_day: group created_at (Unix timestamp integer) by calendar date (YYYY-MM-DD).
+    let by_day = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT date(datetime(created_at, 'unixepoch')) AS day, COUNT(*) AS cnt \
+                 FROM memories WHERE project = ?1 GROUP BY day ORDER BY day",
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![q.project], |row| {
+                Ok(DayCount {
+                    day: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    Ok(Json(MemoryStatsResponse {
+        total,
+        by_kind,
+        compressed_count,
+        saved_chars,
+        by_day,
     }))
 }
 

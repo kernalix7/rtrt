@@ -398,6 +398,14 @@
               </div>
             </div>
           </div>
+          <div class="card" style="margin-top:1rem;">
+            <div class="head">
+              <h2>압축 대기열</h2>
+              <button id="queue-compress-all" class="ghost" type="button" style="font-size:0.85em;">지금 모두 압축</button>
+            </div>
+            <div id="queue-summary" class="hint" style="margin-bottom:0.5rem;">프로젝트를 선택하면 로드됩니다.</div>
+            <div id="queue-list" class="hist-list"></div>
+          </div>
         </div>
 
         <div id="sub-memmap" class="subpage" hidden>
@@ -777,8 +785,8 @@ function wireSubtabs(navId, onActivate) {
   });
 }
 wireSubtabs('memory-subtabs', (sub) => {
-  // Auto-load stats when the stats tab is activated.
-  if (sub === 'memstats' && CURRENT_PROJECT) loadMemStats(CURRENT_PROJECT);
+  // Auto-load stats + compression queue when the stats tab is activated.
+  if (sub === 'memstats' && CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
 });
 
 // Memory: project picker + drill-in
@@ -1345,7 +1353,49 @@ async function loadMemStats(project) {
 }
 
 document.getElementById('memstats-refresh').onclick = () => {
-  if (CURRENT_PROJECT) loadMemStats(CURRENT_PROJECT);
+  if (CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
+};
+
+// Compression queue — GET /api/memory/queue?project=
+async function loadQueue(project) {
+  if (!project) return;
+  const summary = document.getElementById('queue-summary');
+  const list = document.getElementById('queue-list');
+  let d;
+  try {
+    const r = await fetch(`/api/memory/queue?project=${encodeURIComponent(project)}`);
+    if (!r.ok) { summary.textContent = `오류 ${r.status}`; return; }
+    d = await r.json();
+  } catch (e) { summary.textContent = `네트워크 오류: ${e.message || e}`; return; }
+  const onoff = d.enabled ? '자동 압축 ON' : '자동 압축 OFF (설정에서 켜기)';
+  summary.innerHTML = `대기 ${d.ready + d.waiting}건 · 압축 준비됨 <b>${d.ready}</b> · 숙성중 ${d.waiting} `
+    + `· 모델 <code>${escapeHtml(d.model)}</code> · ≥${d.min_chars}자 · ${onoff}`;
+  if (!d.items.length) {
+    list.innerHTML = '<div class="empty">대기열 비어있음 — 압축 대상(긴 미압축 메모리) 없음.</div>';
+    return;
+  }
+  list.innerHTML = d.items.map(i => `
+    <div class="hist-item">
+      <span class="kind">${escapeHtml(i.kind)}</span>
+      <span class="body">#${i.id} · ${i.chars}자 · ${i.age_min}분 전</span>
+      <span class="kind" style="color:${i.ready ? 'var(--ok)' : 'var(--muted)'}">${i.ready ? '✓ 준비' : '⏳ 숙성중'}</span>
+    </div>`).join('');
+}
+
+document.getElementById('queue-compress-all').onclick = async (ev) => {
+  if (!CURRENT_PROJECT) return;
+  const btn = ev.currentTarget;
+  btn.disabled = true; btn.textContent = '압축 중…';
+  try {
+    const r = await fetch('/api/memory/compress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: CURRENT_PROJECT }),
+    });
+    const d = await r.json();
+    pushActivity(`압축 ${CURRENT_PROJECT}: ${d.compressed}건 (skip ${d.skipped})`);
+  } catch (e) { pushActivity(`압축 오류: ${e.message || e}`); }
+  btn.disabled = false; btn.textContent = '지금 모두 압축';
+  loadQueue(CURRENT_PROJECT); loadMemStats(CURRENT_PROJECT);
 };
 
 // Memory graph — force-directed canvas layout

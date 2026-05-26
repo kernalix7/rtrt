@@ -233,6 +233,7 @@ async fn main() -> Result<()> {
         .route("/api/models", get(get_models))
         .route("/api/memory/compress", post(memory_compress))
         .route("/api/memory/stats", get(memory_stats))
+        .route("/api/memory/queue", get(memory_queue))
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -318,11 +319,18 @@ fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
 /// Disabled unless `RTRT_AUTO_COMPRESS_LLM=1`. Honours the same
 /// `RTRT_AUTO_COMPRESS_*` knobs documented in `docs/USAGE.md`.
 fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: Arc<Gateway>) {
-    let enabled = std::env::var("RTRT_AUTO_COMPRESS_LLM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
+    // Resolution order: env var > ~/.rtrt/config.toml > built-in default.
+    // So the daemon turns on when EITHER RTRT_AUTO_COMPRESS_LLM=1 OR the
+    // config's [auto_compress] enabled=true.
+    let cfg = rtrt_core::Config::load().unwrap_or_default().auto_compress;
+    let enabled = match std::env::var("RTRT_AUTO_COMPRESS_LLM") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
+        Err(_) => cfg.enabled,
+    };
     if !enabled {
-        tracing::info!("auto-compress daemon off (set RTRT_AUTO_COMPRESS_LLM=1 to enable)");
+        tracing::info!(
+            "auto-compress daemon off (set RTRT_AUTO_COMPRESS_LLM=1 or [auto_compress] enabled=true)"
+        );
         return;
     }
     let Some(store) = memory else {
@@ -332,25 +340,24 @@ fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: 
     let interval_sec: u64 = std::env::var("RTRT_AUTO_COMPRESS_INTERVAL_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(cfg.interval_sec);
     let age_sec: i64 = std::env::var("RTRT_AUTO_COMPRESS_AGE_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
+        .unwrap_or(cfg.age_sec);
     let min_chars: usize = std::env::var("RTRT_AUTO_COMPRESS_MIN_CHARS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
+        .unwrap_or(cfg.min_chars);
     let batch: usize = std::env::var("RTRT_AUTO_COMPRESS_BATCH")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL")
-        .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+        .unwrap_or(cfg.batch);
+    let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL").unwrap_or_else(|_| cfg.model.clone());
     let max_tokens: u32 = std::env::var("RTRT_AUTO_COMPRESS_MAX_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
+        .unwrap_or(cfg.max_tokens);
     tracing::info!(
         "auto-compress daemon on: model={model}, every {interval_sec}s, age>{age_sec}s, min_chars={min_chars}, batch={batch}"
     );
@@ -2066,6 +2073,80 @@ async fn memory_stats(
         saved_chars,
         by_day,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryQueueQuery {
+    project: String,
+}
+
+/// Compression queue: rows that are eligible for LLM compression (body
+/// length >= configured min_chars, not yet compressed) but haven't been
+/// done. `ready` = the cool-off age has also passed, so the daemon /
+/// "compress now" will pick it up; `waiting` rows are still too recent.
+async fn memory_queue(
+    axum::extract::Query(q): axum::extract::Query<MemoryQueueQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = std::env::var("RTRT_MEMORY_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+    let cfg = rtrt_core::Config::load().unwrap_or_default().auto_compress;
+    let conn = rusqlite::Connection::open(&path).map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("memory store: {e}"),
+        )
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - cfg.age_sec;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, kind, LENGTH(body), created_at FROM memories \
+              WHERE project = ?1 AND LENGTH(body) >= ?2 \
+                AND (metadata IS NULL OR metadata NOT LIKE '%compressed_at%') \
+              ORDER BY created_at ASC LIMIT 200",
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![q.project, cfg.min_chars as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let chars: i64 = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            Ok((id, kind, chars, created_at))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut items = Vec::new();
+    let (mut ready, mut waiting) = (0i64, 0i64);
+    for r in rows.flatten() {
+        let (id, kind, chars, created_at) = r;
+        let is_ready = created_at < cutoff;
+        if is_ready {
+            ready += 1;
+        } else {
+            waiting += 1;
+        }
+        items.push(serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "chars": chars,
+            "age_min": (now - created_at) / 60,
+            "ready": is_ready,
+        }));
+    }
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "ready": ready,
+        "waiting": waiting,
+        "min_chars": cfg.min_chars,
+        "age_sec": cfg.age_sec,
+        "enabled": cfg.enabled,
+        "model": cfg.model,
+    })))
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");

@@ -16,7 +16,7 @@ path = "src/main.rs"
 rtrt-core.workspace = true
 rtrt-compress = { workspace = true, features = ["llm-compress", "treesitter"] }
 rtrt-proxy.workspace = true
-rtrt-memory = { workspace = true, features = ["llm"] }
+rtrt-memory = { workspace = true, features = ["llm", "ollama-embed"] }
 rtrt-providers.workspace = true
 rtrt-templates.workspace = true
 clap.workspace = true

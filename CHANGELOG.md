@@ -9,6 +9,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — dense-vector semantic recall, entity linking, SessionStart injection
+
+**Memory recall gains a true dense-vector path backed by a local Ollama embedder, the dashboard exposes one-click embedding backfill + entity extraction, and a SessionStart hook injects project knowledge from turn one.**
+
+- `rtrt-memory::OllamaEmbedder` (behind the `ollama-embed` feature) calls `{base_url}/api/embeddings`; the default model is `bge-m3` (1024-dim). Wired into `recall_hybrid` so `mode=hybrid` recall fuses BM25 + cosine via reciprocal-rank fusion when an embedder is present, and degrades to graph-blended BM25 when it is not.
+- New `[embeddings]` config section (`enabled` / `model` / `base_url`) with `RTRT_EMBED_ENABLED` / `RTRT_EMBED_MODEL` / `RTRT_EMBED_BASE_URL` env overrides; surfaced read+write through `GET`/`POST /api/config` and the dashboard settings page.
+- Dashboard: `POST /api/memory/embed` backfills embeddings for a project's un-embedded rows; `POST /api/memory/entities` runs LLM entity extraction and links co-mentioning memories. The search subtab shows a semantic badge on vector hits and an embed-backfill button; the graph subtab adds an entity-extract button with typed (entity / block / memory) node colouring.
+- `MemoryStore::add_edge` now returns whether a new edge was created; entity linking is split into the async `link_entities` and a synchronous `link_extracted` so the work runs from a `Send` axum handler without holding a `!Sync` store borrow across an `.await`.
+- New `rtrt hook session-inject` (registered on `SessionStart`) prints the project's top memories as a context block so background knowledge is available before the first prompt.
+
 ### Highlights — local LLM compress model sweep
 
 - `docs/PERF.md` + `docs/PERF.ko.md` publish a length-tiered comparison of local Ollama models on the LLM auto-compress path (20 realistic captures per tier × six tiers, XS ~16 chars to XXL ~6000). Headline: compression ratio is driven by input length far more than the model — short rows barely compress (so `RTRT_AUTO_COMPRESS_MIN_CHARS=512` correctly skips them), dense mid-length sits at ~25-30%, long verbose captures reach 40%+.

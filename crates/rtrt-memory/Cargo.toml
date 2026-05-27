@@ -22,6 +22,7 @@ async-trait.workspace = true
 fastembed = { workspace = true, optional = true }
 rtrt-providers = { workspace = true, optional = true }
 instant-distance = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -39,6 +40,10 @@ llm = ["dep:rtrt-providers"]
 # which is fine for a few thousand memories but starts costing real time
 # beyond ~50k.
 hnsw = ["dep:instant-distance"]
+# Lightweight Ollama-backed embedder. Uses `ureq` (sync) so the caller does not
+# need an async runtime to create the embedder. The embedder loops per text
+# because Ollama's /api/embeddings endpoint accepts a single string at a time.
+ollama-embed = ["dep:ureq"]
 
 [dev-dependencies]
 criterion = { workspace = true }

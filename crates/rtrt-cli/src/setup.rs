@@ -319,6 +319,21 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                 ]
             }));
         }
+        // On SessionStart, inject the project's top memories into the model
+        // context so background knowledge is available from turn 1 without
+        // waiting for a UserPromptSubmit recall.
+        if *event == "SessionStart" {
+            arr_mut.push(serde_json::json!({
+                "matcher": "rtrt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{rtrt_cmd} hook session-inject"),
+                        "timeout": 5
+                    }
+                ]
+            }));
+        }
         // On SessionEnd, run an LLM compression sweep over old rows. No-op
         // unless RTRT_AUTO_COMPRESS_LLM=1, so it costs nothing until the
         // user opts in — but then it runs without a dashboard daemon.

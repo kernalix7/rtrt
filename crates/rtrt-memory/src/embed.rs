@@ -66,6 +66,98 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
+#[cfg(feature = "ollama-embed")]
+mod ollama_impl {
+    use rtrt_core::{Error, Result};
+
+    use super::Embedder;
+
+    /// Ollama-backed embedder. Calls `POST {base_url}/api/embeddings` for each
+    /// text (Ollama accepts one string per call, so `embed` loops). The
+    /// dimension is detected on first call and cached; if the probe fails it
+    /// defaults to 1024 (the bge-m3 native size).
+    pub struct OllamaEmbedder {
+        base_url: String,
+        model: String,
+        // `None` until the first successful embed; then locked in forever.
+        dim: std::sync::OnceLock<usize>,
+    }
+
+    impl OllamaEmbedder {
+        /// Constructs an embedder pointing at `base_url` (e.g.
+        /// `http://127.0.0.1:11434`). A trailing `/v1` is stripped so the
+        /// same URL that works for OpenAI-compat chat routes to the correct
+        /// `/api/embeddings` path.
+        pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+            let mut url = base_url.into();
+            // Strip a trailing `/v1` — the embeddings endpoint lives at the
+            // host root, not under the OpenAI-compat prefix.
+            if url.ends_with("/v1") {
+                url.truncate(url.len() - 3);
+            }
+            url = url.trim_end_matches('/').to_string();
+            Self {
+                base_url: url,
+                model: model.into(),
+                dim: std::sync::OnceLock::new(),
+            }
+        }
+
+        fn embed_one_text(&self, text: &str) -> Result<Vec<f32>> {
+            let url = format!("{}/api/embeddings", self.base_url);
+            let body = serde_json::json!({
+                "model": self.model,
+                "prompt": text,
+            });
+            let resp = ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .send_json(&body)
+                .map_err(|e| Error::Memory(format!("ollama embeddings request: {e}")))?;
+            let v: serde_json::Value = resp
+                .into_json()
+                .map_err(|e| Error::Memory(format!("ollama embeddings decode: {e}")))?;
+            let arr = v
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .ok_or_else(|| Error::Memory("ollama: missing `embedding` array".into()))?;
+            let vec: Vec<f32> = arr
+                .iter()
+                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                .collect();
+            if vec.is_empty() {
+                return Err(Error::Memory("ollama: empty embedding vector".into()));
+            }
+            Ok(vec)
+        }
+    }
+
+    impl Embedder for OllamaEmbedder {
+        fn dimension(&self) -> usize {
+            // Return whatever was detected on the first successful call, or
+            // fall back to the bge-m3 default of 1024.
+            *self.dim.get().unwrap_or(&1024)
+        }
+
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for &text in texts {
+                let vec = self.embed_one_text(text)?;
+                // Latch the dimension on the first successful call.
+                let _ = self.dim.set(vec.len());
+                out.push(vec);
+            }
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(feature = "ollama-embed")]
+pub use ollama_impl::OllamaEmbedder;
+
 #[cfg(feature = "embeddings")]
 mod fastembed_impl {
     use std::sync::Mutex;

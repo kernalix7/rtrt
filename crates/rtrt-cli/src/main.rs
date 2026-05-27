@@ -1057,7 +1057,7 @@ model = "claude-haiku-4-5"  # RTRT_AUTO_COMPRESS_MODEL
 # base_url = "http://127.0.0.1:11434/v1"   # RTRT_PROVIDER_BASE_URL
 interval_sec = 1800       # dashboard daemon cadence
 age_sec = 3600            # RTRT_AUTO_COMPRESS_AGE_SEC — only rows older than this
-min_chars = 512           # RTRT_AUTO_COMPRESS_MIN_CHARS — skip shorter rows
+min_chars = 1             # RTRT_AUTO_COMPRESS_MIN_CHARS — compress every row (raise to skip short ones)
 batch = 20                # RTRT_AUTO_COMPRESS_BATCH — max rows per sweep
 max_tokens = 512          # RTRT_AUTO_COMPRESS_MAX_TOKENS
 "#;

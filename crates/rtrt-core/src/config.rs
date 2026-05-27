@@ -99,7 +99,13 @@ fn default_compress_age() -> i64 {
     3600
 }
 fn default_compress_min_chars() -> usize {
-    512
+    // Default to "compress everything": every row is attempted once. The
+    // no-shrink guard tags rows the model can't shrink with
+    // `compressed_skip=no-shrink` (and `compressed_at`), so they are
+    // excluded from future sweeps — each row costs at most one LLM call
+    // over its lifetime. Raise this if you want to spend calls only on
+    // longer rows (the bench shows ~1000+ chars is where big savings are).
+    1
 }
 fn default_compress_batch() -> usize {
     20
@@ -218,7 +224,7 @@ mod tests {
         assert_eq!(c.capture.dedup_window_sec, 300);
         assert!(!c.auto_compress.enabled);
         assert_eq!(c.auto_compress.model, "claude-haiku-4-5");
-        assert_eq!(c.auto_compress.min_chars, 512);
+        assert_eq!(c.auto_compress.min_chars, 1);
     }
 
     #[test]

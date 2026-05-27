@@ -271,6 +271,15 @@
   .graph-legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.79em; color: var(--muted); }
   .graph-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 
+  /* Savings % badge — used in compress, proxy, queue rows */
+  .badge.save { color: var(--ok); border-color: var(--ok); font-variant-numeric: tabular-nums; }
+
+  /* Local LLM page */
+  .llm-pull-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
+  .llm-pull-row input { flex: 1; min-width: 180px; }
+  .llm-section-head { font-size: 0.82em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin: 0.75rem 0 0.4rem; }
+  .llm-offline { color: var(--muted); font-size: 0.88em; padding: 0.5rem 0; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -302,6 +311,7 @@
     <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드 맵</a>
     <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
     <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
+    <a class="nav" data-page="llm"><span class="icon">🤖</span>로컬 LLM</a>
     <div class="group">설정</div>
     <a class="nav" data-page="settings"><span class="icon">🎛</span>설정</a>
     <a class="nav" data-page="connect"><span class="icon">🔌</span>에이전트 연결</a>
@@ -926,6 +936,33 @@
       </div>
     </section>
 
+    <!-- 로컬 LLM -->
+    <section id="page-llm" class="page" hidden>
+      <div class="section-head">
+        <h1>로컬 LLM</h1>
+        <div class="lede">Ollama 모델 관리 · Pull · 기본 모델 설정</div>
+      </div>
+      <!-- Pull -->
+      <div class="card">
+        <div class="head"><h2>모델 Pull</h2><span class="hint">예: bge-m3, llama3.2</span></div>
+        <div class="llm-pull-row">
+          <input id="llm-pull-name" placeholder="모델 이름 (예: bge-m3)">
+          <button id="llm-pull-btn" class="primary" type="button">Pull</button>
+          <span id="llm-pull-status" class="out-meta"></span>
+        </div>
+      </div>
+      <!-- Running models -->
+      <div id="llm-ps-card" class="card">
+        <div class="head"><h2>실행 중</h2><a id="llm-ps-refresh" style="cursor:pointer;font-size:0.88em;">새로고침</a></div>
+        <div id="llm-ps-body"><div class="empty">로드 중…</div></div>
+      </div>
+      <!-- Installed models -->
+      <div id="llm-models-card" class="card">
+        <div class="head"><h2>설치된 모델</h2><a id="llm-models-refresh" style="cursor:pointer;font-size:0.88em;">새로고침</a></div>
+        <div id="llm-models-body"><div class="empty">로드 중…</div></div>
+      </div>
+    </section>
+
     <!-- 환경 -->
     <section id="page-env" class="page" hidden>
         <div class="card">
@@ -1399,6 +1436,7 @@ const PALETTE_ITEMS = [
   { label: '예시: 압축', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
   { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
   { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
+  { label: '로컬 LLM', hint: 'ollama · models · pull', run: () => navigate('llm') },
 ];
 function navigate(page) {
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
@@ -1417,6 +1455,11 @@ function navigate(page) {
     // Reload config each time the panel opens so it stays current.
     populateModelSelects();
     loadConfig();
+  }
+  if (page === 'llm') {
+    // Load both lists fresh each time the page is opened.
+    loadLlmModels();
+    loadLlmPs();
   }
 }
 function subClick(navId, sub) {
@@ -1785,11 +1828,16 @@ async function loadMemStats(project) {
 
   // KPI tiles: total, compressed count, saved chars, compression ratio
   const ratio = d.total ? ((d.compressed_count || 0) / d.total * 100).toFixed(1) : '0';
-  const savedK = d.saved_chars >= 1000 ? `${(d.saved_chars / 1000).toFixed(1)}K` : String(d.saved_chars || 0);
+  const savedK = (d.saved_chars || 0) >= 1000 ? `${((d.saved_chars || 0) / 1000).toFixed(1)}K` : String(d.saved_chars || 0);
+  // saved_pct from server is the authoritative compression savings rate.
+  const savedPctTile = d.saved_pct != null
+    ? `<div class="kpi accent"><div class="label">압축 절감률</div><div class="value">${Number(d.saved_pct).toFixed(1)}%</div><div class="sub">chars 기준</div></div>`
+    : '';
   document.getElementById('memstats-kpis').innerHTML = `
     <div class="kpi accent"><div class="label">전체 메모리</div><div class="value">${(d.total || 0).toLocaleString()}</div><div class="sub">건</div></div>
     <div class="kpi"><div class="label">압축됨</div><div class="value">${(d.compressed_count || 0).toLocaleString()}</div><div class="sub">${ratio}%</div></div>
     <div class="kpi"><div class="label">절감 글자</div><div class="value">${savedK}</div><div class="sub">chars</div></div>
+    ${savedPctTile}
   `;
 
   // Kind bars
@@ -1832,12 +1880,18 @@ async function loadQueue(project) {
     list.innerHTML = '<div class="empty">대기열 비어있음 — 압축 대상(긴 미압축 메모리) 없음.</div>';
     return;
   }
-  list.innerHTML = d.items.map(i => `
-    <div class="hist-item">
+  list.innerHTML = d.items.map(i => {
+    // saved_pct is present on already-compressed rows; null/absent means pending.
+    const pctBadge = i.saved_pct != null
+      ? `<span class="badge save">−${Number(i.saved_pct).toFixed(1)}%</span>`
+      : `<span style="font-size:0.78em;color:var(--muted);">대기</span>`;
+    return `<div class="hist-item">
       <span class="kind">${escapeHtml(i.kind)}</span>
       <span class="body">#${i.id} · ${i.chars}자 · ${i.age_min}분 전</span>
+      ${pctBadge}
       <span class="kind" style="color:${i.ready ? 'var(--ok)' : 'var(--muted)'}">${i.ready ? '✓ 준비' : '⏳ 숙성중'}</span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 // Governance subtab logic.
@@ -2211,7 +2265,9 @@ document.getElementById('compress-form').onsubmit = async (ev) => {
   const origLen = d.original_len ?? inputText.length;
   const compLen = d.compressed_len ?? (d.compressed || '').length;
   const savedChars = d.saved ?? d.saved_chars ?? (origLen - compLen);
-  const savePct = origLen ? (100 - (compLen / origLen) * 100).toFixed(1) : '0';
+  // Prefer server-supplied saved_pct (f64); fall back to computed ratio.
+  const savePct = d.saved_pct != null ? Number(d.saved_pct).toFixed(1) :
+    (origLen ? (100 - (compLen / origLen) * 100).toFixed(1) : '0');
   const modelNote = d.model ? ` · model=${d.model}` : '';
   sum.innerHTML =
     `<span class="savings-badge">↓ ${savePct}% 절감</span>` +
@@ -2219,7 +2275,7 @@ document.getElementById('compress-form').onsubmit = async (ev) => {
   before.textContent = inputText;
   pre.textContent = d.compressed;
   compare.hidden = false;
-  pushActivity(`compress · -${savedChars}자`);
+  pushActivity(`compress · -${savePct}% (-${savedChars}자)`);
 };
 document.getElementById('proxy-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -2235,8 +2291,12 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
   const r = await fetch('/api/proxy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  const ratio = d.original_len ? ((d.filtered_len / d.original_len) * 100).toFixed(1) : '0';
-  sum.innerHTML = `<span class="badge ok">✓ ${d.original_len} → ${d.filtered_len} (${ratio}%)</span> <span style="margin-left:0.5rem;">절감 ${d.saved_chars}자 · mode=${d.mode}</span>`;
+  // saved_pct from server is the authoritative number; fall back to computed.
+  const proxyPct = d.saved_pct != null ? Number(d.saved_pct).toFixed(1) :
+    (d.original_len ? (100 - (d.filtered_len / d.original_len) * 100).toFixed(1) : '0');
+  sum.innerHTML = `<span class="badge ok">✓ ${d.original_len} → ${d.filtered_len}</span>`
+    + ` <span class="badge save">−${proxyPct}%</span>`
+    + ` <span style="margin-left:0.4rem;color:var(--muted);">절감 ${d.saved_chars}자 · mode=${d.mode}</span>`;
   pre.hidden = false; pre.textContent = d.filtered;
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
@@ -2573,6 +2633,190 @@ function subscribeStream() {
   };
   connect();
 }
+
+// ── Local LLM page (Ollama) ──────────────────────────────────────────────────
+
+// Format raw bytes into a human-readable string (GB / MB / KB).
+function humanBytes(n) {
+  if (n == null) return '—';
+  n = Number(n);
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+// PATCH /api/config — only the sub-object that changed needs to be sent.
+// Backend confirms it merges partial updates, so we don't need to load-then-save-full.
+async function setDefaultModel(field /* 'auto_compress' | 'embeddings' */, modelName) {
+  // POST /api/config requires full capture + auto_compress; a partial body
+  // would 422 or reset other fields to defaults. Load the current config,
+  // patch only the one model field, and POST the whole thing back.
+  try {
+    const cur = await fetch('/api/config');
+    if (!cur.ok) { showToast(`설정 로드 실패 ${cur.status}`, 'err'); return; }
+    const cfg = await cur.json();
+    const body = {
+      capture: cfg.capture,
+      auto_compress: { ...cfg.auto_compress },
+      embeddings: { ...(cfg.embeddings || {}) },
+    };
+    body[field] = { ...body[field], model: modelName };
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { showToast(`설정 저장 실패 ${r.status}`, 'err'); return; }
+    const label = field === 'auto_compress' ? '압축 기본' : '임베딩 기본';
+    showToast(`✓ ${label} 모델 → ${modelName}`, 'ok');
+    pushActivity(`설정: ${label} 모델 = ${modelName}`);
+  } catch (e) { showToast(`저장 오류: ${e.message || e}`, 'err'); }
+}
+
+// GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
+async function loadLlmModels() {
+  const body = document.getElementById('llm-models-body');
+  body.innerHTML = '<div class="empty">로드 중…</div>';
+  let models;
+  try {
+    const r = await fetch('/api/ollama/models');
+    // 502 = Ollama unreachable; 404 = endpoint not compiled in.
+    if (r.status === 404 || r.status === 502) {
+      body.innerHTML = `<div class="llm-offline">ollama 연결 안 됨 (${r.status})</div>`;
+      return;
+    }
+    if (!r.ok) { body.innerHTML = `<div class="llm-offline">오류 ${r.status}</div>`; return; }
+    const d = await r.json();
+    models = d.models || [];
+  } catch (e) { body.innerHTML = `<div class="llm-offline">네트워크 오류: ${e.message || e}</div>`; return; }
+
+  if (!models.length) { body.innerHTML = '<div class="empty">설치된 모델 없음. 위에서 Pull 하세요.</div>'; return; }
+
+  // `size` (not size_bytes) per confirmed backend shape; no `family` field.
+  body.innerHTML = `<table>
+    <thead><tr><th>이름</th><th>크기</th><th>수정일</th><th style="text-align:right;">작업</th></tr></thead>
+    <tbody>${models.map(m => {
+      const mod = m.modified_at ? new Date(m.modified_at).toLocaleDateString('ko-KR') : '—';
+      return `<tr>
+        <td><code>${escapeHtml(m.name)}</code></td>
+        <td>${humanBytes(m.size)}</td>
+        <td style="color:var(--muted);font-size:0.85em;">${mod}</td>
+        <td style="text-align:right;white-space:nowrap;">
+          <button class="ghost" style="font-size:0.8em;padding:0.2rem 0.5rem;" data-llm-compress="${escapeHtml(m.name)}">압축 기본으로</button>
+          <button class="ghost" style="font-size:0.8em;padding:0.2rem 0.5rem;" data-llm-embed="${escapeHtml(m.name)}">임베딩 기본으로</button>
+          <button class="ghost" style="font-size:0.8em;padding:0.2rem 0.5rem;color:var(--err);" data-llm-delete="${escapeHtml(m.name)}">삭제</button>
+        </td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+
+  // Wire per-row buttons.
+  body.querySelectorAll('[data-llm-compress]').forEach(btn => {
+    btn.onclick = () => setDefaultModel('auto_compress', btn.dataset.llmCompress);
+  });
+  body.querySelectorAll('[data-llm-embed]').forEach(btn => {
+    btn.onclick = () => setDefaultModel('embeddings', btn.dataset.llmEmbed);
+  });
+  body.querySelectorAll('[data-llm-delete]').forEach(btn => {
+    btn.onclick = async () => {
+      const name = btn.dataset.llmDelete;
+      if (!confirm(`"${name}" 모델을 삭제합니다. 디스크에서 완전히 제거됩니다.`)) return;
+      btn.disabled = true;
+      try {
+        // DELETE /api/ollama/{name} — path param, URL-encode colons.
+        const r = await fetch(`/api/ollama/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (r.status === 404 || r.status === 502) {
+          showToast(`삭제 실패 (${r.status})`, 'err');
+          return;
+        }
+        if (!r.ok) { showToast(`삭제 실패 ${r.status}`, 'err'); return; }
+        showToast(`✓ ${name} 삭제됨`, 'ok');
+        pushActivity(`ollama delete · ${name}`);
+        loadLlmModels();
+      } catch (e) { showToast(`삭제 오류: ${e.message || e}`, 'err'); }
+      finally { btn.disabled = false; }
+    };
+  });
+}
+
+// GET /api/ollama/ps → { models: [{name, size, digest, expires_at}] }
+async function loadLlmPs() {
+  const body = document.getElementById('llm-ps-body');
+  body.innerHTML = '<div class="empty">로드 중…</div>';
+  let ps;
+  try {
+    const r = await fetch('/api/ollama/ps');
+    if (r.status === 404 || r.status === 502) {
+      body.innerHTML = `<div class="llm-offline">ollama 연결 안 됨 (${r.status})</div>`;
+      return;
+    }
+    if (!r.ok) { body.innerHTML = `<div class="llm-offline">오류 ${r.status}</div>`; return; }
+    const d = await r.json();
+    ps = d.models || [];
+  } catch (e) { body.innerHTML = `<div class="llm-offline">네트워크 오류: ${e.message || e}</div>`; return; }
+
+  if (!ps.length) { body.innerHTML = '<div class="empty">현재 실행 중인 모델 없음.</div>'; return; }
+
+  // `size` (not size_bytes), `expires_at` (not until), no size_vram_bytes in this shape.
+  body.innerHTML = `<table>
+    <thead><tr><th>이름</th><th>크기</th><th>만료</th></tr></thead>
+    <tbody>${ps.map(m => {
+      const exp = m.expires_at ? new Date(m.expires_at).toLocaleTimeString('ko-KR') : '—';
+      return `<tr>
+        <td><code>${escapeHtml(m.name)}</code></td>
+        <td>${humanBytes(m.size)}</td>
+        <td style="color:var(--muted);font-size:0.85em;">${exp}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+}
+
+// Pull button — POST /api/ollama/pull {name}; blocks until done (may be minutes).
+document.getElementById('llm-pull-btn').onclick = async () => {
+  const name = document.getElementById('llm-pull-name').value.trim();
+  if (!name) { showToast('모델 이름을 입력하세요.', 'err'); return; }
+  const btn = document.getElementById('llm-pull-btn');
+  const status = document.getElementById('llm-pull-status');
+  btn.disabled = true;
+  status.textContent = 'Pull 중… (모델 크기에 따라 수 분이 걸릴 수 있습니다)';
+  try {
+    const r = await fetch('/api/ollama/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (r.status === 404) {
+      status.innerHTML = '<span style="color:var(--muted);">pull API 미지원 (404)</span>';
+      return;
+    }
+    if (r.status === 502) {
+      status.innerHTML = '<span style="color:var(--err);">ollama 연결 안 됨 (502)</span>';
+      showToast('ollama 연결 안 됨', 'err');
+      return;
+    }
+    if (!r.ok) {
+      const txt = await r.text();
+      status.innerHTML = `<span style="color:var(--err);">오류 ${r.status}: ${escapeHtml(txt)}</span>`;
+      showToast(`pull 실패: ${txt}`, 'err');
+      return;
+    }
+    const d = await r.json();
+    // Backend returns {status, name}; status === "success" on happy path.
+    status.innerHTML = `<span class="badge ok">✓ ${escapeHtml(d.status || 'ok')}</span>`;
+    showToast(`✓ ${d.name || name} pull 완료`, 'ok');
+    pushActivity(`ollama pull · ${d.name || name}`);
+    loadLlmModels();
+  } catch (e) {
+    status.innerHTML = `<span style="color:var(--err);">오류: ${escapeHtml(e.message || String(e))}</span>`;
+    showToast(`pull 오류: ${e.message || e}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+document.getElementById('llm-models-refresh').onclick = () => loadLlmModels();
+document.getElementById('llm-ps-refresh').onclick = () => loadLlmPs();
 
 // Init
 document.getElementById('env-bind').textContent = window.location.host;

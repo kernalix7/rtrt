@@ -46,6 +46,18 @@ if ($Purge) {
 }
 Write-Host ""
 
+# Remove the dashboard logon task first (best-effort).
+$existingTask = Get-ScheduledTask -TaskName "rtrt-dashboard" -ErrorAction SilentlyContinue
+if ($existingTask -and (Confirm-Step "Stop + remove the rtrt-dashboard logon task?")) {
+    try {
+        Stop-ScheduledTask -TaskName "rtrt-dashboard" -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName "rtrt-dashboard" -Confirm:$false
+        Write-Log "  dashboard task removed"
+    } catch {
+        Write-Warn "  could not remove dashboard task: $($_.Exception.Message)"
+    }
+}
+
 if (Confirm-Step "Remove binaries from $InstallDir?") {
     foreach ($bin in $Bins) {
         $target = Join-Path $InstallDir $bin

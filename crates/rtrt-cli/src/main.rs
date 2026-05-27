@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod service;
 mod setup;
 
 use rtrt_compress::{
@@ -183,6 +184,13 @@ enum Cmd {
         #[arg(long)]
         plugin: bool,
     },
+    /// Run `rtrt-dashboard` as a background OS service so it starts on login
+    /// and restarts on crash (systemd --user on Linux, launchd on macOS).
+    /// Dry-run by default; pass `--apply`.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
     /// Extract top-level signatures from source via tree-sitter (drops bodies).
     Signatures {
         /// Language. Currently: `rust`.
@@ -286,6 +294,26 @@ enum ConfigCmd {
     },
     /// Print the resolved config path and whether it exists.
     Path,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCmd {
+    /// Write + enable the OS service for `rtrt-dashboard`.
+    Install {
+        /// Apply the change. Without this, only a dry-run is printed.
+        #[arg(long)]
+        apply: bool,
+        /// Override the discovered `rtrt-dashboard` binary path.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
+    /// Stop + remove the OS service.
+    Uninstall {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Show the service status.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -923,6 +951,35 @@ async fn main() -> Result<()> {
                 binary,
                 plugin,
             })?;
+        }
+        Cmd::Service { cmd } => {
+            // Resolve the dashboard binary next to the running CLI (same prefix).
+            let resolve_dash = |b: Option<PathBuf>| {
+                b.unwrap_or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("rtrt-dashboard")))
+                        .unwrap_or_else(|| PathBuf::from("rtrt-dashboard"))
+                })
+            };
+            let plan = match cmd {
+                ServiceCmd::Install { apply, binary } => service::ServicePlan {
+                    action: service::ServiceAction::Install,
+                    apply,
+                    binary: resolve_dash(binary),
+                },
+                ServiceCmd::Uninstall { apply } => service::ServicePlan {
+                    action: service::ServiceAction::Uninstall,
+                    apply,
+                    binary: resolve_dash(None),
+                },
+                ServiceCmd::Status => service::ServicePlan {
+                    action: service::ServiceAction::Status,
+                    apply: false,
+                    binary: resolve_dash(None),
+                },
+            };
+            service::run(plan)?;
         }
         Cmd::RepoMap {
             root,

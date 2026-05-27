@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### Highlights — 대시보드 백그라운드 서비스 자동 시작
+
+**설치 시 `rtrt-dashboard`를 백그라운드 OS 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동.**
+
+- 새 `rtrt service install|uninstall|status` 서브커맨드: Linux는 systemd **user** 유닛(`~/.config/systemd/user/rtrt-dashboard.service`), macOS는 launchd LaunchAgent(`~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`). 기본 dry-run, `--apply`로 실행. 유닛이 `RTRT_MEMORY_PATH=~/.rtrt/memory.sqlite`를 고정해 CLI/MCP/훅과 동일 스토어 사용.
+- `install.sh` / `install.ps1`이 기본으로 서비스 시작(Windows는 `rtrt-dashboard` 로그온 예약 작업 등록); `--no-service` / `-NoService` / `RTRT_NO_SERVICE=1`로 옵트아웃. `uninstall.sh` / `uninstall.ps1`은 바이너리 삭제 전에 서비스 중지+제거.
+- `docs/INSTALL.md` + `docs/INSTALL.ko.md`에 서비스, 옵트아웃 플래그, 수동 관리 문서화.
+
 ### Highlights — 절감률 % 일관 표시 · 로컬 LLM 관리 페이지
 
 **대시보드가 압축 절감률을 어디서나 퍼센트로 표시하고, 로컬 Ollama 모델을 끝까지 관리하는 새 페이지가 추가됐습니다.**

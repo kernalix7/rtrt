@@ -15,6 +15,7 @@
 #   -SkipDeps             Skip toolchain check (fail early if missing).
 #                         (env: RTRT_SKIP_DEPS=1)
 #   -Uninstall            Compat shim — defers to uninstall.ps1.
+#   -NoService            Don't register the rtrt-dashboard logon task.
 #   -DryRun               Print intended actions without writing anything.
 
 [CmdletBinding()]
@@ -26,6 +27,7 @@ param(
     [string]   $InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\rtrt"),
     [switch]   $SkipDeps,
     [switch]   $Uninstall,
+    [switch]   $NoService,
     [switch]   $DryRun
 )
 
@@ -102,11 +104,37 @@ function Show-InstallCheck {
     foreach ($bin in $Bins) {
         Write-Log "  $(Join-Path $InstallDir $bin)"
     }
+    Install-DashboardTask
     Write-Host ""
     Write-Log "Next:"
     Write-Log "  rtrt --version"
     Write-Log "  rtrt info"
     Write-Log "  rtrt templates"
+}
+
+# Register a logon scheduled task that starts rtrt-dashboard in the background
+# (Windows has no `rtrt service` path; this is the equivalent auto-start).
+# Default-on; `-NoService` disables. Best-effort — never fails the install.
+function Install-DashboardTask {
+    if ($NoService -or $DryRun) { return }
+    $dash = Join-Path $InstallDir "rtrt-dashboard.exe"
+    if (-not (Test-Path $dash)) { return }
+    Write-Host ""
+    Write-Log "registering rtrt-dashboard logon task"
+    try {
+        $action  = New-ScheduledTaskAction -Execute $dash
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -StartWhenAvailable
+        Register-ScheduledTask -TaskName "rtrt-dashboard" -Action $action `
+            -Trigger $trigger -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName "rtrt-dashboard"
+        Write-Log "  dashboard task registered + started — http://127.0.0.1:7311"
+        Write-Log "  remove: Unregister-ScheduledTask -TaskName rtrt-dashboard -Confirm:`$false"
+    } catch {
+        Write-Warn "  task registration skipped: $($_.Exception.Message)"
+        Write-Warn "  run rtrt-dashboard manually if you want the web UI"
+    }
 }
 
 function Build-FromSource($SrcDir) {

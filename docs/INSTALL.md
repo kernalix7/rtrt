@@ -28,10 +28,22 @@ The installers detect OS + arch, download the matching tarball / zip from the la
 | `--source PATH` | `-Source` | `RTRT_SOURCE` | Build from a local copy (offline / air-gapped) |
 | `--dir PATH` | `-InstallDir` | — | Install dir (default: `~/.local/bin` / `%LOCALAPPDATA%\Programs\rtrt`) |
 | `--skip-deps` | `-SkipDeps` | `RTRT_SKIP_DEPS=1` | Skip the cargo / git toolchain check |
+| `--no-setup` | — | `RTRT_NO_SETUP=1` | Don't auto-refresh the Claude Code MCP config + hooks |
+| `--no-service` | `-NoService` | `RTRT_NO_SERVICE=1` | Don't auto-start the `rtrt-dashboard` background service |
 | `--uninstall` | `-Uninstall` | — | Compatibility shim — defers to `uninstall.sh` / `uninstall.ps1` |
 | `--dry-run` | `-DryRun` | — | Print intended actions without writing |
 
 Flags take precedence over the env-var equivalents. When no release exists and no flag is set, the installer prints a notice and falls back to `--ref main` automatically.
+
+### Background dashboard service
+
+By default the installer starts `rtrt-dashboard` as a background service so the web UI at <http://127.0.0.1:7311> is always available without launching it by hand — it also restarts on crash and comes back on login. Pass `--no-service` (`-NoService` on Windows, or `RTRT_NO_SERVICE=1`) to skip this.
+
+- **Linux** — a systemd **user** unit at `~/.config/systemd/user/rtrt-dashboard.service`.
+- **macOS** — a launchd LaunchAgent at `~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`.
+- **Windows** — a logon scheduled task named `rtrt-dashboard`.
+
+Manage it directly with `rtrt service install|uninstall|status` (Linux/macOS; dry-run by default, pass `--apply`). The uninstaller removes the service before deleting binaries.
 
 Examples:
 

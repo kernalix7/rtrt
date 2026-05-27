@@ -62,6 +62,17 @@ else
 fi
 echo
 
+# Stop + remove the dashboard service first, while the rtrt binary still
+# exists to do it. Best-effort: a missing service / binary is fine.
+rtrt_bin="$INSTALL_DIR/rtrt"
+if [ -x "$rtrt_bin" ] && ask "Stop + remove the rtrt-dashboard service?"; then
+    if "$rtrt_bin" service uninstall --apply >/dev/null 2>&1; then
+        log "  dashboard service removed"
+    else
+        warn "  no dashboard service to remove (or systemd/launchd absent)"
+    fi
+fi
+
 if ask "Remove binaries from $INSTALL_DIR?"; then
     for bin in "${BINS[@]}"; do
         target="$INSTALL_DIR/$bin"

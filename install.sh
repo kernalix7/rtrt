@@ -26,6 +26,9 @@
 #   --no-setup          Don't auto-refresh the Claude Code MCP config + hooks
 #                       even when a prior `rtrt setup` is detected.
 #                       (env: RTRT_NO_SETUP=1)
+#   --no-service        Don't install the rtrt-dashboard background service
+#                       (systemd --user on Linux, launchd on macOS).
+#                       (env: RTRT_NO_SERVICE=1)
 #
 # Compat shims:
 #   --uninstall         Defers to uninstall.sh logic; deletes the three
@@ -53,6 +56,10 @@ DRY_RUN=0
 # Claude Code MCP config + hooks against the just-installed binary.
 # `--no-setup` / RTRT_NO_SETUP=1 disables.
 NO_SETUP="${RTRT_NO_SETUP:-0}"
+# Auto-start: install rtrt-dashboard as a background OS service so it runs
+# without `rtrt-dashboard` being launched by hand. `--no-service` /
+# RTRT_NO_SERVICE=1 disables. Skipped on platforms without systemd/launchd.
+NO_SERVICE="${RTRT_NO_SERVICE:-0}"
 
 # ---------- colour logger ----------
 if [ -t 1 ]; then
@@ -76,8 +83,9 @@ while [ $# -gt 0 ]; do
     --skip-deps)     SKIP_DEPS=1; shift ;;
     --uninstall)     UNINSTALL=1; shift ;;
     --no-setup)      NO_SETUP=1; shift ;;
+    --no-service)    NO_SERVICE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
-    -h|--help)       sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,37p' "$0"; exit 0 ;;
     *)
         err "unknown arg: $1"; exit 2 ;;
     esac
@@ -168,11 +176,37 @@ install_check() {
         log "  $INSTALL_DIR/$bin"
     done
     reconfigure_if_present
+    install_dashboard_service
     echo
     log "Next:"
     log "  rtrt --version"
     log "  rtrt info"
     log "  rtrt templates"
+}
+
+# Install rtrt-dashboard as a background OS service (systemd --user on Linux,
+# launchd on macOS) so it auto-starts on login and restarts on crash — no need
+# to run `rtrt-dashboard` by hand. Default-on; `--no-service` /
+# RTRT_NO_SERVICE=1 disables. Best-effort: a failure here never fails the
+# install (the user can still run `rtrt-dashboard` manually).
+install_dashboard_service() {
+    [ "$NO_SERVICE" -eq 1 ] && return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    rtrt_bin="$INSTALL_DIR/rtrt"
+    [ -x "$rtrt_bin" ] || return 0
+    # Only Linux (systemd) + macOS (launchd) are wired in `rtrt service`.
+    case "$(uname -s)" in
+        Linux|Darwin) ;;
+        *) return 0 ;;
+    esac
+    echo
+    log "installing rtrt-dashboard background service"
+    if "$rtrt_bin" service install --apply >/dev/null 2>&1; then
+        log "  dashboard service started — http://127.0.0.1:7311"
+        log "  stop/remove: rtrt service uninstall --apply"
+    else
+        warn "  service install skipped (no systemd/launchd?) — run rtrt-dashboard manually"
+    fi
 }
 
 # When a prior `rtrt setup --agent claude` is detected, refresh the MCP

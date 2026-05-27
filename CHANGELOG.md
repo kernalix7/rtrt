@@ -9,6 +9,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — dashboard auto-starts as a background service
+
+**The installer now runs `rtrt-dashboard` as a background OS service, so the web UI at <http://127.0.0.1:7311> is always up without launching it by hand — it restarts on crash and comes back on login.**
+
+- New `rtrt service install|uninstall|status` subcommand: a systemd **user** unit on Linux (`~/.config/systemd/user/rtrt-dashboard.service`) and a launchd LaunchAgent on macOS (`~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`). Dry-run by default; pass `--apply`. The unit pins `RTRT_MEMORY_PATH=~/.rtrt/memory.sqlite` so the service reads the same store as the CLI/MCP/hooks.
+- `install.sh` / `install.ps1` start the service by default (Windows registers a `rtrt-dashboard` logon scheduled task); opt out with `--no-service` / `-NoService` / `RTRT_NO_SERVICE=1`. `uninstall.sh` / `uninstall.ps1` stop + remove it before deleting binaries.
+- `docs/INSTALL.md` + `docs/INSTALL.ko.md` document the service, the opt-out flag, and manual management.
+
 ### Highlights — consistent savings %, local LLM management page
 
 **The dashboard now reports compression savings as a percentage everywhere, and a new page manages local Ollama models end to end.**

@@ -28,10 +28,22 @@ irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 | `--source PATH` | `-Source` | `RTRT_SOURCE` | 로컬 복사본 빌드 (오프라인) |
 | `--dir PATH` | `-InstallDir` | — | 설치 경로 변경 |
 | `--skip-deps` | `-SkipDeps` | `RTRT_SKIP_DEPS=1` | cargo / git 툴체인 체크 우회 |
+| `--no-setup` | — | `RTRT_NO_SETUP=1` | Claude Code MCP 설정 + 훅 자동 갱신 안 함 |
+| `--no-service` | `-NoService` | `RTRT_NO_SERVICE=1` | `rtrt-dashboard` 백그라운드 서비스 자동 시작 안 함 |
 | `--uninstall` | `-Uninstall` | — | 호환성 셰임 — `uninstall.sh` / `uninstall.ps1` 권장 |
 | `--dry-run` | `-DryRun` | — | 실제 쓰기 없이 동작만 출력 |
 
 플래그가 환경 변수보다 우선. 릴리스 없고 플래그도 없으면 안내 후 `--ref main`으로 자동 폴백.
+
+### 백그라운드 대시보드 서비스
+
+기본적으로 설치 시 `rtrt-dashboard`를 백그라운드 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동. `--no-service`(Windows는 `-NoService`, 또는 `RTRT_NO_SERVICE=1`)로 끔.
+
+- **Linux** — systemd **user** 유닛 `~/.config/systemd/user/rtrt-dashboard.service`.
+- **macOS** — launchd LaunchAgent `~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`.
+- **Windows** — `rtrt-dashboard` 로그온 예약 작업.
+
+직접 관리: `rtrt service install|uninstall|status` (Linux/macOS; 기본 dry-run, `--apply`로 실행). 언인스톨러는 바이너리 삭제 전에 서비스를 먼저 제거.
 
 예시:
 

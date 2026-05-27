@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rtrt_core::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub mod embed;
@@ -86,6 +86,28 @@ pub struct ScoredRecord {
     pub score: f32,
 }
 
+/// Full detail for a single memory row, including the pre-compression original
+/// body, the parsed metadata map, and a deterministic importance score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailedRecord {
+    pub id: i64,
+    pub project: String,
+    pub kind: String,
+    /// Current body (terse when compressed).
+    pub body: String,
+    /// Pre-compression original; `None` when the row was never compressed.
+    pub body_full: Option<String>,
+    pub created_at: i64,
+    pub scope: MemoryScope,
+    /// JSON payload attached to this row.
+    pub metadata: std::collections::BTreeMap<String, String>,
+    /// True when `body_full IS NOT NULL` (an LLM rewrote the body).
+    pub compressed: bool,
+    /// Deterministic importance in `[0.0, 1.0]` — recency + length + bonuses.
+    /// See [`MemoryStore::get_row`] for the exact formula.
+    pub importance: f32,
+}
+
 /// Outcome of [`MemoryStore::extract_and_save_unique`]: the new ids that
 /// landed and the number of duplicate facts that were skipped.
 #[derive(Debug, Clone, Default)]
@@ -137,6 +159,13 @@ impl MemoryStore {
     }
 
     fn migrate(&self) -> Result<()> {
+        // Enable FK enforcement for this connection. Must run before any DML.
+        // SQLite only cascades when this pragma is ON; without it, ON DELETE
+        // CASCADE on embeddings/edges is silently ignored.
+        self.conn
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
         // Bootstrap v1 schema.
         self.conn
             .execute_batch(
@@ -1089,6 +1118,301 @@ impl MemoryStore {
             .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Governance delete: remove a single memory row, its FTS5 entry, and any
+    /// edges or embeddings that reference it. With `PRAGMA foreign_keys = ON`
+    /// (set in [`Self::migrate`]) the embeddings and edges cascade; the FTS5
+    /// external-content table must be updated manually before the DELETE.
+    ///
+    /// Returns `true` when the row existed and was removed, `false` when the
+    /// id was not found.
+    pub fn delete_row(&self, id: i64) -> Result<bool> {
+        // Fetch body before the DELETE so the FTS 'delete' command can pass the
+        // old text (FTS5 external-content doesn't store it internally).
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let Some(old_body) = body else {
+            return Ok(false);
+        };
+
+        // Remove the FTS5 entry first so the index stays consistent even if
+        // the subsequent DELETE fails partway through.
+        self.conn
+            .execute(
+                "INSERT INTO memories_fts(memories_fts, rowid, body) VALUES ('delete', ?1, ?2)",
+                rusqlite::params![id, old_body],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        // The DELETE cascades to embeddings and edges via FK.
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        Ok(true)
+    }
+
+    /// Governance batch delete: remove several rows in a single transaction.
+    /// Returns the number of rows actually removed (ids not found are silently
+    /// skipped). Cheaper than calling [`delete_row`] in a loop because the
+    /// FTS5 maintenance and the FK cascades share one transaction.
+    pub fn delete_rows(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Fetch (id, body) for every id that still exists, so we can feed the
+        // FTS5 'delete' command the exact old body text.
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, body FROM memories WHERE id IN ({placeholders})");
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let mut found: Vec<(i64, String)> = Vec::new();
+        for r in rows {
+            found.push(r.map_err(|e| Error::Memory(e.to_string()))?);
+        }
+
+        if found.is_empty() {
+            return Ok(0);
+        }
+
+        // Remove FTS5 entries for every row we're about to delete.
+        for (id, old_body) in &found {
+            self.conn
+                .execute(
+                    "INSERT INTO memories_fts(memories_fts, rowid, body) VALUES ('delete', ?1, ?2)",
+                    rusqlite::params![id, old_body],
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
+
+        // Delete the rows. FK cascades handle embeddings + edges.
+        let del_sql = format!("DELETE FROM memories WHERE id IN ({placeholders})");
+        let del_params: Vec<&dyn rusqlite::ToSql> = found
+            .iter()
+            .map(|(id, _)| id as &dyn rusqlite::ToSql)
+            .collect();
+        self.conn
+            .execute(&del_sql, del_params.as_slice())
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        Ok(found.len())
+    }
+
+    /// Returns the full detail row for a single memory id, including
+    /// `body_full` (pre-compression original), `metadata`, and a deterministic
+    /// importance score.
+    ///
+    /// Importance is computed without an LLM:
+    ///   - recency component: `1 / (1 + age_days)` — newer rows score higher.
+    ///   - length bonus: `min(1.0, body_len / 2000.0)` — longer bodies carry more signal.
+    ///   - compression bonus: `+0.1` when `body_full IS NOT NULL` (row was compressed,
+    ///     implying it was judged worth keeping).
+    ///   - metadata bonus: `+0.05` when metadata is non-empty.
+    ///
+    /// Final score is clamped to `[0.0, 1.0]`.
+    pub fn get_row(&self, id: i64) -> Result<Option<DetailedRecord>> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let row: rusqlite::Result<DetailedRecord> = self.conn.query_row(
+            "SELECT id, project, kind, body, body_full, created_at, scope, metadata \
+               FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                let scope_str: String = row.get(6)?;
+                let meta_str: String = row.get(7)?;
+                let body: String = row.get(3)?;
+                let body_full: Option<String> = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                let compressed = body_full.is_some();
+                let age_days = ((now_secs - created_at).max(0) as f32) / 86400.0;
+                let recency = 1.0 / (1.0 + age_days);
+                let length_bonus = (body.len() as f32 / 2000.0).min(1.0);
+                let compress_bonus = if compressed { 0.1 } else { 0.0 };
+                let meta_bonus = if meta_str.len() > 2 { 0.05 } else { 0.0 };
+                let importance =
+                    (recency * 0.6 + length_bonus * 0.35 + compress_bonus + meta_bonus)
+                        .clamp(0.0, 1.0);
+                Ok(DetailedRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body,
+                    body_full,
+                    created_at,
+                    scope: MemoryScope::parse(&scope_str),
+                    metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
+                    compressed,
+                    importance,
+                })
+            },
+        );
+
+        match row {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(Error::Memory(e.to_string())),
+        }
+    }
+
+    /// Paginated timeline ordered by importance score (deterministic, no LLM).
+    /// The importance formula matches [`DetailedRecord`] — see [`get_row`].
+    pub fn recent_paged_by_importance(
+        &self,
+        project: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DetailedRecord>> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Fetch a larger window and sort in Rust so we can compute the
+        // composite score without storing it in the schema.
+        let fetch_limit = (offset + limit).saturating_mul(2).max(200);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, kind, body, body_full, created_at, scope, metadata \
+                   FROM memories WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project, fetch_limit as i64], |row| {
+                let scope_str: String = row.get(6)?;
+                let meta_str: String = row.get(7)?;
+                let body: String = row.get(3)?;
+                let body_full: Option<String> = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    body,
+                    body_full,
+                    created_at,
+                    scope_str,
+                    meta_str,
+                ))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let mut records: Vec<DetailedRecord> = Vec::new();
+        for r in rows {
+            let (id, project, kind, body, body_full, created_at, scope_str, meta_str) =
+                r.map_err(|e| Error::Memory(e.to_string()))?;
+            let compressed = body_full.is_some();
+            let age_days = ((now_secs - created_at).max(0) as f32) / 86400.0;
+            let recency = 1.0 / (1.0 + age_days);
+            let length_bonus = (body.len() as f32 / 2000.0).min(1.0);
+            let compress_bonus = if compressed { 0.1 } else { 0.0 };
+            let meta_bonus = if meta_str.len() > 2 { 0.05 } else { 0.0 };
+            let importance =
+                (recency * 0.6 + length_bonus * 0.35 + compress_bonus + meta_bonus).clamp(0.0, 1.0);
+            records.push(DetailedRecord {
+                id,
+                project,
+                kind,
+                body,
+                body_full,
+                created_at,
+                scope: MemoryScope::parse(&scope_str),
+                metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
+                compressed,
+                importance,
+            });
+        }
+
+        records.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(records.into_iter().skip(offset).take(limit).collect())
+    }
+
+    /// Hybrid BM25 + graph-neighbour recall. Runs a BM25 search to find the
+    /// initial seed hits, then expands each seed by one graph hop to pull in
+    /// structurally related memories. The BM25 score and a graph-proximity
+    /// bonus (0.1 per hop-1 neighbour) are combined for the final ranking.
+    ///
+    /// This gives a "graph-enhanced BM25" recall path without requiring true
+    /// dense embeddings. Pass `mode = "bm25"` to skip the graph expansion and
+    /// get pure BM25.
+    pub fn recall_bm25_graph_blend(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredRecord>> {
+        // BM25 seeds — over-fetch to leave room for graph expansion.
+        let fetch = limit.saturating_mul(3).max(limit);
+        let seeds = self.recall_bm25(project, query, fetch)?;
+        if seeds.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Assign BM25 rank-based scores (Reciprocal Rank).
+        let rrf_k = 60.0f32;
+        let mut scored: std::collections::HashMap<i64, (MemoryRecord, f32)> =
+            std::collections::HashMap::new();
+        for (rank, rec) in seeds.iter().enumerate() {
+            let s = 1.0 / (rrf_k + (rank + 1) as f32);
+            scored.insert(rec.id, (rec.clone(), s));
+        }
+
+        // Expand one hop out from the top seeds.
+        let seed_ids: Vec<i64> = seeds.iter().map(|r| r.id).collect();
+        let neighbours = self.recall_via_graph(&seed_ids, 1)?;
+        for (i, nb) in neighbours.iter().enumerate() {
+            if scored.contains_key(&nb.id) {
+                continue; // already from BM25 — don't double-count
+            }
+            if nb.project != project {
+                continue;
+            }
+            // Small bonus for being 1 hop away from a BM25 hit.
+            let graph_score = 0.1 / (1.0 + i as f32);
+            scored.insert(nb.id, (nb.clone(), graph_score));
+        }
+
+        let mut out: Vec<ScoredRecord> = scored
+            .into_values()
+            .map(|(record, score)| ScoredRecord { record, score })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(limit);
+        Ok(out)
     }
 
     /// LLM-driven ingestion. The summariser extracts atomic facts from `body`

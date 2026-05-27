@@ -38,7 +38,7 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
-use rtrt_memory::{MemoryStore, PayloadFilter};
+use rtrt_memory::{DetailedRecord, MemoryStore, PayloadFilter};
 use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetric, Role};
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,11 @@ async fn main() -> Result<()> {
         .route("/api/memory/compress", post(memory_compress))
         .route("/api/memory/stats", get(memory_stats))
         .route("/api/memory/queue", get(memory_queue))
+        .route("/api/memory/delete", post(memory_delete_batch))
+        .route(
+            "/api/memory/{id}",
+            get(memory_detail).delete(memory_delete_one),
+        )
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }
@@ -683,6 +688,12 @@ struct MemoryRecallRequest {
     limit: u32,
     #[serde(default)]
     filter: Option<String>,
+    /// `bm25` (default) — plain BM25; `hybrid` — BM25 + graph-neighbour blend.
+    /// True dense-vector hybrid requires the `embeddings` feature; this path
+    /// uses `recall_bm25_graph_blend` which needs no separate model.
+    /// TODO: wire fastembed / Ollama bge-m3 for full vector hybrid.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 fn default_recall_limit() -> u32 {
@@ -698,19 +709,48 @@ async fn memory_recall(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
-    let hits = match req.filter.as_deref() {
-        Some(spec) if !spec.is_empty() => {
-            let f =
-                PayloadFilter::parse(spec).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-            guard
-                .recall_bm25_with_filter(&req.project, &req.query, req.limit as usize, &f)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+
+    let mode = req.mode.as_deref().unwrap_or("bm25");
+
+    match mode {
+        "hybrid" => {
+            // Graph-blended BM25 — no LLM, no embedder required.
+            let scored = guard
+                .recall_bm25_graph_blend(&req.project, &req.query, req.limit as usize)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let hits: Vec<serde_json::Value> = scored
+                .into_iter()
+                .map(|sr| {
+                    serde_json::json!({
+                        "id": sr.record.id,
+                        "project": sr.record.project,
+                        "kind": sr.record.kind,
+                        "body": sr.record.body,
+                        "created_at": sr.record.created_at,
+                        "scope": sr.record.scope,
+                        "score": sr.score,
+                    })
+                })
+                .collect();
+            Ok(Json(serde_json::json!({ "hits": hits, "mode": "hybrid" })))
         }
-        _ => guard
-            .recall_bm25(&req.project, &req.query, req.limit as usize)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-    };
-    Ok(Json(serde_json::json!({ "hits": hits })))
+        // "bm25" or any unrecognised value falls through to plain BM25.
+        _ => {
+            let hits = match req.filter.as_deref() {
+                Some(spec) if !spec.is_empty() => {
+                    let f = PayloadFilter::parse(spec)
+                        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                    guard
+                        .recall_bm25_with_filter(&req.project, &req.query, req.limit as usize, &f)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                }
+                _ => guard
+                    .recall_bm25(&req.project, &req.query, req.limit as usize)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            };
+            Ok(Json(serde_json::json!({ "hits": hits, "mode": "bm25" })))
+        }
+    }
 }
 
 async fn memory_projects(
@@ -740,6 +780,9 @@ struct MemoryTimelineQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// `recent` (default) — newest first; `importance` — deterministic score descending.
+    #[serde(default)]
+    sort: Option<String>,
 }
 
 fn default_timeline_limit() -> usize {
@@ -755,36 +798,64 @@ async fn memory_timeline(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
-    let rows = guard
-        .recent_paged(&q.project, q.limit, q.offset)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let sort = q.sort.as_deref().unwrap_or("recent");
     let total = guard
         .count_by_project(&q.project)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|r| {
-            // `body_full` is the preserved pre-compression original (None
-            // when the row was never compressed). `body` is what recall
-            // uses (terse when compressed).
-            let full = guard.full_body(r.id).ok().flatten();
-            let compressed = full.is_some();
-            serde_json::json!({
-                "id": r.id,
-                "kind": r.kind,
-                "scope": r.scope,
-                "body": r.body,
-                "body_full": full,
-                "compressed": compressed,
-                "created_at": r.created_at,
+
+    let items: Vec<serde_json::Value> = if sort == "importance" {
+        // Importance sort — returns DetailedRecord which already includes
+        // body_full, metadata, and a pre-computed score.
+        let rows = guard
+            .recent_paged_by_importance(&q.project, q.limit, q.offset)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        rows.into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "kind": r.kind,
+                    "scope": r.scope,
+                    "body": r.body,
+                    "body_full": r.body_full,
+                    "compressed": r.compressed,
+                    "created_at": r.created_at,
+                    "importance": r.importance,
+                    "metadata": r.metadata,
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        // Default: newest-first paged view.
+        let rows = guard
+            .recent_paged(&q.project, q.limit, q.offset)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        rows.into_iter()
+            .map(|r| {
+                // `body_full` is the preserved pre-compression original (None
+                // when the row was never compressed). `body` is what recall
+                // uses (terse when compressed).
+                let full = guard.full_body(r.id).ok().flatten();
+                let compressed = full.is_some();
+                serde_json::json!({
+                    "id": r.id,
+                    "kind": r.kind,
+                    "scope": r.scope,
+                    "body": r.body,
+                    "body_full": full,
+                    "compressed": compressed,
+                    "created_at": r.created_at,
+                })
+            })
+            .collect()
+    };
+
     Ok(Json(serde_json::json!({
         "items": items,
         "total": total,
         "limit": q.limit,
         "offset": q.offset,
+        "sort": sort,
     })))
 }
 
@@ -2147,6 +2218,99 @@ async fn memory_queue(
         "enabled": cfg.enabled,
         "model": cfg.model,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/memory/{id}  — full detail for a single memory row
+// ---------------------------------------------------------------------------
+
+async fn memory_detail(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> std::result::Result<Json<DetailedRecord>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    match guard
+        .get_row(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some(r) => Ok(Json(r)),
+        None => Err((StatusCode::NOT_FOUND, format!("memory {id} not found"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/memory/{id}  — governance delete for a single row
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct DeleteOneResponse {
+    deleted: bool,
+    id: i64,
+}
+
+async fn memory_delete_one(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> std::result::Result<Json<DeleteOneResponse>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let deleted = guard
+        .delete_row(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if deleted {
+        broadcast_event(
+            &state.events,
+            serde_json::json!({ "type": "memory.delete", "id": id }),
+        );
+        Ok(Json(DeleteOneResponse { deleted: true, id }))
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("memory {id} not found")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/memory/delete  — governance batch delete
+// Body: { "ids": [i64, …] }
+// Response: { "deleted": N }
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DeleteBatchRequest {
+    ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteBatchResponse {
+    deleted: usize,
+}
+
+async fn memory_delete_batch(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteBatchRequest>,
+) -> std::result::Result<Json<DeleteBatchResponse>, (StatusCode, String)> {
+    if req.ids.is_empty() {
+        return Ok(Json(DeleteBatchResponse { deleted: 0 }));
+    }
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let deleted = guard
+        .delete_rows(&req.ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    broadcast_event(
+        &state.events,
+        serde_json::json!({ "type": "memory.delete_batch", "ids": req.ids, "deleted": deleted }),
+    );
+    Ok(Json(DeleteBatchResponse { deleted }))
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");

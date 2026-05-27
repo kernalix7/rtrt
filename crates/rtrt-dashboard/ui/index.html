@@ -205,6 +205,54 @@
   .palette li.active, .palette li:hover { background: var(--accent-soft); color: var(--accent); }
   .palette li .meta { color: var(--muted); font-size: 0.85em; margin-left: auto; }
 
+  /* Memory console — bulk action bar */
+  .bulk-bar { position: sticky; top: 53px; z-index: 8; display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.75rem; background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 8px; margin-bottom: 0.5rem; font-size: 0.88em; }
+  .bulk-bar[hidden] { display: none; }
+  .bulk-bar .bulk-count { font-weight: 600; color: var(--accent); flex: 1; }
+  .bulk-bar button.danger { background: var(--err); color: white; border-color: var(--err); font-weight: 600; padding: 0.3rem 0.75rem; }
+  .bulk-bar button.ghost { padding: 0.3rem 0.6rem; font-size: 0.85em; }
+
+  /* Memory console — history row with checkbox */
+  .hist-item { cursor: default; }
+  .hist-item.selectable { cursor: pointer; }
+  .hist-item.selected { background: var(--accent-soft); border-color: var(--accent); }
+  .hist-check { flex-shrink: 0; accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer; }
+  .hist-click-area { flex: 1; display: flex; gap: 0.75rem; align-items: baseline; min-width: 0; cursor: pointer; }
+
+  /* Importance badge / bar */
+  .imp-bar { display: inline-block; width: 40px; height: 6px; background: var(--border); border-radius: 3px; vertical-align: middle; overflow: hidden; }
+  .imp-bar-fill { height: 100%; border-radius: 3px; background: var(--warn); }
+  .badge.imp { color: var(--warn); border-color: var(--warn); }
+
+  /* Sort controls */
+  .sort-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
+  .sort-btn { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.2rem 0.55rem; font-size: 0.82em; color: var(--muted); cursor: pointer; }
+  .sort-btn.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+  /* Detail modal — wider */
+  .modal.detail-modal { width: min(640px, 94vw); max-height: 86vh; overflow-y: auto; }
+  .detail-meta-table td:first-child { color: var(--muted); font-size: 0.82em; white-space: nowrap; padding-right: 0.75rem; }
+  .detail-body-pre { background: var(--bg); border: 1px solid var(--border); padding: 0.85rem; border-radius: 8px; white-space: pre-wrap; overflow-x: auto; font-family: ui-monospace, monospace; font-size: 0.83em; max-height: 280px; overflow-y: auto; }
+
+  /* Governance subtab */
+  .gov-filter-row { display: flex; gap: 0.5rem; align-items: flex-end; flex-wrap: wrap; margin-bottom: 0.75rem; }
+  .gov-filter-row .ctrl-field { min-width: 110px; }
+  .gov-stat-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 0.5rem; margin-bottom: 0.75rem; }
+  .gov-stat-box { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.75rem; font-size: 0.85em; }
+  .gov-stat-box .label { color: var(--muted); font-size: 0.78em; }
+  .gov-stat-box .value { font-size: 1.2rem; font-weight: 700; }
+  .danger-confirm { background: var(--err); color: white; border-color: var(--err); font-weight: 600; }
+
+  /* Recall mode toggle */
+  .mode-toggle { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .mode-toggle button { border: 0; border-radius: 0; padding: 0.3rem 0.7rem; font-size: 0.82em; background: var(--bg); color: var(--muted); cursor: pointer; }
+  .mode-toggle button.active { background: var(--accent); color: white; }
+  .mode-toggle button:first-child { border-right: 1px solid var(--border); }
+
+  /* Score pill on recall cards */
+  .rc-score { margin-left: auto; font-size: 0.78em; color: var(--muted); white-space: nowrap; }
+  .rc-score .score-val { font-weight: 600; color: var(--fg); }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -292,6 +340,7 @@
         <nav class="subtabs" id="memory-subtabs">
           <a class="active" data-sub="memhistory">히스토리</a>
           <a data-sub="memquery">검색</a>
+          <a data-sub="memgovern">관리</a>
           <a data-sub="memstats">통계</a>
           <a data-sub="memmap">맵</a>
           <a data-sub="memblocks">블록</a>
@@ -299,8 +348,23 @@
         </nav>
 
         <div id="sub-memhistory" class="subpage">
+          <!-- Bulk action bar — sticky, shown when ≥1 row selected -->
+          <div id="bulk-bar" class="bulk-bar" hidden>
+            <span class="bulk-count"><span id="bulk-count-label">0</span>건 선택됨</span>
+            <button id="bulk-delete-btn" class="danger" type="button">선택 삭제</button>
+            <button id="bulk-clear-btn" class="ghost" type="button">선택 해제</button>
+          </div>
           <div class="card">
-            <div class="head"><h2>히스토리</h2><span id="history-meta" class="hint">전부 영구 저장 · 페이지 단위 50건</span></div>
+            <div class="head">
+              <h2>히스토리</h2>
+              <div style="display:flex;align-items:center;gap:0.75rem;">
+                <div class="sort-row" style="margin:0;">
+                  <button id="sort-recent" class="sort-btn active" type="button">최신순</button>
+                  <button id="sort-importance" class="sort-btn" type="button">중요도순</button>
+                </div>
+                <span id="history-meta" class="hint">전부 영구 저장 · 페이지 단위 50건</span>
+              </div>
+            </div>
             <div id="history-list" class="hist-list"><div class="empty">불러오는 중…</div></div>
             <div id="history-pager" class="pager" hidden>
               <button id="history-prev" class="ghost" type="button">← 이전</button>
@@ -332,11 +396,31 @@
           </div>
         </div>
 
+        <!-- Detail modal — shown when a history row is clicked -->
+        <div id="mem-detail-modal" class="modal-backdrop" hidden>
+          <div class="modal detail-modal">
+            <div class="modal-head">
+              <h2 id="detail-modal-title">메모리 상세</h2>
+              <button id="detail-modal-close" class="ghost" aria-label="닫기">✕</button>
+            </div>
+            <div id="detail-modal-body">
+              <div class="empty">불러오는 중…</div>
+            </div>
+          </div>
+        </div>
+
         <div id="sub-memquery" class="subpage" hidden>
           <div class="card">
-            <div class="head"><h2>검색</h2></div>
+            <div class="head">
+              <h2>검색</h2>
+              <div class="mode-toggle" id="recall-mode-toggle" title="검색 모드">
+                <button id="recall-mode-bm25" class="active" type="button">BM25</button>
+                <button id="recall-mode-hybrid" type="button">Hybrid</button>
+              </div>
+            </div>
             <form id="recall-form">
               <input id="recall-project" type="hidden">
+              <input id="recall-mode-val" type="hidden" value="bm25">
               <input id="recall-query" placeholder="검색어" required>
               <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
                 <button class="primary" type="submit">검색</button>
@@ -375,6 +459,62 @@
             </form>
             <div id="recall-results" style="margin-top:0.75rem;">
               <div class="empty">검색어를 입력하세요.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 관리 서브탭 -->
+        <div id="sub-memgovern" class="subpage" hidden>
+          <div class="card">
+            <div class="head"><h2>메모리 관리</h2><a id="gov-refresh" style="cursor:pointer;font-size:0.88em;">새로고침</a></div>
+            <!-- Stat summary -->
+            <div id="gov-stat-summary" class="gov-stat-summary">
+              <div class="gov-stat-box"><div class="label">전체</div><div class="value" id="gov-total">—</div></div>
+              <div class="gov-stat-box"><div class="label">압축됨</div><div class="value" id="gov-compressed">—</div></div>
+              <div class="gov-stat-box"><div class="label">미압축</div><div class="value" id="gov-uncompressed">—</div></div>
+              <div class="gov-stat-box"><div class="label">절감 글자</div><div class="value" id="gov-saved">—</div></div>
+            </div>
+            <!-- Filters -->
+            <div class="gov-filter-row">
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">kind</label>
+                <select id="gov-kind">
+                  <option value="">전체</option>
+                  <option value="note">note</option>
+                  <option value="feedback">feedback</option>
+                  <option value="project">project</option>
+                  <option value="reference">reference</option>
+                  <option value="user">user</option>
+                  <option value="block">block</option>
+                </select>
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">압축 여부</label>
+                <select id="gov-compress-filter">
+                  <option value="">전체</option>
+                  <option value="compressed">압축됨만</option>
+                  <option value="uncompressed">미압축만</option>
+                </select>
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">이전 날짜</label>
+                <input id="gov-before" type="date">
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">이후 날짜</label>
+                <input id="gov-after" type="date">
+              </div>
+              <button id="gov-preview-btn" class="primary" type="button" style="align-self:flex-end;">미리보기</button>
+            </div>
+            <!-- Preview list -->
+            <div id="gov-preview-result" class="hist-list" style="margin-bottom:0.75rem;"></div>
+            <!-- Danger zone -->
+            <div id="gov-danger-zone" hidden style="border-top:1px solid var(--border);padding-top:0.75rem;margin-top:0.25rem;">
+              <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+                <span id="gov-match-count" style="font-size:0.88em;color:var(--muted);"></span>
+                <button id="gov-bulk-delete-btn" class="danger-confirm" type="button">선택 항목 모두 삭제 (위험)</button>
+                <span id="gov-delete-result" class="out-meta"></span>
+              </div>
             </div>
           </div>
         </div>
@@ -787,6 +927,8 @@ function wireSubtabs(navId, onActivate) {
 wireSubtabs('memory-subtabs', (sub) => {
   // Auto-load stats + compression queue when the stats tab is activated.
   if (sub === 'memstats' && CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
+  // Auto-load governance stats when governance tab opens.
+  if (sub === 'memgovern' && CURRENT_PROJECT) { loadGovStats(CURRENT_PROJECT); }
 });
 
 // Memory: project picker + drill-in
@@ -853,6 +995,9 @@ function openProject(name) {
 const HISTORY_PAGE_SIZE = 50;
 let HISTORY_OFFSET = 0;
 let HISTORY_TOTAL = 0;
+let HISTORY_SORT = 'recent';   // 'recent' | 'importance'
+let SELECTED_IDS = new Set();  // ids of checked rows
+
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -883,13 +1028,24 @@ function buildModelOptions(selected) {
   ).join('');
 }
 
+// Update the bulk action bar visibility/count.
+function syncBulkBar() {
+  const bar = document.getElementById('bulk-bar');
+  const count = SELECTED_IDS.size;
+  bar.hidden = count === 0;
+  document.getElementById('bulk-count-label').textContent = count;
+}
+
 async function loadHistory(name, offset) {
   if (offset === undefined) offset = 0;
   HISTORY_OFFSET = offset;
+  // Reset selection on each page load.
+  SELECTED_IDS.clear();
+  syncBulkBar();
   const list = document.getElementById('history-list');
   list.innerHTML = '<div class="empty">불러오는 중…</div>';
-  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
-  if (!r.ok) { list.innerHTML = `<div class="empty err">${r.status}: ${await r.text()}</div>`; return; }
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}`);
+  if (!r.ok) { list.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: 불러오기 실패</div>`; return; }
   const d = await r.json();
   HISTORY_TOTAL = d.total || 0;
   if (!d.items.length) {
@@ -899,31 +1055,62 @@ async function loadHistory(name, offset) {
     return;
   }
   list.innerHTML = d.items.map(i => {
-    // Compressed rows: show the terse body (what recall uses) + a savings
-    // badge + an expandable original (body_full) + a per-row recompress control.
-    let badge = '', orig = '', recompressRow = '';
+    // Compressed rows: terse body + savings badge + expandable original.
+    let compBadge = '', orig = '', recompressRow = '';
     if (i.compressed && i.body_full) {
       const saved = Math.round((1 - i.body.length / i.body_full.length) * 100);
-      badge = `<span class="kind" style="color:var(--ok)" title="압축됨 — recall은 이 압축본 참조">⊟ ${saved}%</span>`;
+      compBadge = `<span class="kind" style="color:var(--ok)" title="압축됨 — recall은 이 압축본 참조">⊟ ${saved}%</span>`;
       orig = `<details class="orig"><summary>원본 ${i.body_full.length}자</summary>${renderBody(i.body_full)}</details>`;
     }
-    // Per-row recompress: available for all rows belonging to a project.
-    const rowProject = encodeURIComponent(name);
+    // Importance badge — rendered when server returns an importance field.
+    let impBadge = '';
+    if (i.importance !== undefined && i.importance !== null) {
+      const pct = Math.min(100, Math.max(0, Math.round(Number(i.importance) * 100)));
+      impBadge = `<span class="badge imp" title="중요도 ${pct}%">★ ${pct}%</span>`;
+    }
+    // Per-row recompress control.
     recompressRow = `<div class="recompress-row" data-proj="${escapeHtml(name)}">
       <select class="row-model-sel">${buildModelOptions('')}</select>
       <button class="ghost row-recompress-btn" type="button" style="font-size:0.8em;">재압축</button>
       <span class="row-recompress-result" style="font-size:0.8em;color:var(--muted);"></span>
     </div>`;
-    return `<div class="hist-item">
-       <span class="when">${relativeTime(i.created_at)}</span>
-       <span class="kind">${i.kind}</span>${badge}
-       <span class="body">${renderBody(i.body)}${orig}${recompressRow}</span>
+    return `<div class="hist-item selectable" data-id="${i.id}">
+       <input type="checkbox" class="hist-check" data-id="${i.id}" title="선택">
+       <div class="hist-click-area" data-id="${i.id}" tabindex="0" role="button" aria-label="상세 보기">
+         <span class="when">${relativeTime(i.created_at)}</span>
+         <span class="kind">${escapeHtml(i.kind)}</span>${compBadge}${impBadge}
+         <span class="body">${renderBody(i.body)}${orig}${recompressRow}</span>
+       </div>
      </div>`;
   }).join('');
 
+  // Wire checkboxes.
+  list.querySelectorAll('.hist-check').forEach(chk => {
+    chk.addEventListener('change', () => {
+      const id = Number(chk.dataset.id);
+      chk.checked ? SELECTED_IDS.add(id) : SELECTED_IDS.delete(id);
+      chk.closest('.hist-item').classList.toggle('selected', chk.checked);
+      syncBulkBar();
+    });
+    // Prevent checkbox click from also triggering the detail row click.
+    chk.addEventListener('click', ev => ev.stopPropagation());
+  });
+
+  // Wire row click → detail modal.
+  list.querySelectorAll('.hist-click-area').forEach(area => {
+    const open = () => openDetailModal(Number(area.dataset.id));
+    area.addEventListener('click', (ev) => {
+      // Ignore clicks on the recompress control inside the area.
+      if (ev.target.closest('.recompress-row')) return;
+      open();
+    });
+    area.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+  });
+
   // Wire per-row recompress buttons.
-  list.querySelectorAll('.row-recompress-btn').forEach((btn, idx) => {
-    btn.onclick = async () => {
+  list.querySelectorAll('.row-recompress-btn').forEach(btn => {
+    btn.onclick = async (ev) => {
+      ev.stopPropagation();
       const row = btn.closest('.recompress-row');
       const project = row.dataset.proj;
       const model = row.querySelector('.row-model-sel').value || undefined;
@@ -942,7 +1129,6 @@ async function loadHistory(name, offset) {
         const info = await resp.json();
         result.textContent = `✓ 압축 ${info.compressed}건 · 건너뜀 ${info.skipped}건`;
         pushActivity(`재압축 · ${project} · ${info.compressed}건`);
-        // Reload to reflect updated compressed state.
         loadHistory(project, HISTORY_OFFSET);
       } catch (e) {
         result.textContent = `오류: ${e.message || e}`;
@@ -961,6 +1147,73 @@ async function loadHistory(name, offset) {
   pager.hidden = totalPages <= 1;
   document.getElementById('history-meta').textContent = `${HISTORY_TOTAL}건 전체 영구 저장 · 페이지당 ${HISTORY_PAGE_SIZE}건`;
 }
+
+// Detail modal: fetch GET /api/memory/{id} and render.
+async function openDetailModal(id) {
+  const modal = document.getElementById('mem-detail-modal');
+  const body = document.getElementById('detail-modal-body');
+  document.getElementById('detail-modal-title').textContent = `메모리 #${id}`;
+  body.innerHTML = '<div class="empty">불러오는 중…</div>';
+  modal.hidden = false;
+  let d;
+  try {
+    const r = await fetch(`/api/memory/${id}`);
+    if (r.status === 404) {
+      body.innerHTML = '<div class="empty" style="color:var(--err);">항목을 찾을 수 없음 (404)</div>';
+      return;
+    }
+    if (!r.ok) {
+      body.innerHTML = `<div class="empty" style="color:var(--err);">오류 ${r.status}</div>`;
+      return;
+    }
+    d = await r.json();
+  } catch (e) {
+    body.innerHTML = `<div class="empty" style="color:var(--err);">네트워크 오류: ${e.message || e}</div>`;
+    return;
+  }
+  // Metadata rows from the item's payload/metadata field (object or null).
+  const meta = d.metadata || d.payload || {};
+  const metaRows = Object.entries(meta).map(([k, v]) =>
+    `<tr><td>${escapeHtml(k)}</td><td><code>${escapeHtml(String(v))}</code></td></tr>`
+  ).join('') || '<tr><td colspan="2" class="empty" style="font-size:0.82em;">메타데이터 없음</td></tr>';
+
+  // Importance display
+  const impHtml = (d.importance !== undefined && d.importance !== null)
+    ? `<tr><td>중요도</td><td>
+        <span class="imp-bar"><span class="imp-bar-fill" style="width:${Math.round(Number(d.importance)*100)}%"></span></span>
+        <span style="margin-left:0.4rem;font-size:0.85em;">${(Number(d.importance)*100).toFixed(0)}%</span>
+       </td></tr>`
+    : '';
+
+  body.innerHTML = `
+    <table class="detail-meta-table" style="margin-bottom:0.85rem;width:100%;">
+      <tr><td>ID</td><td><code>#${d.id}</code></td></tr>
+      <tr><td>kind</td><td><code>${escapeHtml(d.kind || '?')}</code></td></tr>
+      <tr><td>scope</td><td>${d.scope ? `<code>${escapeHtml(d.scope)}</code>` : '<span style="color:var(--muted);">—</span>'}</td></tr>
+      <tr><td>생성</td><td>${relativeTime(d.created_at)} <span style="color:var(--muted);font-size:0.82em;">(${d.created_at ? new Date(d.created_at*1000).toLocaleString() : '—'})</span></td></tr>
+      <tr><td>압축</td><td>${d.compressed ? '<span class="badge ok">⊟ 압축됨</span>' : '<span class="badge">미압축</span>'}</td></tr>
+      ${impHtml}
+    </table>
+    <div style="margin-bottom:0.5rem;font-size:0.82em;color:var(--muted);font-weight:600;">본문</div>
+    <div class="detail-body-pre">${escapeHtml(d.body || '')}</div>
+    ${d.compressed && d.body_full ? `
+      <details style="margin-top:0.6rem;">
+        <summary class="muted-summary">원본 보기 (${d.body_full.length}자)</summary>
+        <div class="detail-body-pre" style="margin-top:0.4rem;">${escapeHtml(d.body_full)}</div>
+      </details>` : ''}
+    ${Object.keys(meta).length ? `
+      <div style="margin-top:0.85rem;font-size:0.82em;color:var(--muted);font-weight:600;">메타데이터</div>
+      <table style="margin-top:0.35rem;width:100%;"><tbody>${metaRows}</tbody></table>` : ''}
+  `;
+}
+
+document.getElementById('detail-modal-close').onclick = () => { document.getElementById('mem-detail-modal').hidden = true; };
+document.getElementById('mem-detail-modal').onclick = (ev) => { if (ev.target.id === 'mem-detail-modal') ev.target.hidden = true; };
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && !document.getElementById('mem-detail-modal').hidden) {
+    document.getElementById('mem-detail-modal').hidden = true;
+  }
+});
 document.getElementById('history-prev').onclick = () => {
   if (!CURRENT_PROJECT) return;
   loadHistory(CURRENT_PROJECT, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
@@ -969,6 +1222,53 @@ document.getElementById('history-next').onclick = () => {
   if (!CURRENT_PROJECT) return;
   loadHistory(CURRENT_PROJECT, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
 };
+
+// Sort toggle buttons.
+document.getElementById('sort-recent').onclick = () => {
+  HISTORY_SORT = 'recent';
+  document.getElementById('sort-recent').classList.add('active');
+  document.getElementById('sort-importance').classList.remove('active');
+  if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, 0);
+};
+document.getElementById('sort-importance').onclick = () => {
+  HISTORY_SORT = 'importance';
+  document.getElementById('sort-importance').classList.add('active');
+  document.getElementById('sort-recent').classList.remove('active');
+  if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, 0);
+};
+
+// Bulk delete — confirm dialog before sending.
+document.getElementById('bulk-delete-btn').onclick = async () => {
+  if (!SELECTED_IDS.size) return;
+  const ids = Array.from(SELECTED_IDS);
+  const ok = confirm(`선택한 ${ids.length}건을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/memory/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    if (r.status === 404) {
+      // Endpoint not yet available; hide the bar gracefully.
+      pushActivity('대량 삭제 API 미지원 (404)');
+      return;
+    }
+    if (!r.ok) { pushActivity(`삭제 오류 ${r.status}`); return; }
+    const d = await r.json();
+    pushActivity(`삭제 완료 ${d.deleted}건`);
+    SELECTED_IDS.clear();
+    syncBulkBar();
+    if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
+  } catch (e) { pushActivity(`삭제 오류: ${e.message || e}`); }
+};
+document.getElementById('bulk-clear-btn').onclick = () => {
+  SELECTED_IDS.clear();
+  document.querySelectorAll('.hist-check').forEach(c => { c.checked = false; });
+  document.querySelectorAll('.hist-item.selected').forEach(i => i.classList.remove('selected'));
+  syncBulkBar();
+};
+
 // Re-load history after save.
 const originalSaveHandler = () => {};
 
@@ -1208,11 +1508,29 @@ async function loadOverview() {
 }
 document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('개요 새로고침'); };
 
+// Recall mode toggle (bm25 / hybrid).
+(function wireRecallModeToggle() {
+  const bm25Btn = document.getElementById('recall-mode-bm25');
+  const hybridBtn = document.getElementById('recall-mode-hybrid');
+  const val = document.getElementById('recall-mode-val');
+  bm25Btn.onclick = () => {
+    val.value = 'bm25';
+    bm25Btn.classList.add('active');
+    hybridBtn.classList.remove('active');
+  };
+  hybridBtn.onclick = () => {
+    val.value = 'hybrid';
+    hybridBtn.classList.add('active');
+    bm25Btn.classList.remove('active');
+  };
+})();
+
 // Memory
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
+  const mode = document.getElementById('recall-mode-val').value || 'bm25';
   const body = {
     project: document.getElementById('recall-project').value,
     query: document.getElementById('recall-query').value,
@@ -1220,6 +1538,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
     filter: document.getElementById('recall-filter').value || null,
     kind: kindVal || null,
     compressed_only: compressedOnly || null,
+    mode,
   };
   const results = document.getElementById('recall-results');
   results.innerHTML = `<div class="empty">검색 중…</div>`;
@@ -1236,24 +1555,35 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
     const compBadge = isCompressed
       ? `<span class="badge ok" title="압축됨">⊟ 압축</span>`
       : '';
+    // Importance display
+    let impBadge = '';
+    if (h.importance !== undefined && h.importance !== null) {
+      const pct = Math.round(Number(h.importance) * 100);
+      impBadge = `<span class="badge imp" title="중요도">★ ${pct}%</span>`;
+    }
+    // Score display — right-aligned in meta row
+    const scoreHtml = h.score !== undefined
+      ? `<span class="rc-score">score <span class="score-val">${Number(h.score).toFixed(3)}</span></span>`
+      : '';
     const origBlock = isCompressed && h.body_full
-      ? `<details class="recall-card rc-orig"><summary style="cursor:pointer;color:var(--muted);font-size:0.82em;">원본 보기 (${h.body_full.length}자)</summary>
-           <div style="margin-top:0.4rem;font-size:0.85em;white-space:pre-wrap;overflow-wrap:anywhere;">${escapeHtml(h.body_full)}</div>
+      ? `<details style="margin-top:0.4rem;">
+           <summary style="cursor:pointer;color:var(--muted);font-size:0.82em;user-select:none;">원본 보기 (${h.body_full.length}자)</summary>
+           <div style="margin-top:0.4rem;font-size:0.85em;white-space:pre-wrap;overflow-wrap:anywhere;padding:0.5rem;background:var(--bg);border-radius:6px;border:1px solid var(--border);">${escapeHtml(h.body_full)}</div>
          </details>`
       : '';
-    return `<div class="recall-card">
+    return `<div class="recall-card" style="cursor:pointer;" onclick="openDetailModal(${h.id})" title="상세 보기">
       <div class="rc-meta">
         <span class="badge">#${h.id}</span>
         <code style="font-size:0.82em;">${escapeHtml(h.kind || '?')}</code>
-        ${compBadge}
+        ${compBadge}${impBadge}
         ${h.scope ? `<span style="font-size:0.8em;color:var(--muted);">${escapeHtml(h.scope)}</span>` : ''}
-        ${h.score !== undefined ? `<span style="font-size:0.78em;color:var(--muted);margin-left:auto;">score ${Number(h.score).toFixed(2)}</span>` : ''}
+        ${scoreHtml}
       </div>
       <div class="rc-body">${escapeHtml(h.body || '')}</div>
       ${origBlock}
     </div>`;
   }).join('');
-  pushActivity(`recall ${body.project} · ${d.hits.length}건`);
+  pushActivity(`recall ${body.project} · ${d.hits.length}건 (${mode})`);
 };
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1381,6 +1711,121 @@ async function loadQueue(project) {
       <span class="kind" style="color:${i.ready ? 'var(--ok)' : 'var(--muted)'}">${i.ready ? '✓ 준비' : '⏳ 숙성중'}</span>
     </div>`).join('');
 }
+
+// Governance subtab logic.
+let GOV_PREVIEW_IDS = [];
+
+async function loadGovStats(project) {
+  if (!project) return;
+  // Reuse the existing stats endpoint to populate the summary boxes.
+  try {
+    const r = await fetch(`/api/memory/stats?project=${encodeURIComponent(project)}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('gov-total').textContent = (d.total || 0).toLocaleString();
+    const comp = d.compressed_count || 0;
+    const uncomp = (d.total || 0) - comp;
+    document.getElementById('gov-compressed').textContent = comp.toLocaleString();
+    document.getElementById('gov-uncompressed').textContent = uncomp.toLocaleString();
+    const savedK = (d.saved_chars || 0) >= 1000
+      ? `${((d.saved_chars || 0) / 1000).toFixed(1)}K`
+      : String(d.saved_chars || 0);
+    document.getElementById('gov-saved').textContent = savedK;
+  } catch (_) { /* stats API optional */ }
+}
+
+async function runGovPreview() {
+  if (!CURRENT_PROJECT) return;
+  const kind = document.getElementById('gov-kind').value;
+  const compFilter = document.getElementById('gov-compress-filter').value;
+  const before = document.getElementById('gov-before').value;
+  const after = document.getElementById('gov-after').value;
+
+  const params = new URLSearchParams({ project: CURRENT_PROJECT, limit: 200, sort: 'recent' });
+  if (kind) params.set('kind', kind);
+  if (compFilter === 'compressed') params.set('compressed_only', '1');
+  if (before) params.set('before', Math.floor(new Date(before).getTime() / 1000));
+  if (after) params.set('after', Math.floor(new Date(after).getTime() / 1000));
+
+  const previewEl = document.getElementById('gov-preview-result');
+  const dangerZone = document.getElementById('gov-danger-zone');
+  previewEl.innerHTML = '<div class="empty">불러오는 중…</div>';
+  dangerZone.hidden = true;
+  GOV_PREVIEW_IDS = [];
+
+  let d;
+  try {
+    const r = await fetch(`/api/memory/timeline?${params}`);
+    if (r.status === 404) {
+      previewEl.innerHTML = '<div class="empty" style="color:var(--muted);">timeline API 미지원 (404)</div>';
+      return;
+    }
+    if (!r.ok) { previewEl.innerHTML = `<div class="empty" style="color:var(--err);">오류 ${r.status}</div>`; return; }
+    d = await r.json();
+  } catch (e) {
+    previewEl.innerHTML = `<div class="empty" style="color:var(--err);">네트워크 오류: ${e.message || e}</div>`;
+    return;
+  }
+
+  // Client-side filtering for compressed_only=uncompressed (server may not support it).
+  let items = d.items || [];
+  if (compFilter === 'uncompressed') items = items.filter(i => !i.compressed);
+  if (compFilter === 'compressed') items = items.filter(i => i.compressed);
+
+  GOV_PREVIEW_IDS = items.map(i => i.id);
+
+  if (!items.length) {
+    previewEl.innerHTML = '<div class="empty">조건에 맞는 항목 없음.</div>';
+    dangerZone.hidden = true;
+    return;
+  }
+
+  previewEl.innerHTML = items.slice(0, 50).map(i => {
+    const compBadge = i.compressed ? `<span style="color:var(--ok);font-size:0.78em;">⊟</span>` : '';
+    const snippet = (i.body || '').slice(0, 80).replace(/\n/g, ' ');
+    return `<div class="hist-item" style="cursor:default;">
+      <span class="when">${relativeTime(i.created_at)}</span>
+      <span class="kind">${escapeHtml(i.kind)}</span>${compBadge}
+      <span class="body" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(snippet)}${i.body && i.body.length > 80 ? '…' : ''}</span>
+    </div>`;
+  }).join('') + (items.length > 50 ? `<div class="empty" style="font-size:0.82em;">… 외 ${items.length - 50}건 (미리보기 최대 50건)</div>` : '');
+
+  document.getElementById('gov-match-count').textContent = `${items.length}건 일치`;
+  dangerZone.hidden = false;
+  document.getElementById('gov-delete-result').textContent = '';
+}
+
+document.getElementById('gov-preview-btn').onclick = runGovPreview;
+document.getElementById('gov-refresh').onclick = () => { if (CURRENT_PROJECT) { loadGovStats(CURRENT_PROJECT); runGovPreview(); } };
+
+document.getElementById('gov-bulk-delete-btn').onclick = async () => {
+  if (!GOV_PREVIEW_IDS.length) return;
+  const ok = confirm(`필터 조건에 해당하는 ${GOV_PREVIEW_IDS.length}건을 모두 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
+  if (!ok) return;
+  const resultEl = document.getElementById('gov-delete-result');
+  resultEl.textContent = '삭제 중…';
+  try {
+    const r = await fetch('/api/memory/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: GOV_PREVIEW_IDS }),
+    });
+    if (r.status === 404) {
+      resultEl.innerHTML = '<span style="color:var(--muted);">삭제 API 미지원 (404)</span>';
+      return;
+    }
+    if (!r.ok) { resultEl.innerHTML = `<span style="color:var(--err);">오류 ${r.status}</span>`; return; }
+    const d = await r.json();
+    resultEl.innerHTML = `<span class="badge ok">✓ ${d.deleted}건 삭제 완료</span>`;
+    pushActivity(`관리 삭제 · ${d.deleted}건`);
+    GOV_PREVIEW_IDS = [];
+    document.getElementById('gov-preview-result').innerHTML = '<div class="empty">삭제 완료. 미리보기를 다시 실행하세요.</div>';
+    document.getElementById('gov-danger-zone').hidden = true;
+    loadGovStats(CURRENT_PROJECT);
+  } catch (e) {
+    resultEl.innerHTML = `<span style="color:var(--err);">오류: ${e.message || e}</span>`;
+  }
+};
 
 document.getElementById('queue-compress-all').onclick = async (ev) => {
   if (!CURRENT_PROJECT) return;
@@ -1893,6 +2338,13 @@ function subscribeStream() {
         if (d.type === 'memory.save') {
           pushActivity(`memory.save · ${d.kind || '?'} · ${d.project || '?'} (#${d.id})`);
           loadOverview();
+        } else if (d.type === 'memory.delete') {
+          pushActivity(`memory.delete · #${d.id}`);
+          // Reload history if the deleted item belongs to the open project.
+          if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
+        } else if (d.type === 'memory.delete_batch') {
+          pushActivity(`memory.delete_batch · ${d.deleted}건 삭제`);
+          if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
         } else if (d.type === 'heartbeat') {
           // keep-alive; ignore
         } else {

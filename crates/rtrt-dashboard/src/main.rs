@@ -36,7 +36,7 @@ use axum::{
     extract::{Path as AxPath, State},
     http::StatusCode,
     response::Html,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
 use rtrt_providers::{
@@ -66,6 +66,22 @@ struct AppState {
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
+}
+
+/// Extract the % savings from a memory row's metadata map (set by the LLM
+/// compress sweep). Returns `None` when the row is not compressed or the
+/// metadata fields are absent/unparseable.
+fn compress_saved_pct_from_meta(
+    meta: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<f64> {
+    let m = meta?;
+    let from: i64 = m.get("compressed_from_chars")?.parse().ok()?;
+    let to: i64 = m.get("compressed_to_chars")?.parse().ok()?;
+    if from <= 0 {
+        return None;
+    }
+    let saved = (from - to).max(0);
+    Some((saved as f64 / from as f64 * 100.0 * 10.0).round() / 10.0)
 }
 
 /// Thin wrapper that makes a [`Gateway`] look like a [`Provider`] so we can
@@ -282,6 +298,10 @@ async fn main() -> Result<()> {
         .route("/api/memory/delete", post(memory_delete_batch))
         .route("/api/memory/embed", post(memory_embed))
         .route("/api/memory/entities", post(memory_entities))
+        .route("/api/ollama/models", get(ollama_models))
+        .route("/api/ollama/{name}", delete(ollama_delete))
+        .route("/api/ollama/ps", get(ollama_ps))
+        .route("/api/ollama/pull", post(ollama_pull))
         .route(
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),
@@ -873,6 +893,7 @@ async fn memory_timeline(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
+                let saved_pct = compress_saved_pct_from_meta(Some(&r.metadata));
                 serde_json::json!({
                     "id": r.id,
                     "kind": r.kind,
@@ -883,6 +904,7 @@ async fn memory_timeline(
                     "created_at": r.created_at,
                     "importance": r.importance,
                     "metadata": r.metadata,
+                    "saved_pct": saved_pct,
                 })
             })
             .collect()
@@ -898,6 +920,12 @@ async fn memory_timeline(
                 // uses (terse when compressed).
                 let full = guard.full_body(r.id).ok().flatten();
                 let compressed = full.is_some();
+                let saved_pct = if compressed {
+                    let meta = guard.get_metadata(r.id).ok();
+                    compress_saved_pct_from_meta(meta.as_ref())
+                } else {
+                    None
+                };
                 serde_json::json!({
                     "id": r.id,
                     "kind": r.kind,
@@ -906,6 +934,7 @@ async fn memory_timeline(
                     "body_full": full,
                     "compressed": compressed,
                     "created_at": r.created_at,
+                    "saved_pct": saved_pct,
                 })
             })
             .collect()
@@ -1225,12 +1254,18 @@ async fn proxy_filter(
         original.saturating_sub(filtered).to_string(),
     );
     state.capture("proxy", &out, &meta).await;
+    let saved_pct = if original > 0 {
+        ((original.saturating_sub(filtered)) as f64 / original as f64 * 100.0 * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
     Ok(Json(serde_json::json!({
         "filtered": out,
         "mode": mode,
         "original_len": original,
         "filtered_len": filtered,
         "saved_chars": original.saturating_sub(filtered),
+        "saved_pct": saved_pct,
     })))
 }
 
@@ -1539,14 +1574,21 @@ async fn compress(
                 original.saturating_sub(compressed).to_string(),
             );
             state.capture("compress", &out, &meta).await;
+            let saved = original.saturating_sub(compressed);
+            let saved_pct = if original > 0 {
+                (saved as f64 / original as f64 * 100.0 * 10.0).round() / 10.0
+            } else {
+                0.0
+            };
             Ok(Json(serde_json::json!({
                 "compressed": out,
                 "mode": "llm",
                 "model": model,
                 "original_len": original,
                 "compressed_len": compressed,
-                "saved": original.saturating_sub(compressed),
-                "saved_chars": original.saturating_sub(compressed),
+                "saved": saved,
+                "saved_chars": saved,
+                "saved_pct": saved_pct,
             })))
         }
 
@@ -1566,14 +1608,21 @@ async fn compress(
                 original.saturating_sub(compressed).to_string(),
             );
             state.capture("compress", &out, &meta).await;
+            let saved = original.saturating_sub(compressed);
+            let saved_pct = if original > 0 {
+                (saved as f64 / original as f64 * 100.0 * 10.0).round() / 10.0
+            } else {
+                0.0
+            };
             Ok(Json(serde_json::json!({
                 "compressed": out,
                 "mode": "ml",
                 "scorer": scorer,
                 "original_len": original,
                 "compressed_len": compressed,
-                "saved": original.saturating_sub(compressed),
-                "saved_chars": original.saturating_sub(compressed),
+                "saved": saved,
+                "saved_chars": saved,
+                "saved_pct": saved_pct,
             })))
         }
 
@@ -1604,13 +1653,20 @@ async fn compress(
                 original.saturating_sub(compressed).to_string(),
             );
             state.capture("compress", &out, &meta).await;
+            let saved = original.saturating_sub(compressed);
+            let saved_pct = if original > 0 {
+                (saved as f64 / original as f64 * 100.0 * 10.0).round() / 10.0
+            } else {
+                0.0
+            };
             Ok(Json(serde_json::json!({
                 "compressed": out,
                 "mode": "rules",
                 "original_len": original,
                 "compressed_len": compressed,
-                "saved": original.saturating_sub(compressed),
-                "saved_chars": original.saturating_sub(compressed),
+                "saved": saved,
+                "saved_chars": saved,
+                "saved_pct": saved_pct,
             })))
         }
     }
@@ -1976,6 +2032,9 @@ struct MemoryCompressRequest {
 struct MemoryCompressResponse {
     compressed: usize,
     skipped: usize,
+    saved_chars: i64,
+    /// Aggregate % reduction across the batch (0.0 when nothing was compressed).
+    saved_pct: f64,
 }
 
 async fn memory_compress(
@@ -2012,6 +2071,8 @@ async fn memory_compress(
 
     let mut compressed_count = 0usize;
     let mut skipped_count = 0usize;
+    let mut total_from_chars: i64 = 0;
+    let mut total_saved_chars: i64 = 0;
 
     for (id, body) in candidates {
         let chat_req = ChatRequest {
@@ -2060,9 +2121,13 @@ async fn memory_compress(
         let mut meta = guard.get_metadata(id).unwrap_or_default();
         meta.insert("compressed_at".into(), now.to_string());
         meta.insert("compressed_model".into(), model.clone());
-        meta.insert("compressed_from_chars".into(), body.len().to_string());
-        meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+        let from_chars = body.len() as i64;
+        let to_chars = new_body.len() as i64;
+        meta.insert("compressed_from_chars".into(), from_chars.to_string());
+        meta.insert("compressed_to_chars".into(), to_chars.to_string());
         let _ = guard.set_metadata(id, &meta);
+        total_from_chars += from_chars;
+        total_saved_chars += (from_chars - to_chars).max(0);
         compressed_count += 1;
         tracing::info!(
             project = %req.project,
@@ -2073,9 +2138,16 @@ async fn memory_compress(
         );
     }
 
+    let saved_pct = if total_from_chars > 0 {
+        (total_saved_chars as f64 / total_from_chars as f64 * 100.0 * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
     Ok(Json(MemoryCompressResponse {
         compressed: compressed_count,
         skipped: skipped_count,
+        saved_chars: total_saved_chars,
+        saved_pct,
     }))
 }
 
@@ -2106,6 +2178,8 @@ struct MemoryStatsResponse {
     by_kind: Vec<KindCount>,
     compressed_count: i64,
     saved_chars: i64,
+    /// Average % reduction across compressed rows (0.0 when none compressed).
+    saved_pct: f64,
     by_day: Vec<DayCount>,
 }
 
@@ -2153,38 +2227,40 @@ async fn memory_stats(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    // compressed_count = rows whose metadata JSON contains "compressed_at".
-    // saved_chars = sum of (compressed_from_chars - compressed_to_chars) parsed from metadata.
-    // The metadata column stores a JSON object; we query all rows with metadata and filter in Rust
-    // to stay compatible with any SQLite version (no JSON1 dependency assumed).
-    let (compressed_count, saved_chars) = {
+    // compressed_count / saved_chars / saved_pct:
+    //   Source of truth = actual body vs body_full lengths for rows where
+    //   body_full IS NOT NULL (the pre-compression original is stored there).
+    //   saved_pct = 1 - sum(len(body)) / sum(len(body_full)) over those rows.
+    let (compressed_count, saved_chars, saved_pct) = {
         let mut stmt = conn
-            .prepare("SELECT metadata FROM memories WHERE project = ?1 AND metadata IS NOT NULL")
+            .prepare(
+                "SELECT LENGTH(body), LENGTH(body_full) FROM memories \
+                  WHERE project = ?1 AND body_full IS NOT NULL",
+            )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![q.project], |row| row.get::<_, String>(0))
+            .query_map(rusqlite::params![q.project], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let mut count: i64 = 0;
-        let mut saved: i64 = 0;
-        for meta_str in rows.flatten() {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                if obj.get("compressed_at").is_some() {
-                    count += 1;
-                    let from: i64 = obj
-                        .get("compressed_from_chars")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let to: i64 = obj
-                        .get("compressed_to_chars")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    saved += (from - to).max(0);
-                }
+        let mut sum_body: i64 = 0;
+        let mut sum_full: i64 = 0;
+        for r in rows.flatten() {
+            let (body_len, full_len) = r;
+            if full_len > 0 {
+                count += 1;
+                sum_body += body_len;
+                sum_full += full_len;
             }
         }
-        (count, saved)
+        let saved = (sum_full - sum_body).max(0);
+        let pct = if sum_full > 0 {
+            ((1.0 - sum_body as f64 / sum_full as f64) * 100.0 * 10.0).round() / 10.0
+        } else {
+            0.0
+        };
+        (count, saved, pct)
     };
 
     // by_day: group created_at (Unix timestamp integer) by calendar date (YYYY-MM-DD).
@@ -2212,6 +2288,7 @@ async fn memory_stats(
         by_kind,
         compressed_count,
         saved_chars,
+        saved_pct,
         by_day,
     }))
 }
@@ -2271,12 +2348,14 @@ async fn memory_queue(
         } else {
             waiting += 1;
         }
+        // Queue rows are not yet compressed; saved_pct is null (pending).
         items.push(serde_json::json!({
             "id": id,
             "kind": kind,
             "chars": chars,
             "age_min": (now - created_at) / 60,
             "ready": is_ready,
+            "saved_pct": serde_json::Value::Null,
         }));
     }
     Ok(Json(serde_json::json!({
@@ -2506,6 +2585,201 @@ async fn memory_entities(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "edges": new_edges })))
+}
+
+// ---------------------------------------------------------------------------
+// Ollama model management  (/api/ollama/*)
+//
+// All endpoints resolve the Ollama base URL via `ollama_base()`:
+//   embeddings.base_url → auto_compress.base_url → http://127.0.0.1:11434
+// Trailing `/v1` is stripped so the same URL works for both the
+// OpenAI-compat chat path and the native Ollama API.
+// ---------------------------------------------------------------------------
+
+/// Resolve and normalise the Ollama base URL (no trailing slash, no `/v1`).
+fn ollama_base() -> String {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let raw = cfg
+        .embeddings
+        .resolved_base_url(cfg.auto_compress.base_url.as_deref());
+    let mut url = raw.trim_end_matches('/').to_string();
+    if url.ends_with("/v1") {
+        url.truncate(url.len() - 3);
+    }
+    url.trim_end_matches('/').to_string()
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/ollama/models  →  GET {base}/api/tags
+// Response: [{ "name": String, "size_bytes": u64, "family": String, "modified_at": String }]
+// ---------------------------------------------------------------------------
+
+async fn ollama_models() -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/api/tags", ollama_base());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama unreachable: {e}")))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ollama /api/tags {code}: {body}"),
+        ));
+    }
+    let raw: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama decode: {e}")))?;
+    let models: Vec<serde_json::Value> = raw
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let family = m
+                .get("details")
+                .and_then(|d| d.get("family"))
+                .and_then(|f| f.as_str())
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({
+                "name":        m.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "size_bytes":  m.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                "family":      family,
+                "modified_at": m.get("modified_at").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "models": models })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/ollama/ps  →  GET {base}/api/ps
+// Response: [{ "name": String, "size_bytes": u64, "size_vram_bytes": u64, "until": String }]
+// ---------------------------------------------------------------------------
+
+async fn ollama_ps() -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/api/ps", ollama_base());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama unreachable: {e}")))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ollama /api/ps {code}: {body}"),
+        ));
+    }
+    let raw: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama decode: {e}")))?;
+    let models: Vec<serde_json::Value> = raw
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            // size_vram is in the `size_vram` field from Ollama /api/ps.
+            let size_vram = m
+                .get("size_vram")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "name":            m.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "size_bytes":      m.get("size").cloned().unwrap_or(serde_json::Value::Null),
+                "size_vram_bytes": size_vram,
+                "until":           m.get("expires_at").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "models": models })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/ollama/pull
+// Body:    { "name": "bge-m3" }
+// Response: { "ok": bool, "status": String }
+//
+// Uses stream:false — Ollama returns a single JSON object when done.
+// Client timeout is intentionally large (pulls take minutes).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OllamaNameRequest {
+    name: String,
+}
+
+async fn ollama_pull(
+    Json(req): Json<OllamaNameRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/api/pull", ollama_base());
+    // No timeout — model pulls can take many minutes on slow connections.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = serde_json::json!({ "name": req.name, "stream": false });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama unreachable: {e}")))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ollama /api/pull {code}: {text}"),
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama decode: {e}")))?;
+    if let Some(err) = v.get("error").and_then(|x| x.as_str()) {
+        return Err((StatusCode::BAD_GATEWAY, err.to_string()));
+    }
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("success")
+        .to_string();
+    Ok(Json(serde_json::json!({ "ok": true, "status": status })))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/ollama/{name}
+// Path param: model name (URL-encoded, e.g. `bge-m3%3Alatest`).
+// Response: { "ok": bool }
+// ---------------------------------------------------------------------------
+
+async fn ollama_delete(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let url = format!("{}/api/delete", ollama_base());
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({ "name": name });
+    let resp = client
+        .delete(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ollama unreachable: {e}")))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ollama /api/delete {code}: {text}"),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");

@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### Highlights — 절감률 % 일관 표시 · 로컬 LLM 관리 페이지
+
+**대시보드가 압축 절감률을 어디서나 퍼센트로 표시하고, 로컬 Ollama 모델을 끝까지 관리하는 새 페이지가 추가됐습니다.**
+
+- 모든 압축 표면이 `saved_pct`(소수 1자리)를 반환: `POST /api/compress`, `POST /api/proxy`, `POST /api/memory/compress`, 그리고 `GET /api/memory/stats`(압축된 행 집계 `saved_pct`)와 타임라인 행(행별 `saved_pct`, 미압축 시 null). UI는 압축/프록시 결과, 통계 KPI 타일, 행별 배지에 퍼센트 표시.
+- 새 **로컬 LLM** 페이지 — `GET /api/ollama/models`, `GET /api/ollama/ps`, `POST /api/ollama/pull`, `DELETE /api/ollama/models` 기반: 설치된 모델 크기와 함께 목록, 현재 로드된 모델 확인, 새 모델 pull(블로킹), 삭제(확인 후), 그리고 원클릭으로 압축/임베딩 기본 모델 지정. Ollama base URL은 config에서 해석(`embeddings` → `auto_compress` → localhost, 끝의 `/v1` 제거).
+
 ### Highlights — 밀집 벡터 시맨틱 recall · 엔티티 연결 · SessionStart 주입
 
 **메모리 recall이 로컬 Ollama 임베더 기반의 진짜 밀집 벡터 경로를 얻고, 대시보드는 임베딩 백필 + 엔티티 추출을 원클릭으로 노출하며, SessionStart 훅이 첫 턴부터 프로젝트 지식을 주입합니다.**

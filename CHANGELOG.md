@@ -9,6 +9,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — consistent savings %, local LLM management page
+
+**The dashboard now reports compression savings as a percentage everywhere, and a new page manages local Ollama models end to end.**
+
+- Every compression surface returns `saved_pct` (1-decimal): `POST /api/compress`, `POST /api/proxy`, `POST /api/memory/compress`, plus `GET /api/memory/stats` (`saved_pct` aggregate over compressed rows) and the timeline rows (per-row `saved_pct`, null when uncompressed). The UI shows the percentage on the compress/proxy result, a stats KPI tile, and per-row badges.
+- New **로컬 LLM** dashboard page backed by `GET /api/ollama/models`, `GET /api/ollama/ps`, `POST /api/ollama/pull`, and `DELETE /api/ollama/models`: list installed models with size, see currently-loaded models, pull a new model (blocking), delete a model (with confirm), and set any model as the compression or embedding default in one click. Ollama base URL resolves from config (`embeddings` → `auto_compress` → localhost, trailing `/v1` stripped).
+
 ### Highlights — dense-vector semantic recall, entity linking, SessionStart injection
 
 **Memory recall gains a true dense-vector path backed by a local Ollama embedder, the dashboard exposes one-click embedding backfill + entity extraction, and a SessionStart hook injects project knowledge from turn one.**

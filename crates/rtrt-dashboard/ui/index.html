@@ -2724,12 +2724,8 @@ async function loadLlmModels() {
       if (!confirm(`"${name}" 모델을 삭제합니다. 디스크에서 완전히 제거됩니다.`)) return;
       btn.disabled = true;
       try {
-        // DELETE /api/ollama/models with JSON {name} in the body.
-        const r = await fetch('/api/ollama/models', {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name }),
-        });
+        // DELETE /api/ollama/{name} — path param, URL-encode colons.
+        const r = await fetch(`/api/ollama/${encodeURIComponent(name)}`, { method: 'DELETE' });
         if (r.status === 404 || r.status === 502) {
           showToast(`삭제 실패 (${r.status})`, 'err');
           return;

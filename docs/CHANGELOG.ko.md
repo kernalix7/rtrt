@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### Highlights — 밀집 벡터 시맨틱 recall · 엔티티 연결 · SessionStart 주입
+
+**메모리 recall이 로컬 Ollama 임베더 기반의 진짜 밀집 벡터 경로를 얻고, 대시보드는 임베딩 백필 + 엔티티 추출을 원클릭으로 노출하며, SessionStart 훅이 첫 턴부터 프로젝트 지식을 주입합니다.**
+
+- `rtrt-memory::OllamaEmbedder` (`ollama-embed` feature)가 `{base_url}/api/embeddings` 호출; 기본 모델 `bge-m3` (1024차원). `recall_hybrid`에 연결돼 임베더가 있으면 `mode=hybrid` recall이 BM25 + 코사인을 reciprocal-rank fusion으로 융합하고, 없으면 그래프 혼합 BM25로 graceful degrade.
+- 새 `[embeddings]` 설정 섹션(`enabled` / `model` / `base_url`) + `RTRT_EMBED_ENABLED` / `RTRT_EMBED_MODEL` / `RTRT_EMBED_BASE_URL` env 오버라이드; `GET`/`POST /api/config`와 대시보드 설정 페이지에서 읽기·쓰기 노출.
+- 대시보드: `POST /api/memory/embed`로 프로젝트의 미임베딩 행 백필, `POST /api/memory/entities`로 LLM 엔티티 추출 후 동시 언급 메모리 연결. 검색 서브탭에 벡터 히트 시맨틱 배지 + 임베딩 백필 버튼, 그래프 서브탭에 엔티티 추출 버튼 + 타입별(엔티티/블록/메모리) 노드 색상.
+- `MemoryStore::add_edge`가 새 엣지 생성 여부를 반환; 엔티티 연결을 async `link_entities`와 동기 `link_extracted`로 분리해 `!Sync` 스토어 borrow를 `.await` 넘겨 잡지 않고 `Send` axum 핸들러에서 실행.
+- 새 `rtrt hook session-inject`(`SessionStart`에 등록)가 프로젝트 상위 메모리를 컨텍스트 블록으로 출력해 첫 프롬프트 전에 배경 지식 확보.
+
 ### Highlights — 로컬 LLM 압축 모델 비교
 
 - `docs/PERF.md` + `docs/PERF.ko.md`에 LLM 자동 압축 경로의 로컬 Ollama 모델 길이별 비교 게시 (티어당 현실 캡처 20개 × 6티어, XS ~16자 ~ XXL ~6000자). 결론: 압축률은 모델보다 입력 길이가 좌우 — 짧은 행은 거의 안 줄어 `RTRT_AUTO_COMPRESS_MIN_CHARS=512`가 올바르게 스킵, dense 중간 길이 ~25-30%, 긴 장황한 캡처 40%+.

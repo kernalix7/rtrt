@@ -38,8 +38,10 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
-use rtrt_memory::{DetailedRecord, MemoryStore, PayloadFilter};
-use rtrt_providers::{ChatMessage, ChatRequest, Gateway, MetricsView, RequestMetric, Role};
+use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
+use rtrt_providers::{
+    ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
+};
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -56,10 +58,32 @@ struct AppState {
     session_id: String,
     dedup_window_sec: i64,
     events: broadcast::Sender<String>,
+    /// Shared Ollama embedder, present when `[embeddings] enabled = true` in
+    /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
+    /// paths working without an Ollama instance.
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
+}
+
+/// Thin wrapper that makes a [`Gateway`] look like a [`Provider`] so we can
+/// pass it to [`rtrt_memory::LlmSummariser`]. The adapter forwards chat calls
+/// directly; streaming is not needed for summarisation.
+struct GatewayAdapter(Arc<Gateway>);
+
+#[async_trait::async_trait]
+impl Provider for GatewayAdapter {
+    fn name(&self) -> &str {
+        "gateway"
+    }
+    fn supported_models(&self) -> &[&'static str] {
+        &[]
+    }
+    async fn chat(&self, req: ChatRequest) -> rtrt_core::Result<ChatResponse> {
+        self.0.chat(req).await
+    }
 }
 
 impl AppState {
@@ -185,6 +209,26 @@ async fn main() -> Result<()> {
     let memory_for_compress_daemon = memory.clone();
     let gateway_for_compress_daemon = gateway.clone();
     let (events_tx, _) = broadcast::channel::<String>(256);
+    // Build the Ollama embedder when enabled in config / env.
+    let embedder: Option<Arc<dyn Embedder>> = {
+        let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+        if ecfg.is_enabled() {
+            let base_url = ecfg.resolved_base_url(
+                rtrt_core::Config::load()
+                    .ok()
+                    .and_then(|c| c.auto_compress.base_url)
+                    .as_deref(),
+            );
+            let model = ecfg.effective_model();
+            tracing::info!("embeddings enabled: model={model} base_url={base_url}");
+            Some(Arc::new(rtrt_memory::OllamaEmbedder::new(base_url, model)))
+        } else {
+            tracing::info!(
+                "embeddings disabled (set RTRT_EMBED_ENABLED=1 or [embeddings] enabled=true)"
+            );
+            None
+        }
+    };
     let state = AppState {
         gateway,
         prompts,
@@ -195,6 +239,7 @@ async fn main() -> Result<()> {
         session_id,
         dedup_window_sec,
         events: events_tx,
+        embedder,
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
@@ -235,6 +280,8 @@ async fn main() -> Result<()> {
         .route("/api/memory/stats", get(memory_stats))
         .route("/api/memory/queue", get(memory_queue))
         .route("/api/memory/delete", post(memory_delete_batch))
+        .route("/api/memory/embed", post(memory_embed))
+        .route("/api/memory/entities", post(memory_entities))
         .route(
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),
@@ -714,10 +761,22 @@ async fn memory_recall(
 
     match mode {
         "hybrid" => {
-            // Graph-blended BM25 — no LLM, no embedder required.
-            let scored = guard
-                .recall_bm25_graph_blend(&req.project, &req.query, req.limit as usize)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // When an Ollama embedder is wired, run true BM25 + dense-vector
+            // RRF. Otherwise fall back to the graph-blended BM25 path so the
+            // endpoint stays usable without an embedding server.
+            let (scored, effective_mode) = if let Some(emb) = state.embedder.as_ref() {
+                let s = guard
+                    .recall_hybrid(&req.project, &req.query, req.limit as usize, emb.as_ref())
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                (s, "hybrid-vector")
+            } else {
+                // No embedder available — use graph-blended BM25 as a
+                // graceful degradation.
+                let s = guard
+                    .recall_bm25_graph_blend(&req.project, &req.query, req.limit as usize)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                (s, "hybrid-graph")
+            };
             let hits: Vec<serde_json::Value> = scored
                 .into_iter()
                 .map(|sr| {
@@ -732,7 +791,9 @@ async fn memory_recall(
                     })
                 })
                 .collect();
-            Ok(Json(serde_json::json!({ "hits": hits, "mode": "hybrid" })))
+            Ok(Json(
+                serde_json::json!({ "hits": hits, "mode": effective_mode }),
+            ))
         }
         // "bm25" or any unrecognised value falls through to plain BM25.
         _ => {
@@ -1742,6 +1803,7 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
 struct ConfigResponse {
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
+    embeddings: rtrt_core::config::EmbeddingsConfig,
     path: String,
 }
 
@@ -1754,6 +1816,7 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
     Ok(Json(ConfigResponse {
         capture: cfg.capture,
         auto_compress: cfg.auto_compress,
+        embeddings: cfg.embeddings,
         path,
     }))
 }
@@ -1766,6 +1829,10 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
 struct ConfigWriteRequest {
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
+    /// Optional so older dashboard builds (no embeddings UI) still POST cleanly;
+    /// when absent the on-disk embeddings section is preserved untouched.
+    #[serde(default)]
+    embeddings: Option<rtrt_core::config::EmbeddingsConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1782,6 +1849,9 @@ async fn post_config(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     cfg.capture = req.capture;
     cfg.auto_compress = req.auto_compress;
+    if let Some(emb) = req.embeddings {
+        cfg.embeddings = emb;
+    }
 
     let path = rtrt_core::Config::default_path().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2311,6 +2381,131 @@ async fn memory_delete_batch(
         serde_json::json!({ "type": "memory.delete_batch", "ids": req.ids, "deleted": deleted }),
     );
     Ok(Json(DeleteBatchResponse { deleted }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/memory/embed
+// Body:  { "project": "…" }
+// Response: { "embedded": N }
+//
+// Backfills embeddings for every memory row in `project` that does not yet
+// have an entry in the `embeddings` table. Requires embeddings to be enabled
+// in the config / env. Returns 503 when no embedder is available.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct MemoryEmbedRequest {
+    project: String,
+}
+
+async fn memory_embed(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryEmbedRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let embedder = state.embedder.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "embeddings not enabled".into(),
+    ))?;
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let embedded = guard
+        .backfill_embeddings(&req.project, embedder.as_ref())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "embedded": embedded })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/memory/entities
+// Body:  { "project": "…", "model": "…" }  (model is optional)
+// Response: { "edges": N }
+//
+// Runs the LLM-driven entity-extraction + edge-linking pass for `project`.
+// The gateway's configured model (or the explicit `model` field) is used.
+// Returns 503 when no gateway provider is available.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct MemoryEntitiesRequest {
+    project: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn memory_entities(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryEntitiesRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+
+    // Resolve the model: explicit arg → config auto_compress model → fallback.
+    let model = req.model.clone().unwrap_or_else(|| {
+        rtrt_core::Config::load()
+            .ok()
+            .map(|c| c.auto_compress.model)
+            .unwrap_or_else(|| "claude-haiku-4-5".to_string())
+    });
+
+    // Build a per-request gateway the same way the auto-compress daemon does,
+    // so the config base_url is honoured even when env vars are absent.
+    let llm_gateway = {
+        let env_has_url = std::env::var_os("RTRT_PROVIDER_BASE_URL").is_some()
+            || std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_some();
+        if env_has_url {
+            Arc::new(rtrt_providers::Gateway::from_env())
+        } else {
+            let cfg_url = rtrt_core::Config::load()
+                .ok()
+                .and_then(|c| c.auto_compress.base_url);
+            Arc::new(if let Some(url) = cfg_url {
+                unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", &url) };
+                let gw = rtrt_providers::Gateway::from_env();
+                unsafe { std::env::remove_var("RTRT_PROVIDER_BASE_URL") };
+                gw
+            } else {
+                rtrt_providers::Gateway::from_env()
+            })
+        }
+    };
+
+    let summariser = rtrt_memory::LlmSummariser::new(Box::new(GatewayAdapter(llm_gateway)), model);
+    let relation = "mentions";
+
+    // `MemoryStore` is `!Sync` (rusqlite `Connection`), so no `&MemoryStore`
+    // borrow may live across an `.await`. Mirror the auto-compress daemon: do
+    // the SQLite reads under the lock, drop it for the async LLM extraction,
+    // then re-lock for the synchronous edge writes.
+    let sources: Vec<(i64, String)> = {
+        let guard = store.lock().await;
+        guard
+            .list_by_project(&req.project, 10_000)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .into_iter()
+            .map(|m| (m.id, m.body))
+            .collect()
+    };
+
+    let mut extracted: Vec<(i64, Vec<String>)> = Vec::with_capacity(sources.len());
+    for (id, body) in &sources {
+        let entities = summariser
+            .extract_entities(body)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        extracted.push((*id, entities));
+    }
+
+    let new_edges = {
+        let guard = store.lock().await;
+        guard
+            .link_extracted(&req.project, &extracted, relation)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    Ok(Json(serde_json::json!({ "edges": new_edges })))
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");

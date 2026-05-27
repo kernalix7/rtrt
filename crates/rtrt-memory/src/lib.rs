@@ -21,6 +21,8 @@ pub mod summarise;
 
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
+#[cfg(feature = "ollama-embed")]
+pub use embed::OllamaEmbedder;
 pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
 #[cfg(feature = "hnsw")]
 pub use hnsw_index::{EmbVec, HnswIndex};
@@ -820,14 +822,18 @@ impl MemoryStore {
     }
 
     /// Inserts a directed labelled edge between two memory records.
-    pub fn add_edge(&self, src_id: i64, dst_id: i64, relation: &str) -> Result<()> {
-        self.conn
+    /// Inserts a directed edge, ignoring duplicates. Returns `true` when a new
+    /// row was created (the pair did not already exist), `false` when the edge
+    /// was already present. Callers that don't care can discard the bool.
+    pub fn add_edge(&self, src_id: i64, dst_id: i64, relation: &str) -> Result<bool> {
+        let affected = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO edges(src_id, dst_id, relation) VALUES (?1, ?2, ?3)",
                 rusqlite::params![src_id, dst_id, relation],
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Drops a specific edge. No-op when missing.
@@ -1554,9 +1560,30 @@ impl MemoryStore {
         relation: &str,
     ) -> Result<usize> {
         let mems = self.list_by_project(project, 10_000)?;
-        let mut new_edges = 0usize;
+        let mut extracted: Vec<(i64, Vec<String>)> = Vec::with_capacity(mems.len());
         for source in &mems {
             let entities = summariser.extract_entities(&source.body).await?;
+            extracted.push((source.id, entities));
+        }
+        self.link_extracted(project, &extracted, relation)
+    }
+
+    /// Synchronous half of [`link_entities`]: given entities already extracted
+    /// per source memory, fans each entity out through BM25 recall and links
+    /// the source to every co-mentioning memory. Returns the count of *new*
+    /// edges created.
+    ///
+    /// Split out so callers in `Send` contexts (e.g. an axum handler) can run
+    /// the async extraction step without holding a `&MemoryStore` borrow — the
+    /// store is `!Sync`, so no reference to it may live across an `.await`.
+    pub fn link_extracted(
+        &self,
+        project: &str,
+        extracted: &[(i64, Vec<String>)],
+        relation: &str,
+    ) -> Result<usize> {
+        let mut new_edges = 0usize;
+        for (source_id, entities) in extracted {
             for entity in entities {
                 let cleaned = entity.replace('"', "");
                 if cleaned.is_empty() {
@@ -1568,27 +1595,10 @@ impl MemoryStore {
                     Err(_) => continue,
                 };
                 for hit in hits {
-                    if hit.id == source.id {
+                    if hit.id == *source_id {
                         continue;
                     }
-                    let before: i64 = self
-                        .conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM edges WHERE src_id = ?1 AND dst_id = ?2 AND relation = ?3",
-                            rusqlite::params![source.id, hit.id, relation],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    self.add_edge(source.id, hit.id, relation)?;
-                    let after: i64 = self
-                        .conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM edges WHERE src_id = ?1 AND dst_id = ?2 AND relation = ?3",
-                            rusqlite::params![source.id, hit.id, relation],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or(0);
-                    if after > before {
+                    if self.add_edge(*source_id, hit.id, relation)? {
                         new_edges += 1;
                     }
                 }
@@ -1654,6 +1664,42 @@ impl MemoryStore {
             self.delete(m.id)?;
         }
         Ok(Some(archival_id))
+    }
+
+    /// Backfill embeddings for every row in `project` that does not yet have
+    /// an entry in the `embeddings` table. Returns the number of newly embedded
+    /// rows. Rows where the embedder returns an error are silently skipped so a
+    /// transient Ollama hiccup doesn't abort the entire backfill.
+    pub fn backfill_embeddings(&self, project: &str, embedder: &dyn Embedder) -> Result<usize> {
+        let all = self.list_by_project(project, 100_000)?;
+        let mut embedded = 0usize;
+        for rec in all {
+            // Skip rows that already have an embedding.
+            let already: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM embeddings WHERE memory_id = ?1",
+                    rusqlite::params![rec.id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0);
+            if already > 0 {
+                continue;
+            }
+            let vec = match embedder.embed_one(&rec.body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let blob = vector_to_blob(&vec);
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![rec.id, embedder.model_name(), blob],
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            embedded += 1;
+        }
+        Ok(embedded)
     }
 
     /// Hybrid recall — Reciprocal Rank Fusion of BM25 and dense-vector

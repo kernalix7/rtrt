@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 rtrt-core.workspace = true
 rtrt-compress = { workspace = true, features = ["treesitter"] }
-rtrt-memory.workspace = true
+rtrt-memory = { workspace = true, features = ["ollama-embed", "llm"] }
 rtrt-proxy.workspace = true
 rtrt-templates.workspace = true
 rtrt-providers.workspace = true
@@ -34,3 +34,5 @@ anyhow.workspace = true
 reqwest.workspace = true
 toml.workspace = true
 dirs.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true

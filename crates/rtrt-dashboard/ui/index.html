@@ -253,6 +253,24 @@
   .rc-score { margin-left: auto; font-size: 0.78em; color: var(--muted); white-space: nowrap; }
   .rc-score .score-val { font-weight: 600; color: var(--fg); }
 
+  /* Semantic badge on hybrid recall results */
+  .badge.semantic { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+  /* Embeddings section in settings */
+  .settings-section .note { font-size: 0.82em; color: var(--muted); padding: 0.4rem 0.6rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; margin-top: 0.35rem; }
+
+  /* Toast notification */
+  #toast-container { position: fixed; bottom: 48px; right: 1.25rem; z-index: 200; display: flex; flex-direction: column; gap: 0.4rem; pointer-events: none; }
+  .toast { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.9rem; box-shadow: var(--shadow); font-size: 0.88em; pointer-events: auto; animation: toast-in .18s ease; max-width: 320px; }
+  .toast.ok { border-left: 3px solid var(--ok); }
+  .toast.err { border-left: 3px solid var(--err); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Graph entity-type color legend */
+  .graph-legend { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.4rem; }
+  .graph-legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.79em; color: var(--muted); }
+  .graph-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -413,9 +431,12 @@
           <div class="card">
             <div class="head">
               <h2>검색</h2>
-              <div class="mode-toggle" id="recall-mode-toggle" title="검색 모드">
-                <button id="recall-mode-bm25" class="active" type="button">BM25</button>
-                <button id="recall-mode-hybrid" type="button">Hybrid</button>
+              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
+                <button id="embed-backfill-btn" class="ghost" type="button" style="font-size:0.85em;" title="이 프로젝트의 메모리를 임베딩 벡터로 백필합니다">임베딩 백필</button>
+                <div class="mode-toggle" id="recall-mode-toggle" title="검색 모드">
+                  <button id="recall-mode-bm25" class="active" type="button">BM25</button>
+                  <button id="recall-mode-hybrid" type="button">Hybrid</button>
+                </div>
               </div>
             </div>
             <form id="recall-form">
@@ -550,13 +571,24 @@
 
         <div id="sub-memmap" class="subpage" hidden>
           <div class="card">
-            <div class="head"><h2>지식 맵</h2><span class="hint">노드 = 메모리, 선 = 연결</span></div>
+            <div class="head">
+              <h2>지식 맵</h2>
+              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
+                <button id="entity-extract-btn" class="ghost" type="button" style="font-size:0.85em;" title="메모리에서 엔티티 및 관계를 추출하여 그래프를 풍부하게 합니다">엔티티 추출</button>
+                <span class="hint">노드 = 메모리/엔티티, 선 = 연결</span>
+              </div>
+            </div>
             <form id="graph-form" style="grid-template-columns:1fr auto;">
               <input id="graph-project" type="hidden">
-              <button class="primary" type="submit">맵 보기</button>
+              <button class="primary" type="submit">맵 새로고침</button>
             </form>
             <div id="graph-meta" class="out-meta"></div>
             <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
+            <div id="graph-legend" class="graph-legend">
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 노드</div>
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>블록</div>
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티</div>
+            </div>
             <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
           </div>
         </div>
@@ -846,6 +878,31 @@
               </div>
             </div>
           </div>
+          <!-- Embeddings -->
+          <div class="settings-section">
+            <h3>임베딩</h3>
+            <div class="toggle-row">
+              <input type="checkbox" id="cfg-emb-enabled">
+              <label for="cfg-emb-enabled">임베딩 활성화</label>
+            </div>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <div class="field-label">
+                <span>model</span>
+                <!-- populated from /api/models; also accepts free-text via datalist -->
+                <input id="cfg-emb-model" list="cfg-emb-model-list" placeholder="예: bge-m3">
+                <datalist id="cfg-emb-model-list"></datalist>
+              </div>
+              <div class="field-label">
+                <span>base_url</span>
+                <input type="url" id="cfg-emb-base-url" placeholder="http://localhost:11434">
+              </div>
+            </div>
+            <div class="note">
+              <strong>SessionStart 주입</strong>: <code>rtrt hook session-inject</code>가
+              세션 시작 시 중요도 상위 N개 메모리를 시스템 프롬프트에 삽입합니다.
+              임베딩이 활성화되면 벡터 검색, 비활성이면 BM25로 폴백합니다.
+            </div>
+          </div>
           <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
             <button type="submit" class="primary">저장</button>
             <span id="settings-save-result" class="out-meta"></span>
@@ -891,6 +948,8 @@
   </div>
 </div>
 
+<div id="toast-container"></div>
+
 <div class="activity">
   <span class="dot-pulse"></span>
   <span class="feed" id="activity-feed">대시보드 부팅 완료. 좌측 메뉴에서 작업을 시작하세요.</span>
@@ -929,6 +988,8 @@ wireSubtabs('memory-subtabs', (sub) => {
   if (sub === 'memstats' && CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
   // Auto-load governance stats when governance tab opens.
   if (sub === 'memgovern' && CURRENT_PROJECT) { loadGovStats(CURRENT_PROJECT); }
+  // Auto-load graph when the map tab opens (saves an extra button click).
+  if (sub === 'memmap' && CURRENT_PROJECT) { loadGraph(CURRENT_PROJECT); }
 });
 
 // Memory: project picker + drill-in
@@ -1005,6 +1066,13 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;');
 }
 
+// Normalise importance to 0–100 integer.
+// Backend returns integer 1–10; legacy/float values ≤1 are treated as 0–1 fractions.
+function importancePct(raw) {
+  const v = Number(raw);
+  return v > 1 ? Math.min(100, Math.round(v * 10)) : Math.min(100, Math.round(v * 100));
+}
+
 // Render a memory body. Legacy rows (and provider_chat captures) may hold a
 // raw JSON payload; pretty-print those in a monospace block. Plain-text
 // summaries (the current hook-capture format) render inline escaped.
@@ -1065,7 +1133,7 @@ async function loadHistory(name, offset) {
     // Importance badge — rendered when server returns an importance field.
     let impBadge = '';
     if (i.importance !== undefined && i.importance !== null) {
-      const pct = Math.min(100, Math.max(0, Math.round(Number(i.importance) * 100)));
+      const pct = importancePct(i.importance);
       impBadge = `<span class="badge imp" title="중요도 ${pct}%">★ ${pct}%</span>`;
     }
     // Per-row recompress control.
@@ -1177,12 +1245,12 @@ async function openDetailModal(id) {
     `<tr><td>${escapeHtml(k)}</td><td><code>${escapeHtml(String(v))}</code></td></tr>`
   ).join('') || '<tr><td colspan="2" class="empty" style="font-size:0.82em;">메타데이터 없음</td></tr>';
 
-  // Importance display
+  // Importance display — importancePct() handles both 1–10 integer and 0–1 float scales.
   const impHtml = (d.importance !== undefined && d.importance !== null)
-    ? `<tr><td>중요도</td><td>
-        <span class="imp-bar"><span class="imp-bar-fill" style="width:${Math.round(Number(d.importance)*100)}%"></span></span>
-        <span style="margin-left:0.4rem;font-size:0.85em;">${(Number(d.importance)*100).toFixed(0)}%</span>
-       </td></tr>`
+    ? (() => { const pct = importancePct(d.importance); return `<tr><td>중요도</td><td>
+        <span class="imp-bar"><span class="imp-bar-fill" style="width:${pct}%"></span></span>
+        <span style="margin-left:0.4rem;font-size:0.85em;">${pct}%</span>
+       </td></tr>`; })()
     : '';
 
   body.innerHTML = `
@@ -1412,6 +1480,16 @@ function pushActivity(msg) {
   document.getElementById('activity-feed').textContent = FEED[0] || '';
 }
 
+// Toast notifications — auto-dismiss after 3.5 s.
+function showToast(msg, kind /* 'ok' | 'err' */ = 'ok') {
+  const container = document.getElementById('toast-container');
+  const div = document.createElement('div');
+  div.className = `toast ${kind}`;
+  div.textContent = msg;
+  container.appendChild(div);
+  setTimeout(() => { if (div.parentNode) div.parentNode.removeChild(div); }, 3500);
+}
+
 // Utility
 function fmtUsd(v) { return v === null || v === undefined ? '—' : `$${Number(v).toFixed(4)}`; }
 function setPill(id, ok, text) {
@@ -1545,9 +1623,11 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   const r = await fetch('/api/memory/recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   if (!r.ok) { results.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</div>`; return; }
   const d = await r.json();
+  // The backend returns the actual mode used (may differ from requested when embeddings are off).
+  const usedMode = d.mode || mode;
   if (!d.hits.length) {
     results.innerHTML = `<div class="empty">결과 없음. 다른 검색어나 필터를 시도해보세요.</div>`;
-    pushActivity(`recall ${body.project} · 0건`);
+    pushActivity(`recall ${body.project} · 0건 (${usedMode})`);
     return;
   }
   results.innerHTML = d.hits.map(h => {
@@ -1555,15 +1635,24 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
     const compBadge = isCompressed
       ? `<span class="badge ok" title="압축됨">⊟ 압축</span>`
       : '';
-    // Importance display
+    // Importance display — normalised via importancePct() for both 1-10 and 0-1 scales.
     let impBadge = '';
     if (h.importance !== undefined && h.importance !== null) {
-      const pct = Math.round(Number(h.importance) * 100);
-      impBadge = `<span class="badge imp" title="중요도">★ ${pct}%</span>`;
+      const pct = importancePct(h.importance);
+      impBadge = `<span class="badge imp" title="중요도 ${pct}%">★ ${pct}%</span>`;
     }
-    // Score display — right-aligned in meta row
+    // Hybrid/semantic badge — shown when the result was surfaced by vector search.
+    // backend mode values: "hybrid-vector" (Ollama) or "hybrid-graph" (BM25+graph fallback).
+    const isVectorMode = usedMode === 'hybrid-vector';
+    const isHybridMode = usedMode.startsWith('hybrid');
+    const isSemanticHit = h.semantic || isVectorMode;
+    const semanticLabel = isVectorMode ? '∼ 벡터' : isHybridMode ? '∼ 하이브리드' : '';
+    const semanticBadge = isSemanticHit
+      ? `<span class="badge semantic" title="시맨틱 검색 결과 (${escapeHtml(usedMode)})">${semanticLabel}</span>`
+      : '';
+    // Score display — right-aligned in meta row; vector scores are typically 0–1 floats.
     const scoreHtml = h.score !== undefined
-      ? `<span class="rc-score">score <span class="score-val">${Number(h.score).toFixed(3)}</span></span>`
+      ? `<span class="rc-score">score <span class="score-val">${Number(h.score).toFixed(4)}</span></span>`
       : '';
     const origBlock = isCompressed && h.body_full
       ? `<details style="margin-top:0.4rem;">
@@ -1575,7 +1664,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
       <div class="rc-meta">
         <span class="badge">#${h.id}</span>
         <code style="font-size:0.82em;">${escapeHtml(h.kind || '?')}</code>
-        ${compBadge}${impBadge}
+        ${compBadge}${semanticBadge}${impBadge}
         ${h.scope ? `<span style="font-size:0.8em;color:var(--muted);">${escapeHtml(h.scope)}</span>` : ''}
         ${scoreHtml}
       </div>
@@ -1583,8 +1672,47 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
       ${origBlock}
     </div>`;
   }).join('');
-  pushActivity(`recall ${body.project} · ${d.hits.length}건 (${mode})`);
+  pushActivity(`recall ${body.project} · ${d.hits.length}건 (${usedMode})`);
 };
+
+// Embedding backfill button — POST /api/memory/embed {project}.
+// Hidden when the endpoint returns 404 (embeddings not compiled in).
+(function wireEmbedBackfill() {
+  const btn = document.getElementById('embed-backfill-btn');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const project = CURRENT_PROJECT;
+    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = '백필 중…';
+    try {
+      const r = await fetch('/api/memory/embed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project }),
+      });
+      if (r.status === 404) {
+        // Embeddings not built into this binary; hide the button silently.
+        btn.hidden = true;
+        return;
+      }
+      if (!r.ok) {
+        const text = await r.text();
+        showToast(`임베딩 오류 ${r.status}: ${text}`, 'err');
+        return;
+      }
+      const d = await r.json();
+      showToast(`임베딩 완료 · ${d.embedded}건 백필됨`, 'ok');
+      pushActivity(`embed backfill · ${project} · ${d.embedded}건`);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  };
+})();
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   let metadata = {};
@@ -1856,6 +1984,8 @@ function initGraph(data) {
   const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2962FF';
   const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#666';
   const fg = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim() || '#000';
+  // Entity nodes rendered in green to distinguish from memory nodes (blue) and blocks (purple).
+  const entityColor = '#16a34a';
 
   // Initialise nodes with random positions; edges reference node ids.
   const idIdx = new Map();
@@ -1869,7 +1999,6 @@ function initGraph(data) {
 
   let hover = -1;
   let drag = -1;
-  let mouseX = 0, mouseY = 0;
   function getXY(ev) {
     const rect = canvas.getBoundingClientRect();
     return [ev.clientX - rect.left, ev.clientY - rect.top];
@@ -1884,7 +2013,6 @@ function initGraph(data) {
   }
   canvas.onmousemove = (ev) => {
     const [x, y] = getXY(ev);
-    mouseX = x; mouseY = y;
     if (drag >= 0) { nodes[drag].x = x; nodes[drag].y = y; nodes[drag].vx = 0; nodes[drag].vy = 0; }
     const h2 = pick(x, y);
     if (h2 !== hover) {
@@ -1892,7 +2020,8 @@ function initGraph(data) {
       const tip = document.getElementById('graph-tip');
       if (hover >= 0) {
         const n = nodes[hover];
-        tip.innerHTML = `<code>#${n.id}</code> ${n.kind} — ${(n.preview || '').replace(/</g,'&lt;')}`;
+        const label = n.entity_type ? `[${escapeHtml(n.entity_type)}] ` : '';
+        tip.innerHTML = `<code>#${n.id}</code> ${escapeHtml(n.kind || '')} ${label}— ${escapeHtml((n.preview || '').slice(0, 80))}`;
       } else {
         tip.textContent = '노드 위에 마우스를 올리면 내용 미리보기.';
       }
@@ -1904,7 +2033,7 @@ function initGraph(data) {
 
   function step() {
     // Spring-electric layout: edges pull, nodes repel.
-    const w = canvas.clientWidth; const h = canvas.clientHeight;
+    const cw = canvas.clientWidth; const ch = canvas.clientHeight;
     for (let i = 0; i < nodes.length; i++) {
       const a = nodes[i];
       for (let j = i+1; j < nodes.length; j++) {
@@ -1932,27 +2061,43 @@ function initGraph(data) {
       n.vx *= 0.82; n.vy *= 0.82;
       n.x += n.vx * 0.5; n.y += n.vy * 0.5;
       // Centre attractor + bounds.
-      n.vx += (w/2 - n.x) * 0.0008;
-      n.vy += (h/2 - n.y) * 0.0008;
-      n.x = Math.max(12, Math.min(w-12, n.x));
-      n.y = Math.max(12, Math.min(h-12, n.y));
+      n.vx += (cw/2 - n.x) * 0.0008;
+      n.vy += (ch/2 - n.y) * 0.0008;
+      n.x = Math.max(12, Math.min(cw-12, n.x));
+      n.y = Math.max(12, Math.min(ch-12, n.y));
     }
 
-    ctx.clearRect(0, 0, w, h);
-    // Edges.
-    ctx.strokeStyle = muted; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+    ctx.clearRect(0, 0, cw, ch);
+    // Edges — draw relation labels on longer edges when there is room.
+    ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
     for (const e of edges) {
       const a = nodes[e.s]; const b = nodes[e.d];
+      // Colour edges by type: entity relations in green, others in muted.
+      ctx.strokeStyle = e.rel ? entityColor : muted;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      // Show relation label mid-edge when the edge is long enough.
+      if (e.rel) {
+        const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
+        const edgeLen = Math.hypot(b.x - a.x, b.y - a.y);
+        if (edgeLen > 60) {
+          ctx.globalAlpha = 0.75;
+          ctx.fillStyle = muted;
+          ctx.font = '9px system-ui';
+          ctx.textAlign = 'center';
+          ctx.fillText(e.rel, mx, my - 3);
+        }
+      }
     }
     ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
     // Nodes.
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
       const isBlock = (n.kind || '').startsWith('block:');
-      const r = isBlock ? 8 : 6;
+      const isEntity = n.node_type === 'entity';
+      const r = isBlock ? 8 : isEntity ? 7 : 6;
       ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = isBlock ? '#7c3aed' : accent;
+      ctx.fillStyle = isBlock ? '#7c3aed' : isEntity ? entityColor : accent;
       ctx.fill();
       if (i === hover) {
         ctx.strokeStyle = fg; ctx.lineWidth = 2; ctx.stroke();
@@ -1964,18 +2109,68 @@ function initGraph(data) {
   function loop() { step(); graphState.raf = requestAnimationFrame(loop); }
   loop();
 }
+
+async function loadGraph(project) {
+  const meta = document.getElementById('graph-meta');
+  meta.textContent = '불러오는 중…';
+  try {
+    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
+    if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+    const d = await r.json();
+    meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
+    if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
+    initGraph(d);
+  } catch (e) {
+    meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
+  }
+}
+
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = document.getElementById('graph-project').value;
-  const meta = document.getElementById('graph-meta');
-  meta.textContent = '불러오는 중…';
-  const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
-  if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
-  const d = await r.json();
-  meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
-  if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
-  initGraph(d);
+  await loadGraph(project);
 };
+
+// Entity extraction button — POST /api/memory/entities {project}.
+// Hidden on 404 (feature not compiled in).
+(function wireEntityExtract() {
+  const btn = document.getElementById('entity-extract-btn');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const project = CURRENT_PROJECT;
+    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = '추출 중…';
+    try {
+      const r = await fetch('/api/memory/entities', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project }),
+      });
+      if (r.status === 404) {
+        // Entity extraction not built into this binary; hide the button.
+        btn.hidden = true;
+        return;
+      }
+      if (!r.ok) {
+        const text = await r.text();
+        showToast(`엔티티 추출 오류 ${r.status}: ${text}`, 'err');
+        return;
+      }
+      const d = await r.json();
+      showToast(`엔티티 추출 완료 · ${d.edges}개 관계 추가됨`, 'ok');
+      pushActivity(`entity extract · ${project} · ${d.edges}개 관계`);
+      // Refresh the graph to show newly extracted entities.
+      await loadGraph(project);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  };
+})();
 
 // Show/hide LLM model dropdown when engine switches.
 document.getElementById('compress-mode').addEventListener('change', function () {
@@ -2205,6 +2400,13 @@ function populateModelSelects() {
     // Restore previously selected value if it still exists.
     if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
   });
+  // Embeddings model datalist — allows free-text entry plus autocomplete from known models.
+  const dl = document.getElementById('cfg-emb-model-list');
+  if (dl) {
+    dl.innerHTML = MODELS_CACHE.map(m =>
+      `<option value="${escapeHtml(m.id)}">`
+    ).join('');
+  }
 }
 
 // Settings page — config form.
@@ -2214,6 +2416,7 @@ async function loadConfig() {
   const d = await r.json();
   const cap = d.capture || {};
   const ac = d.auto_compress || {};
+  const emb = d.embeddings || {};
   const bool = (v) => !!v;
   document.getElementById('cfg-capture-enabled').checked = bool(cap.enabled);
   document.getElementById('cfg-capture-redact').checked = bool(cap.redact);
@@ -2227,9 +2430,12 @@ async function loadConfig() {
   // Set selected model after populating options.
   const modelSel = document.getElementById('cfg-ac-model');
   if (ac.model) {
-    // Rebuild options with this model pre-selected.
     modelSel.innerHTML = buildModelOptions(ac.model);
   }
+  // Embeddings section — fields are present only when the backend includes the key.
+  document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
+  document.getElementById('cfg-emb-model').value = emb.model || '';
+  document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {
@@ -2248,6 +2454,11 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       min_chars: Number(document.getElementById('cfg-ac-min-chars').value),
       batch: Number(document.getElementById('cfg-ac-batch').value),
       max_tokens: Number(document.getElementById('cfg-ac-max-tokens').value),
+    },
+    embeddings: {
+      enabled: document.getElementById('cfg-emb-enabled').checked,
+      model: document.getElementById('cfg-emb-model').value || null,
+      base_url: document.getElementById('cfg-emb-base-url').value || null,
     },
   };
   const result = document.getElementById('settings-save-result');

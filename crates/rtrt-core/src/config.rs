@@ -18,6 +18,84 @@ pub struct Config {
     pub capture: CaptureConfig,
     #[serde(default)]
     pub auto_compress: AutoCompressConfig,
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+}
+
+/// Dense-embedding knobs. When `enabled = true`, the dashboard and CLI route
+/// `/api/memory/recall mode=hybrid` through a real OllamaEmbedder instead of
+/// the graph-blend BM25 path. The embedder uses `model` served at `base_url`.
+///
+/// Resolution order (highest priority first):
+///   `RTRT_EMBED_ENABLED` / `RTRT_EMBED_MODEL` / `RTRT_EMBED_BASE_URL`
+///   → `[embeddings]` in `~/.rtrt/config.toml`
+///   → built-in defaults (disabled, bge-m3, 127.0.0.1:11434)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    /// Enable dense-vector paths. Off by default so the binary builds and runs
+    /// without an Ollama instance.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ollama model to use for embeddings (default: `bge-m3`, 1024-dim).
+    #[serde(default = "default_embed_model_ollama")]
+    pub model: String,
+    /// Ollama base URL. `None` falls back to `auto_compress.base_url`, then
+    /// `http://127.0.0.1:11434`. A trailing `/v1` is stripped so the same URL
+    /// can serve both the OpenAI-compat chat path and the embeddings path.
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_embed_model_ollama(),
+            base_url: None,
+        }
+    }
+}
+
+fn default_embed_model_ollama() -> String {
+    "bge-m3".to_string()
+}
+
+impl EmbeddingsConfig {
+    /// Resolve the effective base URL. Priority: `RTRT_EMBED_BASE_URL` env var
+    /// → `self.base_url` → `compress_base_url` fallback → Ollama default.
+    pub fn resolved_base_url(&self, compress_base_url: Option<&str>) -> String {
+        if let Ok(url) = std::env::var("RTRT_EMBED_BASE_URL") {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+        if let Some(url) = &self.base_url {
+            if !url.is_empty() {
+                return url.clone();
+            }
+        }
+        if let Some(url) = compress_base_url {
+            if !url.is_empty() {
+                return url.to_string();
+            }
+        }
+        "http://127.0.0.1:11434".to_string()
+    }
+
+    /// Whether embeddings are enabled, honouring the `RTRT_EMBED_ENABLED` env
+    /// var first.
+    pub fn is_enabled(&self) -> bool {
+        match std::env::var("RTRT_EMBED_ENABLED").as_deref() {
+            Ok("0") | Ok("false") | Ok("no") => false,
+            Ok(v) if !v.is_empty() => true,
+            _ => self.enabled,
+        }
+    }
+
+    /// Effective model name, honouring `RTRT_EMBED_MODEL` env var first.
+    pub fn effective_model(&self) -> String {
+        std::env::var("RTRT_EMBED_MODEL").unwrap_or_else(|_| self.model.clone())
+    }
 }
 
 /// Auto-capture pipeline knobs. Mirror the `RTRT_AUTO_*` env vars; env

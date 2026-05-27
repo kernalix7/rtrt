@@ -328,6 +328,19 @@ enum HookCmd {
         #[arg(long, env = "RTRT_MEMORY_PATH")]
         store: Option<PathBuf>,
     },
+    /// Inject the project's most-important memories into the model context at
+    /// session start. Wired onto `SessionStart` so background knowledge is
+    /// available from turn 1 without waiting for a prompt. Reads from the
+    /// same store as `hook capture` / `hook recall`.
+    SessionInject {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, env = "RTRT_MEMORY_PATH")]
+        store: Option<PathBuf>,
+        /// Number of memories to surface.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -878,6 +891,11 @@ async fn main() -> Result<()> {
                     limit,
                 } => run_hook_recall(project, store, limit),
                 HookCmd::Compress { project, store } => run_hook_compress(project, store).await,
+                HookCmd::SessionInject {
+                    project,
+                    store,
+                    limit,
+                } => run_hook_session_inject(project, store, limit),
                 other => run_hook_capture(other),
             };
             if let Err(e) = result {
@@ -1431,7 +1449,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
 
 fn run_hook_capture(cmd: HookCmd) -> Result<()> {
     match cmd {
-        HookCmd::Recall { .. } | HookCmd::Compress { .. } => {}
+        HookCmd::Recall { .. } | HookCmd::Compress { .. } | HookCmd::SessionInject { .. } => {}
         HookCmd::Capture {
             kind,
             project,
@@ -1560,6 +1578,47 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
         let body = h.body.replace('\n', " ");
         let clipped: String = body.chars().take(240).collect();
         println!("- [{}] {}", h.kind, clipped);
+    }
+    Ok(())
+}
+
+/// SessionStart context injection. Prints the project's top-N memories
+/// sorted by importance into stdout so Claude Code injects them into the
+/// model context at the start of every session. No prompt is needed because
+/// we surface the most salient background knowledge unconditionally.
+fn run_hook_session_inject(
+    project: Option<String>,
+    store: Option<PathBuf>,
+    limit: usize,
+) -> Result<()> {
+    let project = project
+        .or_else(|| std::env::var("RTRT_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "default".to_string())
+        });
+    let store_path = store.unwrap_or_else(default_memory_path);
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let memory = MemoryStore::open(&store_path)?;
+    // Fetch the top memories ordered by importance (deterministic — recency +
+    // length + compression + metadata bonuses). This surface is most useful at
+    // session start because the agent hasn't asked anything yet.
+    let rows = memory
+        .recent_paged_by_importance(&project, limit, 0)
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // stdout of a SessionStart hook is injected into the model context.
+    println!("## Project memory ({project}) — top {} entries", rows.len());
+    for r in rows {
+        let body = r.body.replace('\n', " ");
+        let clipped: String = body.chars().take(240).collect();
+        println!("- [{}] {}", r.kind, clipped);
     }
     Ok(())
 }

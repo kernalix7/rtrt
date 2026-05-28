@@ -9,6 +9,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — capture teammate / subagent work from Claude Code transcripts
+
+**The dashboard now tails Claude Code's transcript JSONL files and saves every assistant turn into rtrt memory, closing the capture gap for teammate (FleetView) and subagent (Task-tool) sessions whose output never reaches the main agent's transcript and so couldn't be captured by the existing `Stop` / `SubagentStop` hooks.**
+
+- New background task in `rtrt-dashboard` that watches `~/.claude/projects/**/*.jsonl` — both top-level session transcripts and the nested `<session>/subagents/agent-*.jsonl` files Claude Code writes for teammate / subagent runs. Each new assistant line is parsed (text-type parts concatenated, thinking / tool-use ignored) and saved with `kind = teammate-message` for subagent files, `kind = assistant-turn` for main-session files.
+- Per-file byte-offset tracking so only appended bytes are processed each tick (10s poll, mtime-cheap), and `MemoryStore::body_seen_at` dedup so existing rows from the hook-based capture never get duplicated.
+- Captured project bucket = basename of the transcript line's `cwd`, so teammate output for `00G_rtrt` lands next to the rest of that project's memory; metadata records `session_id`, `agent_id`, `slug`, and the source transcript path.
+
 ### Highlights — dashboard auto-starts as a background service
 
 **The installer now runs `rtrt-dashboard` as a background OS service, so the web UI at <http://127.0.0.1:7311> is always up without launching it by hand — it restarts on crash and comes back on login.**

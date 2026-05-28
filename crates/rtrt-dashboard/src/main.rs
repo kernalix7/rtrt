@@ -26,6 +26,8 @@
 //! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
 //! `/healthz` probe remain open so the UI can bootstrap.
 
+mod transcripts;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,6 +225,7 @@ async fn main() -> Result<()> {
     }
     let memory_for_daemon = memory.clone();
     let memory_for_compress_daemon = memory.clone();
+    let memory_for_transcripts = memory.clone();
     let gateway_for_compress_daemon = gateway.clone();
     let (events_tx, _) = broadcast::channel::<String>(256);
     // Build the Ollama embedder when enabled in config / env.
@@ -259,6 +262,7 @@ async fn main() -> Result<()> {
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
+    transcripts::spawn_transcript_watcher(memory_for_transcripts);
 
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()

@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### Highlights — Claude Code transcript에서 팀원/서브에이전트 작업 캡처
+
+**대시보드가 Claude Code의 transcript JSONL을 tail해서 모든 assistant 턴을 rtrt 메모리에 저장 — 팀원(FleetView) / 서브에이전트(Task 도구) 세션 출력이 메인 에이전트 transcript에 안 들어가서 기존 `Stop` / `SubagentStop` 훅이 못 잡던 캡처 공백을 메움.**
+
+- `rtrt-dashboard`에 새 백그라운드 태스크 — `~/.claude/projects/**/*.jsonl`(최상위 세션 transcript + 중첩 `<session>/subagents/agent-*.jsonl` 둘 다) 감시. 각 새 assistant 라인 파싱(text 파트 합치고 thinking/tool-use 무시) 후 저장: 서브에이전트 파일은 `kind = teammate-message`, 메인 세션 파일은 `kind = assistant-turn`.
+- 파일별 바이트 오프셋 추적해 매 틱(10초 폴링, mtime 저비용) 추가된 바이트만 처리. `MemoryStore::body_seen_at` 디덥으로 훅 기반 캡처와 중복 0.
+- 캡처 프로젝트 버킷은 transcript 라인의 `cwd` basename — 00G_rtrt 팀원 출력이 같은 프로젝트 메모리에 정렬. 메타데이터에 `session_id`, `agent_id`, `slug`, transcript 파일 경로 기록.
+
 ### Highlights — 대시보드 백그라운드 서비스 자동 시작
 
 **설치 시 `rtrt-dashboard`를 백그라운드 OS 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동.**

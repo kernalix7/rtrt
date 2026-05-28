@@ -178,19 +178,15 @@ fn parse_assistant_turn(line: &str, file: &Path) -> Option<AssistantTurn> {
         return None;
     }
 
-    // Project = basename of `cwd`. Falls back to the encoded dir name if
-    // `cwd` is missing.
-    let cwd = v.get("cwd").and_then(|c| c.as_str());
-    let project = cwd
+    // Project = basename of the line's `cwd`. Require it: the directory
+    // fallback would bucket cwd-less lines under junk names like the
+    // `subagents` dir or an `agent-<id>` segment, so skip those instead.
+    let project = v
+        .get("cwd")
+        .and_then(|c| c.as_str())
         .and_then(|p| Path::new(p).file_name())
         .and_then(|n| n.to_str())
-        .map(String::from)
-        .or_else(|| {
-            file.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(String::from)
-        })?;
+        .map(String::from)?;
 
     let session_id = v
         .get("sessionId")

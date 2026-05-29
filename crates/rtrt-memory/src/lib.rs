@@ -432,25 +432,34 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Transcript-captured rows not yet classified — `source = "transcript"`
-    /// with no `source_kind` in metadata. Returns `(id, transcript_file)` so the
-    /// caller can decide main vs subagent (by whether the path is under a
-    /// `subagents/` dir), resolve the real parent project for subagents, and
-    /// stamp the result via [`reattribute`]. Idempotent: once stamped a row
-    /// drops out of this set.
-    pub fn reattribution_candidates(&self) -> Result<Vec<(i64, String)>> {
+    /// Transcript-captured rows that may need (re)attribution — purely by
+    /// PROVENANCE, no project-name pattern matching. Returns
+    /// `(id, transcript_file, current_project)` for every `source = "transcript"`
+    /// row that is either not yet classified (`source_kind` unset) OR was
+    /// captured under a `subagents/` path (so the caller can re-resolve its real
+    /// parent project and move it if the current bucket is wrong). The caller
+    /// only writes when the resolved parent differs, so this is idempotent and
+    /// cheap once everything has settled.
+    pub fn reattribution_candidates(&self) -> Result<Vec<(i64, String, String)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf \
+                "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf, m.project \
                    FROM memories m \
                   WHERE json_extract(m.metadata, '$.source') = 'transcript' \
-                    AND json_extract(m.metadata, '$.source_kind') IS NULL \
-                    AND tf IS NOT NULL",
+                    AND tf IS NOT NULL \
+                    AND ( json_extract(m.metadata, '$.source_kind') IS NULL \
+                       OR tf LIKE '%/subagents/%' )",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(|e| Error::Memory(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Memory(e.to_string()))

@@ -639,28 +639,6 @@ struct ProjectView {
 
 /// `GET /api/projects` — union of registered config entries (path /
 /// security_profile) and memory buckets (mem_count), merged by name.
-/// True when a bucket name looks like a stray subagent / git-worktree artifact
-/// rather than a real project: `agent-<hex>`, `p<n>-<branch>` (worktree branch),
-/// or a long `<hex>-<hex>` session hash. Used to keep the project selector clean.
-fn is_stray_bucket(name: &str) -> bool {
-    let b = name.as_bytes();
-    // agent-a...
-    if let Some(rest) = name.strip_prefix("agent-") {
-        if rest.starts_with('a') {
-            return true;
-        }
-    }
-    // p<digit>...-...  (worktree branch dirs like p18-gap)
-    if b.first() == Some(&b'p')
-        && b.get(1).is_some_and(|c| c.is_ascii_digit())
-        && name.contains('-')
-    {
-        return true;
-    }
-    // long hex-...-hex session hash
-    name.len() >= 24 && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 async fn list_projects(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
@@ -691,13 +669,10 @@ async fn list_projects(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         drop(guard);
         for (name, count, _last) in projects {
-            // A registered project always shows; an unregistered memory bucket
-            // that looks like a stray subagent / worktree name is hidden from
-            // the selector (its rows are folded under the parent via the
-            // reattribution migration, but the empty bucket name lingers).
-            if !cfg.projects.iter().any(|p| p.name == name) && is_stray_bucket(&name) {
-                continue;
-            }
+            // No name-pattern filtering: a row's project is decided by the
+            // reattribution pass (transcript parent cwd), which folds stray
+            // subagent / workflow captures under their real project, leaving
+            // those buckets empty so they don't appear here at all.
             views
                 .entry(name.clone())
                 .and_modify(|v| v.mem_count = count)

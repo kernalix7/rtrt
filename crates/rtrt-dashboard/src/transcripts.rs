@@ -50,20 +50,30 @@ pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
         if candidates.is_empty() {
             return;
         }
-        // Resolve parent project per subagent transcript file once (cache by file).
+        // Resolve each subagent file's real parent project from its transcript
+        // path (cache by file). No project-name pattern matching anywhere — a
+        // row's home is decided purely by the cwd of its parent session, so
+        // oddly-named per-agent buckets (feat-*, wf_*, agent-*, …) all resolve
+        // to the actual project they belong to.
         let mut cache: HashMap<String, Option<String>> = HashMap::new();
         let mut subagent = 0usize;
         let mut main = 0usize;
-        for (id, tf) in candidates {
+        for (id, tf, project) in candidates {
             let is_subagent = tf.contains("/subagents/");
             if is_subagent {
                 let parent = cache
                     .entry(tf.clone())
                     .or_insert_with(|| subagent_parent_project(Path::new(&tf)))
                     .clone();
+                // Only move when the resolved parent differs from the current
+                // bucket (keeps it idempotent and cheap once settled). Always
+                // ensure the subagent classification is stamped.
+                let move_to = match &parent {
+                    Some(p) if *p != project => Some(p.as_str()),
+                    _ => None,
+                };
                 let guard = memory.lock().await;
-                // Move to the parent project (when resolved) and tag subagent.
-                if guard.reattribute(id, "subagent", parent.as_deref()).is_ok() {
+                if guard.reattribute(id, "subagent", move_to).is_ok() {
                     subagent += 1;
                 }
             } else {
@@ -196,22 +206,29 @@ struct AssistantTurn {
     is_subagent: bool,
 }
 
-/// For a `<encoded>/<session>/subagents/agent-*.jsonl` file, read the parent
-/// session transcript's cwd and return its basename — the real project. Stable
-/// even when the subagent ran in a git worktree, whose own cwd basename is a
-/// branch name (e.g. `p0-fixes`) rather than the project. Returns `None` for
-/// non-subagent files (the caller falls back to the line's own cwd).
+/// For any transcript under a `subagents/` dir — including deeper nesting like
+/// `<encoded>/<session>/subagents/workflows/wf_*/agent-*.jsonl` — read the
+/// PARENT session transcript's cwd and return its basename, the real project.
+/// Stable even when the subagent ran in a git worktree (whose own cwd basename
+/// is a branch name) and regardless of how deep under `subagents/` the file is.
+/// Returns `None` for non-subagent files (caller falls back to the line's cwd).
 fn subagent_parent_project(file: &Path) -> Option<String> {
-    let is_subagent = file
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"));
-    if !is_subagent {
+    // Find the `subagents` segment; the component just before it is the session
+    // dir, and everything before that is the encoded-cwd dir. This handles both
+    // `.../<session>/subagents/agent-*.jsonl` and the nested workflows layout.
+    let comps: Vec<&std::ffi::OsStr> = file.components().map(|c| c.as_os_str()).collect();
+    let sub_idx = comps
+        .iter()
+        .position(|c| *c == std::ffi::OsStr::new("subagents"))?;
+    if sub_idx < 2 {
         return None;
     }
-    // file = <encoded>/<session>/subagents/agent-*.jsonl
-    let session_dir = file.parent()?.parent()?; // <encoded>/<session>
-    let encoded = session_dir.parent()?; // <encoded>
-    let session_id = session_dir.file_name()?.to_str()?;
+    let session_id = comps[sub_idx - 1].to_str()?;
+    // Rebuild the encoded-cwd path (everything up to, not including, the session).
+    let mut encoded = PathBuf::new();
+    for c in &comps[..sub_idx - 1] {
+        encoded.push(c);
+    }
     let session_jsonl = encoded.join(format!("{session_id}.jsonl"));
     let cwd = first_cwd_in(&session_jsonl)?;
     Path::new(&cwd)

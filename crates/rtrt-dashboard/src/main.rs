@@ -1167,6 +1167,10 @@ struct MemoryGraphQuery {
     project: String,
     #[serde(default = "default_graph_limit")]
     limit: usize,
+    /// `similarity` (default — memory↔memory, no LLM) or `entity` (bipartite
+    /// memory↔entity, requires entity extraction).
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 fn default_graph_limit() -> usize {
@@ -1182,34 +1186,69 @@ async fn memory_graph(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
+
+    // Entity mode: bipartite memory↔entity graph (needs extracted entities).
+    if q.mode.as_deref() == Some("entity") {
+        let graph = guard
+            .graph_bipartite(&q.project, q.limit)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut nodes: Vec<serde_json::Value> =
+            Vec::with_capacity(graph.memories.len() + graph.entities.len());
+        for m in &graph.memories {
+            nodes.push(serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+            }));
+        }
+        for e in &graph.entities {
+            nodes.push(serde_json::json!({
+                "id": format!("e{}", e.id),
+                "node_type": "entity",
+                "label": e.name,
+                "degree": e.degree,
+            }));
+        }
+        let edges: Vec<serde_json::Value> = graph
+            .links
+            .iter()
+            .map(|(mem_id, ent_id)| serde_json::json!({"src": format!("m{mem_id}"), "dst": format!("e{ent_id}")}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "entity",
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // Default similarity mode: memory↔memory, no generative LLM (cosine over
+    // stored embeddings, or BM25 lexical fallback).
     let graph = guard
-        .graph_bipartite(&q.project, q.limit)
+        .graph_similarity(&q.project, q.limit, 4, 0.15)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut nodes: Vec<serde_json::Value> =
-        Vec::with_capacity(graph.memories.len() + graph.entities.len());
-    for m in &graph.memories {
-        nodes.push(serde_json::json!({
-            "id": format!("m{}", m.id),
-            "node_type": "memory",
-            "label": m.preview,
-            "kind": m.kind,
-            "source_kind": m.source_kind,
-        }));
-    }
-    for e in &graph.entities {
-        nodes.push(serde_json::json!({
-            "id": format!("e{}", e.id),
-            "node_type": "entity",
-            "label": e.name,
-            "degree": e.degree,
-        }));
-    }
-    let edges: Vec<serde_json::Value> = graph
-        .links
+    let nodes: Vec<serde_json::Value> = graph
+        .memories
         .iter()
-        .map(|(mem_id, ent_id)| serde_json::json!({"src": format!("m{mem_id}"), "dst": format!("e{ent_id}")}))
+        .map(|m| {
+            serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
         .collect();
     Ok(Json(serde_json::json!({
+        "mode": "similarity",
+        "basis": graph.basis,
         "nodes": nodes,
         "edges": edges,
     })))

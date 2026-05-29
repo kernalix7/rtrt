@@ -147,12 +147,45 @@ pub struct BipartiteGraph {
     pub links: Vec<(i64, i64)>,
 }
 
+/// Similarity graph for one project: memory nodes plus weighted memory↔memory
+/// edges built WITHOUT any generative LLM. Edge weight in `[0,1]`. When stored
+/// embeddings exist the edges are dense-vector cosine similarity; otherwise they
+/// fall back to BM25 lexical overlap — both are model-call-free (cosine reads
+/// already-stored vectors; BM25 is the FTS5 index).
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarityGraph {
+    pub memories: Vec<MemNode>,
+    /// `(memory_a, memory_b, weight)`, undirected (a < b), strongest first.
+    pub edges: Vec<(i64, i64, f32)>,
+    /// `"vector"` (cosine over stored embeddings) or `"bm25"` (lexical fallback).
+    pub basis: String,
+}
+
 /// Prefix applied to the `kind` column for Letta-style memory blocks.
 const BLOCK_KIND_PREFIX: &str = "block:";
 
 /// Builds the `kind` string for a Letta memory block.
 pub fn block_kind(name: &str) -> String {
     format!("{BLOCK_KIND_PREFIX}{name}")
+}
+
+/// Build a safe FTS5 `MATCH` query from free text: take the longest distinct
+/// alphanumeric/Hangul tokens (≥3 chars), cap at 12, and OR them. Quoting each
+/// token keeps FTS5 operators / punctuation in the body from breaking the query.
+fn fts_query_from_text(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut toks: Vec<&str> = text
+        .split(|c: char| !(c.is_alphanumeric()))
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| seen.insert(t.to_lowercase()))
+        .collect();
+    // Prefer longer tokens — they carry more signal than short common words.
+    toks.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    toks.truncate(12);
+    toks.iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 impl MemoryStore {
@@ -1896,6 +1929,148 @@ impl MemoryStore {
             memories,
             entities,
             links,
+        })
+    }
+
+    /// Build a memory↔memory similarity graph with NO generative LLM. Each
+    /// memory is linked to its `top_k` most-similar peers. When stored
+    /// embeddings cover the project, edges are cosine similarity over those
+    /// vectors (no inference — the vectors already exist); otherwise it falls
+    /// back to BM25 lexical overlap via the FTS5 index. Edges are undirected
+    /// (`a < b`), deduped, and kept only at/above `min_weight`.
+    pub fn graph_similarity(
+        &self,
+        project: &str,
+        limit: usize,
+        top_k: usize,
+        min_weight: f32,
+    ) -> Result<SimilarityGraph> {
+        // Memory nodes (newest first, capped at `limit`).
+        let mut mem_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind') \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC \
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows: Vec<(MemNode, String)> = mem_stmt
+            .query_map(rusqlite::params![project, limit as i64], |r| {
+                let body: String = r.get(2)?;
+                let node = MemNode {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    preview: body.chars().take(60).collect(),
+                    source_kind: r.get(3)?,
+                };
+                Ok((node, body))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let memories: Vec<MemNode> = rows.iter().map(|(n, _)| n.clone()).collect();
+        let id_in_scope: std::collections::HashSet<i64> = memories.iter().map(|m| m.id).collect();
+
+        // Try the dense-vector path: load stored embeddings for in-scope rows.
+        let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+        {
+            let mut vec_stmt = self
+                .conn
+                .prepare(
+                    "SELECT e.memory_id, e.vector FROM embeddings e \
+                       JOIN memories m ON m.id = e.memory_id \
+                      WHERE m.project = ?1",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            let it = vec_stmt
+                .query_map(rusqlite::params![project], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            for row in it {
+                let (id, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
+                if id_in_scope.contains(&id) {
+                    if let Ok(v) = vector_from_blob(&blob) {
+                        vectors.push((id, v));
+                    }
+                }
+            }
+        }
+
+        let mut edge_set: std::collections::BTreeMap<(i64, i64), f32> =
+            std::collections::BTreeMap::new();
+        let basis;
+
+        if vectors.len() >= 2 {
+            basis = "vector".to_string();
+            // Pairwise cosine; keep each node's top_k strongest peers.
+            for i in 0..vectors.len() {
+                let mut peers: Vec<(i64, f32)> = Vec::with_capacity(vectors.len() - 1);
+                for j in 0..vectors.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let w = cosine(&vectors[i].1, &vectors[j].1);
+                    if w >= min_weight {
+                        peers.push((vectors[j].0, w));
+                    }
+                }
+                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                peers.truncate(top_k);
+                let a = vectors[i].0;
+                for (b, w) in peers {
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    let e = edge_set.entry(key).or_insert(w);
+                    if w > *e {
+                        *e = w;
+                    }
+                }
+            }
+        } else {
+            basis = "bm25".to_string();
+            // Lexical fallback: query the FTS index with each memory's salient
+            // tokens, link to the top_k matches (excluding itself).
+            for (node, body) in &rows {
+                let query = fts_query_from_text(body);
+                if query.is_empty() {
+                    continue;
+                }
+                let hits = match self.recall_bm25(project, &query, top_k + 1) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                // recall_bm25 scores are BM25 (higher = better, unbounded);
+                // normalise to a 0..1-ish weight by rank so the UI can size edges.
+                let n = hits.len().max(1);
+                for (rank, hit) in hits.iter().enumerate() {
+                    if hit.id == node.id || !id_in_scope.contains(&hit.id) {
+                        continue;
+                    }
+                    let w = 1.0 - (rank as f32 / n as f32); // 1.0 best → lower
+                    if w < min_weight {
+                        continue;
+                    }
+                    let (a, b) = (node.id, hit.id);
+                    let key = if a < b { (a, b) } else { (b, a) };
+                    let e = edge_set.entry(key).or_insert(w);
+                    if w > *e {
+                        *e = w;
+                    }
+                }
+            }
+        }
+
+        let mut edges: Vec<(i64, i64, f32)> =
+            edge_set.into_iter().map(|((a, b), w)| (a, b, w)).collect();
+        edges.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(SimilarityGraph {
+            memories,
+            edges,
+            basis,
         })
     }
 

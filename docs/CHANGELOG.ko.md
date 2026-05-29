@@ -8,9 +8,13 @@
 
 ## [Unreleased]
 
-### Highlights — 엔티티 중심 인터랙티브 메모리 그래프
+### Highlights — 인터랙티브 메모리 그래프 (기본: 무-LLM 유사도)
 
-**메모리 그래프가 흩뿌린 점에서 엔티티 ↔ 메모리 탐색 맵으로.**
+**메모리 그래프가 흩뿌린 점에서 탐색 맵으로. 기본 모드는 엔티티 추출도 생성 LLM도 불필요.**
+
+- **유사도 모드(기본)**: `graph_similarity`가 각 메모리를 가장 유사한 이웃과 가중 엣지로 연결 — 이미 저장된 임베딩 코사인(추론 호출 0) 또는 임베딩 없으면 FTS5 BM25 어휘 유사도(완전 무모델). `GET /api/memory/graph` → `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. UI 기본값 — 추출 단계 없이 그래프 즉시 표시.
+- **엔티티 모드(옵션, `mode=entity`)**: 이분 메모리↔엔티티 그래프(엔티티 1급 노드), 개념 수준 구조 원하는 사용자용 LLM 엔티티 추출.
+- UI: 유사도/엔티티 모드 토글; 유사도 엣지는 weight 비례, basis 캡션; 엔티티 추출 버튼은 엔티티 모드에만.
 
 - `rtrt-memory` 스키마 v7에 `entities(project, name)` + `memory_entities(memory_id, entity_id)` 추가 — 추출된 엔티티가 1급 노드(기존 메모리↔메모리 `edges` 경로는 유지, 가산적). 새 `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, `graph_bipartite`(메모리 노드 + degree 있는 엔티티 노드 + memory→entity 링크 반환, 각 메모리의 `source_kind` 포함).
 - `GET /api/memory/graph`가 이분 `{nodes, edges}` 반환(메모리 노드 `m<id>` + kind·source_kind, 엔티티 노드 `e<id>` + degree); `POST /api/memory/entities`가 이제 이분 그래프 구축.

@@ -648,6 +648,13 @@
               <button class="primary" type="submit">맵 새로고침</button>
             </form>
             <div id="graph-meta" class="out-meta"></div>
+            <div class="graph-controls" aria-label="그래프 모드">
+              <div class="mode-toggle" id="graph-mode-toggle" title="그래프 모드">
+                <button id="graph-mode-similarity" class="active" type="button" data-graph-mode="similarity">유사도</button>
+                <button id="graph-mode-entity" type="button" data-graph-mode="entity">엔티티</button>
+              </div>
+              <span id="graph-mode-note" class="hint">LLM 추출 없이 메모리 간 유사도를 표시합니다.</span>
+            </div>
             <div class="graph-controls" aria-label="그래프 필터">
               <div class="sort-row" aria-label="노드 표시">
                 <button id="graph-toggle-memory" class="sort-btn active" type="button" aria-pressed="true">메모리</button>
@@ -671,6 +678,7 @@
                 <div class="empty">노드를 클릭하면 상세 정보가 표시됩니다.</div>
               </div>
             </div>
+            <div id="graph-basis-caption" class="out-meta"></div>
             <div id="graph-legend" class="graph-legend">
               <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티 · 크기 = 연결 수</div>
               <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
@@ -2456,10 +2464,65 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory graph — entity-centric bipartite canvas layout.
+// Memory graph — similarity and entity canvas layout.
 const GRAPH_LIMIT = 300;
+const GRAPH_MODE_KEY = 'rtrt.graph.mode';
 let graphState = null;
+let graphMode = localStorage.getItem(GRAPH_MODE_KEY) === 'entity' ? 'entity' : 'similarity';
+let graphEntityExtractUnavailable = false;
 let graphFilters = { showMemory: true, showEntity: true, source: 'all', search: '' };
+
+function graphIsSimilarityMode() {
+  return graphMode === 'similarity';
+}
+
+function graphBasisLabel(basis) {
+  return basis === 'bm25' ? '어휘(BM25)' : '임베딩';
+}
+
+function renderGraphLegend() {
+  const legend = document.getElementById('graph-legend');
+  if (!legend) return;
+  if (graphIsSimilarityMode()) {
+    legend.innerHTML = `
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>메모리 · 서브</div>
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:var(--muted);"></div>선 굵기/농도 = 유사도</div>
+    `;
+  } else {
+    legend.innerHTML = `
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티 · 크기 = 연결 수</div>
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
+      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>메모리 · 서브</div>
+    `;
+  }
+}
+
+function syncGraphModeUi() {
+  const simBtn = document.getElementById('graph-mode-similarity');
+  const entityModeBtn = document.getElementById('graph-mode-entity');
+  const entityToggle = document.getElementById('graph-toggle-entity');
+  const extractBtn = document.getElementById('entity-extract-btn');
+  const note = document.getElementById('graph-mode-note');
+  const search = document.getElementById('graph-search');
+  const basis = document.getElementById('graph-basis-caption');
+  if (simBtn) {
+    simBtn.classList.toggle('active', graphIsSimilarityMode());
+    simBtn.setAttribute('aria-pressed', String(graphIsSimilarityMode()));
+  }
+  if (entityModeBtn) {
+    entityModeBtn.classList.toggle('active', !graphIsSimilarityMode());
+    entityModeBtn.setAttribute('aria-pressed', String(!graphIsSimilarityMode()));
+  }
+  if (entityToggle) entityToggle.hidden = graphIsSimilarityMode();
+  if (extractBtn) extractBtn.hidden = graphIsSimilarityMode() || graphEntityExtractUnavailable;
+  if (note) note.textContent = graphIsSimilarityMode()
+    ? 'LLM 추출 없이 메모리 간 유사도를 표시합니다.'
+    : '엔티티 추출 결과로 메모리와 엔티티 연결을 표시합니다.';
+  if (search) search.placeholder = graphIsSimilarityMode() ? '메모리 검색' : '엔티티 또는 메모리 검색';
+  if (basis && !graphIsSimilarityMode()) basis.textContent = '';
+  renderGraphLegend();
+}
 
 function graphNodeLabel(n) {
   return String(n.label || n.preview || n.body || n.name || n.id || '');
@@ -2478,6 +2541,7 @@ function graphNodeRadius(n) {
 }
 
 function graphNodeVisible(n) {
+  if (graphIsSimilarityMode() && n.node_type === 'entity') return false;
   if (n.node_type === 'memory') {
     if (!graphFilters.showMemory) return false;
     if (graphFilters.source === 'main' && graphNodeSource(n) === 'subagent') return false;
@@ -2501,6 +2565,7 @@ function initGraph(data) {
   const bg = styles.getPropertyValue('--bg').trim() || '#fff';
   const entityColor = '#16a34a';
   const subagentColor = '#7c3aed';
+  const isSimilarity = data.mode === 'similarity';
 
   if (graphState && graphState.cleanup) graphState.cleanup();
 
@@ -2534,7 +2599,10 @@ function initGraph(data) {
   });
   const idIdx = new Map(nodes.map((n, i) => [n.id, i]));
   const edges = (data.edges || [])
-    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), src: e.src, dst: e.dst }))
+    .map(e => {
+      const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
+      return { s: idIdx.get(e.src), d: idIdx.get(e.dst), src: e.src, dst: e.dst, weight };
+    })
     .filter(e => e.s !== undefined && e.d !== undefined);
   const adjacency = new Map(nodes.map(n => [n.id, new Set()]));
   const linkedMemoryByEntity = new Map();
@@ -2562,8 +2630,12 @@ function initGraph(data) {
   let moved = false;
   let raf = null;
   const listeners = [];
+  const hasVisibleNodes = nodes.some(n => graphNodeVisible(n));
   const hasEntities = nodes.some(n => n.node_type === 'entity');
-  emptyState.hidden = hasEntities;
+  emptyState.hidden = isSimilarity ? hasVisibleNodes : hasEntities;
+  emptyState.innerHTML = isSimilarity
+    ? '<div>표시할 유사도 그래프가 없습니다.<br>메모리가 충분히 쌓이면 연결이 표시됩니다.</div>'
+    : '<div>아직 엔티티가 없습니다.<br>상단의 <strong>엔티티 추출</strong> 버튼으로 메모리에서 엔티티를 생성하세요.</div>';
 
   function on(target, type, fn, opts) {
     target.addEventListener(type, fn, opts);
@@ -2615,15 +2687,18 @@ function initGraph(data) {
       return;
     }
     if (n.node_type === 'memory') {
-      const linkedEntities = Array.from(adjacency.get(n.id) || [])
+      const linkedNeighbors = Array.from(adjacency.get(n.id) || [])
         .map(id => nodes[idIdx.get(id)])
-        .filter(x => x && x.node_type === 'entity');
+        .filter(Boolean);
+      const linkedEntities = linkedNeighbors.filter(x => x.node_type === 'entity');
+      const linkedMemories = linkedNeighbors.filter(x => x.node_type === 'memory');
       detail.innerHTML = `
         <h3>메모리</h3>
         <div>${memoryBadges(n)}</div>
         <div class="label-preview">${escapeHtml(graphNodeLabel(n).slice(0, 700))}</div>
         <button id="graph-history-link" class="ghost" type="button" style="margin-top:0.65rem;font-size:0.85em;">히스토리에서 보기</button>
-        ${linkedEntities.length ? `<div class="out-meta">연결된 엔티티</div><ul>${linkedEntities.slice(0, 16).map(e => `<li>${escapeHtml(graphNodeLabel(e))}</li>`).join('')}</ul>` : ''}
+        ${isSimilarity && linkedMemories.length ? `<div class="out-meta">유사한 메모리</div><ul>${linkedMemories.slice(0, 16).map(m => `<li>${escapeHtml(graphNodeLabel(m).slice(0, 140))}</li>`).join('')}</ul>` : ''}
+        ${!isSimilarity && linkedEntities.length ? `<div class="out-meta">연결된 엔티티</div><ul>${linkedEntities.slice(0, 16).map(e => `<li>${escapeHtml(graphNodeLabel(e))}</li>`).join('')}</ul>` : ''}
       `;
       const link = document.getElementById('graph-history-link');
       if (link) link.onclick = switchToHistory;
@@ -2666,7 +2741,7 @@ function initGraph(data) {
     return [a, b];
   }
 
-  function drawArrow(from, to) {
+  function drawEdge(from, to, edge) {
     const fromR = graphNodeRadius(from) + 1;
     const toR = graphNodeRadius(to) + 2;
     const dx = to.x - from.x;
@@ -2680,6 +2755,7 @@ function initGraph(data) {
     ctx.moveTo(sx, sy);
     ctx.lineTo(ex, ey);
     ctx.stroke();
+    if (isSimilarity) return;
     const size = 5;
     const angle = Math.atan2(dy, dx);
     ctx.beginPath();
@@ -2705,8 +2781,15 @@ function initGraph(data) {
       const [from, to] = edgeDirection(e);
       if (!graphNodeVisible(from) || !graphNodeVisible(to)) continue;
       const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
-      ctx.globalAlpha = selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22;
-      drawArrow(from, to);
+      if (isSimilarity) {
+        const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
+        ctx.lineWidth = (0.5 + weight * 3.2) / Math.sqrt(view.k);
+        ctx.globalAlpha = selectedId ? (activeEdge ? 0.22 + weight * 0.5 : 0.06) : 0.08 + weight * 0.42;
+      } else {
+        ctx.lineWidth = 1 / Math.sqrt(view.k);
+        ctx.globalAlpha = selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22;
+      }
+      drawEdge(from, to, e);
     }
     ctx.globalAlpha = 1;
     for (const n of nodes) {
@@ -2913,9 +2996,13 @@ function initGraph(data) {
 
 async function loadGraph(project) {
   const meta = document.getElementById('graph-meta');
+  const basis = document.getElementById('graph-basis-caption');
+  syncGraphModeUi();
   meta.textContent = '불러오는 중…';
+  if (basis) basis.textContent = '';
   try {
-    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}&limit=${GRAPH_LIMIT}`);
+    const modeParam = graphIsSimilarityMode() ? 'mode=similarity' : 'mode=entity';
+    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}&${modeParam}&limit=${GRAPH_LIMIT}`);
     if (!r.ok) {
       const text = await r.text();
       showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
@@ -2925,9 +3012,16 @@ async function loadGraph(project) {
     const d = await r.json();
     d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
     d.edges = Array.isArray(d.edges) ? d.edges : [];
+    d.mode = d.mode === 'entity' ? 'entity' : 'similarity';
     const entityCount = d.nodes.filter(n => n.node_type === 'entity').length;
     const memoryCount = d.nodes.filter(n => n.node_type === 'memory').length;
-    meta.innerHTML = `<span class="badge ok">${entityCount} 엔티티</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
+    if (d.mode === 'similarity') {
+      meta.innerHTML = `<span class="badge ok">유사도</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
+      if (basis) basis.textContent = `유사도 기준: ${graphBasisLabel(d.basis)}`;
+    } else {
+      meta.innerHTML = `<span class="badge ok">${entityCount} 엔티티</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
+      if (basis) basis.textContent = '';
+    }
     initGraph(d);
   } catch (e) {
     meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
@@ -2938,7 +3032,9 @@ async function loadGraph(project) {
   const memBtn = document.getElementById('graph-toggle-memory');
   const entityBtn = document.getElementById('graph-toggle-entity');
   const search = document.getElementById('graph-search');
+  const modeBtns = document.querySelectorAll('#graph-mode-toggle [data-graph-mode]');
   function sync() {
+    syncGraphModeUi();
     if (memBtn) {
       memBtn.classList.toggle('active', graphFilters.showMemory);
       memBtn.setAttribute('aria-pressed', String(graphFilters.showMemory));
@@ -2954,6 +3050,17 @@ async function loadGraph(project) {
   }
   if (memBtn) memBtn.onclick = () => { graphFilters.showMemory = !graphFilters.showMemory; sync(); };
   if (entityBtn) entityBtn.onclick = () => { graphFilters.showEntity = !graphFilters.showEntity; sync(); };
+  modeBtns.forEach(btn => {
+    btn.onclick = async () => {
+      const nextMode = btn.dataset.graphMode === 'entity' ? 'entity' : 'similarity';
+      if (graphMode === nextMode) return;
+      graphMode = nextMode;
+      localStorage.setItem(GRAPH_MODE_KEY, graphMode);
+      sync();
+      const project = currentProject();
+      if (project) await loadGraph(project);
+    };
+  });
   document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {
       graphFilters.source = btn.dataset.graphSource || 'all';
@@ -2993,7 +3100,8 @@ document.getElementById('graph-form').onsubmit = async (ev) => {
       });
       if (r.status === 404) {
         // Entity extraction not built into this binary; hide the button.
-        btn.hidden = true;
+        graphEntityExtractUnavailable = true;
+        syncGraphModeUi();
         return;
       }
       if (!r.ok) {

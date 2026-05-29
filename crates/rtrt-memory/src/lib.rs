@@ -187,6 +187,14 @@ impl MemoryStore {
             }
         }
         let conn = Connection::open(path.as_ref()).map_err(|e| Error::Memory(e.to_string()))?;
+        // WAL lets readers (dashboard API) proceed while a writer (the transcript
+        // watcher / capture path) holds the write lock — without it a sweep can
+        // stall every read for seconds. busy_timeout waits out brief contention
+        // instead of failing with SQLITE_BUSY.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;",
+        )
+        .map_err(|e| Error::Memory(e.to_string()))?;
         let store = Self {
             conn,
             embedder: None,

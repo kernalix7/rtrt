@@ -2821,11 +2821,11 @@ function initGraph(data) {
         ctx.stroke();
       }
       if (shouldLabelNode(n) && view.k > 0.45) {
-        ctx.globalAlpha = dim ? 0.22 : 0.9;
+        ctx.globalAlpha = dim ? 0.22 : 0.85;
         ctx.fillStyle = fg;
-        ctx.font = `${Math.max(10, 12 / Math.sqrt(view.k))}px system-ui`;
+        ctx.font = `${Math.max(6.5, 8 / Math.sqrt(view.k))}px system-ui`;
         ctx.textAlign = 'center';
-        ctx.fillText(graphNodeLabel(n).slice(0, 24), n.x, n.y + r + 15);
+        ctx.fillText(graphNodeLabel(n).slice(0, 22), n.x, n.y + r + 9);
       }
     }
     ctx.restore();

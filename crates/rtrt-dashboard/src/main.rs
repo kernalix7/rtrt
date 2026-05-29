@@ -42,6 +42,7 @@ use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summaris
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
 };
+use rtrt_security::{Profile, ScanReport};
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -302,6 +303,9 @@ async fn main() -> Result<()> {
         .route("/api/ollama/{name}", delete(ollama_delete))
         .route("/api/ollama/ps", get(ollama_ps))
         .route("/api/ollama/pull", post(ollama_pull))
+        .route("/api/security/profiles", get(security_profiles))
+        .route("/api/security/profile/{name}", get(security_profile))
+        .route("/api/security/scan", post(security_scan))
         .route(
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),
@@ -552,6 +556,36 @@ async fn get_template(
     rtrt_templates::find(&name)
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, format!("template not found: {name}")))
+}
+
+async fn security_profiles() -> Json<Vec<String>> {
+    Json(rtrt_security::list_profiles())
+}
+
+async fn security_profile(
+    AxPath(name): AxPath<String>,
+) -> std::result::Result<Json<Profile>, (StatusCode, String)> {
+    rtrt_security::load_profile(&name)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct SecurityScanRequest {
+    profile: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+async fn security_scan(
+    Json(req): Json<SecurityScanRequest>,
+) -> std::result::Result<Json<ScanReport>, (StatusCode, String)> {
+    let profile = rtrt_security::load_profile(&req.profile)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let path = req.path.unwrap_or_else(|| ".".to_string());
+    rtrt_security::run(&profile, std::path::Path::new(&path))
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize)]

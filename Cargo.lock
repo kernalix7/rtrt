@@ -3177,6 +3177,7 @@ dependencies = [
  "rtrt-memory",
  "rtrt-providers",
  "rtrt-proxy",
+ "rtrt-security",
  "rtrt-templates",
  "rusqlite",
  "serde",

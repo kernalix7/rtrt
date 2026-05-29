@@ -11,7 +11,8 @@
 //! Engines are synchronous and offline: deps come from on-disk manifests, never
 //! the network.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -161,37 +162,65 @@ fn check_hallucinated_imports(
     let mut findings = Vec::new();
 
     // --- Rust ---
+    // Each source file is judged against the deps of the crate it belongs to
+    // (the nearest ancestor Cargo.toml), unioned with the workspace root's
+    // `[workspace.dependencies]`. In a monorepo, ctx.root's manifest alone is
+    // not enough — a member's own `[dependencies]`, its package name, and its
+    // crate-local modules (`mod foo;`) all live in the member crate.
     if !rust_files.is_empty() {
-        let declared = declared_rust_deps(ctx);
-        // Only check when we actually found a manifest; otherwise we'd flag
-        // everything in a sub-crate that imports workspace siblings, etc.
-        if !declared.is_empty() {
-            for (rel, contents) in rust_files {
-                for (i, line) in contents.lines().enumerate() {
-                    let trimmed = line.trim_start();
-                    if trimmed.starts_with("//") || trimmed.starts_with("*") {
-                        continue;
+        let ws_deps = workspace_root_deps(&ctx.root);
+        // Cache declared-deps per crate dir so we parse each manifest once.
+        let mut cache: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        for (rel, contents) in rust_files {
+            let abs = ctx.root.join(rel);
+            let Some(crate_dir) = nearest_manifest_dir(&abs, &ctx.root) else {
+                // No manifest anywhere up to the root — can't judge; skip.
+                continue;
+            };
+            let declared = cache.entry(crate_dir.clone()).or_insert_with(|| {
+                let mut set = ws_deps.clone();
+                if let Ok(text) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) {
+                    if let Ok(value) = text.parse::<toml::Value>() {
+                        collect_member_deps(&value, &mut set);
+                        collect_workspace_deps(&value, &mut set);
                     }
-                    let cap = RUST_USE
-                        .captures(line)
-                        .or_else(|| RUST_EXTERN.captures(line));
-                    let Some(cap) = cap else { continue };
-                    let krate = normalise_rust_crate(&cap[1]);
-                    if RUST_BUILTINS.contains(&krate.as_str()) {
-                        continue;
-                    }
-                    if declared.contains(&krate) {
-                        continue;
-                    }
-                    findings.push(make_finding(
-                        rule,
-                        rel,
-                        Some(i + 1),
-                        format!("import of undeclared crate `{krate}` (possible AI hallucination)"),
-                        line.to_string(),
-                        "Verify the crate exists and add it to Cargo.toml, or remove the import.",
-                    ));
                 }
+                set
+            });
+            if declared.is_empty() {
+                continue;
+            }
+            for (i, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                    continue;
+                }
+                let cap = RUST_USE
+                    .captures(line)
+                    .or_else(|| RUST_EXTERN.captures(line));
+                let Some(cap) = cap else { continue };
+                let seg = &cap[1];
+                let krate = normalise_rust_crate(seg);
+                if RUST_BUILTINS.contains(&krate.as_str()) {
+                    continue;
+                }
+                if declared.contains(&krate) {
+                    continue;
+                }
+                // Not an external crate if it's a crate-local module — `mod seg;`
+                // resolves to <crate>/src/seg.rs or <crate>/src/seg/mod.rs, or a
+                // sibling module next to this file.
+                if is_local_module(seg, &abs, &crate_dir) {
+                    continue;
+                }
+                findings.push(make_finding(
+                    rule,
+                    rel,
+                    Some(i + 1),
+                    format!("import of undeclared crate `{krate}` (possible AI hallucination)"),
+                    line.to_string(),
+                    "Verify the crate exists and add it to Cargo.toml, or remove the import.",
+                ));
             }
         }
     }
@@ -253,17 +282,61 @@ fn normalise_rust_crate(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// Read declared crate deps from the nearest `Cargo.toml` at `ctx.root`.
-/// Includes `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`.
-fn declared_rust_deps(ctx: &ScanContext) -> HashSet<String> {
+/// Directory of the nearest `Cargo.toml` at or above `file`'s directory, not
+/// going above `root`. This is the crate `file` belongs to.
+fn nearest_manifest_dir(file: &Path, root: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").is_file() {
+            return Some(d.to_path_buf());
+        }
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Collect `[workspace.dependencies]` from the workspace root — found by walking
+/// up from `root` (inclusive) to the first manifest carrying `[workspace]`.
+/// These are visible to every member via `foo.workspace = true`.
+fn workspace_root_deps(root: &Path) -> HashSet<String> {
     let mut set = HashSet::new();
-    let manifest = ctx.root.join("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
-        return set;
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return set;
-    };
+    let mut cursor = Some(root);
+    while let Some(dir) = cursor {
+        let candidate = dir.join("Cargo.toml");
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            if let Ok(value) = text.parse::<toml::Value>() {
+                if value.get("workspace").is_some() {
+                    collect_workspace_deps(&value, &mut set);
+                    break;
+                }
+            }
+        }
+        cursor = dir.parent();
+    }
+    set
+}
+
+/// True when `seg` resolves to a crate-local module rather than an external
+/// crate: `<crate>/src/seg.rs`, `<crate>/src/seg/mod.rs`, or a module sibling to
+/// `file` (`<file_dir>/seg.rs` / `<file_dir>/seg/mod.rs`). Covers `mod seg;` and
+/// inline nested modules without parsing the whole crate.
+fn is_local_module(seg: &str, file: &Path, crate_dir: &Path) -> bool {
+    let mut roots: Vec<PathBuf> = vec![crate_dir.join("src")];
+    if let Some(parent) = file.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    roots.iter().any(|base| {
+        base.join(format!("{seg}.rs")).is_file() || base.join(seg).join("mod.rs").is_file()
+    })
+}
+
+/// Collect crate names declared in a member manifest's dependency tables and its
+/// own package name. The table *key* is the crate name whatever the value shape
+/// (string version, `{ workspace = true }`, `{ version = "..", features = [..] }`).
+fn collect_member_deps(value: &toml::Value, set: &mut HashSet<String>) {
     for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(tbl) = value.get(table_name).and_then(|v| v.as_table()) {
             for (name, spec) in tbl {
@@ -275,7 +348,8 @@ fn declared_rust_deps(ctx: &ScanContext) -> HashSet<String> {
             }
         }
     }
-    // Also accept workspace-internal references named in [package].
+    // Accept the crate's own package name (defensive; `use crate::` is already
+    // ignored, but a re-export path may reference the package name).
     if let Some(pkg) = value
         .get("package")
         .and_then(|p| p.get("name"))
@@ -283,7 +357,23 @@ fn declared_rust_deps(ctx: &ScanContext) -> HashSet<String> {
     {
         set.insert(normalise_rust_crate(pkg));
     }
-    set
+}
+
+/// Collect crate names declared in a manifest's `[workspace.dependencies]`.
+fn collect_workspace_deps(value: &toml::Value, set: &mut HashSet<String>) {
+    let Some(tbl) = value
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|v| v.as_table())
+    else {
+        return;
+    };
+    for (name, spec) in tbl {
+        set.insert(normalise_rust_crate(name));
+        if let Some(real) = spec.get("package").and_then(|v| v.as_str()) {
+            set.insert(normalise_rust_crate(real));
+        }
+    }
 }
 
 /// Node builtin modules (subset that matters; never flagged).
@@ -648,6 +738,68 @@ regex = "1"
         assert!(findings.is_empty(), "expected clean, got: {findings:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_inherited_dep_is_not_hallucinated() {
+        // Layout:
+        //   <ws>/Cargo.toml              -> [workspace.dependencies] anyhow, foo-bar
+        //   <ws>/member/Cargo.toml       -> deps declared via inheritance
+        //   <ws>/member/src.rs           -> imports those crates
+        // Scan root is the member dir.
+        let ws = fixture_dir("wsinherit");
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+anyhow = "1"
+foo-bar = "0.3"
+"#,
+        )
+        .unwrap();
+        let member = ws.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            r#"
+[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+anyhow.workspace = true
+foo-bar = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("lib.rs"),
+            // anyhow + foo_bar are workspace-inherited; serde is a table-form
+            // version dep; tempfile is a dev-dep. None should fire.
+            // total_invention is undeclared and SHOULD fire.
+            "use anyhow::Result;\nuse foo_bar::Thing;\nuse serde::Serialize;\nuse tempfile::tempdir;\nuse total_invention::Boom;\n",
+        )
+        .unwrap();
+
+        let r = rule("hallucinated-import");
+        let findings = run(&AiEngine, &ctx(member.clone()), &[&r]);
+
+        // Only the genuinely-undeclared crate should fire.
+        assert_eq!(findings.len(), 1, "findings: {findings:?}");
+        assert!(
+            findings[0].title.contains("total_invention"),
+            "title: {}",
+            findings[0].title
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

@@ -124,10 +124,33 @@ struct ManifestLicense {
 #[derive(Deserialize)]
 struct CargoToml {
     package: Option<CargoPackage>,
+    workspace: Option<CargoWorkspace>,
 }
 
 #[derive(Deserialize)]
 struct CargoPackage {
+    license: Option<CargoLicenseField>,
+}
+
+/// A `[package].license` value is normally a plain SPDX string, but under
+/// workspace inheritance it is a table `{ workspace = true }`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CargoLicenseField {
+    Str(String),
+    Inherited {
+        #[serde(default)]
+        workspace: bool,
+    },
+}
+
+#[derive(Deserialize)]
+struct CargoWorkspace {
+    package: Option<CargoWorkspacePackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoWorkspacePackage {
     license: Option<String>,
 }
 
@@ -181,11 +204,7 @@ fn discover_manifests(ctx: &ScanContext) -> Vec<ManifestLicense> {
         match name {
             "Cargo.toml" => {
                 if let Ok(text) = std::fs::read_to_string(path) {
-                    let license = toml::from_str::<CargoToml>(&text)
-                        .ok()
-                        .and_then(|c| c.package)
-                        .and_then(|p| p.license)
-                        .filter(|s| !s.trim().is_empty());
+                    let license = resolve_cargo_license(&text, path, &ctx.root);
                     out.push(ManifestLicense {
                         rel_path,
                         kind: ManifestKind::Cargo,
@@ -212,6 +231,74 @@ fn discover_manifests(ctx: &ScanContext) -> Vec<ManifestLicense> {
     }
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     out
+}
+
+/// Resolve the effective license for a Cargo manifest, honouring workspace
+/// inheritance. A member that declares `license.workspace = true` (or that omits
+/// `[package].license` while inheriting other fields from the workspace) takes
+/// its license from the nearest ancestor `Cargo.toml` carrying
+/// `[workspace.package].license`. Returns `None` only when neither the member
+/// nor the resolved workspace root declares a non-empty license.
+fn resolve_cargo_license(
+    text: &str,
+    manifest_path: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<String> {
+    let parsed = toml::from_str::<CargoToml>(text).ok();
+
+    // A literal license string on the member wins outright.
+    let package_license = parsed
+        .as_ref()
+        .and_then(|c| c.package.as_ref())
+        .and_then(|p| {
+            p.license.as_ref().and_then(|l| match l {
+                CargoLicenseField::Str(s) => Some(s.clone()),
+                // `license.workspace = true` carries no literal value; inherit later.
+                // `workspace = false` is not real inheritance, but Cargo treats a
+                // table without a string the same way — no literal to use here.
+                CargoLicenseField::Inherited { workspace } if *workspace => None,
+                CargoLicenseField::Inherited { .. } => None,
+            })
+        });
+    if let Some(s) = package_license.filter(|s| !s.trim().is_empty()) {
+        return Some(s);
+    }
+
+    // The member either inherits its license (`license.workspace = true`) or
+    // declares none at all — in both cases fall back to the workspace root.
+    if let Some(s) = find_workspace_license(manifest_path, root) {
+        return Some(s);
+    }
+
+    None
+}
+
+/// Walk up from the manifest's directory to `root` (inclusive), returning the
+/// `[workspace.package].license` of the first ancestor `Cargo.toml` that has one.
+fn find_workspace_license(
+    manifest_path: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<String> {
+    let mut dir = manifest_path.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("Cargo.toml");
+        if let Ok(text) = std::fs::read_to_string(&candidate)
+            && let Ok(parsed) = toml::from_str::<CargoToml>(&text)
+            && let Some(license) = parsed
+                .workspace
+                .and_then(|w| w.package)
+                .and_then(|p| p.license)
+                .filter(|s| !s.trim().is_empty())
+        {
+            return Some(license);
+        }
+        // Stop once we have just processed the scan root.
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// When `require_header`, flag source files whose first 5 lines lack an
@@ -481,6 +568,69 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].file, "bad.rs");
         assert!(findings[0].title.contains("missing SPDX"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_inherited_license_is_clean() {
+        let dir = fixture_dir("ws-inherit");
+        // Workspace root declares the license under [workspace.package].
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n\n[workspace.package]\nlicense = \"MIT\"\n",
+        )
+        .unwrap();
+        // Member inherits via `license.workspace = true` — no literal string.
+        let member = dir.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nlicense.workspace = true\n",
+        )
+        .unwrap();
+
+        let r = rule("allowed = [\"MIT\"]");
+        let engine = LicensesEngine;
+        let findings = findings_of(engine.scan(&ctx(&dir), &[&r]));
+
+        assert!(
+            findings.is_empty(),
+            "workspace-inherited MIT must not fire: {findings:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_inherited_but_root_lacks_license_fires() {
+        let dir = fixture_dir("ws-noroot");
+        // Workspace root declares no license at all.
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n\n[workspace.package]\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        // Member still tries to inherit the (absent) workspace license.
+        let member = dir.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nlicense.workspace = true\n",
+        )
+        .unwrap();
+
+        let r = rule("allowed = [\"MIT\"]");
+        let engine = LicensesEngine;
+        let findings = findings_of(engine.scan(&ctx(&dir), &[&r]));
+
+        // The member manifest fires: the root has no [workspace.package].license
+        // to inherit, so the license is genuinely missing.
+        let member = findings
+            .iter()
+            .find(|f| f.file == "member/Cargo.toml")
+            .expect("member manifest must fire");
+        assert!(member.title.contains("no license field"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

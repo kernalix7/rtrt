@@ -9,6 +9,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — project-centric dashboard + per-project security
+
+**The dashboard is reorganized around a project context instead of a flat 13-item menu, and security becomes project-aware.**
+
+- New project registry in `rtrt-core`: `ProjectEntry { name, path, security_profile }` + `Config.projects` with `project()` / `upsert_project()` helpers. Persisted to `~/.rtrt/config.toml` as `[[projects]]`.
+- Dashboard API: `GET /api/projects` (config registry unioned with memory buckets → name / path / bound profile / mem_count), `PUT /api/projects` (upsert + config write-back), `POST /api/security/profile` (validate + save a custom profile to `~/.rtrt/security/profiles/`).
+- UI: a global project selector in the sidebar (remembered via localStorage) with an add/edit-project modal; the nav is split into a **프로젝트** scope group (개요 / 메모리 / 보안 / 코드맵 / 진단) and a **도구** group (압축 / 로컬 LLM / 프롬프트 / 템플릿 / 연결 / 설정). Scope pages read one `currentProject()` instead of each carrying its own project picker.
+- Security page is project-aware: it scans the selected project's path, defaults to that project's bound profile, an "이 프로젝트에 적용" control binds a profile to the project, and a "프로파일 설정" subtab lists / views (rules + standards) / clones / saves profiles.
+
 ### Highlights — security & license profiles for AI-generated artifacts
 
 **New `rtrt-security` crate (11th workspace crate): profile-driven security + license scanning modeled on RHEL/OpenSCAP profiles. Six built-in profiles map every rule to industry standards (CWE / OWASP Top 10 + ASVS / NIST 800-53 + 800-218 SSDF / CIS Controls v8 / SLSA / EU AI Act), run by five pluggable engines, surfaced through the CLI, the dashboard, and MCP.**

@@ -228,6 +228,7 @@
   .imp-bar { display: inline-block; width: 40px; height: 6px; background: var(--border); border-radius: 3px; vertical-align: middle; overflow: hidden; }
   .imp-bar-fill { height: 100%; border-radius: 3px; background: var(--warn); }
   .badge.imp { color: var(--warn); border-color: var(--warn); }
+  .badge.source-subagent { color: #7c3aed; border-color: #7c3aed; }
 
   /* Sort controls */
   .sort-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
@@ -424,6 +425,11 @@
                 </div>
                 <span id="history-meta" class="hint">전부 영구 저장 · 페이지 단위 50건</span>
               </div>
+            </div>
+            <div id="source-kind-filter" class="sort-row" aria-label="출처 필터">
+              <button class="sort-btn active" type="button" data-source-kind="all">전체</button>
+              <button class="sort-btn" type="button" data-source-kind="main">메인</button>
+              <button class="sort-btn" type="button" data-source-kind="subagent">서브</button>
             </div>
             <div id="history-list" class="hist-list"><div class="empty">불러오는 중…</div></div>
             <div id="history-pager" class="pager" hidden>
@@ -1356,6 +1362,7 @@ const HISTORY_PAGE_SIZE = 50;
 let HISTORY_OFFSET = 0;
 let HISTORY_TOTAL = 0;
 let HISTORY_SORT = 'recent';   // 'recent' | 'importance'
+let HISTORY_SOURCE_FILTER = 'all'; // 'all' | 'main' | 'subagent'
 let SELECTED_IDS = new Set();  // ids of checked rows
 
 function escapeHtml(s) {
@@ -1370,6 +1377,43 @@ function escapeHtml(s) {
 function importancePct(raw) {
   const v = Number(raw);
   return v > 1 ? Math.min(100, Math.round(v * 10)) : Math.min(100, Math.round(v * 100));
+}
+
+function timelineSourceKind(item) {
+  let kind = null;
+  if (item.source_kind !== undefined && item.source_kind !== null) kind = item.source_kind;
+  else if (item.metadata && item.metadata.source_kind !== undefined && item.metadata.source_kind !== null) kind = item.metadata.source_kind;
+  if (kind === 'main' || kind === 'subagent') return kind;
+  return null;
+}
+
+function sourceKindBadge(kind) {
+  if (kind === 'main') return `<span class="badge">🧠 메인</span>`;
+  if (kind === 'subagent') return `<span class="badge source-subagent">🤖 서브</span>`;
+  return '';
+}
+
+function applySourceKindFilter() {
+  const list = document.getElementById('history-list');
+  const rows = list.querySelectorAll('.hist-item');
+  let shown = 0;
+  rows.forEach(row => {
+    const visible = HISTORY_SOURCE_FILTER === 'all' || row.dataset.sourceKind === HISTORY_SOURCE_FILTER;
+    row.style.display = visible ? '' : 'none';
+    if (visible) shown++;
+  });
+  let empty = document.getElementById('history-source-empty');
+  if (rows.length && shown === 0) {
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.id = 'history-source-empty';
+      empty.className = 'empty';
+      list.appendChild(empty);
+    }
+    empty.textContent = '선택한 출처의 메모리 없음.';
+  } else if (empty) {
+    empty.remove();
+  }
 }
 
 // Render a memory body. Legacy rows (and provider_chat captures) may hold a
@@ -1411,7 +1455,11 @@ async function loadHistory(name, offset) {
   syncBulkBar();
   const list = document.getElementById('history-list');
   list.innerHTML = '<div class="empty">불러오는 중…</div>';
-  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}`);
+  // Server-side source filter so 메인/서브 spans the whole project, not just
+  // the current page.
+  const skParam = (HISTORY_SOURCE_FILTER && HISTORY_SOURCE_FILTER !== 'all')
+    ? `&source_kind=${encodeURIComponent(HISTORY_SOURCE_FILTER)}` : '';
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}${skParam}`);
   if (!r.ok) {
     const text = await r.text();
     showToast(`메모리 히스토리 로드 실패 ${r.status}: ${text}`, 'err');
@@ -1427,6 +1475,8 @@ async function loadHistory(name, offset) {
     return;
   }
   list.innerHTML = d.items.map(i => {
+    const srcKind = timelineSourceKind(i);
+    const srcBadge = sourceKindBadge(srcKind);
     // Compressed rows: terse body + savings badge + expandable original.
     let compBadge = '', orig = '', recompressRow = '';
     if (i.compressed && i.body_full) {
@@ -1446,15 +1496,16 @@ async function loadHistory(name, offset) {
       <button class="ghost row-recompress-btn" type="button" style="font-size:0.8em;">재압축</button>
       <span class="row-recompress-result" style="font-size:0.8em;color:var(--muted);"></span>
     </div>`;
-    return `<div class="hist-item selectable" data-id="${i.id}">
+    return `<div class="hist-item selectable" data-id="${i.id}" data-source-kind="${escapeHtml(srcKind || '')}">
        <input type="checkbox" class="hist-check" data-id="${i.id}" title="선택">
        <div class="hist-click-area" data-id="${i.id}" tabindex="0" role="button" aria-label="상세 보기">
          <span class="when">${relativeTime(i.created_at)}</span>
-         <span class="kind">${escapeHtml(i.kind)}</span>${compBadge}${impBadge}
+         <span class="kind">${escapeHtml(i.kind)}</span>${srcBadge}${compBadge}${impBadge}
          <span class="body">${renderBody(i.body)}${orig}${recompressRow}</span>
        </div>
      </div>`;
   }).join('');
+  applySourceKindFilter();
 
   // Wire checkboxes.
   list.querySelectorAll('.hist-check').forEach(chk => {
@@ -1612,6 +1663,20 @@ document.getElementById('sort-importance').onclick = () => {
   const project = currentProject();
   if (project) loadHistory(project, 0);
 };
+document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
+  btn.onclick = () => {
+    HISTORY_SOURCE_FILTER = btn.dataset.sourceKind || 'all';
+    document.querySelectorAll('#source-kind-filter .sort-btn').forEach(x => x.classList.toggle('active', x === btn));
+    SELECTED_IDS.clear();
+    document.querySelectorAll('.hist-check').forEach(c => { c.checked = false; });
+    document.querySelectorAll('.hist-item.selected').forEach(i => i.classList.remove('selected'));
+    syncBulkBar();
+    // Reload from page 0 with the server-side source filter so it spans the
+    // whole project rather than only the rows already on screen.
+    const project = currentProject();
+    if (project) loadHistory(project, 0);
+  };
+});
 
 // Bulk delete — confirm dialog before sending.
 document.getElementById('bulk-delete-btn').onclick = async () => {

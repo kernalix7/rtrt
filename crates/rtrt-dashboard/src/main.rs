@@ -26,6 +26,8 @@
 //! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
 //! `/healthz` probe remain open so the UI can bootstrap.
 
+mod transcripts;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -224,6 +226,7 @@ async fn main() -> Result<()> {
     }
     let memory_for_daemon = memory.clone();
     let memory_for_compress_daemon = memory.clone();
+    let memory_for_transcripts = memory.clone();
     let gateway_for_compress_daemon = gateway.clone();
     let (events_tx, _) = broadcast::channel::<String>(256);
     // Build the Ollama embedder when enabled in config / env.
@@ -260,6 +263,8 @@ async fn main() -> Result<()> {
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
+    transcripts::spawn_reattribution(memory_for_transcripts.clone());
+    transcripts::spawn_transcript_watcher(memory_for_transcripts);
 
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
@@ -634,6 +639,28 @@ struct ProjectView {
 
 /// `GET /api/projects` — union of registered config entries (path /
 /// security_profile) and memory buckets (mem_count), merged by name.
+/// True when a bucket name looks like a stray subagent / git-worktree artifact
+/// rather than a real project: `agent-<hex>`, `p<n>-<branch>` (worktree branch),
+/// or a long `<hex>-<hex>` session hash. Used to keep the project selector clean.
+fn is_stray_bucket(name: &str) -> bool {
+    let b = name.as_bytes();
+    // agent-a...
+    if let Some(rest) = name.strip_prefix("agent-") {
+        if rest.starts_with('a') {
+            return true;
+        }
+    }
+    // p<digit>...-...  (worktree branch dirs like p18-gap)
+    if b.first() == Some(&b'p')
+        && b.get(1).is_some_and(|c| c.is_ascii_digit())
+        && name.contains('-')
+    {
+        return true;
+    }
+    // long hex-...-hex session hash
+    name.len() >= 24 && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
 async fn list_projects(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
@@ -664,6 +691,13 @@ async fn list_projects(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         drop(guard);
         for (name, count, _last) in projects {
+            // A registered project always shows; an unregistered memory bucket
+            // that looks like a stray subagent / worktree name is hidden from
+            // the selector (its rows are folded under the parent via the
+            // reattribution migration, but the empty bucket name lingers).
+            if !cfg.projects.iter().any(|p| p.name == name) && is_stray_bucket(&name) {
+                continue;
+            }
             views
                 .entry(name.clone())
                 .and_modify(|v| v.mem_count = count)
@@ -1035,6 +1069,9 @@ struct MemoryTimelineQuery {
     /// `recent` (default) — newest first; `importance` — deterministic score descending.
     #[serde(default)]
     sort: Option<String>,
+    /// Restrict to a `source_kind` (`main` / `subagent`). Absent = all rows.
+    #[serde(default)]
+    source_kind: Option<String>,
 }
 
 fn default_timeline_limit() -> usize {
@@ -1052,15 +1089,16 @@ async fn memory_timeline(
     let guard = store.lock().await;
 
     let sort = q.sort.as_deref().unwrap_or("recent");
+    let sk = q.source_kind.as_deref().filter(|s| !s.is_empty());
     let total = guard
-        .count_by_project(&q.project)
+        .count_by_project_filtered(&q.project, sk)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = if sort == "importance" {
         // Importance sort — returns DetailedRecord which already includes
         // body_full, metadata, and a pre-computed score.
         let rows = guard
-            .recent_paged_by_importance(&q.project, q.limit, q.offset)
+            .recent_paged_by_importance_filtered(&q.project, q.limit, q.offset, sk)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -1082,7 +1120,7 @@ async fn memory_timeline(
     } else {
         // Default: newest-first paged view.
         let rows = guard
-            .recent_paged(&q.project, q.limit, q.offset)
+            .recent_paged_filtered(&q.project, q.limit, q.offset, sk)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -1091,12 +1129,15 @@ async fn memory_timeline(
                 // uses (terse when compressed).
                 let full = guard.full_body(r.id).ok().flatten();
                 let compressed = full.is_some();
+                let meta = guard.get_metadata(r.id).ok();
                 let saved_pct = if compressed {
-                    let meta = guard.get_metadata(r.id).ok();
                     compress_saved_pct_from_meta(meta.as_ref())
                 } else {
                     None
                 };
+                // main | subagent — lets the UI split a project's own work from
+                // its subagent / teammate captures.
+                let source_kind = meta.as_ref().and_then(|m| m.get("source_kind")).cloned();
                 serde_json::json!({
                     "id": r.id,
                     "kind": r.kind,
@@ -1106,6 +1147,7 @@ async fn memory_timeline(
                     "compressed": compressed,
                     "created_at": r.created_at,
                     "saved_pct": saved_pct,
+                    "source_kind": source_kind,
                 })
             })
             .collect()

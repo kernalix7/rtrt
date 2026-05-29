@@ -3222,6 +3222,7 @@ dependencies = [
  "rtrt-memory",
  "rtrt-providers",
  "rtrt-proxy",
+ "rtrt-security",
  "rtrt-templates",
  "schemars 0.8.22",
  "serde",

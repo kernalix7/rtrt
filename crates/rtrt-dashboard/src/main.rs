@@ -2119,6 +2119,7 @@ struct ConfigResponse {
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
     embeddings: rtrt_core::config::EmbeddingsConfig,
+    security: rtrt_core::config::SecurityConfig,
     path: String,
 }
 
@@ -2132,6 +2133,7 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
         capture: cfg.capture,
         auto_compress: cfg.auto_compress,
         embeddings: cfg.embeddings,
+        security: cfg.security,
         path,
     }))
 }
@@ -2148,6 +2150,9 @@ struct ConfigWriteRequest {
     /// when absent the on-disk embeddings section is preserved untouched.
     #[serde(default)]
     embeddings: Option<rtrt_core::config::EmbeddingsConfig>,
+    /// Optional global security defaults (default profile). Preserved when absent.
+    #[serde(default)]
+    security: Option<rtrt_core::config::SecurityConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2166,6 +2171,9 @@ async fn post_config(
     cfg.auto_compress = req.auto_compress;
     if let Some(emb) = req.embeddings {
         cfg.embeddings = emb;
+    }
+    if let Some(sec) = req.security {
+        cfg.security = sec;
     }
 
     let path = rtrt_core::Config::default_path().ok_or((

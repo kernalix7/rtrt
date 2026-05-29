@@ -1002,6 +1002,16 @@
               임베딩이 활성화되면 벡터 검색, 비활성이면 BM25로 폴백합니다.
             </div>
           </div>
+          <!-- Security -->
+          <div class="settings-section">
+            <h3>보안</h3>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label" for="setting-default-security-profile">
+                <span>기본 보안 프로파일</span>
+                <select id="setting-default-security-profile"><option value="">로딩 중…</option></select>
+              </label>
+            </div>
+          </div>
           <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
             <button type="submit" class="primary">저장</button>
             <span id="settings-save-result" class="out-meta"></span>
@@ -1166,6 +1176,7 @@ document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate
 // Global project selector
 let PROJECTS_CACHE = [];
 let SECURITY_PROFILES_CACHE = [];
+let GLOBAL_DEFAULT_PROFILE = 'ai-default';
 
 function currentProject() {
   return document.getElementById('project-selector').value;
@@ -1240,7 +1251,7 @@ async function populateSecurityProfileSelect(selectId, selected) {
     select.innerHTML = '<option value="">프로파일 없음</option>';
     return [];
   }
-  const desired = profiles.includes(selected) ? selected : (profiles.includes('ai-default') ? 'ai-default' : profiles[0]);
+  const desired = profiles.includes(selected) ? selected : (profiles.includes(GLOBAL_DEFAULT_PROFILE) ? GLOBAL_DEFAULT_PROFILE : profiles[0]);
   select.innerHTML = profiles.map(name =>
     `<option value="${escapeAttr(name)}"${name === desired ? ' selected' : ''}>${escapeHtml(name)}</option>`
   ).join('');
@@ -1294,7 +1305,7 @@ async function openProjectModal(forceNew) {
   const project = forceNew ? null : selectedProject();
   document.getElementById('project-name-input').value = project ? project.name : '';
   document.getElementById('project-path-input').value = project && project.path ? project.path : '';
-  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : 'ai-default');
+  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : GLOBAL_DEFAULT_PROFILE);
   document.getElementById('project-modal').hidden = false;
   setTimeout(() => document.getElementById('project-name-input').focus(), 0);
 }
@@ -1313,7 +1324,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const name = document.getElementById('project-name-input').value.trim();
   const path = document.getElementById('project-path-input').value.trim();
-  const security_profile = document.getElementById('project-security-profile-select').value || 'ai-default';
+  const security_profile = document.getElementById('project-security-profile-select').value || GLOBAL_DEFAULT_PROFILE;
   if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
   try {
     const r = await fetch('/api/projects', {
@@ -3426,6 +3437,10 @@ async function loadConfig() {
   const cap = d.capture || {};
   const ac = d.auto_compress || {};
   const emb = d.embeddings || {};
+  const securityDefaultProfile = d.security?.default_profile;
+  if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+    GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+  }
   const bool = (v) => !!v;
   document.getElementById('cfg-capture-enabled').checked = bool(cap.enabled);
   document.getElementById('cfg-capture-redact').checked = bool(cap.redact);
@@ -3445,6 +3460,7 @@ async function loadConfig() {
   document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
   document.getElementById('cfg-emb-model').value = emb.model || '';
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
+  await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {
@@ -3469,6 +3485,9 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       model: document.getElementById('cfg-emb-model').value || null,
       base_url: document.getElementById('cfg-emb-base-url').value || null,
     },
+    security: {
+      default_profile: document.getElementById('setting-default-security-profile').value,
+    },
   };
   const result = document.getElementById('settings-save-result');
   result.textContent = '저장 중…';
@@ -3482,7 +3501,9 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
     return;
   }
   result.innerHTML = '<span class="badge ok">✓ 저장됨</span>';
+  GLOBAL_DEFAULT_PROFILE = body.security.default_profile || GLOBAL_DEFAULT_PROFILE;
   pushActivity('설정 저장 완료');
+  showToast('설정 저장 완료', 'ok');
 };
 
 document.getElementById('compress-now-btn').onclick = async () => {
@@ -3848,7 +3869,7 @@ function renderSecurityProfileSummary(profile) {
 }
 
 async function loadSecurityProfiles(selected) {
-  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : 'ai-default';
+  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : GLOBAL_DEFAULT_PROFILE;
   await populateSecurityProfileSelect('security-profile-select', selected || bound);
 }
 
@@ -3865,7 +3886,7 @@ function refreshSecurityScope() {
   if (meta) meta.textContent = msg ? '' : `${currentProject()} · ${projectPath()}`;
   if (!msg) {
     const p = selectedProject();
-    loadSecurityProfiles(p && p.security_profile ? p.security_profile : 'ai-default');
+    loadSecurityProfiles(p && p.security_profile ? p.security_profile : GLOBAL_DEFAULT_PROFILE);
   }
 }
 

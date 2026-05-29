@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod security;
 mod service;
 mod setup;
 
@@ -190,6 +191,11 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
+    },
+    /// Security scanning and profile management.
+    Security {
+        #[command(subcommand)]
+        cmd: security::SecurityCmd,
     },
     /// Extract top-level signatures from source via tree-sitter (drops bodies).
     Signatures {
@@ -981,6 +987,7 @@ async fn main() -> Result<()> {
             };
             service::run(plan)?;
         }
+        Cmd::Security { cmd } => security::run(cmd)?,
         Cmd::RepoMap {
             root,
             max_bytes,

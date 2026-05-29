@@ -1,4 +1,228 @@
 name = "owasp-top-10"
-description = "PLACEHOLDER — filled by security-profiles workflow."
+description = "OWASP Top 10 (2021) — statically detectable risks across A01–A10. One or more rules per category, mapped to CWE and OWASP controls."
 severity_threshold = "high"
-rules = []
+
+# ─── A01:2021 Broken Access Control ──────────────────────────────────────────
+
+[[rules]]
+id = "a01.missing-authz-check"
+engine = "patterns"
+severity = "high"
+description = "Handler or route function reaches a data store without an apparent authorization guard. Heuristic: async fn named 'get_', 'list_', 'delete_', 'update_' that contains a SQL/query call but no 'auth', 'require', 'guard', 'permission', 'role', or 'is_admin' call on the same logical path."
+match = "(?i)async fn (get_|list_|delete_|update_|fetch_)[A-Za-z_]+[^}]{0,600}(query|execute|find_by|select)[^}]{0,200}\\)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-862", "CWE-285"]
+owasp = ["A01:2021-Broken Access Control"]
+asvs = ["4.1.1", "4.1.3"]
+nist = ["AC-3", "AC-6"]
+
+# ─── A02:2021 Cryptographic Failures ─────────────────────────────────────────
+
+[[rules]]
+id = "a02.weak-crypto-algorithm"
+engine = "patterns"
+severity = "high"
+description = "Use of broken or weak cryptographic algorithms: MD5, SHA-1, DES, RC4, or ECB mode. These offer insufficient collision or confidentiality guarantees for security-sensitive data."
+match = "(?i)(Md5|Sha1|HmacSha1|des::|Rc4|AesCbc|AesEcb|ecb_mode|MessageDigest::md5|DigestAlgorithm::SHA1)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-327", "CWE-328"]
+owasp = ["A02:2021-Cryptographic Failures"]
+asvs = ["6.2.2", "6.2.5"]
+nist = ["SC-13", "SC-28"]
+
+[[rules]]
+id = "a02.hardcoded-secret"
+engine = "secrets"
+severity = "critical"
+description = "Hardcoded secrets, API keys, private keys, or high-entropy credential strings committed to source. Covers AWS keys, GitHub tokens, Stripe keys, JWTs, and generic high-entropy assignments."
+
+[rules.standards]
+cwe = ["CWE-321", "CWE-798"]
+owasp = ["A02:2021-Cryptographic Failures"]
+asvs = ["2.10.4", "6.4.1"]
+nist = ["IA-5", "SC-12"]
+
+# ─── A03:2021 Injection ───────────────────────────────────────────────────────
+
+[[rules]]
+id = "a03.command-injection"
+engine = "patterns"
+severity = "critical"
+description = "User-supplied input passed directly to Command::new or a shell-execution API without validation or allowlist. An attacker can inject arbitrary OS commands."
+match = "Command::new\\([^)\"']{8,}\\)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-78"]
+owasp = ["A03:2021-Injection"]
+asvs = ["5.3.8"]
+nist = ["SI-10"]
+
+[[rules]]
+id = "a03.sql-format-injection"
+engine = "patterns"
+severity = "critical"
+description = "SQL query built with string formatting (format!, concat, +) instead of parameterised queries. Even one interpolation point allows SQL injection."
+match = "(?i)(format!|concat!|String::from)[^;]{0,120}(SELECT|INSERT|UPDATE|DELETE|WHERE)[^;]{0,120}\\{"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-89"]
+owasp = ["A03:2021-Injection"]
+asvs = ["5.3.4", "5.3.5"]
+nist = ["SI-10"]
+
+# ─── A05:2021 Security Misconfiguration ──────────────────────────────────────
+
+[[rules]]
+id = "a05.debug-mode-enabled"
+engine = "patterns"
+severity = "medium"
+description = "Debug or development mode flag left enabled in source. Debug mode may expose stack traces, internal state, or disable security controls in production."
+match = "(?i)(debug\\s*=\\s*true|enable_debug\\s*=\\s*true|dev_mode\\s*=\\s*true|RUST_BACKTRACE\\s*=\\s*\"full\")"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-489", "CWE-215"]
+owasp = ["A05:2021-Security Misconfiguration"]
+asvs = ["14.1.2"]
+nist = ["CM-6", "CM-7"]
+
+[[rules]]
+id = "a05.wildcard-cors"
+engine = "patterns"
+severity = "high"
+description = "CORS policy allows any origin ('*'). This disables the same-origin protection for any response that includes credentials or sensitive data."
+match = "(?i)(allow_origin|Access-Control-Allow-Origin|AllowOrigin)[^\\n]{0,80}[\"'*][*][\"']"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-942", "CWE-346"]
+owasp = ["A05:2021-Security Misconfiguration"]
+asvs = ["14.5.3"]
+nist = ["SC-8", "SC-18"]
+
+[[rules]]
+id = "a05.bind-all-interfaces"
+engine = "patterns"
+severity = "medium"
+description = "Server binds to 0.0.0.0 (all interfaces). In production or containerised environments this may expose the service on unintended network interfaces."
+match = "\"0\\.0\\.0\\.0\""
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-605"]
+owasp = ["A05:2021-Security Misconfiguration"]
+asvs = ["14.4.1"]
+nist = ["CM-7", "SC-7"]
+
+# ─── A06:2021 Vulnerable and Outdated Components ─────────────────────────────
+
+[[rules]]
+id = "a06.dependency-advisories"
+engine = "deps"
+severity = "high"
+description = "Project dependencies contain known security advisories (RustSec). Outdated or vulnerable transitive dependencies are a leading supply-chain risk."
+db = "rustsec"
+forbid_wildcard = true
+forbid_yanked = true
+
+[rules.standards]
+cwe = ["CWE-1104"]
+owasp = ["A06:2021-Vulnerable and Outdated Components"]
+asvs = ["14.2.1"]
+nist = ["SA-10", "RA-5"]
+slsa = ["dependency-review-L1"]
+
+# ─── A07:2021 Identification and Authentication Failures ─────────────────────
+
+[[rules]]
+id = "a07.jwt-none-algorithm"
+engine = "patterns"
+severity = "critical"
+description = "JWT decoded or verified with algorithm='none' or Algorithm::None. This bypasses signature verification, allowing arbitrary token forgery."
+match = "(?i)(algorithm\\s*[:=]\\s*[\"']none[\"']|Algorithm::None|alg.*none)"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-347", "CWE-287"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+asvs = ["3.5.3"]
+nist = ["IA-3", "IA-5"]
+
+[[rules]]
+id = "a07.hardcoded-credentials"
+engine = "secrets"
+severity = "critical"
+description = "Hardcoded authentication credentials (passwords, tokens, API keys) embedded in source. Shared credentials cannot be individually revoked and leak via repository access."
+
+[rules.standards]
+cwe = ["CWE-798", "CWE-259"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+asvs = ["2.10.4"]
+nist = ["IA-5", "IA-9"]
+
+# ─── A08:2021 Software and Data Integrity Failures ───────────────────────────
+
+[[rules]]
+id = "a08.git-path-dependency"
+engine = "deps"
+severity = "high"
+description = "Cargo.lock or Cargo.toml references a git or local-path dependency. These bypass the crates.io supply-chain and may introduce unreviewed or mutable code."
+forbid_git = true
+
+[rules.standards]
+cwe = ["CWE-494", "CWE-829"]
+owasp = ["A08:2021-Software and Data Integrity Failures"]
+asvs = ["10.3.2"]
+nist = ["SA-10", "SI-7"]
+slsa = ["provenance-L2"]
+
+[[rules]]
+id = "a08.suspicious-base64-blob"
+engine = "ai"
+severity = "medium"
+description = "Long base64 literal (>=120 chars) embedded in source. Could indicate a smuggled payload, encoded shellcode, or a secret that evaded the secrets scanner."
+check = "base64-blob"
+
+[rules.standards]
+cwe = ["CWE-506", "CWE-494"]
+owasp = ["A08:2021-Software and Data Integrity Failures"]
+asvs = ["10.3.1"]
+nist = ["SI-7", "SA-15"]
+
+# ─── A09:2021 Security Logging and Monitoring Failures ───────────────────────
+
+[[rules]]
+id = "a09.secret-in-log"
+engine = "patterns"
+severity = "high"
+description = "Secret, password, or token value passed directly to a logging macro (log::info!, tracing::info!, println!, eprintln!). Secrets must never be written to log sinks."
+match = "(?i)(log::|tracing::|println!|eprintln!|debug!|info!|warn!|error!)[^;]{0,200}(password|passwd|secret|api_key|token|credential|auth_header)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-532", "CWE-312"]
+owasp = ["A09:2021-Security Logging and Monitoring Failures"]
+asvs = ["7.1.1", "7.1.2"]
+nist = ["AU-3", "AU-9", "SI-12"]
+
+# ─── A10:2021 Server-Side Request Forgery ─────────────────────────────────────
+
+[[rules]]
+id = "a10.ssrf-user-controlled-url"
+engine = "patterns"
+severity = "high"
+description = "User-supplied input used as a URL in an HTTP client request without host allowlisting. Attackers can redirect requests to internal services (SSRF)."
+match = "(?i)(reqwest|ureq|hyper|surf)::[a-z_]*get[^;]{0,160}(url|uri|endpoint|target|host|req\\.)[^;]{0,80}\\)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-918"]
+owasp = ["A10:2021-Server-Side Request Forgery"]
+asvs = ["5.2.6"]
+nist = ["SI-10", "SC-7"]

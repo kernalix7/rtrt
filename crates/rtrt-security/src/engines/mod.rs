@@ -13,10 +13,10 @@ use crate::engine::Engine;
 /// route to, so listing them all here is cheap.
 pub fn registry() -> Vec<Box<dyn Engine>> {
     vec![
-        Box::new(secrets::SecretsEngine::default()),
-        Box::new(licenses::LicensesEngine::default()),
-        Box::new(deps::DepsEngine::default()),
-        Box::new(patterns::PatternsEngine::default()),
-        Box::new(ai::AiEngine::default()),
+        Box::new(secrets::SecretsEngine),
+        Box::new(licenses::LicensesEngine),
+        Box::new(deps::DepsEngine),
+        Box::new(patterns::PatternsEngine),
+        Box::new(ai::AiEngine),
     ]
 }

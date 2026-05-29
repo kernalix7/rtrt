@@ -404,16 +404,33 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<MemoryRecord>> {
+        self.recent_paged_filtered(project, limit, offset, None)
+    }
+
+    /// Like [`recent_paged`] but optionally restricted to rows whose
+    /// `metadata.source_kind` equals `source_kind` (e.g. `"main"` / `"subagent"`).
+    /// `None` returns every row — the server-side half of the memory page's
+    /// 전체 / 메인 / 서브 filter, so the filter spans the whole project rather
+    /// than just the current page.
+    pub fn recent_paged_filtered(
+        &self,
+        project: &str,
+        limit: usize,
+        offset: usize,
+        source_kind: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, project, kind, body, created_at, scope FROM memories \
-                  WHERE project = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
+                  WHERE project = ?1 \
+                    AND (?4 IS NULL OR json_extract(metadata, '$.source_kind') = ?4) \
+                  ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         let rows = stmt
             .query_map(
-                rusqlite::params![project, limit as i64, offset as i64],
+                rusqlite::params![project, limit as i64, offset as i64, source_kind],
                 |row| {
                     let scope: String = row.get(5)?;
                     Ok(MemoryRecord {
@@ -503,11 +520,23 @@ impl MemoryStore {
     /// Row count for one project. Used by paginated views to compute the
     /// total page count without scanning every row client-side.
     pub fn count_by_project(&self, project: &str) -> Result<usize> {
+        self.count_by_project_filtered(project, None)
+    }
+
+    /// [`count_by_project`] optionally restricted by `metadata.source_kind`, so
+    /// the paged total matches a source-filtered timeline.
+    pub fn count_by_project_filtered(
+        &self,
+        project: &str,
+        source_kind: Option<&str>,
+    ) -> Result<usize> {
         let n: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM memories WHERE project = ?1",
-                rusqlite::params![project],
+                "SELECT COUNT(*) FROM memories \
+                  WHERE project = ?1 \
+                    AND (?2 IS NULL OR json_extract(metadata, '$.source_kind') = ?2)",
+                rusqlite::params![project, source_kind],
                 |row| row.get(0),
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
@@ -1341,6 +1370,18 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<DetailedRecord>> {
+        self.recent_paged_by_importance_filtered(project, limit, offset, None)
+    }
+
+    /// [`recent_paged_by_importance`] optionally restricted by
+    /// `metadata.source_kind`.
+    pub fn recent_paged_by_importance_filtered(
+        &self,
+        project: &str,
+        limit: usize,
+        offset: usize,
+        source_kind: Option<&str>,
+    ) -> Result<Vec<DetailedRecord>> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1354,27 +1395,31 @@ impl MemoryStore {
             .prepare(
                 "SELECT id, project, kind, body, body_full, created_at, scope, metadata \
                    FROM memories WHERE project = ?1 \
+                    AND (?3 IS NULL OR json_extract(metadata, '$.source_kind') = ?3) \
                   ORDER BY created_at DESC, id DESC LIMIT ?2",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![project, fetch_limit as i64], |row| {
-                let scope_str: String = row.get(6)?;
-                let meta_str: String = row.get(7)?;
-                let body: String = row.get(3)?;
-                let body_full: Option<String> = row.get(4)?;
-                let created_at: i64 = row.get(5)?;
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    body,
-                    body_full,
-                    created_at,
-                    scope_str,
-                    meta_str,
-                ))
-            })
+            .query_map(
+                rusqlite::params![project, fetch_limit as i64, source_kind],
+                |row| {
+                    let scope_str: String = row.get(6)?;
+                    let meta_str: String = row.get(7)?;
+                    let body: String = row.get(3)?;
+                    let body_full: Option<String> = row.get(4)?;
+                    let created_at: i64 = row.get(5)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        body,
+                        body_full,
+                        created_at,
+                        scope_str,
+                        meta_str,
+                    ))
+                },
+            )
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         let mut records: Vec<DetailedRecord> = Vec::new();

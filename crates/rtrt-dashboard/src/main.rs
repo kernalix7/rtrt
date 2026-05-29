@@ -1069,6 +1069,9 @@ struct MemoryTimelineQuery {
     /// `recent` (default) — newest first; `importance` — deterministic score descending.
     #[serde(default)]
     sort: Option<String>,
+    /// Restrict to a `source_kind` (`main` / `subagent`). Absent = all rows.
+    #[serde(default)]
+    source_kind: Option<String>,
 }
 
 fn default_timeline_limit() -> usize {
@@ -1086,15 +1089,16 @@ async fn memory_timeline(
     let guard = store.lock().await;
 
     let sort = q.sort.as_deref().unwrap_or("recent");
+    let sk = q.source_kind.as_deref().filter(|s| !s.is_empty());
     let total = guard
-        .count_by_project(&q.project)
+        .count_by_project_filtered(&q.project, sk)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = if sort == "importance" {
         // Importance sort — returns DetailedRecord which already includes
         // body_full, metadata, and a pre-computed score.
         let rows = guard
-            .recent_paged_by_importance(&q.project, q.limit, q.offset)
+            .recent_paged_by_importance_filtered(&q.project, q.limit, q.offset, sk)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -1116,7 +1120,7 @@ async fn memory_timeline(
     } else {
         // Default: newest-first paged view.
         let rows = guard
-            .recent_paged(&q.project, q.limit, q.offset)
+            .recent_paged_filtered(&q.project, q.limit, q.offset, sk)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {

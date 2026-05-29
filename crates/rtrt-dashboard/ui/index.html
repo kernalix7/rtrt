@@ -1455,7 +1455,11 @@ async function loadHistory(name, offset) {
   syncBulkBar();
   const list = document.getElementById('history-list');
   list.innerHTML = '<div class="empty">불러오는 중…</div>';
-  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}`);
+  // Server-side source filter so 메인/서브 spans the whole project, not just
+  // the current page.
+  const skParam = (HISTORY_SOURCE_FILTER && HISTORY_SOURCE_FILTER !== 'all')
+    ? `&source_kind=${encodeURIComponent(HISTORY_SOURCE_FILTER)}` : '';
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}${skParam}`);
   if (!r.ok) {
     const text = await r.text();
     showToast(`메모리 히스토리 로드 실패 ${r.status}: ${text}`, 'err');
@@ -1667,7 +1671,10 @@ document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
     document.querySelectorAll('.hist-check').forEach(c => { c.checked = false; });
     document.querySelectorAll('.hist-item.selected').forEach(i => i.classList.remove('selected'));
     syncBulkBar();
-    applySourceKindFilter();
+    // Reload from page 0 with the server-side source filter so it spans the
+    // whole project rather than only the rows already on screen.
+    const project = currentProject();
+    if (project) loadHistory(project, 0);
   };
 });
 

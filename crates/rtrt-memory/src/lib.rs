@@ -318,6 +318,54 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Stamp a transcript-captured row's `source_kind` (`main` | `subagent`)
+    /// into its metadata, and optionally move it to a different project. The FTS
+    /// index mirrors only the body, so changing `project` needs no FTS sync.
+    /// One UPDATE via `json_set` so a row is never left half-migrated.
+    pub fn reattribute(&self, id: i64, source_kind: &str, project: Option<&str>) -> Result<()> {
+        match project {
+            Some(p) => self.conn.execute(
+                "UPDATE memories \
+                    SET project = ?3, \
+                        metadata = json_set(COALESCE(metadata, '{}'), '$.source_kind', ?2) \
+                  WHERE id = ?1",
+                rusqlite::params![id, source_kind, p],
+            ),
+            None => self.conn.execute(
+                "UPDATE memories \
+                    SET metadata = json_set(COALESCE(metadata, '{}'), '$.source_kind', ?2) \
+                  WHERE id = ?1",
+                rusqlite::params![id, source_kind],
+            ),
+        }
+        .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Transcript-captured rows not yet classified — `source = "transcript"`
+    /// with no `source_kind` in metadata. Returns `(id, transcript_file)` so the
+    /// caller can decide main vs subagent (by whether the path is under a
+    /// `subagents/` dir), resolve the real parent project for subagents, and
+    /// stamp the result via [`reattribute`]. Idempotent: once stamped a row
+    /// drops out of this set.
+    pub fn reattribution_candidates(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf \
+                   FROM memories m \
+                  WHERE json_extract(m.metadata, '$.source') = 'transcript' \
+                    AND json_extract(m.metadata, '$.source_kind') IS NULL \
+                    AND tf IS NOT NULL",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
     /// Returns one summary row per project — `(project, count, latest_ts)` —
     /// so the dashboard can present a project picker without scanning the
     /// whole table on the client.

@@ -20,6 +20,22 @@ pub struct Config {
     pub auto_compress: AutoCompressConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub projects: Vec<ProjectEntry>,
+}
+
+/// A registered project. Either a real repo on disk (`path` set) or a
+/// memory-only project (`path = None`). `security_profile` binds the project
+/// to a named profile; `None` means fall back to `ai-default`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectEntry {
+    pub name: String,
+    /// Absolute repo path; `None` = memory-only project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Bound profile name; `None` = use ai-default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_profile: Option<String>,
 }
 
 /// Dense-embedding knobs. When `enabled = true`, the dashboard and CLI route
@@ -289,6 +305,20 @@ impl Config {
             _ => Ok(Self::default()),
         }
     }
+
+    /// Look up a registered project by name.
+    pub fn project(&self, name: &str) -> Option<&ProjectEntry> {
+        self.projects.iter().find(|p| p.name == name)
+    }
+
+    /// Insert or replace a project entry, matching on `name`.
+    pub fn upsert_project(&mut self, entry: ProjectEntry) {
+        if let Some(existing) = self.projects.iter_mut().find(|p| p.name == entry.name) {
+            *existing = entry;
+        } else {
+            self.projects.push(entry);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +363,43 @@ mod tests {
     #[test]
     fn malformed_toml_errors() {
         assert!(Config::from_toml_str("[auto_compress\nmodel =").is_err());
+    }
+
+    #[test]
+    fn upsert_replaces_by_name_no_dup() {
+        let mut c = Config::default();
+        c.upsert_project(ProjectEntry {
+            name: "alpha".to_string(),
+            path: Some("/repo/alpha".to_string()),
+            security_profile: None,
+        });
+        c.upsert_project(ProjectEntry {
+            name: "beta".to_string(),
+            path: None,
+            security_profile: Some("strict".to_string()),
+        });
+        // replace alpha
+        c.upsert_project(ProjectEntry {
+            name: "alpha".to_string(),
+            path: Some("/repo/alpha-2".to_string()),
+            security_profile: Some("ai-default".to_string()),
+        });
+        assert_eq!(c.projects.len(), 2);
+        let alpha = c.project("alpha").unwrap();
+        assert_eq!(alpha.path.as_deref(), Some("/repo/alpha-2"));
+        assert_eq!(alpha.security_profile.as_deref(), Some("ai-default"));
+    }
+
+    #[test]
+    fn project_finds_and_none() {
+        let mut c = Config::default();
+        assert!(c.project("missing").is_none());
+        c.upsert_project(ProjectEntry {
+            name: "gamma".to_string(),
+            path: None,
+            security_profile: None,
+        });
+        assert!(c.project("gamma").is_some());
+        assert!(c.project("nope").is_none());
     }
 }

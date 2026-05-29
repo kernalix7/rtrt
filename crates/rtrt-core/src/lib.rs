@@ -8,7 +8,7 @@ pub mod error;
 pub mod plugin;
 pub mod token;
 
-pub use config::Config;
+pub use config::{Config, ProjectEntry};
 pub use error::{Error, Result};
 pub use plugin::{Plugin, PluginKind, PluginMetadata};
 pub use token::{CompressionLevel, TokenCount, TokenStats};

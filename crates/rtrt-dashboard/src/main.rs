@@ -1182,27 +1182,32 @@ async fn memory_graph(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
-    let records = guard
-        .list_by_project(&q.project, q.limit)
+    let graph = guard
+        .graph_bipartite(&q.project, q.limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let edges = guard
-        .project_edges(&q.project)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let nodes: Vec<serde_json::Value> = records
-        .into_iter()
-        .map(|r| {
-            let preview: String = r.body.chars().take(60).collect();
-            serde_json::json!({
-                "id": r.id,
-                "kind": r.kind,
-                "scope": r.scope,
-                "preview": preview,
-            })
-        })
-        .collect();
-    let edges: Vec<serde_json::Value> = edges
-        .into_iter()
-        .map(|(s, d, rel)| serde_json::json!({"src": s, "dst": d, "relation": rel}))
+    let mut nodes: Vec<serde_json::Value> =
+        Vec::with_capacity(graph.memories.len() + graph.entities.len());
+    for m in &graph.memories {
+        nodes.push(serde_json::json!({
+            "id": format!("m{}", m.id),
+            "node_type": "memory",
+            "label": m.preview,
+            "kind": m.kind,
+            "source_kind": m.source_kind,
+        }));
+    }
+    for e in &graph.entities {
+        nodes.push(serde_json::json!({
+            "id": format!("e{}", e.id),
+            "node_type": "entity",
+            "label": e.name,
+            "degree": e.degree,
+        }));
+    }
+    let edges: Vec<serde_json::Value> = graph
+        .links
+        .iter()
+        .map(|(mem_id, ent_id)| serde_json::json!({"src": format!("m{mem_id}"), "dst": format!("e{ent_id}")}))
         .collect();
     Ok(Json(serde_json::json!({
         "nodes": nodes,
@@ -2766,7 +2771,6 @@ async fn memory_entities(
     };
 
     let summariser = rtrt_memory::LlmSummariser::new(Box::new(GatewayAdapter(llm_gateway)), model);
-    let relation = "mentions";
 
     // `MemoryStore` is `!Sync` (rusqlite `Connection`), so no `&MemoryStore`
     // borrow may live across an `.await`. Mirror the auto-compress daemon: do
@@ -2794,7 +2798,7 @@ async fn memory_entities(
     let new_edges = {
         let guard = store.lock().await;
         guard
-            .link_extracted(&req.project, &extracted, relation)
+            .link_extracted_bipartite(&req.project, &extracted)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "edges": new_edges })))

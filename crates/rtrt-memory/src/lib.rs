@@ -118,6 +118,35 @@ pub struct UniqueIngest {
     pub skipped: usize,
 }
 
+/// A memory node in the bipartite entity graph.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemNode {
+    pub id: i64,
+    pub kind: String,
+    /// First 60 chars of the body.
+    pub preview: String,
+    /// `metadata.$.source_kind` (`main` / `subagent`), absent when unset.
+    pub source_kind: Option<String>,
+}
+
+/// An entity node in the bipartite entity graph.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntNode {
+    pub id: i64,
+    pub name: String,
+    /// Number of memories linked to this entity.
+    pub degree: usize,
+}
+
+/// Bipartite memory↔entity graph for one project: memory nodes, entity nodes,
+/// and the `(memory_id, entity_id)` links between them.
+#[derive(Debug, Clone, Serialize)]
+pub struct BipartiteGraph {
+    pub memories: Vec<MemNode>,
+    pub entities: Vec<EntNode>,
+    pub links: Vec<(i64, i64)>,
+}
+
 /// Prefix applied to the `kind` column for Letta-style memory blocks.
 const BLOCK_KIND_PREFIX: &str = "block:";
 
@@ -271,6 +300,35 @@ impl MemoryStore {
                     r#"
                     ALTER TABLE memories ADD COLUMN body_full TEXT;
                     PRAGMA user_version = 6;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
+        // v7: bipartite entity graph. `entities` holds the deduped entity names
+        // per project; `memory_entities` is the join table linking a memory to
+        // every entity it mentions. This is additive — the BM25-driven `edges`
+        // path (memory↔memory) stays intact for other features; the bipartite
+        // tables let the dashboard render a memory/entity graph directly.
+        if v < 7 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS entities (
+                        id      INTEGER PRIMARY KEY,
+                        project TEXT NOT NULL,
+                        name    TEXT NOT NULL,
+                        UNIQUE(project, name)
+                    );
+                    CREATE TABLE IF NOT EXISTS memory_entities (
+                        memory_id INTEGER NOT NULL,
+                        entity_id INTEGER NOT NULL,
+                        UNIQUE(memory_id, entity_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+                        ON memory_entities(entity_id);
+                    CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+                        ON memory_entities(memory_id);
+                    PRAGMA user_version = 7;
                     "#,
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
@@ -1700,6 +1758,147 @@ impl MemoryStore {
         Ok(new_edges)
     }
 
+    /// Insert an entity for `project` if absent, returning its id. Dedups on the
+    /// `(project, name)` unique constraint.
+    pub fn upsert_entity(&self, project: &str, name: &str) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO entities (project, name) VALUES (?1, ?2)",
+                rusqlite::params![project, name],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.conn
+            .query_row(
+                "SELECT id FROM entities WHERE project = ?1 AND name = ?2",
+                rusqlite::params![project, name],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Link a memory to an entity. Idempotent via the `(memory_id, entity_id)`
+    /// unique constraint; returns `true` only when a new link was created.
+    pub fn link_memory_entity(&self, memory_id: i64, entity_id: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id) VALUES (?1, ?2)",
+                rusqlite::params![memory_id, entity_id],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
+    /// Bipartite half of entity linking: given entities already extracted per
+    /// source memory, upsert each entity and link the memory to it. Returns the
+    /// count of *new* links created. Synchronous and `Send`-safe so axum
+    /// handlers can run the async extraction without holding a `&self` borrow
+    /// across an `.await`.
+    pub fn link_extracted_bipartite(
+        &self,
+        project: &str,
+        extracted: &[(i64, Vec<String>)],
+    ) -> Result<usize> {
+        let mut new_links = 0usize;
+        for (memory_id, names) in extracted {
+            for name in names {
+                let cleaned = name.trim().replace('"', "");
+                let cleaned = cleaned.trim();
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let entity_id = self.upsert_entity(project, cleaned)?;
+                if self.link_memory_entity(*memory_id, entity_id)? {
+                    new_links += 1;
+                }
+            }
+        }
+        Ok(new_links)
+    }
+
+    /// Build the bipartite memory↔entity graph for `project`: up to `limit`
+    /// memories, the project's entities, and the links between them. Each
+    /// entity's `degree` is its linked-memory count; a memory's `source_kind`
+    /// is read from `metadata.$.source_kind`.
+    pub fn graph_bipartite(&self, project: &str, limit: usize) -> Result<BipartiteGraph> {
+        let mut mem_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind') \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC \
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let memories: Vec<MemNode> = mem_stmt
+            .query_map(rusqlite::params![project, limit as i64], |r| {
+                let body: String = r.get(2)?;
+                Ok(MemNode {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    preview: body.chars().take(60).collect(),
+                    source_kind: r.get(3)?,
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let mem_ids: std::collections::HashSet<i64> = memories.iter().map(|m| m.id).collect();
+
+        let mut ent_stmt = self
+            .conn
+            .prepare(
+                "SELECT e.id, e.name, COUNT(me.memory_id) \
+                   FROM entities e \
+                   LEFT JOIN memory_entities me ON me.entity_id = e.id \
+                  WHERE e.project = ?1 \
+                  GROUP BY e.id, e.name",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let entities: Vec<EntNode> = ent_stmt
+            .query_map(rusqlite::params![project], |r| {
+                let degree: i64 = r.get(2)?;
+                Ok(EntNode {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    degree: degree as usize,
+                })
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let ent_ids: std::collections::HashSet<i64> = entities.iter().map(|e| e.id).collect();
+
+        let mut link_stmt = self
+            .conn
+            .prepare(
+                "SELECT me.memory_id, me.entity_id \
+                   FROM memory_entities me \
+                   JOIN entities e ON e.id = me.entity_id \
+                  WHERE e.project = ?1",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let links: Vec<(i64, i64)> = link_stmt
+            .query_map(rusqlite::params![project], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .into_iter()
+            // Keep only links whose memory survived the `limit` cap and whose
+            // entity belongs to this project.
+            .filter(|(m, e)| mem_ids.contains(m) && ent_ids.contains(e))
+            .collect();
+
+        Ok(BipartiteGraph {
+            memories,
+            entities,
+            links,
+        })
+    }
+
     /// Letta / MemGPT-style alias for [`compress_project`]: archives the
     /// oldest entries beyond `hot_limit` into a single summary while keeping
     /// the hot context intact. Returns the new archival entry id, if any.
@@ -2328,5 +2527,90 @@ mod tests {
         let go_hits = store.recall_bm25("p2", "module", 5).unwrap();
         assert_eq!(go_hits.len(), 1);
         assert!(go_hits[0].body.contains("module"));
+    }
+
+    #[test]
+    fn upsert_entity_dedups_by_project_name() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store.upsert_entity("p1", "rust").unwrap();
+        let b = store.upsert_entity("p1", "rust").unwrap();
+        assert_eq!(a, b, "same (project,name) must return the same id");
+        // Same name, different project is a distinct entity.
+        let c = store.upsert_entity("p2", "rust").unwrap();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn link_memory_entity_is_idempotent() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let mem = store.save("p1", "note", "rust is fast").unwrap();
+        let ent = store.upsert_entity("p1", "rust").unwrap();
+        assert!(
+            store.link_memory_entity(mem, ent).unwrap(),
+            "first link new"
+        );
+        assert!(
+            !store.link_memory_entity(mem, ent).unwrap(),
+            "duplicate link must not count"
+        );
+    }
+
+    #[test]
+    fn link_extracted_bipartite_builds_entities_and_links() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let m1 = store.save("p1", "note", "rust and axum").unwrap();
+        let m2 = store.save("p1", "note", "axum handler").unwrap();
+        // m1 -> [rust, axum], m2 -> [axum]; entity names are cleaned/deduped.
+        let extracted = vec![
+            (m1, vec!["rust".to_string(), "\"axum\"".to_string()]),
+            (m2, vec![" axum ".to_string(), "".to_string()]),
+        ];
+        let new_links = store.link_extracted_bipartite("p1", &extracted).unwrap();
+        assert_eq!(new_links, 3, "rust+axum for m1, axum for m2");
+        // Re-running creates no new links (idempotent entities + links).
+        let again = store.link_extracted_bipartite("p1", &extracted).unwrap();
+        assert_eq!(again, 0);
+
+        let graph = store.graph_bipartite("p1", 100).unwrap();
+        assert_eq!(graph.entities.len(), 2, "rust + axum, deduped");
+        assert_eq!(graph.links.len(), 3);
+    }
+
+    #[test]
+    fn graph_bipartite_returns_degree_and_source_kind() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let m1 = store.save("p1", "note", "rust and axum together").unwrap();
+        let m2 = store.save("p1", "note", "axum only here").unwrap();
+        store.reattribute(m1, "main", None).unwrap();
+        store.reattribute(m2, "subagent", None).unwrap();
+        store
+            .link_extracted_bipartite(
+                "p1",
+                &[
+                    (m1, vec!["rust".into(), "axum".into()]),
+                    (m2, vec!["axum".into()]),
+                ],
+            )
+            .unwrap();
+
+        let graph = store.graph_bipartite("p1", 100).unwrap();
+
+        let axum = graph
+            .entities
+            .iter()
+            .find(|e| e.name == "axum")
+            .expect("axum entity present");
+        assert_eq!(axum.degree, 2, "axum linked by m1 and m2");
+        let rust = graph
+            .entities
+            .iter()
+            .find(|e| e.name == "rust")
+            .expect("rust entity present");
+        assert_eq!(rust.degree, 1);
+
+        let mem1 = graph.memories.iter().find(|m| m.id == m1).unwrap();
+        assert_eq!(mem1.source_kind.as_deref(), Some("main"));
+        let mem2 = graph.memories.iter().find(|m| m.id == m2).unwrap();
+        assert_eq!(mem2.source_kind.as_deref(), Some("subagent"));
     }
 }

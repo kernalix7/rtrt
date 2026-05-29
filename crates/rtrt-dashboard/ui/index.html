@@ -147,6 +147,23 @@
 
   /* Graph canvas */
   #graph-canvas { cursor: grab; }
+  .graph-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0 0.5rem; }
+  .graph-controls .sort-row { margin: 0; }
+  .graph-search { min-width: min(260px, 100%); flex: 1 1 220px; }
+  .graph-shell { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 0.75rem; align-items: stretch; }
+  .graph-canvas-wrap { position: relative; min-height: 420px; }
+  #graph-canvas { display: block; width: 100%; height: 420px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+  .graph-empty-state { position: absolute; inset: 1px; display: grid; place-items: center; padding: 1.2rem; background: var(--bg); border-radius: 8px; text-align: center; color: var(--muted); pointer-events: none; }
+  .graph-empty-state[hidden] { display: none; }
+  .graph-detail-panel { min-height: 420px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem; overflow: auto; }
+  .graph-detail-panel h3 { margin: 0 0 0.45rem; font-size: 0.98rem; }
+  .graph-detail-panel .label-preview { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 0.55rem; padding: 0.65rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); font-size: 0.88em; }
+  .graph-detail-panel ul { margin: 0.55rem 0 0; padding-left: 1rem; }
+  .graph-detail-panel li { margin-bottom: 0.35rem; overflow-wrap: anywhere; }
+  @media (max-width: 860px) {
+    .graph-shell { grid-template-columns: 1fr; }
+    .graph-detail-panel { min-height: 180px; }
+  }
 
   /* Memory project picker */
   .proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }
@@ -631,13 +648,35 @@
               <button class="primary" type="submit">맵 새로고침</button>
             </form>
             <div id="graph-meta" class="out-meta"></div>
-            <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
-            <div id="graph-legend" class="graph-legend">
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 노드</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>블록</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티</div>
+            <div class="graph-controls" aria-label="그래프 필터">
+              <div class="sort-row" aria-label="노드 표시">
+                <button id="graph-toggle-memory" class="sort-btn active" type="button" aria-pressed="true">메모리</button>
+                <button id="graph-toggle-entity" class="sort-btn active" type="button" aria-pressed="true">엔티티</button>
+              </div>
+              <div id="graph-source-filter" class="sort-row" aria-label="메모리 출처 필터">
+                <button class="sort-btn active" type="button" data-graph-source="all">전체</button>
+                <button class="sort-btn" type="button" data-graph-source="main">메인</button>
+                <button class="sort-btn" type="button" data-graph-source="subagent">서브</button>
+              </div>
+              <input id="graph-search" class="graph-search" type="search" placeholder="엔티티 또는 메모리 검색">
             </div>
-            <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+            <div class="graph-shell">
+              <div class="graph-canvas-wrap">
+                <canvas id="graph-canvas" width="800" height="420"></canvas>
+                <div id="graph-empty-state" class="graph-empty-state" hidden>
+                  <div>아직 엔티티가 없습니다.<br>상단의 <strong>엔티티 추출</strong> 버튼으로 메모리에서 엔티티를 생성하세요.</div>
+                </div>
+              </div>
+              <div id="graph-detail-panel" class="graph-detail-panel" aria-live="polite">
+                <div class="empty">노드를 클릭하면 상세 정보가 표시됩니다.</div>
+              </div>
+            </div>
+            <div id="graph-legend" class="graph-legend">
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티 · 크기 = 연결 수</div>
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
+              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>메모리 · 서브</div>
+            </div>
+            <div id="graph-tip" class="out-meta">드래그로 노드 이동, 배경 드래그로 이동, 휠로 확대/축소.</div>
           </div>
         </div>
 
@@ -2417,150 +2456,466 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory graph — force-directed canvas layout
+// Memory graph — entity-centric bipartite canvas layout.
+const GRAPH_LIMIT = 300;
 let graphState = null;
+let graphFilters = { showMemory: true, showEntity: true, source: 'all', search: '' };
+
+function graphNodeLabel(n) {
+  return String(n.label || n.preview || n.body || n.name || n.id || '');
+}
+
+function graphNodeSource(n) {
+  return n.source_kind || 'main';
+}
+
+function graphNodeRadius(n) {
+  if (n.node_type === 'entity') {
+    const degree = Math.max(1, Number(n.degree || 1));
+    return 11 + Math.min(20, Math.sqrt(degree) * 3.5);
+  }
+  return 5.5;
+}
+
+function graphNodeVisible(n) {
+  if (n.node_type === 'memory') {
+    if (!graphFilters.showMemory) return false;
+    if (graphFilters.source === 'main' && graphNodeSource(n) === 'subagent') return false;
+    if (graphFilters.source === 'subagent' && graphNodeSource(n) !== 'subagent') return false;
+    return true;
+  }
+  if (n.node_type === 'entity') return graphFilters.showEntity;
+  return true;
+}
+
 function initGraph(data) {
   const canvas = document.getElementById('graph-canvas');
   const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth; const h = canvas.clientHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2962FF';
-  const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#666';
-  const fg = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim() || '#000';
-  // Entity nodes rendered in green to distinguish from memory nodes (blue) and blocks (purple).
+  const detail = document.getElementById('graph-detail-panel');
+  const tip = document.getElementById('graph-tip');
+  const emptyState = document.getElementById('graph-empty-state');
+  const styles = getComputedStyle(document.documentElement);
+  const accent = styles.getPropertyValue('--accent').trim() || '#2962FF';
+  const muted = styles.getPropertyValue('--muted').trim() || '#666';
+  const fg = styles.getPropertyValue('--fg').trim() || '#000';
+  const bg = styles.getPropertyValue('--bg').trim() || '#fff';
   const entityColor = '#16a34a';
+  const subagentColor = '#7c3aed';
 
-  // Initialise nodes with random positions; edges reference node ids.
-  const idIdx = new Map();
-  const nodes = data.nodes.map((n, i) => {
-    idIdx.set(n.id, i);
-    return { ...n, x: w/2 + (Math.random()-0.5)*w*0.6, y: h/2 + (Math.random()-0.5)*h*0.6, vx: 0, vy: 0 };
+  if (graphState && graphState.cleanup) graphState.cleanup();
+
+  const dpr = window.devicePixelRatio || 1;
+  let cw = 1;
+  let ch = 1;
+  function resizeCanvas() {
+    cw = Math.max(1, canvas.clientWidth);
+    ch = Math.max(1, canvas.clientHeight);
+    canvas.width = Math.floor(cw * dpr);
+    canvas.height = Math.floor(ch * dpr);
+  }
+  resizeCanvas();
+
+  const nodes = (data.nodes || []).map((raw, i) => {
+    const node_type = raw.node_type === 'entity' ? 'entity' : 'memory';
+    const angle = (i / Math.max(1, (data.nodes || []).length)) * Math.PI * 2;
+    const ring = node_type === 'entity' ? Math.min(cw, ch) * 0.22 : Math.min(cw, ch) * 0.34;
+    return {
+      ...raw,
+      node_type,
+      label: graphNodeLabel(raw),
+      degree: Number(raw.degree || 0),
+      x: cw / 2 + Math.cos(angle) * ring + (Math.random() - 0.5) * 30,
+      y: ch / 2 + Math.sin(angle) * ring + (Math.random() - 0.5) * 30,
+      vx: 0,
+      vy: 0,
+      fx: null,
+      fy: null,
+    };
   });
-  const edges = data.edges
-    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), rel: e.relation }))
+  const idIdx = new Map(nodes.map((n, i) => [n.id, i]));
+  const edges = (data.edges || [])
+    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), src: e.src, dst: e.dst }))
     .filter(e => e.s !== undefined && e.d !== undefined);
-
-  let hover = -1;
-  let drag = -1;
-  function getXY(ev) {
-    const rect = canvas.getBoundingClientRect();
-    return [ev.clientX - rect.left, ev.clientY - rect.top];
-  }
-  function pick(x, y) {
-    for (let i = nodes.length-1; i >= 0; i--) {
-      const n = nodes[i];
-      const dx = x - n.x; const dy = y - n.y;
-      if (dx*dx + dy*dy < 100) return i;
+  const adjacency = new Map(nodes.map(n => [n.id, new Set()]));
+  const linkedMemoryByEntity = new Map();
+  for (const e of edges) {
+    const a = nodes[e.s];
+    const b = nodes[e.d];
+    adjacency.get(a.id).add(b.id);
+    adjacency.get(b.id).add(a.id);
+    const entity = a.node_type === 'entity' ? a : b.node_type === 'entity' ? b : null;
+    const memory = a.node_type === 'memory' ? a : b.node_type === 'memory' ? b : null;
+    if (entity && memory) {
+      if (!linkedMemoryByEntity.has(entity.id)) linkedMemoryByEntity.set(entity.id, []);
+      linkedMemoryByEntity.get(entity.id).push(memory);
     }
-    return -1;
   }
-  canvas.onmousemove = (ev) => {
-    const [x, y] = getXY(ev);
-    if (drag >= 0) { nodes[drag].x = x; nodes[drag].y = y; nodes[drag].vx = 0; nodes[drag].vy = 0; }
-    const h2 = pick(x, y);
-    if (h2 !== hover) {
-      hover = h2;
-      const tip = document.getElementById('graph-tip');
-      if (hover >= 0) {
-        const n = nodes[hover];
-        const label = n.entity_type ? `[${escapeHtml(n.entity_type)}] ` : '';
-        tip.innerHTML = `<code>#${n.id}</code> ${escapeHtml(n.kind || '')} ${label}— ${escapeHtml((n.preview || '').slice(0, 80))}`;
-      } else {
-        tip.textContent = '노드 위에 마우스를 올리면 내용 미리보기.';
+
+  let view = { x: 0, y: 0, k: 1 };
+  let alpha = 1;
+  let hoverId = null;
+  let selectedId = null;
+  let dragNode = null;
+  let panning = false;
+  let downAt = null;
+  let lastPointer = null;
+  let moved = false;
+  let raf = null;
+  const listeners = [];
+  const hasEntities = nodes.some(n => n.node_type === 'entity');
+  emptyState.hidden = hasEntities;
+
+  function on(target, type, fn, opts) {
+    target.addEventListener(type, fn, opts);
+    listeners.push([target, type, fn, opts]);
+  }
+
+  function eventPoint(ev) {
+    const rect = canvas.getBoundingClientRect();
+    return { sx: ev.clientX - rect.left, sy: ev.clientY - rect.top };
+  }
+
+  function screenToWorld(sx, sy) {
+    return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k };
+  }
+
+  function pickNode(sx, sy) {
+    const p = screenToWorld(sx, sy);
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i];
+      if (!graphNodeVisible(n)) continue;
+      const r = graphNodeRadius(n) + 6 / view.k;
+      if (Math.hypot(p.x - n.x, p.y - n.y) <= r) return n;
+    }
+    return null;
+  }
+
+  function sourceLabel(source) {
+    return source === 'subagent' ? '서브' : '메인';
+  }
+
+  function memoryBadges(n) {
+    return `<span class="badge">${escapeHtml(n.kind || '?')}</span> <span class="badge${graphNodeSource(n) === 'subagent' ? ' source-subagent' : ''}">${sourceLabel(graphNodeSource(n))}</span>`;
+  }
+
+  function switchToHistory() {
+    document.querySelectorAll('#memory-subtabs a').forEach(x => x.classList.remove('active'));
+    const tab = document.querySelector('#memory-subtabs a[data-sub="memhistory"]');
+    if (tab) tab.classList.add('active');
+    document.querySelectorAll('#mem-detail .subpage').forEach(x => x.hidden = true);
+    const page = document.getElementById('sub-memhistory');
+    if (page) page.hidden = false;
+    const project = currentProject();
+    if (project) loadHistory(project, 0);
+  }
+
+  function renderDetail(n) {
+    if (!n) {
+      detail.innerHTML = '<div class="empty">노드를 클릭하면 상세 정보가 표시됩니다.</div>';
+      return;
+    }
+    if (n.node_type === 'memory') {
+      const linkedEntities = Array.from(adjacency.get(n.id) || [])
+        .map(id => nodes[idIdx.get(id)])
+        .filter(x => x && x.node_type === 'entity');
+      detail.innerHTML = `
+        <h3>메모리</h3>
+        <div>${memoryBadges(n)}</div>
+        <div class="label-preview">${escapeHtml(graphNodeLabel(n).slice(0, 700))}</div>
+        <button id="graph-history-link" class="ghost" type="button" style="margin-top:0.65rem;font-size:0.85em;">히스토리에서 보기</button>
+        ${linkedEntities.length ? `<div class="out-meta">연결된 엔티티</div><ul>${linkedEntities.slice(0, 16).map(e => `<li>${escapeHtml(graphNodeLabel(e))}</li>`).join('')}</ul>` : ''}
+      `;
+      const link = document.getElementById('graph-history-link');
+      if (link) link.onclick = switchToHistory;
+      return;
+    }
+    const linkedMemories = (linkedMemoryByEntity.get(n.id) || []).filter(Boolean);
+    detail.innerHTML = `
+      <h3>${escapeHtml(graphNodeLabel(n))}</h3>
+      <div><span class="badge ok">엔티티</span> <span class="badge">${linkedMemories.length} 연결</span></div>
+      ${n.kind ? `<div class="out-meta">kind: <code>${escapeHtml(n.kind)}</code></div>` : ''}
+      <div class="out-meta">연결된 메모리</div>
+      ${linkedMemories.length ? `<ul>${linkedMemories.slice(0, 30).map(m => `<li>${escapeHtml(graphNodeLabel(m).slice(0, 140))}</li>`).join('')}</ul>` : '<div class="empty">연결된 메모리가 없습니다.</div>'}
+    `;
+  }
+
+  function setTip(n) {
+    if (!n) {
+      tip.textContent = '드래그로 노드 이동, 배경 드래그로 이동, 휠로 확대/축소.';
+      return;
+    }
+    const type = n.node_type === 'entity' ? '엔티티' : `메모리/${sourceLabel(graphNodeSource(n))}`;
+    tip.innerHTML = `<code>${escapeHtml(n.id)}</code> ${escapeHtml(type)} — ${escapeHtml(graphNodeLabel(n).slice(0, 100))}`;
+  }
+
+  function isSearchMatch(n) {
+    const q = graphFilters.search.trim().toLowerCase();
+    return q && graphNodeLabel(n).toLowerCase().includes(q);
+  }
+
+  function isRelated(n) {
+    if (!selectedId) return true;
+    return n.id === selectedId || (adjacency.get(selectedId) && adjacency.get(selectedId).has(n.id));
+  }
+
+  function edgeDirection(edge) {
+    const a = nodes[edge.s];
+    const b = nodes[edge.d];
+    if (a.node_type === 'memory' && b.node_type === 'entity') return [a, b];
+    if (b.node_type === 'memory' && a.node_type === 'entity') return [b, a];
+    return [a, b];
+  }
+
+  function drawArrow(from, to) {
+    const fromR = graphNodeRadius(from) + 1;
+    const toR = graphNodeRadius(to) + 2;
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const sx = from.x + (dx / d) * fromR;
+    const sy = from.y + (dy / d) * fromR;
+    const ex = to.x - (dx / d) * toR;
+    const ey = to.y - (dy / d) * toR;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    const size = 5;
+    const angle = Math.atan2(dy, dx);
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - Math.cos(angle - 0.45) * size, ey - Math.sin(angle - 0.45) * size);
+    ctx.lineTo(ex - Math.cos(angle + 0.45) * size, ey - Math.sin(angle + 0.45) * size);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.save();
+    ctx.translate(view.x, view.y);
+    ctx.scale(view.k, view.k);
+    ctx.lineWidth = 1 / Math.sqrt(view.k);
+    ctx.strokeStyle = muted;
+    ctx.fillStyle = muted;
+    for (const e of edges) {
+      const [from, to] = edgeDirection(e);
+      if (!graphNodeVisible(from) || !graphNodeVisible(to)) continue;
+      const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
+      ctx.globalAlpha = selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22;
+      drawArrow(from, to);
+    }
+    ctx.globalAlpha = 1;
+    for (const n of nodes) {
+      if (!graphNodeVisible(n)) continue;
+      const dim = selectedId && !isRelated(n);
+      const searchHit = isSearchMatch(n);
+      const r = graphNodeRadius(n);
+      ctx.globalAlpha = dim ? 0.18 : 1;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = n.node_type === 'entity' ? entityColor : graphNodeSource(n) === 'subagent' ? subagentColor : accent;
+      ctx.fill();
+      if (n.id === selectedId || n.id === hoverId || searchHit) {
+        ctx.globalAlpha = dim ? 0.35 : 1;
+        ctx.strokeStyle = searchHit ? '#fbbf24' : fg;
+        ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
+        ctx.stroke();
+      }
+      if ((n.node_type === 'entity' || n.id === selectedId || searchHit) && view.k > 0.45) {
+        ctx.globalAlpha = dim ? 0.22 : 0.9;
+        ctx.fillStyle = fg;
+        ctx.font = `${Math.max(10, 11 / Math.sqrt(view.k))}px system-ui`;
+        ctx.textAlign = 'center';
+        ctx.fillText(graphNodeLabel(n).slice(0, 28), n.x, n.y + r + 13);
       }
     }
-  };
-  canvas.onmousedown = (ev) => { const [x, y] = getXY(ev); drag = pick(x, y); canvas.style.cursor = drag >= 0 ? 'grabbing' : 'grab'; };
-  canvas.onmouseup = () => { drag = -1; canvas.style.cursor = 'grab'; };
-  canvas.onmouseleave = () => { drag = -1; hover = -1; };
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
 
-  function step() {
-    // Spring-electric layout: edges pull, nodes repel.
-    const cw = canvas.clientWidth; const ch = canvas.clientHeight;
+  function simulate() {
+    const repel = nodes.length > 180 ? 1800 : 2600;
     for (let i = 0; i < nodes.length; i++) {
       const a = nodes[i];
-      for (let j = i+1; j < nodes.length; j++) {
+      for (let j = i + 1; j < nodes.length; j++) {
         const b = nodes[j];
-        const dx = b.x - a.x; const dy = b.y - a.y;
-        const d2 = dx*dx + dy*dy + 0.01;
-        const f = 1200 / d2;
-        const fx = (dx / Math.sqrt(d2)) * f;
-        const fy = (dy / Math.sqrt(d2)) * f;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const d2 = dx * dx + dy * dy + 0.1;
+        const d = Math.sqrt(d2);
+        const force = repel / d2;
+        const fx = (dx / d) * force;
+        const fy = (dy / d) * force;
         a.vx -= fx; a.vy -= fy;
         b.vx += fx; b.vy += fy;
       }
     }
     for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      const dx = b.x - a.x; const dy = b.y - a.y;
-      const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
-      const f = (d - 100) * 0.02;
-      const fx = (dx/d) * f; const fy = (dy/d) * f;
-      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+      const [a, b] = edgeDirection(e);
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const wanted = a.node_type === b.node_type ? 150 : 115;
+      const force = (d - wanted) * 0.018;
+      const fx = (dx / d) * force;
+      const fy = (dy / d) * force;
+      a.vx += fx; a.vy += fy;
+      b.vx -= fx; b.vy -= fy;
     }
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      if (i === drag) continue;
-      n.vx *= 0.82; n.vy *= 0.82;
-      n.x += n.vx * 0.5; n.y += n.vy * 0.5;
-      // Centre attractor + bounds.
-      n.vx += (cw/2 - n.x) * 0.0008;
-      n.vy += (ch/2 - n.y) * 0.0008;
-      n.x = Math.max(12, Math.min(cw-12, n.x));
-      n.y = Math.max(12, Math.min(ch-12, n.y));
-    }
-
-    ctx.clearRect(0, 0, cw, ch);
-    // Edges — draw relation labels on longer edges when there is room.
-    ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
-    for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      // Colour edges by type: entity relations in green, others in muted.
-      ctx.strokeStyle = e.rel ? entityColor : muted;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-      // Show relation label mid-edge when the edge is long enough.
-      if (e.rel) {
-        const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
-        const edgeLen = Math.hypot(b.x - a.x, b.y - a.y);
-        if (edgeLen > 60) {
-          ctx.globalAlpha = 0.75;
-          ctx.fillStyle = muted;
-          ctx.font = '9px system-ui';
-          ctx.textAlign = 'center';
-          ctx.fillText(e.rel, mx, my - 3);
-        }
+    for (const n of nodes) {
+      if (n.fx !== null && n.fy !== null) {
+        n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0;
+        continue;
       }
+      n.vx += (cw / 2 - n.x) * 0.0007;
+      n.vy += (ch / 2 - n.y) * 0.0007;
+      n.vx *= 0.82;
+      n.vy *= 0.82;
+      n.x += n.vx * 0.55 * alpha;
+      n.y += n.vy * 0.55 * alpha;
+      const pad = graphNodeRadius(n) + 10;
+      n.x = Math.max(pad, Math.min(cw - pad, n.x));
+      n.y = Math.max(pad, Math.min(ch - pad, n.y));
     }
-    ctx.globalAlpha = 1;
-    ctx.textAlign = 'left';
-    // Nodes.
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      const isBlock = (n.kind || '').startsWith('block:');
-      const isEntity = n.node_type === 'entity';
-      const r = isBlock ? 8 : isEntity ? 7 : 6;
-      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = isBlock ? '#7c3aed' : isEntity ? entityColor : accent;
-      ctx.fill();
-      if (i === hover) {
-        ctx.strokeStyle = fg; ctx.lineWidth = 2; ctx.stroke();
-      }
-    }
+    alpha = Math.max(0.01, alpha * 0.99);
   }
-  if (graphState && graphState.raf) cancelAnimationFrame(graphState.raf);
-  graphState = { canvas, nodes, edges };
-  function loop() { step(); graphState.raf = requestAnimationFrame(loop); }
-  loop();
+
+  function loop() {
+    raf = null;
+    if (alpha > 0.03 || dragNode) {
+      const iterations = nodes.length > 80 ? 1 : 2;
+      for (let i = 0; i < iterations; i++) simulate();
+    }
+    draw();
+    if (alpha > 0.03 || dragNode) raf = requestAnimationFrame(loop);
+  }
+
+  function wakeLayout(nextAlpha) {
+    alpha = Math.max(alpha, nextAlpha);
+    if (!raf) raf = requestAnimationFrame(loop);
+  }
+
+  function selectNode(n) {
+    selectedId = n ? n.id : null;
+    renderDetail(n);
+    draw();
+  }
+
+  on(canvas, 'mousedown', (ev) => {
+    const p = eventPoint(ev);
+    const world = screenToWorld(p.sx, p.sy);
+    const node = pickNode(p.sx, p.sy);
+    downAt = { sx: p.sx, sy: p.sy };
+    lastPointer = { sx: p.sx, sy: p.sy };
+    moved = false;
+    if (node) {
+      dragNode = node;
+      dragNode.fx = world.x;
+      dragNode.fy = world.y;
+      wakeLayout(0.7);
+      canvas.style.cursor = 'grabbing';
+    } else {
+      panning = true;
+      canvas.style.cursor = 'grabbing';
+    }
+  });
+
+  on(canvas, 'mousemove', (ev) => {
+    const p = eventPoint(ev);
+    if (downAt && Math.hypot(p.sx - downAt.sx, p.sy - downAt.sy) > 3) moved = true;
+    if (dragNode) {
+      const world = screenToWorld(p.sx, p.sy);
+      dragNode.fx = world.x;
+      dragNode.fy = world.y;
+      dragNode.x = world.x;
+      dragNode.y = world.y;
+      setTip(dragNode);
+      return;
+    }
+    if (panning && lastPointer) {
+      view.x += p.sx - lastPointer.sx;
+      view.y += p.sy - lastPointer.sy;
+      lastPointer = { sx: p.sx, sy: p.sy };
+      draw();
+      return;
+    }
+    const node = pickNode(p.sx, p.sy);
+    hoverId = node ? node.id : null;
+    setTip(node);
+    canvas.style.cursor = node ? 'grab' : 'grab';
+    draw();
+  });
+
+  on(canvas, 'mouseup', (ev) => {
+    const p = eventPoint(ev);
+    if (dragNode) {
+      const node = dragNode;
+      node.fx = null;
+      node.fy = null;
+      dragNode = null;
+      if (!moved) selectNode(node);
+    } else if (panning && !moved) {
+      selectNode(null);
+    }
+    panning = false;
+    downAt = null;
+    lastPointer = { sx: p.sx, sy: p.sy };
+    canvas.style.cursor = 'grab';
+  });
+
+  on(canvas, 'mouseleave', () => {
+    if (dragNode) { dragNode.fx = null; dragNode.fy = null; }
+    dragNode = null;
+    panning = false;
+    hoverId = null;
+    setTip(null);
+    canvas.style.cursor = 'grab';
+  });
+
+  on(canvas, 'wheel', (ev) => {
+    ev.preventDefault();
+    const p = eventPoint(ev);
+    const before = screenToWorld(p.sx, p.sy);
+    const factor = ev.deltaY < 0 ? 1.12 : 0.89;
+    view.k = Math.max(0.25, Math.min(4, view.k * factor));
+    view.x = p.sx - before.x * view.k;
+    view.y = p.sy - before.y * view.k;
+    draw();
+  }, { passive: false });
+
+  on(window, 'resize', () => {
+    resizeCanvas();
+    wakeLayout(0.5);
+  });
+
+  graphState = {
+    canvas,
+    nodes,
+    edges,
+    draw,
+    applyFilters() {
+      const selected = selectedId ? nodes[idIdx.get(selectedId)] : null;
+      if (selected && !graphNodeVisible(selected)) selectNode(null);
+      draw();
+    },
+    cleanup() {
+      if (raf) cancelAnimationFrame(raf);
+      for (const [target, type, fn, opts] of listeners) target.removeEventListener(type, fn, opts);
+    },
+  };
+  renderDetail(null);
+  wakeLayout(1);
 }
 
 async function loadGraph(project) {
   const meta = document.getElementById('graph-meta');
   meta.textContent = '불러오는 중…';
   try {
-    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
+    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}&limit=${GRAPH_LIMIT}`);
     if (!r.ok) {
       const text = await r.text();
       showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
@@ -2568,13 +2923,49 @@ async function loadGraph(project) {
       return;
     }
     const d = await r.json();
-    meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
-    if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
+    d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+    d.edges = Array.isArray(d.edges) ? d.edges : [];
+    const entityCount = d.nodes.filter(n => n.node_type === 'entity').length;
+    const memoryCount = d.nodes.filter(n => n.node_type === 'memory').length;
+    meta.innerHTML = `<span class="badge ok">${entityCount} 엔티티</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
     initGraph(d);
   } catch (e) {
     meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
   }
 }
+
+(function wireGraphFilters() {
+  const memBtn = document.getElementById('graph-toggle-memory');
+  const entityBtn = document.getElementById('graph-toggle-entity');
+  const search = document.getElementById('graph-search');
+  function sync() {
+    if (memBtn) {
+      memBtn.classList.toggle('active', graphFilters.showMemory);
+      memBtn.setAttribute('aria-pressed', String(graphFilters.showMemory));
+    }
+    if (entityBtn) {
+      entityBtn.classList.toggle('active', graphFilters.showEntity);
+      entityBtn.setAttribute('aria-pressed', String(graphFilters.showEntity));
+    }
+    document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.graphSource === graphFilters.source);
+    });
+    if (graphState && graphState.applyFilters) graphState.applyFilters();
+  }
+  if (memBtn) memBtn.onclick = () => { graphFilters.showMemory = !graphFilters.showMemory; sync(); };
+  if (entityBtn) entityBtn.onclick = () => { graphFilters.showEntity = !graphFilters.showEntity; sync(); };
+  document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
+    btn.onclick = () => {
+      graphFilters.source = btn.dataset.graphSource || 'all';
+      sync();
+    };
+  });
+  if (search) search.oninput = () => {
+    graphFilters.search = search.value || '';
+    if (graphState && graphState.draw) graphState.draw();
+  };
+  sync();
+})();
 
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();

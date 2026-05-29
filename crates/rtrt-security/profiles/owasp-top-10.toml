@@ -1,0 +1,4 @@
+name = "owasp-top-10"
+description = "PLACEHOLDER — filled by security-profiles workflow."
+severity_threshold = "high"
+rules = []

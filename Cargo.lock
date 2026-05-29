@@ -3278,6 +3278,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtrt-security"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "once_cell",
+ "regex",
+ "rtrt-core",
+ "serde",
+ "serde_json",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
 name = "rtrt-templates"
 version = "0.1.0"
 dependencies = [

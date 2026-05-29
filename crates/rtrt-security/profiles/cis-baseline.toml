@@ -1,0 +1,4 @@
+name = "cis-baseline"
+description = "PLACEHOLDER — filled by security-profiles workflow."
+severity_threshold = "high"
+rules = []

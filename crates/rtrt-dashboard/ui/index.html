@@ -40,6 +40,11 @@
   aside a.nav:hover { background: var(--bg); }
   aside a.nav.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
   aside a.nav .icon { width: 18px; text-align: center; }
+  .project-picker { padding: 0 0.25rem 0.75rem; border-bottom: 1px solid var(--border); margin-bottom: 0.35rem; }
+  .project-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.4rem; padding: 0 0.25rem; color: var(--muted); font-size: 0.78em; letter-spacing: 0.06em; text-transform: uppercase; }
+  .project-selector-row { display: grid; grid-template-columns: 1fr 34px; gap: 0.35rem; }
+  .project-selector-row select { min-width: 0; width: 100%; }
+  .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0; border-radius: 8px; font-weight: 700; }
   main { padding: 1.5rem 2rem 4rem; max-width: 1100px; }
 
   /* Section heading */
@@ -284,6 +289,13 @@
   .security-scan-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
   .security-scan-row select { min-width: 170px; }
   .security-scan-row input { flex: 1; min-width: 180px; }
+  .scope-status { margin-bottom: 0.75rem; }
+  .scope-empty { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1rem; color: var(--muted); text-align: center; box-shadow: var(--shadow); }
+  .security-profile-tools { display: grid; grid-template-columns: minmax(160px, 0.35fr) 1fr; gap: 0.75rem; }
+  .security-profile-list { display: grid; gap: 0.35rem; align-content: start; }
+  .security-profile-list button { text-align: left; }
+  .security-profile-list button.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .security-profile-editor { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
   .security-summary { display: flex; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
   .security-engine-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.9rem; }
   .security-finding-group { margin-top: 1rem; }
@@ -306,6 +318,7 @@
     aside { display: none; }
     main { padding: 1rem; }
     .row { grid-template-columns: 1fr; }
+    .security-profile-tools { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -322,21 +335,28 @@
 
 <div class="layout">
   <aside>
-    <div class="group">개요</div>
-    <a class="nav active" data-page="overview"><span class="icon">🏠</span>대시보드</a>
+    <div class="project-picker">
+      <div class="project-picker-head">
+        <span>프로젝트</span>
+      </div>
+      <div class="project-selector-row">
+        <select id="project-selector"><option value="">프로젝트 로드 중…</option></select>
+        <button id="project-add-btn" class="ghost icon-btn" type="button" title="프로젝트 추가/편집">＋</button>
+      </div>
+    </div>
+    <div class="group">프로젝트</div>
+    <a class="nav active" data-page="overview"><span class="icon">🏠</span>개요</a>
     <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
+    <a class="nav" data-page="security"><span class="icon">🛡️</span>보안</a>
+    <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드맵</a>
+    <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
     <div class="group">도구</div>
     <a class="nav" data-page="compress"><span class="icon">🗜</span>압축</a>
-    <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
-    <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드 맵</a>
-    <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
-    <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
     <a class="nav" data-page="llm"><span class="icon">🤖</span>로컬 LLM</a>
-    <a class="nav" data-page="security"><span class="icon">🛡️</span>보안</a>
-    <div class="group">설정</div>
-    <a class="nav" data-page="settings"><span class="icon">🎛</span>설정</a>
+    <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
+    <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
     <a class="nav" data-page="connect"><span class="icon">🔌</span>에이전트 연결</a>
-    <a class="nav" data-page="env"><span class="icon">⚙️</span>환경</a>
+    <a class="nav" data-page="settings"><span class="icon">🎛</span>설정</a>
   </aside>
 
   <main>
@@ -369,20 +389,11 @@
 
     <!-- 메모리 -->
     <section id="page-memory" class="page" hidden>
-
-      <!-- 프로젝트 선택 -->
-      <div id="mem-projects" class="mem-projects">
-        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.75rem;">
-          <h2 style="margin:0;">프로젝트</h2>
-          <a id="mem-new-project" style="cursor:pointer;">+ 새 프로젝트</a>
-        </div>
-        <div id="mem-project-grid" class="proj-grid"></div>
-      </div>
+      <div id="mem-empty" class="scope-empty">프로젝트를 선택하거나 추가하세요</div>
 
       <!-- 프로젝트 상세 -->
       <div id="mem-detail" hidden>
         <div class="proj-head">
-          <a id="mem-back" style="cursor:pointer;">← 프로젝트 목록</a>
           <h2 id="mem-detail-name" style="margin:0;"></h2>
           <span id="mem-detail-meta" class="muted"></span>
         </div>
@@ -750,8 +761,10 @@
 
     <!-- 진단 -->
     <section id="page-diagnose" class="page" hidden>
+        <div id="diagnose-scope-empty" class="scope-empty" hidden>프로젝트를 선택하거나 추가하세요</div>
         <div class="card">
           <div class="head"><h2>실패 진단</h2><span class="hint">로그 → LLM이 원인 + 수정 한 줄</span></div>
+          <div id="diagnose-project-meta" class="out-meta scope-status"></div>
           <form id="diagnose-form">
             <input id="diagnose-model" placeholder="model (예: claude-haiku-4-5)" required>
             <textarea id="diagnose-raw" rows="8" placeholder="빌드 / 테스트 실패 로그" required></textarea>
@@ -772,10 +785,12 @@
 
     <!-- 코드 맵 -->
     <section id="page-repomap" class="page" hidden>
+        <div id="repomap-scope-empty" class="scope-empty" hidden>프로젝트를 선택하거나 추가하세요</div>
         <div class="card">
           <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동</span></div>
+          <div id="repomap-project-meta" class="out-meta scope-status"></div>
           <form id="repomap-form">
-            <input id="repomap-root" placeholder="프로젝트 경로 (예: /home/user/projects/foo)" required>
+            <input id="repomap-root" type="hidden">
             <button class="primary" type="submit">맵 생성</button>
             <details><summary class="muted-summary">고급 옵션</summary>
               <div class="adv">
@@ -990,22 +1005,49 @@
         <h1>보안</h1>
         <div class="lede">프로파일 기반 보안 스캔 · 표준 매핑 · 수정 힌트</div>
       </div>
-      <div class="card">
-        <div class="head"><h2>스캔</h2><span class="hint">경로와 프로파일을 선택하세요</span></div>
-        <div class="security-scan-row">
-          <select id="security-profile-select"><option value="">로드 중…</option></select>
-          <input id="security-path-input" value="." placeholder="스캔 경로">
-          <button id="security-scan-btn" class="primary" type="button">스캔</button>
-          <button id="security-view-profile-btn" class="ghost" type="button">프로파일 보기</button>
+      <nav class="subtabs" id="security-subtabs">
+        <a class="active" data-sub="securityscan">스캔</a>
+        <a data-sub="securityprofiles">프로파일 설정</a>
+      </nav>
+      <div id="sub-securityscan" class="subpage">
+        <div id="security-scope-empty" class="scope-empty" hidden>프로젝트를 선택하거나 추가하세요</div>
+        <div class="card">
+          <div class="head"><h2>스캔</h2><span class="hint">선택한 프로젝트 경로를 스캔합니다</span></div>
+          <div id="security-project-meta" class="out-meta scope-status"></div>
+          <div class="security-scan-row">
+            <select id="security-profile-select"><option value="">로드 중…</option></select>
+            <button id="security-apply-profile-btn" class="ghost" type="button">이 프로젝트에 적용</button>
+            <button id="security-scan-btn" class="primary" type="button">스캔</button>
+            <button id="security-view-profile-btn" class="ghost" type="button">프로파일 보기</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="head"><h2>결과</h2><span id="security-result-meta" class="hint">스캔 전</span></div>
+          <div id="security-results-body"><div class="empty">스캔 결과가 여기에 표시됩니다.</div></div>
+        </div>
+        <div id="security-profile-card" class="card" hidden>
+          <div class="head"><h2>프로파일</h2><span id="security-profile-meta" class="hint"></span></div>
+          <div id="security-profile-body"></div>
         </div>
       </div>
-      <div class="card">
-        <div class="head"><h2>결과</h2><span id="security-result-meta" class="hint">스캔 전</span></div>
-        <div id="security-results-body"><div class="empty">스캔 결과가 여기에 표시됩니다.</div></div>
-      </div>
-      <div id="security-profile-card" class="card" hidden>
-        <div class="head"><h2>프로파일</h2><span id="security-profile-meta" class="hint"></span></div>
-        <div id="security-profile-body"></div>
+      <div id="sub-securityprofiles" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>프로파일 설정</h2><span class="hint">프로파일 조회 · 복제 · 저장</span></div>
+          <div class="security-profile-tools">
+            <div id="security-profile-list" class="security-profile-list"><div class="empty">로드 중…</div></div>
+            <div>
+              <div id="security-profile-detail"><div class="empty">프로파일을 선택하세요.</div></div>
+              <div class="security-profile-editor">
+                <div class="row">
+                  <input id="security-profile-new-name" placeholder="새 프로파일 이름">
+                  <button id="security-profile-clone-btn" class="ghost" type="button">복제</button>
+                </div>
+                <textarea id="security-profile-toml" rows="12" placeholder="TOML"></textarea>
+                <button id="security-profile-save-btn" class="primary" type="button">저장</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -1031,6 +1073,21 @@
   </div>
 </div>
 
+<div id="project-modal" class="modal-backdrop" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>프로젝트 추가/편집</h2>
+      <button id="project-modal-close" class="ghost" aria-label="닫기">✕</button>
+    </div>
+    <form id="project-form">
+      <input id="project-name-input" placeholder="프로젝트 이름" required>
+      <input id="project-path-input" placeholder="프로젝트 경로">
+      <select id="project-security-profile-select"><option value="">프로파일 로드 중…</option></select>
+      <button class="primary" type="submit">저장</button>
+    </form>
+  </div>
+</div>
+
 <div id="toast-container"></div>
 
 <div class="activity">
@@ -1053,6 +1110,181 @@ document.getElementById('theme-toggle').onclick = () => {
 // Sidebar nav
 document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate(a.dataset.page));
 
+// Global project selector
+let PROJECTS_CACHE = [];
+let SECURITY_PROFILES_CACHE = [];
+
+function currentProject() {
+  return document.getElementById('project-selector').value;
+}
+
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, '&quot;');
+}
+
+function selectedProject() {
+  const name = currentProject();
+  return PROJECTS_CACHE.find(p => p.name === name) || null;
+}
+
+function projectPath() {
+  const p = selectedProject();
+  return p && p.path ? p.path : '';
+}
+
+function activePage() {
+  const page = document.querySelector('.page:not([hidden])');
+  return page ? page.id.replace(/^page-/, '') : 'overview';
+}
+
+function syncProjectInputs(value) {
+  CURRENT_PROJECT = value || null;
+  PROJECT_INPUTS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = value || '';
+  });
+}
+
+function projectScopeMessage(needsPath) {
+  if (!currentProject()) return '프로젝트를 선택하거나 추가하세요';
+  if (needsPath && !projectPath()) return '경로 미설정 — 프로젝트 편집에서 추가하세요';
+  return '';
+}
+
+function setScopeState(emptyId, cardSelector, needsPath) {
+  const empty = document.getElementById(emptyId);
+  const card = document.querySelector(cardSelector);
+  const msg = projectScopeMessage(needsPath);
+  if (empty) {
+    empty.textContent = msg || '';
+    empty.hidden = !msg;
+  }
+  if (card) card.hidden = !!msg;
+  return !msg;
+}
+
+async function fetchSecurityProfiles() {
+  try {
+    const r = await fetch('/api/security/profiles');
+    if (!r.ok) {
+      showToast(await securityErrorMessage(r, '보안 프로파일 로드 실패'), 'err');
+      return [];
+    }
+    const profiles = await r.json();
+    SECURITY_PROFILES_CACHE = Array.isArray(profiles) ? profiles : [];
+    return SECURITY_PROFILES_CACHE;
+  } catch (e) {
+    showToast(`보안 프로파일 로드 오류: ${e.message || e}`, 'err');
+    return [];
+  }
+}
+
+async function populateSecurityProfileSelect(selectId, selected) {
+  const select = document.getElementById(selectId);
+  if (!select) return [];
+  const profiles = await fetchSecurityProfiles();
+  if (!profiles.length) {
+    select.innerHTML = '<option value="">프로파일 없음</option>';
+    return [];
+  }
+  const desired = profiles.includes(selected) ? selected : (profiles.includes('ai-default') ? 'ai-default' : profiles[0]);
+  select.innerHTML = profiles.map(name =>
+    `<option value="${escapeAttr(name)}"${name === desired ? ' selected' : ''}>${escapeHtml(name)}</option>`
+  ).join('');
+  select.value = desired;
+  return profiles;
+}
+
+async function loadProjects() {
+  const select = document.getElementById('project-selector');
+  const saved = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project') || '';
+  const previous = currentProject() || saved;
+  try {
+    const r = await fetch('/api/projects');
+    if (!r.ok) {
+      showToast(await securityErrorMessage(r, '프로젝트 로드 실패'), 'err');
+      select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+      PROJECTS_CACHE = [];
+      syncProjectInputs('');
+      refreshProjectScopePage();
+      return;
+    }
+    const projects = await r.json();
+    PROJECTS_CACHE = Array.isArray(projects) ? projects : [];
+    if (!PROJECTS_CACHE.length) {
+      select.innerHTML = '<option value="">프로젝트 없음</option>';
+      syncProjectInputs('');
+      refreshProjectScopePage();
+      return;
+    }
+    select.innerHTML = '<option value="">프로젝트 선택</option>' + PROJECTS_CACHE.map(p =>
+      `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
+    ).join('');
+    select.value = PROJECTS_CACHE.some(p => p.name === previous) ? previous : '';
+    syncProjectInputs(select.value);
+    if (select.value) localStorage.setItem('rtrt.project', select.value);
+    refreshProjectScopePage();
+  } catch (e) {
+    showToast(`프로젝트 로드 오류: ${e.message || e}`, 'err');
+    select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+    PROJECTS_CACHE = [];
+    syncProjectInputs('');
+    refreshProjectScopePage();
+  }
+}
+
+function closeProjectModal() {
+  document.getElementById('project-modal').hidden = true;
+}
+
+async function openProjectModal(forceNew) {
+  const project = forceNew ? null : selectedProject();
+  document.getElementById('project-name-input').value = project ? project.name : '';
+  document.getElementById('project-path-input').value = project && project.path ? project.path : '';
+  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : 'ai-default');
+  document.getElementById('project-modal').hidden = false;
+  setTimeout(() => document.getElementById('project-name-input').focus(), 0);
+}
+
+document.getElementById('project-add-btn').onclick = () => openProjectModal(false);
+document.getElementById('project-modal-close').onclick = closeProjectModal;
+document.getElementById('project-modal').onclick = (ev) => { if (ev.target.id === 'project-modal') closeProjectModal(); };
+document.getElementById('project-selector').onchange = () => {
+  const name = currentProject();
+  localStorage.setItem('rtrt.project', name);
+  localStorage.setItem('rtrt-project', name);
+  syncProjectInputs(name);
+  refreshProjectScopePage();
+};
+document.getElementById('project-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const name = document.getElementById('project-name-input').value.trim();
+  const path = document.getElementById('project-path-input').value.trim();
+  const security_profile = document.getElementById('project-security-profile-select').value || 'ai-default';
+  if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
+  try {
+    const r = await fetch('/api/projects', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, path, security_profile }),
+    });
+    if (!r.ok) {
+      showToast(await securityErrorMessage(r, '프로젝트 저장 실패'), 'err');
+      return;
+    }
+    await r.json().catch(() => ({}));
+    closeProjectModal();
+    localStorage.setItem('rtrt.project', name);
+    await loadProjects();
+    document.getElementById('project-selector').value = name;
+    syncProjectInputs(name);
+    refreshProjectScopePage();
+    showToast('프로젝트 저장 완료', 'ok');
+  } catch (e) {
+    showToast(`프로젝트 저장 오류: ${e.message || e}`, 'err');
+  }
+};
+
 // Sub-tabs (도구, 설정). Optional onActivate(subName) callback.
 function wireSubtabs(navId, onActivate) {
   const nav = document.getElementById(navId);
@@ -1067,15 +1299,20 @@ function wireSubtabs(navId, onActivate) {
   });
 }
 wireSubtabs('memory-subtabs', (sub) => {
+  const project = currentProject();
   // Auto-load stats + compression queue when the stats tab is activated.
-  if (sub === 'memstats' && CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
+  if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
   // Auto-load governance stats when governance tab opens.
-  if (sub === 'memgovern' && CURRENT_PROJECT) { loadGovStats(CURRENT_PROJECT); }
+  if (sub === 'memgovern' && project) { loadGovStats(project); }
   // Auto-load graph when the map tab opens (saves an extra button click).
-  if (sub === 'memmap' && CURRENT_PROJECT) { loadGraph(CURRENT_PROJECT); }
+  if (sub === 'memmap' && project) { loadGraph(project); }
+});
+wireSubtabs('security-subtabs', (sub) => {
+  if (sub === 'securityprofiles') loadSecurityProfileSettings();
+  if (sub === 'securityscan') refreshSecurityScope();
 });
 
-// Memory: project picker + drill-in
+// Memory: project drill-in from the global selector
 function relativeTime(ts) {
   if (!ts) return '—';
   const diff = Math.floor(Date.now() / 1000 - ts);
@@ -1086,48 +1323,27 @@ function relativeTime(ts) {
   const d = new Date(ts * 1000);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
-async function loadProjects() {
-  const r = await fetch('/api/memory/projects');
-  if (!r.ok) return;
-  const d = await r.json();
-  const grid = document.getElementById('mem-project-grid');
-  if (!d.projects.length) {
-    grid.innerHTML = `<div class="empty" style="grid-column:1/-1;">저장된 메모리가 없습니다. 우측 상단 <a id="mem-empty-new" style="cursor:pointer;">+ 새 프로젝트</a> 또는 CLI <code>rtrt memory save</code> 로 시작하세요.</div>`;
-    const e = document.getElementById('mem-empty-new');
-    if (e) e.onclick = () => promptNewProject();
+let CURRENT_PROJECT = null;
+const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
+
+function openProject(name) {
+  if (!name) {
+    CURRENT_PROJECT = null;
+    document.getElementById('mem-empty').hidden = false;
+    document.getElementById('mem-detail').hidden = true;
     return;
   }
-  grid.innerHTML = d.projects.map(p =>
-    `<div class="proj-card" data-pick="${p.project}">
-       <div class="name">${p.project}</div>
-       <div class="row2"><span>${p.count}건</span><span>${relativeTime(p.latest_ts)}</span></div>
-     </div>`
-  ).join('');
-  grid.querySelectorAll('.proj-card').forEach(c => c.onclick = () => openProject(c.dataset.pick));
-}
-function promptNewProject() {
-  const name = prompt('새 프로젝트 이름 (예: rtrt)');
-  if (name && name.trim()) openProject(name.trim());
-}
-document.getElementById('mem-new-project').onclick = promptNewProject;
-document.getElementById('mem-back').onclick = () => {
-  document.getElementById('mem-detail').hidden = true;
-  document.getElementById('mem-projects').hidden = false;
-  loadProjects();
-};
-
-let CURRENT_PROJECT = null;
-function openProject(name) {
   CURRENT_PROJECT = name;
-  document.getElementById('mem-projects').hidden = true;
+  syncProjectInputs(name);
+  document.getElementById('mem-empty').hidden = true;
   const detail = document.getElementById('mem-detail');
   detail.hidden = false;
   document.getElementById('mem-detail-name').textContent = name;
-  // Auto-fill every project input on the detail panes.
-  ['recall-project', 'save-project', 'blocks-project', 'block-set-project', 'export-project', 'graph-project'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.value = name;
-  });
+  const project = selectedProject();
+  const memCount = project && project.mem_count !== undefined ? `${project.mem_count}건` : '';
+  const path = project && project.path ? project.path : '경로 미설정';
+  document.getElementById('mem-detail-meta').textContent = [memCount, path].filter(Boolean).join(' · ');
+  localStorage.setItem('rtrt.project', name);
   localStorage.setItem('rtrt-project', name);
   // Default sub = history.
   document.querySelectorAll('#memory-subtabs a').forEach(x => x.classList.remove('active'));
@@ -1196,7 +1412,12 @@ async function loadHistory(name, offset) {
   const list = document.getElementById('history-list');
   list.innerHTML = '<div class="empty">불러오는 중…</div>';
   const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}`);
-  if (!r.ok) { list.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: 불러오기 실패</div>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`메모리 히스토리 로드 실패 ${r.status}: ${text}`, 'err');
+    list.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: 불러오기 실패</div>`;
+    return;
+  }
   const d = await r.json();
   HISTORY_TOTAL = d.total || 0;
   if (!d.items.length) {
@@ -1366,12 +1587,14 @@ document.addEventListener('keydown', (ev) => {
   }
 });
 document.getElementById('history-prev').onclick = () => {
-  if (!CURRENT_PROJECT) return;
-  loadHistory(CURRENT_PROJECT, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
+  const project = currentProject();
+  if (!project) return;
+  loadHistory(project, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
 };
 document.getElementById('history-next').onclick = () => {
-  if (!CURRENT_PROJECT) return;
-  loadHistory(CURRENT_PROJECT, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
+  const project = currentProject();
+  if (!project) return;
+  loadHistory(project, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
 };
 
 // Sort toggle buttons.
@@ -1379,13 +1602,15 @@ document.getElementById('sort-recent').onclick = () => {
   HISTORY_SORT = 'recent';
   document.getElementById('sort-recent').classList.add('active');
   document.getElementById('sort-importance').classList.remove('active');
-  if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, 0);
+  const project = currentProject();
+  if (project) loadHistory(project, 0);
 };
 document.getElementById('sort-importance').onclick = () => {
   HISTORY_SORT = 'importance';
   document.getElementById('sort-importance').classList.add('active');
   document.getElementById('sort-recent').classList.remove('active');
-  if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, 0);
+  const project = currentProject();
+  if (project) loadHistory(project, 0);
 };
 
 // Bulk delete — confirm dialog before sending.
@@ -1410,7 +1635,8 @@ document.getElementById('bulk-delete-btn').onclick = async () => {
     pushActivity(`삭제 완료 ${d.deleted}건`);
     SELECTED_IDS.clear();
     syncBulkBar();
-    if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
+    const project = currentProject();
+    if (project) loadHistory(project, HISTORY_OFFSET);
   } catch (e) { pushActivity(`삭제 오류: ${e.message || e}`); }
 };
 document.getElementById('bulk-clear-btn').onclick = () => {
@@ -1423,22 +1649,8 @@ document.getElementById('bulk-clear-btn').onclick = () => {
 // Re-load history after save.
 const originalSaveHandler = () => {};
 
-// Project name memory — last-used value persists across reloads so the user
-// doesn't have to retype it every time.
-const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
-function syncProject(value) {
-  if (!value) return;
-  localStorage.setItem('rtrt-project', value);
-  PROJECT_INPUTS.forEach(id => { const el = document.getElementById(id); if (el && !el.value) el.value = value; });
-}
-const savedProject = localStorage.getItem('rtrt-project');
-if (savedProject) {
-  PROJECT_INPUTS.forEach(id => { const el = document.getElementById(id); if (el) el.value = savedProject; });
-}
-PROJECT_INPUTS.forEach(id => {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener('change', () => syncProject(el.value));
-});
+const savedProject = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project');
+if (savedProject) syncProjectInputs(savedProject);
 
 // Sample data — one-click form fillers so the user can try a tool without
 // digging up an example. Each entry is a function so it can vary per call.
@@ -1468,23 +1680,44 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
 
 // Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
 const PALETTE_ITEMS = [
-  { label: '대시보드', hint: 'overview', run: () => navigate('overview') },
-  { label: '메모리 — 프로젝트', hint: 'memory · projects', run: () => navigate('memory') },
-  { label: '압축', hint: 'compress / proxy', run: () => { navigate('compress'); document.getElementById('compress-input').focus(); } },
-  { label: '진단', hint: 'diagnose', run: () => navigate('diagnose') },
-  { label: '코드 맵', hint: 'repo-map', run: () => navigate('repomap') },
-  { label: '템플릿', hint: 'project scaffolds', run: () => navigate('templates') },
-  { label: '프롬프트', hint: 'prompts', run: () => navigate('prompts') },
-  { label: '설정', hint: 'config / auto-compress', run: () => navigate('settings') },
-  { label: '에이전트 연결', hint: 'mcp setup', run: () => navigate('connect') },
-  { label: '환경', hint: 'env info', run: () => navigate('env') },
+  { label: '프로젝트 · 개요', hint: '프로젝트 / overview', run: () => navigate('overview') },
+  { label: '프로젝트 · 메모리', hint: '프로젝트 / memory', run: () => navigate('memory') },
+  { label: '프로젝트 · 보안', hint: '프로젝트 / security', run: () => navigate('security') },
+  { label: '프로젝트 · 코드맵', hint: '프로젝트 / repo-map', run: () => navigate('repomap') },
+  { label: '프로젝트 · 진단', hint: '프로젝트 / diagnose', run: () => navigate('diagnose') },
+  { label: '프로젝트 추가/편집', hint: '프로젝트 / selector', run: () => openProjectModal(false) },
+  { label: '도구 · 압축', hint: '도구 / compress / proxy', run: () => { navigate('compress'); document.getElementById('compress-input').focus(); } },
+  { label: '도구 · 로컬 LLM', hint: '도구 / ollama · models · pull', run: () => navigate('llm') },
+  { label: '도구 · 프롬프트', hint: '도구 / prompts', run: () => navigate('prompts') },
+  { label: '도구 · 템플릿', hint: '도구 / project scaffolds', run: () => navigate('templates') },
+  { label: '도구 · 연결', hint: '도구 / mcp setup', run: () => navigate('connect') },
+  { label: '도구 · 설정', hint: '도구 / config / auto-compress', run: () => navigate('settings') },
   { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
-  { label: '예시: 압축', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
-  { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
-  { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
-  { label: '로컬 LLM', hint: 'ollama · models · pull', run: () => navigate('llm') },
-  { label: '보안', hint: 'security · scan', run: () => navigate('security') },
+  { label: '도구 · 예시: 압축', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
+  { label: '도구 · 예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
+  { label: '프로젝트 · 예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
 ];
+function refreshMemoryScope() {
+  openProject(currentProject());
+}
+function refreshRepomapScope() {
+  const ok = setScopeState('repomap-scope-empty', '#page-repomap .card', true);
+  const path = projectPath();
+  document.getElementById('repomap-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
+  document.getElementById('repomap-root').value = path;
+}
+function refreshDiagnoseScope() {
+  const ok = setScopeState('diagnose-scope-empty', '#page-diagnose .card', true);
+  const path = projectPath();
+  document.getElementById('diagnose-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
+}
+function refreshProjectScopePage() {
+  const page = activePage();
+  if (page === 'memory') refreshMemoryScope();
+  if (page === 'security') refreshSecurityScope();
+  if (page === 'repomap') refreshRepomapScope();
+  if (page === 'diagnose') refreshDiagnoseScope();
+}
 function navigate(page) {
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
@@ -1493,10 +1726,13 @@ function navigate(page) {
   const target = document.getElementById('page-' + page);
   if (target) target.hidden = false;
   if (page === 'memory') {
-    // Show project picker by default; user can drill in.
-    document.getElementById('mem-detail').hidden = true;
-    document.getElementById('mem-projects').hidden = false;
-    loadProjects();
+    refreshMemoryScope();
+  }
+  if (page === 'repomap') {
+    refreshRepomapScope();
+  }
+  if (page === 'diagnose') {
+    refreshDiagnoseScope();
   }
   if (page === 'settings') {
     // Reload config each time the panel opens so it stays current.
@@ -1510,6 +1746,7 @@ function navigate(page) {
   }
   if (page === 'security') {
     loadSecurityProfiles();
+    refreshSecurityScope();
   }
 }
 function subClick(navId, sub) {
@@ -1699,11 +1936,13 @@ document.getElementById('overview-refresh').onclick = () => { loadOverview(); pu
 // Memory
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
   const mode = document.getElementById('recall-mode-val').value || 'bm25';
   const body = {
-    project: document.getElementById('recall-project').value,
+    project,
     query: document.getElementById('recall-query').value,
     limit: Number(document.getElementById('recall-limit').value) || 10,
     filter: document.getElementById('recall-filter').value || null,
@@ -1714,7 +1953,12 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   const results = document.getElementById('recall-results');
   results.innerHTML = `<div class="empty">검색 중…</div>`;
   const r = await fetch('/api/memory/recall', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { results.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</div>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`메모리 검색 실패 ${r.status}: ${text}`, 'err');
+    results.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: ${text}</div>`;
+    return;
+  }
   const d = await r.json();
   // The backend returns the actual mode used (may differ from requested when embeddings are off).
   const usedMode = d.mode || mode;
@@ -1774,7 +2018,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   const btn = document.getElementById('embed-backfill-btn');
   if (!btn) return;
   btn.onclick = async () => {
-    const project = CURRENT_PROJECT;
+    const project = currentProject();
     if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
     btn.disabled = true;
     const origText = btn.textContent;
@@ -1808,29 +2052,42 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
 })();
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   let metadata = {};
   const raw = document.getElementById('save-metadata').value.trim();
   if (raw) { try { metadata = JSON.parse(raw); } catch (e) { document.getElementById('save-result').innerHTML = `<span style="color:var(--err);">JSON 파싱 실패: ${e}</span>`; return; } }
   const body = {
-    project: document.getElementById('save-project').value,
+    project,
     kind: document.getElementById('save-kind').value || 'note',
     body: document.getElementById('save-body').value,
     metadata,
   };
   const r = await fetch('/api/memory/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const out = document.getElementById('save-result');
-  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`메모리 저장 실패 ${r.status}: ${text}`, 'err');
+    out.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+    return;
+  }
   const d = await r.json();
   out.innerHTML = `<span class="badge ok">✓ 저장 id=${d.id}</span>`;
   pushActivity(`save ${body.project} · id=${d.id}`);
 };
 document.getElementById('blocks-list-form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const project = document.getElementById('blocks-project').value;
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const tbody = document.querySelector('#blocks-tbl tbody');
   tbody.innerHTML = `<tr><td colspan="2" class="empty">불러오는 중…</td></tr>`;
   const r = await fetch(`/api/memory/blocks?project=${encodeURIComponent(project)}`);
-  if (!r.ok) { tbody.innerHTML = `<tr><td colspan="2" class="empty" style="color:var(--err);">${r.status}: ${await r.text()}</td></tr>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`블록 로드 실패 ${r.status}: ${text}`, 'err');
+    tbody.innerHTML = `<tr><td colspan="2" class="empty" style="color:var(--err);">${r.status}: ${text}</td></tr>`;
+    return;
+  }
   const d = await r.json();
   tbody.innerHTML = d.blocks.length
     ? d.blocks.map(b => `<tr><td><code>${b.kind.replace(/^block:/,'')}</code></td><td>${b.body.replace(/</g,'&lt;')}</td></tr>`).join('')
@@ -1838,20 +2095,28 @@ document.getElementById('blocks-list-form').onsubmit = async (ev) => {
 };
 document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const body = {
-    project: document.getElementById('block-set-project').value,
+    project,
     name: document.getElementById('block-set-name').value,
     body: document.getElementById('block-set-body').value,
   };
   const r = await fetch('/api/memory/blocks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const out = document.getElementById('block-set-result');
-  if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`블록 저장 실패 ${r.status}: ${text}`, 'err');
+    out.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+    return;
+  }
   const d = await r.json();
   out.innerHTML = `<span class="badge ok">✓ 저장 id=${d.id}</span>`;
 };
 document.getElementById('export-form').onsubmit = (ev) => {
   ev.preventDefault();
-  const project = document.getElementById('export-project').value;
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
 };
@@ -1867,7 +2132,12 @@ async function loadMemStats(project) {
   let d;
   try {
     const r = await fetch(`/api/memory/stats?project=${encodeURIComponent(project)}`);
-    if (!r.ok) { loading.textContent = `오류 ${r.status}: ${await r.text()}`; return; }
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`메모리 통계 로드 실패 ${r.status}: ${text}`, 'err');
+      loading.textContent = `오류 ${r.status}: ${text}`;
+      return;
+    }
     d = await r.json();
   } catch (e) {
     loading.textContent = `네트워크 오류: ${e.message || e}`;
@@ -1909,7 +2179,8 @@ async function loadMemStats(project) {
 }
 
 document.getElementById('memstats-refresh').onclick = () => {
-  if (CURRENT_PROJECT) { loadMemStats(CURRENT_PROJECT); loadQueue(CURRENT_PROJECT); }
+  const project = currentProject();
+  if (project) { loadMemStats(project); loadQueue(project); }
 };
 
 // Compression queue — GET /api/memory/queue?project=
@@ -1920,7 +2191,7 @@ async function loadQueue(project) {
   let d;
   try {
     const r = await fetch(`/api/memory/queue?project=${encodeURIComponent(project)}`);
-    if (!r.ok) { summary.textContent = `오류 ${r.status}`; return; }
+    if (!r.ok) { showToast(`압축 대기열 로드 실패 ${r.status}`, 'err'); summary.textContent = `오류 ${r.status}`; return; }
     d = await r.json();
   } catch (e) { summary.textContent = `네트워크 오류: ${e.message || e}`; return; }
   const onoff = d.enabled ? '자동 압축 ON' : '자동 압축 OFF (설정에서 켜기)';
@@ -1967,13 +2238,14 @@ async function loadGovStats(project) {
 }
 
 async function runGovPreview() {
-  if (!CURRENT_PROJECT) return;
+  const project = currentProject();
+  if (!project) return;
   const kind = document.getElementById('gov-kind').value;
   const compFilter = document.getElementById('gov-compress-filter').value;
   const before = document.getElementById('gov-before').value;
   const after = document.getElementById('gov-after').value;
 
-  const params = new URLSearchParams({ project: CURRENT_PROJECT, limit: 200, sort: 'recent' });
+  const params = new URLSearchParams({ project, limit: 200, sort: 'recent' });
   if (kind) params.set('kind', kind);
   if (compFilter === 'compressed') params.set('compressed_only', '1');
   if (before) params.set('before', Math.floor(new Date(before).getTime() / 1000));
@@ -2028,7 +2300,10 @@ async function runGovPreview() {
 }
 
 document.getElementById('gov-preview-btn').onclick = runGovPreview;
-document.getElementById('gov-refresh').onclick = () => { if (CURRENT_PROJECT) { loadGovStats(CURRENT_PROJECT); runGovPreview(); } };
+document.getElementById('gov-refresh').onclick = () => {
+  const project = currentProject();
+  if (project) { loadGovStats(project); runGovPreview(); }
+};
 
 document.getElementById('gov-bulk-delete-btn').onclick = async () => {
   if (!GOV_PREVIEW_IDS.length) return;
@@ -2053,26 +2328,28 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
     GOV_PREVIEW_IDS = [];
     document.getElementById('gov-preview-result').innerHTML = '<div class="empty">삭제 완료. 미리보기를 다시 실행하세요.</div>';
     document.getElementById('gov-danger-zone').hidden = true;
-    loadGovStats(CURRENT_PROJECT);
+    const project = currentProject();
+    if (project) loadGovStats(project);
   } catch (e) {
     resultEl.innerHTML = `<span style="color:var(--err);">오류: ${e.message || e}</span>`;
   }
 };
 
 document.getElementById('queue-compress-all').onclick = async (ev) => {
-  if (!CURRENT_PROJECT) return;
+  const project = currentProject();
+  if (!project) return;
   const btn = ev.currentTarget;
   btn.disabled = true; btn.textContent = '압축 중…';
   try {
     const r = await fetch('/api/memory/compress', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project: CURRENT_PROJECT }),
+      body: JSON.stringify({ project }),
     });
     const d = await r.json();
-    pushActivity(`압축 ${CURRENT_PROJECT}: ${d.compressed}건 (skip ${d.skipped})`);
+    pushActivity(`압축 ${project}: ${d.compressed}건 (skip ${d.skipped})`);
   } catch (e) { pushActivity(`압축 오류: ${e.message || e}`); }
   btn.disabled = false; btn.textContent = '지금 모두 압축';
-  loadQueue(CURRENT_PROJECT); loadMemStats(CURRENT_PROJECT);
+  loadQueue(project); loadMemStats(project);
 };
 
 // Memory graph — force-directed canvas layout
@@ -2219,7 +2496,12 @@ async function loadGraph(project) {
   meta.textContent = '불러오는 중…';
   try {
     const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
-    if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
+      meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+      return;
+    }
     const d = await r.json();
     meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
     if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
@@ -2231,7 +2513,8 @@ async function loadGraph(project) {
 
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const project = document.getElementById('graph-project').value;
+  const project = currentProject();
+  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   await loadGraph(project);
 };
 
@@ -2241,7 +2524,7 @@ document.getElementById('graph-form').onsubmit = async (ev) => {
   const btn = document.getElementById('entity-extract-btn');
   if (!btn) return;
   btn.onclick = async () => {
-    const project = CURRENT_PROJECT;
+    const project = currentProject();
     if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
     btn.disabled = true;
     const origText = btn.textContent;
@@ -2351,6 +2634,8 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
+  if (!projectPath()) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshDiagnoseScope(); return; }
   const body = {
     model: document.getElementById('diagnose-model').value,
     raw: document.getElementById('diagnose-raw').value,
@@ -2360,16 +2645,24 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
   const pre = document.getElementById('diagnose-output');
   meta.textContent = '진단 중…'; pre.hidden = true;
   const r = await fetch('/api/diagnose', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`진단 실패 ${r.status}: ${text}`, 'err');
+    meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+    return;
+  }
   const d = await r.json();
   meta.innerHTML = `<span class="badge ok">${d.provider}/${d.model}</span> in ${d.input_tokens} · out ${d.output_tokens}`;
   pre.hidden = false; pre.textContent = d.diagnosis;
-  pushActivity(`diagnose · ${d.provider}`);
+  pushActivity(`diagnose · ${currentProject()} · ${d.provider}`);
 };
 document.getElementById('repomap-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
+  const root = projectPath();
+  if (!root) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshRepomapScope(); return; }
   const body = {
-    root: document.getElementById('repomap-root').value,
+    root,
     ext: document.getElementById('repomap-ext').value || '',
     max_bytes: Number(document.getElementById('repomap-max').value) || 524288,
   };
@@ -2377,7 +2670,12 @@ document.getElementById('repomap-form').onsubmit = async (ev) => {
   const pre = document.getElementById('repomap-output');
   sum.textContent = '스캔 중…'; pre.hidden = true;
   const r = await fetch('/api/repo-map', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!r.ok) { sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
+  if (!r.ok) {
+    const text = await r.text();
+    showToast(`코드맵 생성 실패 ${r.status}: ${text}`, 'err');
+    sum.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+    return;
+  }
   const d = await r.json();
   sum.innerHTML = `<span class="badge ok">${d.files} 파일</span> ${d.total_bytes} bytes 스캔 · 시그니처 ${d.signature_chars} chars`;
   pre.hidden = false;
@@ -2662,10 +2960,12 @@ function subscribeStream() {
         } else if (d.type === 'memory.delete') {
           pushActivity(`memory.delete · #${d.id}`);
           // Reload history if the deleted item belongs to the open project.
-          if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
+          const project = currentProject();
+          if (project) loadHistory(project, HISTORY_OFFSET);
         } else if (d.type === 'memory.delete_batch') {
           pushActivity(`memory.delete_batch · ${d.deleted}건 삭제`);
-          if (CURRENT_PROJECT) loadHistory(CURRENT_PROJECT, HISTORY_OFFSET);
+          const project = currentProject();
+          if (project) loadHistory(project, HISTORY_OFFSET);
         } else if (d.type === 'heartbeat') {
           // keep-alive; ignore
         } else {
@@ -2906,35 +3206,73 @@ function renderSecurityScan(data) {
   document.getElementById('security-results-body').innerHTML = summary + engines + grouped;
 }
 
-async function loadSecurityProfiles() {
-  const select = document.getElementById('security-profile-select');
-  if (!select) return;
-  const selected = select.value;
-  try {
-    const r = await fetch('/api/security/profiles');
-    if (!r.ok) {
-      const msg = await securityErrorMessage(r, '보안 프로파일 로드 실패');
-      showToast(msg, 'err');
-      select.innerHTML = '<option value="">로드 실패</option>';
-      return;
-    }
-    const profiles = await r.json();
-    if (!Array.isArray(profiles) || !profiles.length) {
-      select.innerHTML = '<option value="">프로파일 없음</option>';
-      return;
-    }
-    select.innerHTML = profiles.map(name =>
-      `<option value="${escapeHtml(name)}"${name === selected ? ' selected' : ''}>${escapeHtml(name)}</option>`
-    ).join('');
-  } catch (e) {
-    showToast(`보안 프로파일 로드 오류: ${e.message || e}`, 'err');
-    select.innerHTML = '<option value="">로드 실패</option>';
+function normalizeSecurityProfile(data, fallbackName) {
+  const profile = data && data.profile ? data.profile : data;
+  const rules = Array.isArray(profile) ? profile : (profile && Array.isArray(profile.rules) ? profile.rules : []);
+  return {
+    name: (profile && profile.name) || fallbackName || '',
+    description: (profile && profile.description) || '',
+    severity_threshold: (profile && profile.severity_threshold) || 'low',
+    exclude: (profile && profile.exclude) || [],
+    rules,
+  };
+}
+
+function renderSecurityProfileSummary(profile) {
+  const excludes = securityValueList(profile.exclude);
+  const header = `<table style="margin-bottom:0.75rem;"><tbody>
+    <tr><td>name</td><td><code>${escapeHtml(profile.name || '—')}</code></td></tr>
+    <tr><td>description</td><td>${escapeHtml(profile.description || '—')}</td></tr>
+    <tr><td>severity_threshold</td><td><code>${escapeHtml(profile.severity_threshold || '—')}</code></td></tr>
+    <tr><td>exclude</td><td>${excludes.length ? excludes.map(x => `<code>${escapeHtml(x)}</code>`).join(' ') : '—'}</td></tr>
+  </tbody></table>`;
+  if (!profile.rules.length) return header + '<div class="empty">규칙 없음</div>';
+  const rows = profile.rules.map(rule => {
+    const sev = securitySeverity(rule.severity);
+    const title = rule.title || rule.description || rule.message || rule.name || '—';
+    const engine = rule.engine || rule.source || '—';
+    return `<div class="security-finding-row">
+      <div class="security-finding-main">
+        ${securitySeverityBadge(sev)}
+        <code>${escapeHtml(securityRuleId(rule))}</code>
+        <span>${escapeHtml(engine)}</span>
+        <span class="security-finding-title">${escapeHtml(title)}</span>
+      </div>
+      <div class="security-finding-detail">
+        <div class="security-standards">${securityStandardChips(rule)}</div>
+      </div>
+    </div>`;
+  }).join('');
+  return header + `<div class="security-finding-group">${rows}</div>`;
+}
+
+async function loadSecurityProfiles(selected) {
+  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : 'ai-default';
+  await populateSecurityProfileSelect('security-profile-select', selected || bound);
+}
+
+function refreshSecurityScope() {
+  const msg = projectScopeMessage(true);
+  const empty = document.getElementById('security-scope-empty');
+  const cards = document.querySelectorAll('#sub-securityscan > .card');
+  if (empty) {
+    empty.textContent = msg || '';
+    empty.hidden = !msg;
+  }
+  cards.forEach(card => { card.hidden = !!msg; });
+  const meta = document.getElementById('security-project-meta');
+  if (meta) meta.textContent = msg ? '' : `${currentProject()} · ${projectPath()}`;
+  if (!msg) {
+    const p = selectedProject();
+    loadSecurityProfiles(p && p.security_profile ? p.security_profile : 'ai-default');
   }
 }
 
 async function runSecurityScan() {
+  if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); refreshSecurityScope(); return; }
+  const path = projectPath();
+  if (!path) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshSecurityScope(); return; }
   const profile = document.getElementById('security-profile-select').value;
-  const path = document.getElementById('security-path-input').value.trim() || '.';
   if (!profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
   const btn = document.getElementById('security-scan-btn');
   const body = document.getElementById('security-results-body');
@@ -2956,7 +3294,7 @@ async function runSecurityScan() {
     const data = await r.json();
     renderSecurityScan(data);
     showToast('보안 스캔 완료', 'ok');
-    pushActivity(`security scan · ${profile} · ${path}`);
+    pushActivity(`security scan · ${currentProject()} · ${profile} · ${path}`);
   } catch (e) {
     const msg = `보안 스캔 오류: ${e.message || e}`;
     showToast(msg, 'err');
@@ -2964,6 +3302,35 @@ async function runSecurityScan() {
   } finally {
     btn.disabled = false;
   }
+}
+
+async function applySecurityProfileToProject() {
+  const name = currentProject();
+  const security_profile = document.getElementById('security-profile-select').value;
+  if (!name) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
+  if (!security_profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
+  try {
+    const r = await fetch('/api/projects', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, security_profile }),
+    });
+    if (!r.ok) { showToast(await securityErrorMessage(r, '프로파일 적용 실패'), 'err'); return; }
+    const p = selectedProject();
+    if (p) p.security_profile = security_profile;
+    await loadProjects();
+    document.getElementById('project-selector').value = name;
+    syncProjectInputs(name);
+    showToast('프로파일 적용 완료', 'ok');
+  } catch (e) {
+    showToast(`프로파일 적용 오류: ${e.message || e}`, 'err');
+  }
+}
+
+async function fetchSecurityProfile(name) {
+  const r = await fetch(`/api/security/profile/${encodeURIComponent(name)}`);
+  if (!r.ok) throw new Error(await securityErrorMessage(r, '보안 프로파일 로드 실패'));
+  return normalizeSecurityProfile(await r.json(), name);
 }
 
 async function viewSecurityProfile() {
@@ -2976,45 +3343,116 @@ async function viewSecurityProfile() {
   meta.textContent = name;
   body.innerHTML = '<div class="empty">로드 중…</div>';
   try {
-    const r = await fetch(`/api/security/profile/${encodeURIComponent(name)}`);
-    if (!r.ok) {
-      const msg = await securityErrorMessage(r, '보안 프로파일 로드 실패');
-      showToast(msg, 'err');
-      body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
-      return;
-    }
-    const data = await r.json();
-    const rules = Array.isArray(data) ? data : (data.rules || (data.profile && data.profile.rules) || []);
-    meta.textContent = `${name} · ${rules.length}개 규칙`;
-    if (!rules.length) {
-      body.innerHTML = '<div class="empty">규칙 없음</div>';
-      return;
-    }
-    body.innerHTML = `<div class="security-finding-group">${rules.map(rule => {
-      const sev = securitySeverity(rule.severity);
-      const title = rule.title || rule.description || rule.message || '—';
-      const engine = rule.engine || rule.source || '—';
-      return `<div class="security-finding-row">
-        <div class="security-finding-main">
-          ${securitySeverityBadge(sev)}
-          <code>${escapeHtml(securityRuleId(rule))}</code>
-          <span>${escapeHtml(engine)}</span>
-          <span class="security-finding-title">${escapeHtml(title)}</span>
-        </div>
-        <div class="security-finding-detail">
-          <div class="security-standards">${securityStandardChips(rule)}</div>
-        </div>
-      </div>`;
-    }).join('')}</div>`;
+    const profile = await fetchSecurityProfile(name);
+    meta.textContent = `${profile.name} · ${profile.rules.length}개 규칙`;
+    body.innerHTML = renderSecurityProfileSummary(profile);
   } catch (e) {
-    const msg = `보안 프로파일 오류: ${e.message || e}`;
+    const msg = e.message || e;
     showToast(msg, 'err');
     body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
   }
 }
 
+let ACTIVE_SECURITY_PROFILE = null;
+
+async function loadSecurityProfileSettings() {
+  const list = document.getElementById('security-profile-list');
+  list.innerHTML = '<div class="empty">로드 중…</div>';
+  const profiles = await fetchSecurityProfiles();
+  if (!profiles.length) {
+    list.innerHTML = '<div class="empty">프로파일 없음</div>';
+    return;
+  }
+  list.innerHTML = profiles.map(name =>
+    `<button class="ghost" type="button" data-profile="${escapeAttr(name)}">${escapeHtml(name)}</button>`
+  ).join('');
+  list.querySelectorAll('[data-profile]').forEach(btn => {
+    btn.onclick = () => loadSecurityProfileDetail(btn.dataset.profile);
+  });
+  const initial = document.getElementById('security-profile-select').value || profiles[0];
+  loadSecurityProfileDetail(initial);
+}
+
+async function loadSecurityProfileDetail(name) {
+  const detail = document.getElementById('security-profile-detail');
+  document.querySelectorAll('#security-profile-list [data-profile]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.profile === name);
+  });
+  detail.innerHTML = '<div class="empty">로드 중…</div>';
+  try {
+    ACTIVE_SECURITY_PROFILE = await fetchSecurityProfile(name);
+    detail.innerHTML = renderSecurityProfileSummary(ACTIVE_SECURITY_PROFILE);
+    document.getElementById('security-profile-new-name').value = `${ACTIVE_SECURITY_PROFILE.name}-copy`;
+    document.getElementById('security-profile-toml').value = '';
+  } catch (e) {
+    ACTIVE_SECURITY_PROFILE = null;
+    const msg = e.message || e;
+    showToast(msg, 'err');
+    detail.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+  }
+}
+
+function tomlString(value) {
+  return `"${String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+}
+
+function tomlValue(value) {
+  if (Array.isArray(value)) return `[${value.map(tomlValue).join(', ')}]`;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return tomlString(value);
+}
+
+function securityProfileToToml(profile, newName) {
+  const lines = [
+    '[profile]',
+    `name = ${tomlString(newName || profile.name)}`,
+    `description = ${tomlString(profile.description || '')}`,
+    `severity_threshold = ${tomlString(profile.severity_threshold || 'low')}`,
+  ];
+  if (profile.exclude && profile.exclude.length) lines.push(`exclude = ${tomlValue(profile.exclude)}`);
+  const ruleFields = ['id', 'rule_id', 'name', 'title', 'description', 'severity', 'engine', 'source', 'pattern', 'path', 'message', 'fix_hint'];
+  profile.rules.forEach(rule => {
+    lines.push('', '[[rules]]');
+    ruleFields.forEach(key => {
+      if (rule[key] !== undefined && rule[key] !== null && rule[key] !== '') lines.push(`${key} = ${tomlValue(rule[key])}`);
+    });
+  });
+  return lines.join('\n') + '\n';
+}
+
+function cloneSecurityProfileToml() {
+  if (!ACTIVE_SECURITY_PROFILE) { showToast('프로파일을 선택하세요.', 'err'); return; }
+  const nameInput = document.getElementById('security-profile-new-name');
+  const newName = nameInput.value.trim() || `${ACTIVE_SECURITY_PROFILE.name}-copy`;
+  nameInput.value = newName;
+  document.getElementById('security-profile-toml').value = securityProfileToToml(ACTIVE_SECURITY_PROFILE, newName);
+}
+
+async function saveSecurityProfileToml() {
+  const name = document.getElementById('security-profile-new-name').value.trim();
+  const toml = document.getElementById('security-profile-toml').value;
+  if (!name) { showToast('새 프로파일 이름을 입력하세요.', 'err'); return; }
+  if (!toml.trim()) { showToast('저장할 TOML이 없습니다. 먼저 복제하세요.', 'err'); return; }
+  try {
+    const r = await fetch('/api/security/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, toml }),
+    });
+    if (!r.ok) { showToast(await securityErrorMessage(r, '프로파일 저장 실패'), 'err'); return; }
+    showToast('프로파일 저장 완료', 'ok');
+    await loadSecurityProfiles();
+    await loadSecurityProfileSettings();
+  } catch (e) {
+    showToast(`프로파일 저장 오류: ${e.message || e}`, 'err');
+  }
+}
+
 document.getElementById('security-scan-btn').onclick = runSecurityScan;
 document.getElementById('security-view-profile-btn').onclick = viewSecurityProfile;
+document.getElementById('security-apply-profile-btn').onclick = applySecurityProfileToProject;
+document.getElementById('security-profile-clone-btn').onclick = cloneSecurityProfileToml;
+document.getElementById('security-profile-save-btn').onclick = saveSecurityProfileToml;
 
 // GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
 async function loadLlmModels() {
@@ -3162,6 +3600,7 @@ document.getElementById('llm-ps-refresh').onclick = () => loadLlmPs();
 
 // Init
 document.getElementById('env-bind').textContent = window.location.host;
+loadProjects();
 loadOverview();
 loadTemplates();
 loadPrompts();

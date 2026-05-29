@@ -306,6 +306,8 @@ async fn main() -> Result<()> {
         .route("/api/security/profiles", get(security_profiles))
         .route("/api/security/profile/{name}", get(security_profile))
         .route("/api/security/scan", post(security_scan))
+        .route("/api/security/profile", post(security_profile_save))
+        .route("/api/projects", get(list_projects).put(upsert_project))
         .route(
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),
@@ -586,6 +588,141 @@ async fn security_scan(
     rtrt_security::run(&profile, std::path::Path::new(&path))
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileSaveReq {
+    name: String,
+    toml: String,
+}
+
+/// `POST /api/security/profile` — validate and persist a profile to the user
+/// profile directory. Powers profile clone/edit-save in the UI.
+async fn security_profile_save(
+    Json(req): Json<ProfileSaveReq>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate the TOML by parsing it into a Profile first.
+    Profile::from_toml(&req.toml).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let dir = rtrt_security::user_profile_dir().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cannot determine profile directory".to_string(),
+    ))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create dir {}: {e}", dir.display()),
+        )
+    })?;
+    let path = dir.join(format!("{}.toml", req.name));
+    std::fs::write(&path, &req.toml).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectView {
+    name: String,
+    path: Option<String>,
+    security_profile: Option<String>,
+    mem_count: usize,
+}
+
+/// `GET /api/projects` — union of registered config entries (path /
+/// security_profile) and memory buckets (mem_count), merged by name.
+async fn list_projects(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
+    use std::collections::BTreeMap;
+
+    let mut views: BTreeMap<String, ProjectView> = BTreeMap::new();
+
+    // Registered config entries first.
+    let cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    for entry in &cfg.projects {
+        views.insert(
+            entry.name.clone(),
+            ProjectView {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+                security_profile: entry.security_profile.clone(),
+                mem_count: 0,
+            },
+        );
+    }
+
+    // Memory buckets contribute counts (and may introduce memory-only names).
+    if let Some(mem) = &state.memory {
+        let guard = mem.lock().await;
+        let projects = guard
+            .projects()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        drop(guard);
+        for (name, count, _last) in projects {
+            views
+                .entry(name.clone())
+                .and_modify(|v| v.mem_count = count)
+                .or_insert(ProjectView {
+                    name,
+                    path: None,
+                    security_profile: None,
+                    mem_count: count,
+                });
+        }
+    }
+
+    // BTreeMap iteration is already sorted by name.
+    Ok(Json(views.into_values().collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectUpsertReq {
+    name: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    security_profile: Option<String>,
+}
+
+/// `PUT /api/projects` — upsert a project entry into the config registry.
+async fn upsert_project(
+    Json(req): Json<ProjectUpsertReq>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let name = req.name.clone();
+    cfg.upsert_project(rtrt_core::ProjectEntry {
+        name: req.name,
+        path: req.path,
+        security_profile: req.security_profile,
+    });
+
+    let path = rtrt_core::Config::default_path().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cannot determine config path".to_string(),
+    ))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create dir {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    let s = toml::to_string_pretty(&cfg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(&path, s).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 #[derive(Debug, Clone, Serialize)]

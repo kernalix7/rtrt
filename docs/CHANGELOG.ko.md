@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Highlights — 프로젝트 중심 대시보드 + 프로젝트별 보안
+
+**대시보드를 flat 13개 메뉴 대신 프로젝트 컨텍스트 중심으로 재구성하고, 보안을 프로젝트 인식형으로 전환.**
+
+- `rtrt-core`에 프로젝트 레지스트리: `ProjectEntry { name, path, security_profile }` + `Config.projects` (`project()` / `upsert_project()` 헬퍼). `~/.rtrt/config.toml`에 `[[projects]]`로 저장.
+- 대시보드 API: `GET /api/projects`(config 레지스트리 ∪ 메모리 버킷 → 이름/경로/바인딩 프로파일/mem_count), `PUT /api/projects`(upsert + config 기록), `POST /api/security/profile`(검증 + 커스텀 프로파일을 `~/.rtrt/security/profiles/`에 저장).
+- UI: 사이드바에 전역 프로젝트 셀렉터(localStorage 기억) + 프로젝트 추가/편집 모달; nav를 **프로젝트** 스코프 그룹(개요/메모리/보안/코드맵/진단)과 **도구** 그룹(압축/로컬 LLM/프롬프트/템플릿/연결/설정)으로 분리. 스코프 페이지는 페이지별 프로젝트 선택기 대신 단일 `currentProject()` 사용.
+- 보안 페이지 프로젝트 인식: 선택 프로젝트 경로를 스캔, 바인딩된 프로파일 기본 선택, "이 프로젝트에 적용"으로 프로파일 바인딩, "프로파일 설정" 서브탭에서 프로파일 목록/보기(룰+표준)/복제/저장.
+
 ### Highlights — AI 산출물 보안 & 라이선스 프로파일
 
 **새 `rtrt-security` 크레이트(11번째 워크스페이스 크레이트): RHEL/OpenSCAP 보안 프로파일을 본뜬 프로파일 기반 보안+라이선스 스캔. 빌트인 프로파일 6개가 모든 룰을 산업 표준(CWE / OWASP Top 10 + ASVS / NIST 800-53 + 800-218 SSDF / CIS Controls v8 / SLSA / EU AI Act)에 매핑하고, 5개 플러그인 엔진이 실행하며, CLI·대시보드·MCP로 노출.**

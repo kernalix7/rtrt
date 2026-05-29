@@ -2537,7 +2537,7 @@ function graphNodeRadius(n) {
     const degree = Math.max(1, Number(n.degree || 1));
     return 11 + Math.min(20, Math.sqrt(degree) * 3.5);
   }
-  return 5.5;
+  return 8;
 }
 
 function graphNodeVisible(n) {
@@ -2618,9 +2618,13 @@ function initGraph(data) {
       linkedMemoryByEntity.get(entity.id).push(memory);
     }
   }
+  for (const n of nodes) {
+    n.degree = Math.max(Number(n.degree || 0), adjacency.get(n.id)?.size || 0);
+  }
 
   let view = { x: 0, y: 0, k: 1 };
   let alpha = 1;
+  let tickCount = 0;
   let hoverId = null;
   let selectedId = null;
   let dragNode = null;
@@ -2733,6 +2737,12 @@ function initGraph(data) {
     return n.id === selectedId || (adjacency.get(selectedId) && adjacency.get(selectedId).has(n.id));
   }
 
+  function shouldLabelNode(n) {
+    if (n.id === hoverId || n.id === selectedId || isSearchMatch(n)) return true;
+    const degree = Number(n.degree || 0);
+    return degree >= (isSimilarity ? 5 : 3);
+  }
+
   function edgeDirection(edge) {
     const a = nodes[edge.s];
     const b = nodes[edge.d];
@@ -2783,8 +2793,10 @@ function initGraph(data) {
       const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
       if (isSimilarity) {
         const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
-        ctx.lineWidth = (0.5 + weight * 3.2) / Math.sqrt(view.k);
-        ctx.globalAlpha = selectedId ? (activeEdge ? 0.22 + weight * 0.5 : 0.06) : 0.08 + weight * 0.42;
+        ctx.lineWidth = (0.5 + weight * 2.5) / Math.sqrt(view.k);
+        ctx.globalAlpha = selectedId
+          ? (activeEdge ? 0.18 + weight * 0.58 : 0.025 + weight * 0.08)
+          : 0.035 + weight * 0.5;
       } else {
         ctx.lineWidth = 1 / Math.sqrt(view.k);
         ctx.globalAlpha = selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22;
@@ -2808,12 +2820,12 @@ function initGraph(data) {
         ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
         ctx.stroke();
       }
-      if ((n.node_type === 'entity' || n.id === selectedId || searchHit) && view.k > 0.45) {
+      if (shouldLabelNode(n) && view.k > 0.45) {
         ctx.globalAlpha = dim ? 0.22 : 0.9;
         ctx.fillStyle = fg;
-        ctx.font = `${Math.max(10, 11 / Math.sqrt(view.k))}px system-ui`;
+        ctx.font = `${Math.max(10, 12 / Math.sqrt(view.k))}px system-ui`;
         ctx.textAlign = 'center';
-        ctx.fillText(graphNodeLabel(n).slice(0, 28), n.x, n.y + r + 13);
+        ctx.fillText(graphNodeLabel(n).slice(0, 24), n.x, n.y + r + 15);
       }
     }
     ctx.restore();
@@ -2821,16 +2833,30 @@ function initGraph(data) {
   }
 
   function simulate() {
-    const repel = nodes.length > 180 ? 1800 : 2600;
+    tickCount += 1;
+    const centerX = cw / 2;
+    const centerY = ch / 2;
+    const visibleCount = Math.max(1, nodes.filter(graphNodeVisible).length);
+    const repel = visibleCount > 160 ? 1800 : visibleCount > 90 ? 2400 : 3100;
+    const centerStrength = visibleCount > 120 ? 0.010 : 0.014;
+    const maxSpeed = 10;
     for (let i = 0; i < nodes.length; i++) {
       const a = nodes[i];
+      if (!graphNodeVisible(a)) continue;
       for (let j = i + 1; j < nodes.length; j++) {
         const b = nodes[j];
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const d2 = dx * dx + dy * dy + 0.1;
+        if (!graphNodeVisible(b)) continue;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+          dx = (Math.random() - 0.5) * 0.8;
+          dy = (Math.random() - 0.5) * 0.8;
+        }
+        const minD = graphNodeRadius(a) + graphNodeRadius(b) + 20;
+        const d2 = dx * dx + dy * dy + 0.5;
         const d = Math.sqrt(d2);
-        const force = repel / d2;
+        const collision = d < minD ? (minD - d) * 0.12 : 0;
+        const force = (repel / d2 + collision) * alpha;
         const fx = (dx / d) * force;
         const fy = (dy / d) * force;
         a.vx -= fx; a.vy -= fy;
@@ -2839,32 +2865,42 @@ function initGraph(data) {
     }
     for (const e of edges) {
       const [a, b] = edgeDirection(e);
+      if (!graphNodeVisible(a) || !graphNodeVisible(b)) continue;
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const d = Math.hypot(dx, dy) || 1;
-      const wanted = a.node_type === b.node_type ? 150 : 115;
-      const force = (d - wanted) * 0.018;
+      const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
+      const wanted = isSimilarity ? 170 - weight * 70 : a.node_type === b.node_type ? 155 : 120;
+      const force = (d - wanted) * (isSimilarity ? 0.012 + weight * 0.012 : 0.018) * alpha;
       const fx = (dx / d) * force;
       const fy = (dy / d) * force;
       a.vx += fx; a.vy += fy;
       b.vx -= fx; b.vy -= fy;
     }
     for (const n of nodes) {
+      if (!graphNodeVisible(n)) continue;
       if (n.fx !== null && n.fy !== null) {
         n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0;
         continue;
       }
-      n.vx += (cw / 2 - n.x) * 0.0007;
-      n.vy += (ch / 2 - n.y) * 0.0007;
-      n.vx *= 0.82;
-      n.vy *= 0.82;
-      n.x += n.vx * 0.55 * alpha;
-      n.y += n.vy * 0.55 * alpha;
-      const pad = graphNodeRadius(n) + 10;
-      n.x = Math.max(pad, Math.min(cw - pad, n.x));
-      n.y = Math.max(pad, Math.min(ch - pad, n.y));
+      n.vx += (centerX - n.x) * centerStrength * alpha;
+      n.vy += (centerY - n.y) * centerStrength * alpha;
+      const pad = Math.max(60, graphNodeRadius(n) + 34);
+      if (n.x < pad) n.vx += (pad - n.x) * 0.025 * alpha;
+      if (n.x > cw - pad) n.vx -= (n.x - (cw - pad)) * 0.025 * alpha;
+      if (n.y < pad) n.vy += (pad - n.y) * 0.025 * alpha;
+      if (n.y > ch - pad) n.vy -= (n.y - (ch - pad)) * 0.025 * alpha;
+      const speed = Math.hypot(n.vx, n.vy);
+      if (speed > maxSpeed) {
+        n.vx = (n.vx / speed) * maxSpeed;
+        n.vy = (n.vy / speed) * maxSpeed;
+      }
+      n.vx *= 0.74;
+      n.vy *= 0.74;
+      n.x += n.vx;
+      n.y += n.vy;
     }
-    alpha = Math.max(0.01, alpha * 0.99);
+    alpha = tickCount > 360 ? 0 : Math.max(0, alpha * 0.982 - 0.0015);
   }
 
   function loop() {
@@ -2879,6 +2915,7 @@ function initGraph(data) {
 
   function wakeLayout(nextAlpha) {
     alpha = Math.max(alpha, nextAlpha);
+    tickCount = 0;
     if (!raf) raf = requestAnimationFrame(loop);
   }
 

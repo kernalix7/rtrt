@@ -1174,7 +1174,9 @@ struct MemoryGraphQuery {
 }
 
 fn default_graph_limit() -> usize {
-    200
+    // Keep the default modest: a force-directed graph past ~80 nodes is a
+    // hairball, and the BM25 fallback path costs one FTS query per node.
+    80
 }
 
 async fn memory_graph(

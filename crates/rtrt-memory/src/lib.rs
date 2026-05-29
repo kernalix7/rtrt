@@ -169,23 +169,14 @@ pub fn block_kind(name: &str) -> String {
     format!("{BLOCK_KIND_PREFIX}{name}")
 }
 
-/// Build a safe FTS5 `MATCH` query from free text: take the longest distinct
-/// alphanumeric/Hangul tokens (≥3 chars), cap at 12, and OR them. Quoting each
-/// token keeps FTS5 operators / punctuation in the body from breaking the query.
-fn fts_query_from_text(text: &str) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut toks: Vec<&str> = text
-        .split(|c: char| !(c.is_alphanumeric()))
+/// Salient-token set of free text for lexical similarity: distinct lowercase
+/// alphanumeric/Hangul tokens of ≥3 chars. Used by the similarity graph's
+/// model-free fallback (Jaccard overlap between memories).
+fn token_set(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 3)
-        .filter(|t| seen.insert(t.to_lowercase()))
-        .collect();
-    // Prefer longer tokens — they carry more signal than short common words.
-    toks.sort_by_key(|t| std::cmp::Reverse(t.len()));
-    toks.truncate(12);
-    toks.iter()
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .map(|t| t.to_lowercase())
+        .collect()
 }
 
 impl MemoryStore {
@@ -2030,30 +2021,37 @@ impl MemoryStore {
                 }
             }
         } else {
-            basis = "bm25".to_string();
-            // Lexical fallback: query the FTS index with each memory's salient
-            // tokens, link to the top_k matches (excluding itself).
-            for (node, body) in &rows {
-                let query = fts_query_from_text(body);
-                if query.is_empty() {
+            basis = "lexical".to_string();
+            // Lexical fallback, fully in-memory (no FTS query per node — that
+            // was O(n × FTS) and too slow). Build a salient-token set per memory
+            // and link by Jaccard overlap; each node keeps its top_k peers.
+            let toksets: Vec<(i64, std::collections::HashSet<String>)> = rows
+                .iter()
+                .map(|(n, body)| (n.id, token_set(body)))
+                .collect();
+            for i in 0..toksets.len() {
+                if toksets[i].1.is_empty() {
                     continue;
                 }
-                let hits = match self.recall_bm25(project, &query, top_k + 1) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                // recall_bm25 scores are BM25 (higher = better, unbounded);
-                // normalise to a 0..1-ish weight by rank so the UI can size edges.
-                let n = hits.len().max(1);
-                for (rank, hit) in hits.iter().enumerate() {
-                    if hit.id == node.id || !id_in_scope.contains(&hit.id) {
+                let mut peers: Vec<(i64, f32)> = Vec::new();
+                for j in 0..toksets.len() {
+                    if i == j || toksets[j].1.is_empty() {
                         continue;
                     }
-                    let w = 1.0 - (rank as f32 / n as f32); // 1.0 best → lower
-                    if w < min_weight {
+                    let inter = toksets[i].1.intersection(&toksets[j].1).count();
+                    if inter == 0 {
                         continue;
                     }
-                    let (a, b) = (node.id, hit.id);
+                    let union = toksets[i].1.union(&toksets[j].1).count().max(1);
+                    let w = inter as f32 / union as f32; // Jaccard
+                    if w >= min_weight {
+                        peers.push((toksets[j].0, w));
+                    }
+                }
+                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                peers.truncate(top_k);
+                let a = toksets[i].0;
+                for (b, w) in peers {
                     let key = if a < b { (a, b) } else { (b, a) };
                     let e = edge_set.entry(key).or_insert(w);
                     if w > *e {

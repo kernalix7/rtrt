@@ -915,8 +915,8 @@
     <!-- 설정 -->
     <section id="page-settings" class="page" hidden>
       <div class="section-head">
-        <h1>설정</h1>
-        <div class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
+        <h1 id="settings-title">설정 <span id="settings-global-badge" class="badge ok" hidden>전역 기본</span></h1>
+        <div id="settings-lede" class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
       </div>
       <div class="card">
         <div class="head"><h2>구성</h2><span class="hint">GET /api/config 로드</span></div>
@@ -1094,6 +1094,17 @@
         </div>
       </div>
       <div id="sub-securityprofiles" class="subpage" hidden>
+        <div id="security-global-default-card" class="card" hidden>
+          <div class="head"><h2>전역 기본 보안</h2><span class="hint">새 프로젝트와 미지정 프로젝트의 기본값</span></div>
+          <div class="field-row" style="margin-top:0.5rem;">
+            <label class="field-label" for="security-global-default-profile-select">
+              <span>전역 기본 보안 프로파일</span>
+              <select id="security-global-default-profile-select"><option value="">로딩 중…</option></select>
+            </label>
+            <button id="security-global-default-save-btn" class="primary" type="button">전역 기본 저장</button>
+          </div>
+          <div id="security-global-default-result" class="out-meta"></div>
+        </div>
         <div class="card">
           <div class="head"><h2>프로파일 설정</h2><span class="hint">프로파일 조회 · 복제 · 저장</span></div>
           <div class="security-profile-tools">
@@ -1177,9 +1188,19 @@ document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate
 let PROJECTS_CACHE = [];
 let SECURITY_PROFILES_CACHE = [];
 let GLOBAL_DEFAULT_PROFILE = 'ai-default';
+const GLOBAL_PROJECT_VALUE = '__global__';
+const GLOBAL_SCOPE_MESSAGE = '전역 모드입니다 — 개별 프로젝트를 선택하세요';
 
 function currentProject() {
   return document.getElementById('project-selector').value;
+}
+
+function isGlobalScope() {
+  return document.getElementById('project-selector').value === GLOBAL_PROJECT_VALUE;
+}
+
+function isGlobalProjectValue(value) {
+  return value === GLOBAL_PROJECT_VALUE;
 }
 
 function escapeAttr(s) {
@@ -1210,6 +1231,7 @@ function syncProjectInputs(value) {
 }
 
 function projectScopeMessage(needsPath) {
+  if (isGlobalScope()) return GLOBAL_SCOPE_MESSAGE;
   if (!currentProject()) return '프로젝트를 선택하거나 추가하세요';
   if (needsPath && !projectPath()) return '경로 미설정 — 프로젝트 편집에서 추가하세요';
   return '';
@@ -1225,6 +1247,29 @@ function setScopeState(emptyId, cardSelector, needsPath) {
   }
   if (card) card.hidden = !!msg;
   return !msg;
+}
+
+function updateGlobalScopeIndicators() {
+  const global = isGlobalScope();
+  const settingsTitle = document.getElementById('settings-title');
+  const settingsLede = document.getElementById('settings-lede');
+  const settingsBadge = document.getElementById('settings-global-badge');
+  if (settingsTitle) {
+    settingsTitle.childNodes[0].nodeValue = global ? '전역 기본 설정 ' : '설정 ';
+  }
+  if (settingsLede) {
+    settingsLede.textContent = global
+      ? '보안 기본 프로파일 · 압축 · 임베딩 · 캡처 전역 기본값을 관리합니다.'
+      : '캡처 · 자동 압축 설정을 보고 저장합니다.';
+  }
+  if (settingsBadge) settingsBadge.hidden = !global;
+  const securityGlobalCard = document.getElementById('security-global-default-card');
+  if (securityGlobalCard) securityGlobalCard.hidden = !global;
+}
+
+function showGlobalScopeEmpty(targetId) {
+  const el = document.getElementById(targetId);
+  if (el) el.innerHTML = `<div class="empty">${GLOBAL_SCOPE_MESSAGE}</div>`;
 }
 
 async function fetchSecurityProfiles() {
@@ -1262,38 +1307,40 @@ async function populateSecurityProfileSelect(selectId, selected) {
 async function loadProjects() {
   const select = document.getElementById('project-selector');
   const saved = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project') || '';
-  const previous = currentProject() || saved;
+  const previous = currentProject() || saved || GLOBAL_PROJECT_VALUE;
+  const globalOption = `<option value="${GLOBAL_PROJECT_VALUE}">🌐 글로벌 · 전역 기본</option>`;
   try {
     const r = await fetch('/api/projects');
     if (!r.ok) {
       showToast(await securityErrorMessage(r, '프로젝트 로드 실패'), 'err');
-      select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+      select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+      select.value = GLOBAL_PROJECT_VALUE;
       PROJECTS_CACHE = [];
       syncProjectInputs('');
       refreshProjectScopePage();
+      navigate('settings');
       return;
     }
     const projects = await r.json();
     PROJECTS_CACHE = Array.isArray(projects) ? projects : [];
-    if (!PROJECTS_CACHE.length) {
-      select.innerHTML = '<option value="">프로젝트 없음</option>';
-      syncProjectInputs('');
-      refreshProjectScopePage();
-      return;
-    }
-    select.innerHTML = '<option value="">프로젝트 선택</option>' + PROJECTS_CACHE.map(p =>
+    const projectOptions = PROJECTS_CACHE.length ? PROJECTS_CACHE.map(p =>
       `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
-    ).join('');
-    select.value = PROJECTS_CACHE.some(p => p.name === previous) ? previous : '';
-    syncProjectInputs(select.value);
-    if (select.value) localStorage.setItem('rtrt.project', select.value);
+    ).join('') : '<option value="">프로젝트 없음</option>';
+    select.innerHTML = globalOption + projectOptions;
+    select.value = previous === GLOBAL_PROJECT_VALUE || PROJECTS_CACHE.some(p => p.name === previous) ? previous : GLOBAL_PROJECT_VALUE;
+    syncProjectInputs(isGlobalScope() ? '' : select.value);
+    localStorage.setItem('rtrt.project', select.value);
+    localStorage.setItem('rtrt-project', select.value);
     refreshProjectScopePage();
+    if (isGlobalScope()) navigate('settings');
   } catch (e) {
     showToast(`프로젝트 로드 오류: ${e.message || e}`, 'err');
-    select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+    select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+    select.value = GLOBAL_PROJECT_VALUE;
     PROJECTS_CACHE = [];
     syncProjectInputs('');
     refreshProjectScopePage();
+    navigate('settings');
   }
 }
 
@@ -1317,7 +1364,12 @@ document.getElementById('project-selector').onchange = () => {
   const name = currentProject();
   localStorage.setItem('rtrt.project', name);
   localStorage.setItem('rtrt-project', name);
-  syncProjectInputs(name);
+  syncProjectInputs(isGlobalScope() ? '' : name);
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) {
+    navigate('settings');
+    return;
+  }
   refreshProjectScopePage();
 };
 document.getElementById('project-form').onsubmit = async (ev) => {
@@ -1326,6 +1378,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
   const path = document.getElementById('project-path-input').value.trim();
   const security_profile = document.getElementById('project-security-profile-select').value || GLOBAL_DEFAULT_PROFILE;
   if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
+  if (isGlobalProjectValue(name)) { showToast('예약된 전역 항목 이름입니다.', 'err'); return; }
   try {
     const r = await fetch('/api/projects', {
       method: 'PUT',
@@ -1339,6 +1392,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
     await r.json().catch(() => ({}));
     closeProjectModal();
     localStorage.setItem('rtrt.project', name);
+    document.getElementById('project-selector').value = name;
     await loadProjects();
     document.getElementById('project-selector').value = name;
     syncProjectInputs(name);
@@ -1364,6 +1418,7 @@ function wireSubtabs(navId, onActivate) {
 }
 wireSubtabs('memory-subtabs', (sub) => {
   const project = currentProject();
+  if (isGlobalScope()) { refreshMemoryScope(); return; }
   // Auto-load stats + compression queue when the stats tab is activated.
   if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
   // Auto-load governance stats when governance tab opens.
@@ -1391,8 +1446,17 @@ let CURRENT_PROJECT = null;
 const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
 
 function openProject(name) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) {
+    CURRENT_PROJECT = null;
+    syncProjectInputs('');
+    document.getElementById('mem-empty').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('mem-empty').hidden = false;
+    document.getElementById('mem-detail').hidden = true;
+    return;
+  }
   if (!name) {
     CURRENT_PROJECT = null;
+    document.getElementById('mem-empty').textContent = '프로젝트를 선택하거나 추가하세요';
     document.getElementById('mem-empty').hidden = false;
     document.getElementById('mem-detail').hidden = true;
     return;
@@ -1506,6 +1570,7 @@ function syncBulkBar() {
 }
 
 async function loadHistory(name, offset) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) { showGlobalScopeEmpty('history-list'); return; }
   if (offset === undefined) offset = 0;
   HISTORY_OFFSET = offset;
   // Reset selection on each page load.
@@ -1594,6 +1659,7 @@ async function loadHistory(name, offset) {
       ev.stopPropagation();
       const row = btn.closest('.recompress-row');
       const project = row.dataset.proj;
+      if (isGlobalScope() || isGlobalProjectValue(project)) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
       const model = row.querySelector('.row-model-sel').value || undefined;
       const result = row.querySelector('.row-recompress-result');
       btn.disabled = true;
@@ -1631,6 +1697,7 @@ async function loadHistory(name, offset) {
 
 // Detail modal: fetch GET /api/memory/{id} and render.
 async function openDetailModal(id) {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   const modal = document.getElementById('mem-detail-modal');
   const body = document.getElementById('detail-modal-body');
   document.getElementById('detail-modal-title').textContent = `메모리 #${id}`;
@@ -1697,12 +1764,12 @@ document.addEventListener('keydown', (ev) => {
 });
 document.getElementById('history-prev').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
 };
 document.getElementById('history-next').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
 };
 
@@ -1712,14 +1779,14 @@ document.getElementById('sort-recent').onclick = () => {
   document.getElementById('sort-recent').classList.add('active');
   document.getElementById('sort-importance').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.getElementById('sort-importance').onclick = () => {
   HISTORY_SORT = 'importance';
   document.getElementById('sort-importance').classList.add('active');
   document.getElementById('sort-recent').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
   btn.onclick = () => {
@@ -1732,12 +1799,13 @@ document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
     // Reload from page 0 with the server-side source filter so it spans the
     // whole project rather than only the rows already on screen.
     const project = currentProject();
-    if (project) loadHistory(project, 0);
+    if (project && !isGlobalScope()) loadHistory(project, 0);
   };
 });
 
 // Bulk delete — confirm dialog before sending.
 document.getElementById('bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!SELECTED_IDS.size) return;
   const ids = Array.from(SELECTED_IDS);
   const ok = confirm(`선택한 ${ids.length}건을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
@@ -1759,7 +1827,7 @@ document.getElementById('bulk-delete-btn').onclick = async () => {
     SELECTED_IDS.clear();
     syncBulkBar();
     const project = currentProject();
-    if (project) loadHistory(project, HISTORY_OFFSET);
+    if (project && !isGlobalScope()) loadHistory(project, HISTORY_OFFSET);
   } catch (e) { pushActivity(`삭제 오류: ${e.message || e}`); }
 };
 document.getElementById('bulk-clear-btn').onclick = () => {
@@ -1773,7 +1841,7 @@ document.getElementById('bulk-clear-btn').onclick = () => {
 const originalSaveHandler = () => {};
 
 const savedProject = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project');
-if (savedProject) syncProjectInputs(savedProject);
+if (savedProject && !isGlobalProjectValue(savedProject)) syncProjectInputs(savedProject);
 
 // Sample data — one-click form fillers so the user can try a tool without
 // digging up an example. Each entry is a function so it can vary per call.
@@ -1827,7 +1895,7 @@ function refreshRepomapScope() {
   const ok = setScopeState('repomap-scope-empty', '#page-repomap .card', true);
   const path = projectPath();
   document.getElementById('repomap-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
-  document.getElementById('repomap-root').value = path;
+  document.getElementById('repomap-root').value = ok ? path : '';
 }
 function refreshDiagnoseScope() {
   const ok = setScopeState('diagnose-scope-empty', '#page-diagnose .card', true);
@@ -1842,6 +1910,7 @@ function refreshProjectScopePage() {
   if (page === 'diagnose') refreshDiagnoseScope();
 }
 function navigate(page) {
+  updateGlobalScopeIndicators();
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
   const link = document.querySelector(`aside a.nav[data-page="${page}"]`);
@@ -1858,6 +1927,7 @@ function navigate(page) {
     refreshDiagnoseScope();
   }
   if (page === 'settings') {
+    updateGlobalScopeIndicators();
     // Reload config each time the panel opens so it stays current.
     populateModelSelects();
     loadConfig();
@@ -2060,6 +2130,7 @@ document.getElementById('overview-refresh').onclick = () => { loadOverview(); pu
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('recall-results'); showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
@@ -2142,6 +2213,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   if (!btn) return;
   btn.onclick = async () => {
     const project = currentProject();
+    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
     if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
     btn.disabled = true;
     const origText = btn.textContent;
@@ -2176,6 +2248,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('save-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   let metadata = {};
   const raw = document.getElementById('save-metadata').value.trim();
@@ -2201,6 +2274,7 @@ document.getElementById('save-form').onsubmit = async (ev) => {
 document.getElementById('blocks-list-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.querySelector('#blocks-tbl tbody').innerHTML = `<tr><td colspan="2" class="empty">${GLOBAL_SCOPE_MESSAGE}</td></tr>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const tbody = document.querySelector('#blocks-tbl tbody');
   tbody.innerHTML = `<tr><td colspan="2" class="empty">불러오는 중…</td></tr>`;
@@ -2219,6 +2293,7 @@ document.getElementById('blocks-list-form').onsubmit = async (ev) => {
 document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('block-set-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const body = {
     project,
@@ -2239,6 +2314,7 @@ document.getElementById('blocks-set-form').onsubmit = async (ev) => {
 document.getElementById('export-form').onsubmit = (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
@@ -2246,6 +2322,12 @@ document.getElementById('export-form').onsubmit = (ev) => {
 
 // Memory stats subtab — calls GET /api/memory/stats?project=
 async function loadMemStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('memstats-loading').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('memstats-loading').hidden = false;
+    document.getElementById('memstats-body').hidden = true;
+    return;
+  }
   if (!project) return;
   const loading = document.getElementById('memstats-loading');
   const body = document.getElementById('memstats-body');
@@ -2303,11 +2385,16 @@ async function loadMemStats(project) {
 
 document.getElementById('memstats-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadMemStats(project); loadQueue(project); }
+  if (project && !isGlobalScope()) { loadMemStats(project); loadQueue(project); }
 };
 
 // Compression queue — GET /api/memory/queue?project=
 async function loadQueue(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('queue-summary').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('queue-list').innerHTML = '';
+    return;
+  }
   if (!project) return;
   const summary = document.getElementById('queue-summary');
   const list = document.getElementById('queue-list');
@@ -2342,6 +2429,7 @@ async function loadQueue(project) {
 let GOV_PREVIEW_IDS = [];
 
 async function loadGovStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) return;
   if (!project) return;
   // Reuse the existing stats endpoint to populate the summary boxes.
   try {
@@ -2362,6 +2450,7 @@ async function loadGovStats(project) {
 
 async function runGovPreview() {
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('gov-preview-result'); return; }
   if (!project) return;
   const kind = document.getElementById('gov-kind').value;
   const compFilter = document.getElementById('gov-compress-filter').value;
@@ -2425,10 +2514,11 @@ async function runGovPreview() {
 document.getElementById('gov-preview-btn').onclick = runGovPreview;
 document.getElementById('gov-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadGovStats(project); runGovPreview(); }
+  if (project && !isGlobalScope()) { loadGovStats(project); runGovPreview(); }
 };
 
 document.getElementById('gov-bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!GOV_PREVIEW_IDS.length) return;
   const ok = confirm(`필터 조건에 해당하는 ${GOV_PREVIEW_IDS.length}건을 모두 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
   if (!ok) return;
@@ -2452,7 +2542,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
     document.getElementById('gov-preview-result').innerHTML = '<div class="empty">삭제 완료. 미리보기를 다시 실행하세요.</div>';
     document.getElementById('gov-danger-zone').hidden = true;
     const project = currentProject();
-    if (project) loadGovStats(project);
+    if (project && !isGlobalScope()) loadGovStats(project);
   } catch (e) {
     resultEl.innerHTML = `<span style="color:var(--err);">오류: ${e.message || e}</span>`;
   }
@@ -2460,6 +2550,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
 
 document.getElementById('queue-compress-all').onclick = async (ev) => {
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) return;
   const btn = ev.currentTarget;
   btn.disabled = true; btn.textContent = '압축 중…';
@@ -2693,7 +2784,7 @@ function initGraph(data) {
     const page = document.getElementById('sub-memhistory');
     if (page) page.hidden = false;
     const project = currentProject();
-    if (project) loadHistory(project, 0);
+    if (project && !isGlobalScope()) loadHistory(project, 0);
   }
 
   function renderDetail(n) {
@@ -3043,6 +3134,12 @@ function initGraph(data) {
 }
 
 async function loadGraph(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('graph-meta').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('graph-empty-state').hidden = false;
+    document.getElementById('graph-empty-state').innerHTML = `<div>${GLOBAL_SCOPE_MESSAGE}</div>`;
+    return;
+  }
   const meta = document.getElementById('graph-meta');
   const basis = document.getElementById('graph-basis-caption');
   syncGraphModeUi();
@@ -3106,7 +3203,7 @@ async function loadGraph(project) {
       localStorage.setItem(GRAPH_MODE_KEY, graphMode);
       sync();
       const project = currentProject();
-      if (project) await loadGraph(project);
+      if (project && !isGlobalScope()) await loadGraph(project);
     };
   });
   document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
@@ -3125,6 +3222,7 @@ async function loadGraph(project) {
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); await loadGraph(project); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   await loadGraph(project);
 };
@@ -3136,6 +3234,7 @@ document.getElementById('graph-form').onsubmit = async (ev) => {
   if (!btn) return;
   btn.onclick = async () => {
     const project = currentProject();
+    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
     if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
     btn.disabled = true;
     const origText = btn.textContent;
@@ -3246,6 +3345,7 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshDiagnoseScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!projectPath()) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshDiagnoseScope(); return; }
   const body = {
@@ -3270,6 +3370,7 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
 };
 document.getElementById('repomap-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshRepomapScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const root = projectPath();
   if (!root) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshRepomapScope(); return; }
@@ -3510,6 +3611,10 @@ document.getElementById('compress-now-btn').onclick = async () => {
   const project = document.getElementById('compress-now-project').value.trim();
   if (!project) {
     document.getElementById('compress-now-result').innerHTML = '<span style="color:var(--err);">프로젝트 이름을 입력하세요.</span>';
+    return;
+  }
+  if (isGlobalProjectValue(project)) {
+    document.getElementById('compress-now-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`;
     return;
   }
   const model = document.getElementById('compress-now-model').value || undefined;
@@ -3874,6 +3979,7 @@ async function loadSecurityProfiles(selected) {
 }
 
 function refreshSecurityScope() {
+  updateGlobalScopeIndicators();
   const msg = projectScopeMessage(true);
   const empty = document.getElementById('security-scope-empty');
   const cards = document.querySelectorAll('#sub-securityscan > .card');
@@ -3884,6 +3990,11 @@ function refreshSecurityScope() {
   cards.forEach(card => { card.hidden = !!msg; });
   const meta = document.getElementById('security-project-meta');
   if (meta) meta.textContent = msg ? '' : `${currentProject()} · ${projectPath()}`;
+  if (isGlobalScope()) {
+    subClick('security-subtabs', 'securityprofiles');
+    loadSecurityGlobalDefaultCard();
+    return;
+  }
   if (!msg) {
     const p = selectedProject();
     loadSecurityProfiles(p && p.security_profile ? p.security_profile : GLOBAL_DEFAULT_PROFILE);
@@ -3891,6 +4002,7 @@ function refreshSecurityScope() {
 }
 
 async function runSecurityScan() {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); refreshSecurityScope(); return; }
   const path = projectPath();
   if (!path) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshSecurityScope(); return; }
@@ -3929,6 +4041,7 @@ async function runSecurityScan() {
 async function applySecurityProfileToProject() {
   const name = currentProject();
   const security_profile = document.getElementById('security-profile-select').value;
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!name) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!security_profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
   try {
@@ -3977,7 +4090,60 @@ async function viewSecurityProfile() {
 
 let ACTIVE_SECURITY_PROFILE = null;
 
+async function loadSecurityGlobalDefaultCard() {
+  const card = document.getElementById('security-global-default-card');
+  if (card) card.hidden = !isGlobalScope();
+  if (!isGlobalScope()) return;
+  try {
+    const r = await fetch('/api/config');
+    if (r.ok) {
+      const d = await r.json();
+      const securityDefaultProfile = d.security?.default_profile;
+      if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+        GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+      }
+    }
+  } catch (_) { /* keep cached default */ }
+  await populateSecurityProfileSelect('security-global-default-profile-select', GLOBAL_DEFAULT_PROFILE);
+}
+
+async function saveSecurityGlobalDefaultProfile() {
+  if (!isGlobalScope()) return;
+  const select = document.getElementById('security-global-default-profile-select');
+  const result = document.getElementById('security-global-default-result');
+  const defaultProfile = select ? select.value : '';
+  if (!defaultProfile) { showToast('전역 기본 보안 프로파일을 선택하세요.', 'err'); return; }
+  result.textContent = '저장 중…';
+  try {
+    const cur = await fetch('/api/config');
+    if (!cur.ok) {
+      result.innerHTML = `<span style="color:var(--err);">설정 로드 실패 ${cur.status}</span>`;
+      return;
+    }
+    const body = await cur.json();
+    body.security = { ...(body.security || {}), default_profile: defaultProfile };
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      result.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`;
+      return;
+    }
+    GLOBAL_DEFAULT_PROFILE = defaultProfile;
+    await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
+    result.innerHTML = '<span class="badge ok">✓ 전역 기본 저장됨</span>';
+    pushActivity('전역 기본 보안 프로파일 저장 완료');
+    showToast('전역 기본 저장 완료', 'ok');
+  } catch (e) {
+    result.innerHTML = `<span style="color:var(--err);">오류: ${escapeHtml(e.message || String(e))}</span>`;
+  }
+}
+
 async function loadSecurityProfileSettings() {
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) loadSecurityGlobalDefaultCard();
   const list = document.getElementById('security-profile-list');
   list.innerHTML = '<div class="empty">로드 중…</div>';
   const profiles = await fetchSecurityProfiles();
@@ -4075,6 +4241,7 @@ document.getElementById('security-view-profile-btn').onclick = viewSecurityProfi
 document.getElementById('security-apply-profile-btn').onclick = applySecurityProfileToProject;
 document.getElementById('security-profile-clone-btn').onclick = cloneSecurityProfileToml;
 document.getElementById('security-profile-save-btn').onclick = saveSecurityProfileToml;
+document.getElementById('security-global-default-save-btn').onclick = saveSecurityGlobalDefaultProfile;
 
 // GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
 async function loadLlmModels() {

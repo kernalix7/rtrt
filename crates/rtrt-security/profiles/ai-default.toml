@@ -1,0 +1,141 @@
+name        = "ai-default"
+description = "Recommended baseline for AI-generated artifacts. Catches secrets, copyleft license leaks, lockfile hygiene issues, AI-specific supply-chain risks, and high-value injection patterns. Threshold = medium; every rule at high severity triggers a gate failure."
+severity_threshold = "medium"
+
+# ─── SECRETS ────────────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "secret.scan"
+engine      = "secrets"
+severity    = "high"
+description = "Full built-in secret-pattern scan — AWS keys, GitHub tokens, Stripe keys, private keys, JWTs, high-entropy assignments, and committed .env values."
+
+[rules.standards]
+cwe   = ["CWE-312", "CWE-798"]
+owasp = ["A02:2021-Cryptographic Failures", "A07:2021-Identification and Authentication Failures"]
+nist  = ["PW.1.2", "PS.2.1", "PO.5.2"]
+
+# ─── LICENSES ───────────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "license.no-copyleft"
+engine      = "licenses"
+severity    = "high"
+description = "Reject copyleft and source-available licenses that are incompatible with an MIT-licensed binary distribution."
+forbidden   = ["GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "GPL-3.0-or-later", "AGPL-3.0-only", "AGPL-3.0-or-later", "SSPL-1.0", "LGPL-2.1-only", "LGPL-2.1-or-later", "LGPL-3.0-only", "LGPL-3.0-or-later"]
+
+[rules.standards]
+cwe   = ["CWE-1104"]
+owasp = ["A06:2021-Vulnerable and Outdated Components"]
+nist  = ["PW.4.1", "PO.1.2"]
+
+# ─── DEPENDENCIES ───────────────────────────────────────────────────────────
+
+[[rules]]
+id             = "deps.lockfile-hygiene"
+engine         = "deps"
+severity       = "medium"
+description    = "Forbid wildcard version requirements and git/path dependencies in production manifests — both defeat reproducible builds and audit trails."
+forbid_wildcard = true
+forbid_git      = true
+
+[rules.standards]
+cwe   = ["CWE-1104", "CWE-494"]
+owasp = ["A06:2021-Vulnerable and Outdated Components"]
+nist  = ["PW.4.1", "PW.4.4"]
+slsa  = ["SLSA-L2-Provenance"]
+
+# ─── AI-ARTIFACT RISKS ──────────────────────────────────────────────────────
+
+[[rules]]
+id          = "ai.hallucinated-import"
+engine      = "ai"
+severity    = "high"
+description = "Flag imports of packages not declared in the project's dependency manifests — LLM slopsquatting risk where a hallucinated crate name may be registered by a malicious actor."
+check       = "hallucinated-import"
+
+[rules.standards]
+cwe   = ["CWE-829", "CWE-494"]
+owasp = ["A08:2021-Software and Data Integrity Failures"]
+nist  = ["PW.4.1", "PW.4.4"]
+eu_ai_act = ["Art.15-Robustness", "Art.9-Risk-Management"]
+
+[[rules]]
+id          = "ai.eval-usage"
+engine      = "ai"
+severity    = "high"
+description = "Flag dynamic code execution surfaces (eval, exec, new Function, pickle.loads, child_process without validation) that AI-generated code sometimes introduces without adequate guardrails."
+check       = "eval-usage"
+
+[rules.standards]
+cwe   = ["CWE-78", "CWE-94", "CWE-502"]
+owasp = ["A03:2021-Injection", "A08:2021-Software and Data Integrity Failures"]
+nist  = ["PW.5.1", "PW.6.1", "SI-10"]
+eu_ai_act = ["Art.15-Robustness"]
+
+[[rules]]
+id          = "ai.todo-secret"
+engine      = "ai"
+severity    = "medium"
+description = "Flag TODO/FIXME/XXX comments adjacent to authentication or secret-handling code — a common sign that an LLM left a security stub that was never completed."
+check       = "todo-secret"
+
+[rules.standards]
+cwe   = ["CWE-798", "CWE-259"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+nist  = ["PW.1.2", "PW.2.2"]
+
+# ─── HIGH-VALUE PATTERNS ────────────────────────────────────────────────────
+
+[[rules]]
+id          = "pattern.command-injection"
+engine      = "patterns"
+severity    = "high"
+description = "Flag Rust Command::new / process::Command chains that pass a variable directly as the program name or first argument without an allowlist — classic OS command injection surface."
+lang        = "rust"
+match       = "Command::new\\s*\\(\\s*[a-zA-Z_][a-zA-Z0-9_]*\\s*\\)"
+
+[rules.standards]
+cwe   = ["CWE-78"]
+owasp = ["A03:2021-Injection"]
+nist  = ["PW.5.1", "SI-10"]
+eu_ai_act = ["Art.15-Robustness"]
+
+[[rules]]
+id          = "pattern.sql-string-concat"
+engine      = "patterns"
+severity    = "high"
+description = "Flag SQL queries built by string concatenation or format macros — parameterised queries must be used instead."
+lang        = "rust"
+match       = "format!\\s*\\(\\s*\"[^\"]*SELECT[^\"]*\\{|format!\\s*\\(\\s*\"[^\"]*INSERT[^\"]*\\{|format!\\s*\\(\\s*\"[^\"]*UPDATE[^\"]*\\{|format!\\s*\\(\\s*\"[^\"]*DELETE[^\"]*\\{"
+
+[rules.standards]
+cwe   = ["CWE-89"]
+owasp = ["A03:2021-Injection"]
+nist  = ["PW.5.1", "SI-10"]
+
+[[rules]]
+id          = "pattern.hardcoded-bind-any"
+engine      = "patterns"
+severity    = "medium"
+description = "Flag hardcoded 0.0.0.0 bind addresses in source — services should bind to a configurable interface, defaulting to loopback in non-production contexts."
+lang        = "rust"
+match       = "\"0\\.0\\.0\\.0"
+
+[rules.standards]
+cwe   = ["CWE-605", "CWE-923"]
+owasp = ["A05:2021-Security Misconfiguration"]
+nist  = ["CM-7", "PW.5.1"]
+
+[[rules]]
+id          = "pattern.unsafe-block"
+engine      = "ai"
+severity    = "medium"
+description = "Flag Rust unsafe blocks — AI-generated code frequently introduces unsafe without necessity; each occurrence requires explicit justification."
+check       = "unsafe-block"
+
+[rules.standards]
+cwe   = ["CWE-119", "CWE-787"]
+owasp = ["A04:2021-Insecure Design"]
+nist  = ["PW.5.1", "PW.6.2"]
+eu_ai_act = ["Art.15-Robustness"]

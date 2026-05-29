@@ -19,6 +19,7 @@ rtrt-memory = { workspace = true, features = ["ollama-embed", "llm"] }
 rtrt-proxy.workspace = true
 rtrt-templates.workspace = true
 rtrt-providers.workspace = true
+rtrt-security.workspace = true
 uuid.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true

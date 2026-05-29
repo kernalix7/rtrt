@@ -1,0 +1,32 @@
+[package]
+name = "rtrt-security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Security & license profiles for AI-generated artifacts — declarative TOML profiles mapped to industry standards (CIS, NIST, OWASP, CWE, SLSA, EU AI Act) run by pluggable scan engines."
+
+# Profile-driven, like RHEL/OpenSCAP security profiles: a profile is a set of
+# rules, each rule routes to one engine (secrets / licenses / deps / patterns /
+# ai), and every rule carries a `standards` mapping so findings cite the
+# control they enforce. Built-in profiles ship as embedded TOML; users drop
+# their own under ~/.rtrt/security/profiles/.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rtrt-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+dirs.workspace = true
+once_cell.workspace = true
+
+[features]
+default = []

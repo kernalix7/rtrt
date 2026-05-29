@@ -1,0 +1,192 @@
+name = "nist-ssdf"
+description = "NIST SP 800-218 Secure Software Development Framework (SSDF) + SP 800-53 controls. Covers PW.4 (reuse secure components), PW.5 (secure coding), PW.7 (review / todo stubs), PS.1 (protect code / secrets), and RV.1 (vulnerability identification)."
+severity_threshold = "high"
+exclude = ["docs/", "CHANGELOG", ".github/ISSUE_TEMPLATE"]
+
+# ---------------------------------------------------------------------------
+# PS.1 — Protect all forms of code from unauthorized access and tampering.
+# Secrets committed to source are a direct PS.1 violation: they expose the
+# build / deploy pipeline to credential theft.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "secret.scan"
+engine = "secrets"
+severity = "critical"
+description = "Scan for committed secrets (API keys, tokens, private keys, high-entropy assignments). Committed credentials violate SSDF PS.1 and enable supply-chain compromise."
+
+[rules.standards]
+nist = ["PS.1", "SI-12", "IA-5"]
+cwe = ["CWE-312", "CWE-798"]
+owasp = ["A07:2021-Identification-and-Authentication-Failures"]
+other = ["SSDF:PS.1.1"]
+
+# ---------------------------------------------------------------------------
+# PW.4 — Reuse existing, well-secured software where feasible.
+# Known-vulnerable or yanked dependencies violate the intent of PW.4: if you
+# pull in a component, it must be vetted and maintained.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "deps.advisories"
+engine = "deps"
+severity = "high"
+description = "Flag dependencies with known security advisories in the RustSec advisory database (SSDF PW.4 — reuse secure components)."
+db = "rustsec"
+forbid_yanked = true
+
+[rules.standards]
+nist = ["PW.4", "SA-22", "CM-7"]
+cwe = ["CWE-1395"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+slsa = ["dependencies-complete"]
+other = ["SSDF:PW.4.1"]
+
+[[rules]]
+id = "deps.git-sources"
+engine = "deps"
+severity = "medium"
+description = "Flag dependencies pinned to git refs or local paths. Unreleased sources bypass the advisory database and break supply-chain provenance (SSDF PW.4, SLSA)."
+forbid_git = true
+
+[rules.standards]
+nist = ["PW.4", "SA-12", "CM-7"]
+cwe = ["CWE-494"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+slsa = ["provenance-L2"]
+other = ["SSDF:PW.4.2"]
+
+[[rules]]
+id = "deps.wildcard-versions"
+engine = "deps"
+severity = "medium"
+description = "Flag wildcard ('*') version requirements in Cargo manifests. Wildcard ranges silently pull in breaking or vulnerable releases (SSDF PW.4)."
+forbid_wildcard = true
+
+[rules.standards]
+nist = ["PW.4", "CM-7"]
+cwe = ["CWE-1395"]
+other = ["SSDF:PW.4.1"]
+
+# ---------------------------------------------------------------------------
+# PW.5 — Create source code by adhering to secure coding practices.
+# The rules below target Rust-specific unsafe usage and OS-command / eval
+# injection patterns that violate SSDF PW.5.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "pattern.unsafe-block"
+engine = "ai"
+severity = "medium"
+description = "Flag Rust unsafe blocks. AI-generated code frequently emits unneeded unsafe{} sections; each block widens the memory-safety attack surface (SSDF PW.5)."
+check = "unsafe-block"
+
+[rules.standards]
+nist = ["PW.5", "SI-16"]
+cwe = ["CWE-119", "CWE-676"]
+other = ["SSDF:PW.5.1"]
+
+[[rules]]
+id = "pattern.command-injection"
+engine = "patterns"
+severity = "high"
+description = "Flag Command::new() calls that chain user-controlled .arg() or .args() without a safeword boundary — classic OS-command injection (SSDF PW.5, CWE-78)."
+match = "Command::new\\([^)]+\\)[\\s\\S]{0,120}\\.arg(s)?\\("
+lang = "rust"
+
+[rules.standards]
+nist = ["PW.5", "SI-10"]
+cwe = ["CWE-78"]
+owasp = ["A03:2021-Injection"]
+other = ["SSDF:PW.5.2"]
+
+[[rules]]
+id = "pattern.eval-usage"
+engine = "ai"
+severity = "high"
+description = "Flag eval()/exec()/Function() in JS/TS and pickle.loads in Python. These allow arbitrary code execution if fed untrusted input (SSDF PW.5, CWE-95)."
+check = "eval-usage"
+
+[rules.standards]
+nist = ["PW.5", "SI-10"]
+cwe = ["CWE-95", "CWE-502"]
+owasp = ["A03:2021-Injection"]
+other = ["SSDF:PW.5.2"]
+
+[[rules]]
+id = "pattern.sql-format-string"
+engine = "patterns"
+severity = "high"
+description = "Flag SQL strings assembled with format!/format_args! macros rather than parameterised queries — SQL injection vector (SSDF PW.5, CWE-89)."
+match = "format!\\([^)]*(?:SELECT|INSERT|UPDATE|DELETE|WHERE)[^)]*\\{"
+lang = "rust"
+
+[rules.standards]
+nist = ["PW.5", "SI-10"]
+cwe = ["CWE-89"]
+owasp = ["A03:2021-Injection"]
+other = ["SSDF:PW.5.2"]
+
+[[rules]]
+id = "pattern.unwrap-in-handler"
+engine = "patterns"
+severity = "low"
+description = "Flag .unwrap() or .expect() calls inside Axum handler files. Panics in request handlers abort the process and deny service (SSDF PW.5, CWE-248)."
+match = "\\.(unwrap|expect)\\("
+lang = "rust"
+path_glob = "handler"
+
+[rules.standards]
+nist = ["PW.5", "SC-5"]
+cwe = ["CWE-248", "CWE-400"]
+other = ["SSDF:PW.5.1"]
+
+# ---------------------------------------------------------------------------
+# PW.7 — Review and/or analyze human-readable code to identify
+# vulnerabilities and verify compliance with security requirements.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "ai.todo-secret"
+engine = "ai"
+severity = "medium"
+description = "Flag TODO/FIXME/XXX comments adjacent to auth/secret/token/password symbols — unfinished security stubs that ship incomplete controls (SSDF PW.7, EU AI Act Art. 15)."
+check = "todo-secret"
+
+[rules.standards]
+nist = ["PW.7", "SA-11"]
+cwe = ["CWE-546"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+other = ["SSDF:PW.7.2"]
+
+[[rules]]
+id = "ai.hallucinated-import"
+engine = "ai"
+severity = "medium"
+description = "Flag imports of packages not declared in the project manifest — LLM slopsquatting risk that can introduce malicious transitive deps (SSDF PW.7, EU AI Act Art. 15)."
+check = "hallucinated-import"
+
+[rules.standards]
+nist = ["PW.7", "PW.4", "SA-12"]
+cwe = ["CWE-494", "CWE-829"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+other = ["SSDF:PW.7.1"]
+
+# ---------------------------------------------------------------------------
+# RV.1 — Identify and confirm vulnerabilities on an ongoing basis.
+# License compliance is part of ongoing supply-chain hygiene mandated by
+# SSDF RV.1 and reinforced by NIST SP 800-53 SA-22 / CM-7.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "license.forbidden-copyleft"
+engine = "licenses"
+severity = "high"
+description = "Flag strong-copyleft licenses (GPL-3.0, AGPL-3.0, LGPL-3.0) in project manifests. Their viral terms conflict with the MIT-licensed rtrt codebase and trigger legal / distribution risk (SSDF RV.1)."
+forbidden = ["GPL-3.0-only", "GPL-3.0-or-later", "AGPL-3.0-only", "AGPL-3.0-or-later", "LGPL-3.0-only", "LGPL-3.0-or-later"]
+
+[rules.standards]
+nist = ["RV.1", "SA-22"]
+cwe = ["CWE-1104"]
+other = ["SSDF:RV.1.2", "SPDX:GPL-3.0-family"]

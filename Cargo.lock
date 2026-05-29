@@ -3120,6 +3120,7 @@ dependencies = [
  "rtrt-memory",
  "rtrt-providers",
  "rtrt-proxy",
+ "rtrt-security",
  "rtrt-templates",
  "serde_json",
  "tokio",
@@ -3176,6 +3177,7 @@ dependencies = [
  "rtrt-memory",
  "rtrt-providers",
  "rtrt-proxy",
+ "rtrt-security",
  "rtrt-templates",
  "rusqlite",
  "serde",
@@ -3220,6 +3222,7 @@ dependencies = [
  "rtrt-memory",
  "rtrt-providers",
  "rtrt-proxy",
+ "rtrt-security",
  "rtrt-templates",
  "schemars 0.8.22",
  "serde",
@@ -3275,6 +3278,21 @@ dependencies = [
  "regex",
  "rtrt-core",
  "serde",
+]
+
+[[package]]
+name = "rtrt-security"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "once_cell",
+ "regex",
+ "rtrt-core",
+ "serde",
+ "serde_json",
+ "toml",
+ "walkdir",
 ]
 
 [[package]]

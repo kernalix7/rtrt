@@ -1,0 +1,195 @@
+name        = "asvs-l2"
+description = "OWASP ASVS Level 2 — standard verification for most applications. Covers V2 auth, V3 session, V5 validation/encoding, V6 crypto, V7 error/logging, V8 data protection, V9 communications, and V14 configuration."
+severity_threshold = "medium"
+
+# ── V2 Authentication ────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v2.hardcoded-credential"
+engine      = "secrets"
+severity    = "critical"
+description = "Hardcoded credential or high-entropy secret detected — violates ASVS 2.10.4 (no hardcoded secrets in source)."
+
+[rules.standards]
+asvs  = ["2.10.4"]
+cwe   = ["CWE-798", "CWE-259"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+nist  = ["IA-5"]
+
+# ── V3 Session Management ────────────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v3.insecure-cookie-flag"
+engine      = "patterns"
+severity    = "high"
+description = "Cookie set without Secure or HttpOnly flag — session tokens may leak over plain-HTTP or to client-side scripts (ASVS 3.4.1 / 3.4.2)."
+match       = "(?i)set.?cookie[^;\\n]{0,120}(?:(?!secure)[^;\\n]){0,80}(?:(?!httponly)[^;\\n]){0,80}$"
+
+[rules.standards]
+asvs  = ["3.4.1", "3.4.2"]
+cwe   = ["CWE-614", "CWE-1004"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+nist  = ["SC-23"]
+cis   = ["16.7"]
+
+[[rules]]
+id          = "asvs.v3.session-in-url"
+engine      = "patterns"
+severity    = "medium"
+description = "Session token or JWT passed as a URL query parameter — leaks into server logs and referrer headers (ASVS 3.2.3)."
+match       = "(?i)[?&](token|session_?id|jsessionid|sid|auth)[=][A-Za-z0-9_.-]{8,}"
+
+[rules.standards]
+asvs  = ["3.2.3"]
+cwe   = ["CWE-598"]
+owasp = ["A07:2021-Identification and Authentication Failures"]
+nist  = ["SC-23"]
+
+# ── V5 Validation, Sanitization & Encoding ───────────────────────────────────
+
+[[rules]]
+id          = "asvs.v5.sql-string-format"
+engine      = "patterns"
+severity    = "high"
+description = "SQL query built with string interpolation — potential SQL injection (ASVS 5.3.4 / 5.3.5)."
+match       = "(?i)(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|EXEC)[^\"'`\\n]{0,80}(?:\\{|\\+|%s|format!)"
+lang        = "rust"
+
+[rules.standards]
+asvs  = ["5.3.4", "5.3.5"]
+cwe   = ["CWE-89"]
+owasp = ["A03:2021-Injection"]
+nist  = ["SI-10"]
+cis   = ["18.3"]
+
+[[rules]]
+id          = "asvs.v5.os-command-injection"
+engine      = "patterns"
+severity    = "high"
+description = "OS command constructed from user-controlled input via Command::new or similar — ASVS 5.3.8 OS command injection risk."
+match       = "Command::new\\s*\\([^)]{0,80}(?:req|input|user|param|arg|query)"
+lang        = "rust"
+
+[rules.standards]
+asvs  = ["5.3.8"]
+cwe   = ["CWE-78"]
+owasp = ["A03:2021-Injection"]
+nist  = ["SI-10"]
+cis   = ["18.3"]
+
+[[rules]]
+id          = "asvs.v5.eval-exec-usage"
+engine      = "ai"
+severity    = "high"
+description = "Dynamic code execution via eval/exec/pickle.loads found — ASVS 5.3.9 untrusted deserialization / code injection."
+check       = "eval-usage"
+
+[rules.standards]
+asvs  = ["5.3.9", "5.5.3"]
+cwe   = ["CWE-95", "CWE-502"]
+owasp = ["A03:2021-Injection", "A08:2021-Software and Data Integrity Failures"]
+nist  = ["SI-10", "SI-16"]
+
+# ── V6 Stored Cryptography ───────────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v6.weak-hash"
+engine      = "patterns"
+severity    = "high"
+description = "Weak or broken hash algorithm (MD5 / SHA-1) used — insufficient for password hashing or data integrity (ASVS 6.2.2 / 6.2.5)."
+match       = "(?i)(?:Md5|sha1|sha_1|MD5|SHA1)(?:::|::new|Hasher)"
+
+[rules.standards]
+asvs  = ["6.2.2", "6.2.5"]
+cwe   = ["CWE-327", "CWE-328"]
+owasp = ["A02:2021-Cryptographic Failures"]
+nist  = ["SC-13"]
+cis   = ["16.5"]
+
+[[rules]]
+id          = "asvs.v6.unsafe-block"
+engine      = "ai"
+severity    = "medium"
+description = "Rust unsafe block detected — manual memory management bypasses safe crypto guarantees and may introduce vulnerabilities (ASVS 6.4.2)."
+check       = "unsafe-block"
+
+[rules.standards]
+asvs  = ["6.4.2"]
+cwe   = ["CWE-119", "CWE-125"]
+owasp = ["A06:2021-Vulnerable and Outdated Components"]
+nist  = ["SA-11", "SI-16"]
+
+# ── V7 Error Handling & Logging ──────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v7.secret-in-log"
+engine      = "patterns"
+severity    = "medium"
+description = "Secret, token, or password value logged via tracing/log macros — credential leakage into log files (ASVS 7.1.1 / 7.1.2)."
+match       = "(?i)(?:info|warn|error|debug|trace)!?\\([^)]{0,120}(?:password|secret|token|api.?key|credential)"
+
+[rules.standards]
+asvs  = ["7.1.1", "7.1.2"]
+cwe   = ["CWE-532"]
+owasp = ["A09:2021-Security Logging and Monitoring Failures"]
+nist  = ["AU-9", "SI-12"]
+cis   = ["8.3"]
+
+# ── V9 Communications ────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v9.tls-verification-disabled"
+engine      = "patterns"
+severity    = "high"
+description = "TLS certificate verification explicitly disabled — allows MITM attacks (ASVS 9.2.1 / 9.2.3)."
+match       = "(?i)(?:danger_accept_invalid_certs|verify_peer.*false|ssl_verify.*false|CURLOPT_SSL_VERIFYPEER.*0|InsecureSkipVerify.*true|disable_certificate_verification)"
+
+[rules.standards]
+asvs  = ["9.2.1", "9.2.3"]
+cwe   = ["CWE-295"]
+owasp = ["A02:2021-Cryptographic Failures", "A07:2021-Identification and Authentication Failures"]
+nist  = ["SC-8", "SC-23"]
+cis   = ["16.5"]
+
+# ── V14 Configuration ────────────────────────────────────────────────────────
+
+[[rules]]
+id          = "asvs.v14.debug-flag"
+engine      = "patterns"
+severity    = "medium"
+description = "Debug or development mode flag enabled in non-test code — may expose stack traces or verbose error output in production (ASVS 14.1.1 / 14.2.2)."
+match       = "(?i)(?:debug\\s*=\\s*true|DEBUG\\s*=\\s*1|dev(?:elop)?_mode\\s*=\\s*true|FLASK_DEBUG\\s*=\\s*1|APP_ENV\\s*=\\s*[\"']?development)"
+
+[rules.standards]
+asvs  = ["14.1.1", "14.2.2"]
+cwe   = ["CWE-489", "CWE-215"]
+owasp = ["A05:2021-Security Misconfiguration"]
+nist  = ["CM-6", "CM-7"]
+cis   = ["4.1"]
+
+[[rules]]
+id          = "asvs.v14.bind-all-interfaces"
+engine      = "patterns"
+severity    = "medium"
+description = "Service binds to 0.0.0.0 — exposes the listener on every network interface; prefer explicit bind address (ASVS 14.2.1)."
+match       = "0\\.0\\.0\\.0"
+
+[rules.standards]
+asvs  = ["14.2.1"]
+cwe   = ["CWE-605"]
+owasp = ["A05:2021-Security Misconfiguration"]
+nist  = ["CM-7", "SC-7"]
+cis   = ["4.4", "12.2"]
+
+[[rules]]
+id          = "asvs.v14.todo-security-stub"
+engine      = "ai"
+severity    = "medium"
+description = "TODO/FIXME adjacent to auth/secret/token — likely a security stub left by an LLM or developer that was never completed (ASVS 14.2.2)."
+check       = "todo-secret"
+
+[rules.standards]
+asvs  = ["14.2.2"]
+cwe   = ["CWE-1164"]
+owasp = ["A05:2021-Security Misconfiguration"]
+nist  = ["SA-11"]

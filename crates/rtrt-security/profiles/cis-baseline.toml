@@ -1,0 +1,198 @@
+name        = "cis-baseline"
+description = "CIS Controls v8 baseline adapted to source artifacts. Covers data protection (Control 3), secure configuration (Control 4), vulnerability management (Control 7), and application security (Control 16) using only statically checkable engines."
+severity_threshold = "high"
+exclude = ["target", ".git", "node_modules", "vendor", "testdata", "fixtures"]
+
+# ─── CIS Control 3 — Data Protection ────────────────────────────────────────
+
+[[rules]]
+id          = "secret.credentials-scan"
+engine      = "secrets"
+severity    = "critical"
+description = "Detect hardcoded credentials, tokens, and private keys committed to source. CIS 3.11 requires sensitive data not be stored unencrypted in source control."
+
+[rules.standards]
+cis   = ["3.11"]
+cwe   = ["CWE-798", "CWE-259"]
+owasp = ["A02:2021-Cryptographic-Failures", "A07:2021-Identification-and-Authentication-Failures"]
+nist  = ["IA-5", "SC-28"]
+
+# ─── CIS Control 4 — Secure Configuration ───────────────────────────────────
+
+[[rules]]
+id          = "config.debug-flag"
+engine      = "patterns"
+severity    = "medium"
+description = "Debug mode enabled in source or config. CIS 4.1 mandates secure-baseline configs; debug flags weaken production posture and may leak internal state."
+match       = "(?i)(debug\\s*=\\s*true|RUST_BACKTRACE\\s*=\\s*full|log_level\\s*=\\s*\"trace\")"
+lang        = "any"
+
+[rules.standards]
+cis   = ["4.1"]
+cwe   = ["CWE-489"]
+owasp = ["A05:2021-Security-Misconfiguration"]
+nist  = ["CM-6", "CM-7"]
+
+[[rules]]
+id          = "config.bind-all-interfaces"
+engine      = "patterns"
+severity    = "medium"
+description = "Server binding to 0.0.0.0 or [::] without explicit justification. CIS 4.8 requires services listen only on necessary interfaces."
+match       = "0\\.0\\.0\\.0(?::[0-9]+)?"
+lang        = "rust"
+
+[rules.standards]
+cis   = ["4.8"]
+cwe   = ["CWE-605"]
+owasp = ["A05:2021-Security-Misconfiguration"]
+nist  = ["CM-7", "SC-7"]
+
+[[rules]]
+id          = "config.permissive-cors"
+engine      = "patterns"
+severity    = "high"
+description = "CORS wildcard origin (*) allows any site to make credentialed requests. CIS 4.1 / 16.1 require minimal, explicit access grants."
+match       = "(?i)(allow[_-]?origin[^\\n]*\\*|Access-Control-Allow-Origin[^\\n]*\\*)"
+lang        = "any"
+
+[rules.standards]
+cis   = ["4.1", "16.1"]
+cwe   = ["CWE-942"]
+owasp = ["A05:2021-Security-Misconfiguration", "A01:2021-Broken-Access-Control"]
+nist  = ["SC-8", "AC-17"]
+
+[[rules]]
+id          = "config.tls-disabled"
+engine      = "patterns"
+severity    = "high"
+description = "TLS or certificate verification disabled in code. CIS 4.4 requires all transmissions of sensitive data use encryption in transit."
+match       = "(?i)(verify\\s*=\\s*false|tls_verify\\s*=\\s*false|accept_invalid_certs|danger_accept_invalid_certs\\s*=\\s*true|CURLOPT_SSL_VERIFYPEER[^\\n]*0)"
+lang        = "any"
+
+[rules.standards]
+cis   = ["4.4"]
+cwe   = ["CWE-295"]
+owasp = ["A02:2021-Cryptographic-Failures"]
+nist  = ["SC-8", "SC-12"]
+
+# ─── CIS Control 7 — Vulnerability Management ────────────────────────────────
+
+[[rules]]
+id          = "deps.advisory-db"
+engine      = "deps"
+severity    = "high"
+description = "Dependency with a known RustSec advisory. CIS 7.4 requires applying security patches for vulnerable dependencies within defined SLAs."
+db            = "rustsec"
+forbid_git    = false
+forbid_wildcard = false
+forbid_yanked = true
+
+[rules.standards]
+cis   = ["7.4", "7.5"]
+cwe   = ["CWE-1395"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+nist  = ["SI-2", "RA-5"]
+
+[[rules]]
+id          = "deps.wildcard-version"
+engine      = "deps"
+severity    = "medium"
+description = "Wildcard (*) version constraint in dependency manifest allows arbitrary future versions, violating CIS 7.3 controlled-version principles."
+db              = ""
+forbid_git      = false
+forbid_wildcard = true
+forbid_yanked   = false
+
+[rules.standards]
+cis   = ["7.3"]
+cwe   = ["CWE-1395"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+nist  = ["CM-3", "SI-2"]
+
+[[rules]]
+id          = "deps.git-source"
+engine      = "deps"
+severity    = "medium"
+description = "Git-source or path dependency bypasses registry vetting. CIS 7.2 requires software components come from authoritative, auditable sources."
+db            = ""
+forbid_git    = true
+forbid_wildcard = false
+forbid_yanked = false
+
+[rules.standards]
+cis   = ["7.2"]
+cwe   = ["CWE-494"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+nist  = ["CM-7", "SA-12"]
+slsa  = ["provenance-L2"]
+
+# ─── CIS Control 16 — Application Security ───────────────────────────────────
+
+[[rules]]
+id          = "appsec.command-injection"
+engine      = "patterns"
+severity    = "critical"
+description = "User-controlled data passed directly to a shell command. CIS 16.6 / 16.11 require input validation at all application entry points."
+match       = "Command::new\\s*\\([^)]*(?:req|input|user|arg|param|query|path|body)"
+lang        = "rust"
+
+[rules.standards]
+cis   = ["16.6", "16.11"]
+cwe   = ["CWE-78"]
+owasp = ["A03:2021-Injection"]
+nist  = ["SI-10"]
+asvs  = ["5.3.4"]
+
+[[rules]]
+id          = "appsec.sql-format-injection"
+engine      = "patterns"
+severity    = "high"
+description = "String-formatted SQL query may allow injection. CIS 16.6 requires parameterised queries for all database interactions."
+match       = "(?i)format!\\s*\\([^)]*(?:SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)"
+lang        = "rust"
+
+[rules.standards]
+cis   = ["16.6"]
+cwe   = ["CWE-89"]
+owasp = ["A03:2021-Injection"]
+nist  = ["SI-10"]
+asvs  = ["5.3.4"]
+
+[[rules]]
+id          = "appsec.eval-exec-usage"
+engine      = "ai"
+severity    = "high"
+description = "Dynamic code evaluation (eval/exec/Function/pickle) detected. CIS 16.11 prohibits untrusted code execution paths."
+check       = "eval-usage"
+
+[rules.standards]
+cis   = ["16.11"]
+cwe   = ["CWE-95", "CWE-502"]
+owasp = ["A03:2021-Injection"]
+nist  = ["SI-10", "SA-15"]
+
+[[rules]]
+id          = "appsec.unsafe-block"
+engine      = "ai"
+severity    = "medium"
+description = "Rust unsafe block detected. CIS 16.10 requires documented justification for memory-unsafe operations; audit for necessity."
+check       = "unsafe-block"
+
+[rules.standards]
+cis   = ["16.10"]
+cwe   = ["CWE-119", "CWE-416"]
+owasp = ["A04:2021-Insecure-Design"]
+nist  = ["SA-11", "SA-15"]
+
+[[rules]]
+id          = "appsec.todo-security-stub"
+engine      = "ai"
+severity    = "medium"
+description = "TODO/FIXME adjacent to auth/secret/password/token — unimplemented security control. CIS 16.4 requires all security controls be fully implemented before release."
+check       = "todo-secret"
+
+[rules.standards]
+cis   = ["16.4"]
+cwe   = ["CWE-306"]
+owasp = ["A07:2021-Identification-and-Authentication-Failures"]
+nist  = ["SA-15", "PL-8"]

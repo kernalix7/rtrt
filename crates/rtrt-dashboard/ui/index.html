@@ -280,6 +280,26 @@
   .llm-section-head { font-size: 0.82em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin: 0.75rem 0 0.4rem; }
   .llm-offline { color: var(--muted); font-size: 0.88em; padding: 0.5rem 0; }
 
+  /* Security page */
+  .security-scan-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.75rem; }
+  .security-scan-row select { min-width: 170px; }
+  .security-scan-row input { flex: 1; min-width: 180px; }
+  .security-summary { display: flex; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+  .security-engine-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.9rem; }
+  .security-finding-group { margin-top: 1rem; }
+  .security-finding-group h3 { margin: 0 0 0.4rem; font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .security-finding-row { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem 0.8rem; margin-bottom: 0.5rem; }
+  .security-finding-main { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .security-finding-title { flex: 1; min-width: 220px; }
+  .security-finding-detail { margin-top: 0.45rem; color: var(--muted); font-size: 0.9em; display: grid; gap: 0.45rem; }
+  .security-standards { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+  .security-chip { display: inline-flex; align-items: center; padding: 0.08rem 0.45rem; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: 0.78em; color: var(--muted); }
+  .badge.sev-critical { color: #dc2626; border-color: #dc2626; }
+  .badge.sev-high { color: #ea580c; border-color: #ea580c; }
+  .badge.sev-medium { color: #d97706; border-color: #d97706; }
+  .badge.sev-low { color: #65a30d; border-color: #65a30d; }
+  .badge.sev-info { color: #6b7280; border-color: #6b7280; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -312,6 +332,7 @@
     <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
     <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
     <a class="nav" data-page="llm"><span class="icon">🤖</span>로컬 LLM</a>
+    <a class="nav" data-page="security"><span class="icon">🛡️</span>보안</a>
     <div class="group">설정</div>
     <a class="nav" data-page="settings"><span class="icon">🎛</span>설정</a>
     <a class="nav" data-page="connect"><span class="icon">🔌</span>에이전트 연결</a>
@@ -963,6 +984,31 @@
       </div>
     </section>
 
+    <!-- 보안 -->
+    <section id="page-security" class="page" hidden>
+      <div class="section-head">
+        <h1>보안</h1>
+        <div class="lede">프로파일 기반 보안 스캔 · 표준 매핑 · 수정 힌트</div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>스캔</h2><span class="hint">경로와 프로파일을 선택하세요</span></div>
+        <div class="security-scan-row">
+          <select id="security-profile-select"><option value="">로드 중…</option></select>
+          <input id="security-path-input" value="." placeholder="스캔 경로">
+          <button id="security-scan-btn" class="primary" type="button">스캔</button>
+          <button id="security-view-profile-btn" class="ghost" type="button">프로파일 보기</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>결과</h2><span id="security-result-meta" class="hint">스캔 전</span></div>
+        <div id="security-results-body"><div class="empty">스캔 결과가 여기에 표시됩니다.</div></div>
+      </div>
+      <div id="security-profile-card" class="card" hidden>
+        <div class="head"><h2>프로파일</h2><span id="security-profile-meta" class="hint"></span></div>
+        <div id="security-profile-body"></div>
+      </div>
+    </section>
+
     <!-- 환경 -->
     <section id="page-env" class="page" hidden>
         <div class="card">
@@ -1437,6 +1483,7 @@ const PALETTE_ITEMS = [
   { label: '예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
   { label: '예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
   { label: '로컬 LLM', hint: 'ollama · models · pull', run: () => navigate('llm') },
+  { label: '보안', hint: 'security · scan', run: () => navigate('security') },
 ];
 function navigate(page) {
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
@@ -1460,6 +1507,9 @@ function navigate(page) {
     // Load both lists fresh each time the page is opened.
     loadLlmModels();
     loadLlmPs();
+  }
+  if (page === 'security') {
+    loadSecurityProfiles();
   }
 }
 function subClick(navId, sub) {
@@ -2673,6 +2723,298 @@ async function setDefaultModel(field /* 'auto_compress' | 'embeddings' */, model
     pushActivity(`설정: ${label} 모델 = ${modelName}`);
   } catch (e) { showToast(`저장 오류: ${e.message || e}`, 'err'); }
 }
+
+// Security
+const SECURITY_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
+const SECURITY_STANDARD_KEYS = ['CWE', 'OWASP', 'NIST', 'ASVS', 'CIS', 'SLSA', 'EU_AI_ACT', 'other'];
+
+function securitySeverity(value) {
+  const sev = String(value || 'info').toLowerCase();
+  return SECURITY_SEVERITIES.includes(sev) ? sev : 'info';
+}
+
+function securitySeverityBadge(sev) {
+  const s = securitySeverity(sev);
+  return `<span class="badge sev-${s}">${escapeHtml(s)}</span>`;
+}
+
+async function securityErrorMessage(r, fallback) {
+  let text = '';
+  try { text = await r.text(); } catch (_) {}
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      text = parsed.error || parsed.message || text;
+    } catch (_) {}
+  }
+  return `${fallback} ${r.status}${text ? `: ${text}` : ''}`;
+}
+
+function securityValueList(value) {
+  if (value === null || value === undefined || value === '') return [];
+  if (Array.isArray(value)) {
+    const out = [];
+    value.forEach(v => out.push(...securityValueList(v)));
+    return out;
+  }
+  if (typeof value === 'object') {
+    const out = [];
+    Object.entries(value).forEach(([k, v]) => {
+      securityValueList(v).forEach(item => out.push(`${k}: ${item}`));
+    });
+    return out;
+  }
+  return [String(value)];
+}
+
+function securityStandardsSource(item) {
+  if (item && item.standards) return item.standards;
+  return {
+    CWE: item && (item.CWE || item.cwe),
+    OWASP: item && (item.OWASP || item.owasp),
+    NIST: item && (item.NIST || item.nist),
+    ASVS: item && (item.ASVS || item.asvs),
+    CIS: item && (item.CIS || item.cis),
+    SLSA: item && (item.SLSA || item.slsa),
+    EU_AI_ACT: item && (item.EU_AI_ACT || item.eu_ai_act),
+    other: item && item.other,
+  };
+}
+
+function securityStandardEntries(source) {
+  if (!source) return [];
+  if (Array.isArray(source)) {
+    const out = [];
+    source.forEach(v => {
+      if (v && typeof v === 'object') out.push(...securityStandardEntries(v));
+      else securityValueList(v).forEach(item => out.push(item));
+    });
+    return out;
+  }
+  if (typeof source !== 'object') return securityValueList(source);
+
+  const norm = s => String(s).toUpperCase().replace(/[-\s]/g, '_');
+  const used = new Set();
+  const out = [];
+  SECURITY_STANDARD_KEYS.forEach(std => {
+    Object.entries(source).forEach(([k, v]) => {
+      if (used.has(k) || norm(k) !== norm(std)) return;
+      used.add(k);
+      securityValueList(v).forEach(item => out.push(`${std}: ${item}`));
+    });
+  });
+  Object.entries(source).forEach(([k, v]) => {
+    if (used.has(k)) return;
+    securityValueList(v).forEach(item => out.push(`${k}: ${item}`));
+  });
+  return out;
+}
+
+function securityStandardChips(item) {
+  const entries = securityStandardEntries(securityStandardsSource(item));
+  if (!entries.length) return '<span class="security-chip">표준 없음</span>';
+  return entries.map(s => `<span class="security-chip">${escapeHtml(s)}</span>`).join('');
+}
+
+function securityLoc(item) {
+  const loc = item.location || {};
+  const file = item.file || item.path || item.filename || loc.file || loc.path || '—';
+  const line = item.line || item.line_number || loc.line || loc.line_number || '—';
+  return `${file}:${line}`;
+}
+
+function securityRuleId(item) {
+  return item.rule_id || item.rule || item.id || item.name || '—';
+}
+
+function securityFindingRow(item) {
+  const sev = securitySeverity(item.severity);
+  const title = item.title || item.message || item.description || '—';
+  const engine = item.engine || item.source || '—';
+  const fix = item.fix_hint || item.fix || item.remediation || '수정 힌트 없음';
+  return `<div class="security-finding-row">
+    <div class="security-finding-main">
+      ${securitySeverityBadge(sev)}
+      <code>${escapeHtml(securityRuleId(item))}</code>
+      <span>${escapeHtml(engine)}</span>
+      <code>${escapeHtml(securityLoc(item))}</code>
+      <span class="security-finding-title">${escapeHtml(title)}</span>
+    </div>
+    <details>
+      <summary class="muted-summary">수정 힌트 · 표준</summary>
+      <div class="security-finding-detail">
+        <div>${escapeHtml(fix)}</div>
+        <div class="security-standards">${securityStandardChips(item)}</div>
+      </div>
+    </details>
+  </div>`;
+}
+
+function securityEngineLabel(item) {
+  if (item && typeof item === 'object') {
+    const name = item.engine || item.name || item.id || 'engine';
+    const reason = item.reason || item.error || item.status || '';
+    return reason ? `${name}: ${reason}` : name;
+  }
+  return String(item);
+}
+
+function securityEngineList(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return '<span class="security-chip">없음</span>';
+  return list.map(item => `<span class="security-chip">${escapeHtml(securityEngineLabel(item))}</span>`).join('');
+}
+
+function securityCounts(findings, data) {
+  const raw = data.severity_counts || data.counts || {};
+  const counts = {};
+  SECURITY_SEVERITIES.forEach(sev => {
+    counts[sev] = Number(raw[sev] || raw[sev.toUpperCase()] || 0);
+  });
+  if (!Object.values(counts).some(Boolean)) {
+    findings.forEach(f => { counts[securitySeverity(f.severity)] += 1; });
+  }
+  return counts;
+}
+
+function renderSecurityScan(data) {
+  const findings = Array.isArray(data.findings) ? data.findings : (Array.isArray(data.results) ? data.results : []);
+  const counts = securityCounts(findings, data);
+  const enginesRun = data.engines_run || data.enginesRun || [];
+  const enginesSkipped = data.engines_skipped || data.enginesSkipped || [];
+  document.getElementById('security-result-meta').textContent = `${findings.length}건 · ${new Date().toLocaleTimeString('ko-KR')}`;
+
+  const summary = `<div class="security-summary">${SECURITY_SEVERITIES.map(sev =>
+    `<span class="badge sev-${sev}">${escapeHtml(sev)} <strong>${counts[sev]}</strong></span>`
+  ).join('')}</div>`;
+  const engines = `<div class="security-engine-lists">
+    <div><div class="llm-section-head">engines_run</div><div class="security-standards">${securityEngineList(enginesRun)}</div></div>
+    <div><div class="llm-section-head">engines_skipped</div><div class="security-standards">${securityEngineList(enginesSkipped)}</div></div>
+  </div>`;
+
+  let grouped = '';
+  SECURITY_SEVERITIES.forEach(sev => {
+    const rows = findings.filter(f => securitySeverity(f.severity) === sev);
+    if (!rows.length) return;
+    grouped += `<div class="security-finding-group">
+      <h3>${escapeHtml(sev)}</h3>
+      ${rows.map(securityFindingRow).join('')}
+    </div>`;
+  });
+  if (!findings.length) grouped = '<div class="empty">문제 없음 ✓</div>';
+
+  document.getElementById('security-results-body').innerHTML = summary + engines + grouped;
+}
+
+async function loadSecurityProfiles() {
+  const select = document.getElementById('security-profile-select');
+  if (!select) return;
+  const selected = select.value;
+  try {
+    const r = await fetch('/api/security/profiles');
+    if (!r.ok) {
+      const msg = await securityErrorMessage(r, '보안 프로파일 로드 실패');
+      showToast(msg, 'err');
+      select.innerHTML = '<option value="">로드 실패</option>';
+      return;
+    }
+    const profiles = await r.json();
+    if (!Array.isArray(profiles) || !profiles.length) {
+      select.innerHTML = '<option value="">프로파일 없음</option>';
+      return;
+    }
+    select.innerHTML = profiles.map(name =>
+      `<option value="${escapeHtml(name)}"${name === selected ? ' selected' : ''}>${escapeHtml(name)}</option>`
+    ).join('');
+  } catch (e) {
+    showToast(`보안 프로파일 로드 오류: ${e.message || e}`, 'err');
+    select.innerHTML = '<option value="">로드 실패</option>';
+  }
+}
+
+async function runSecurityScan() {
+  const profile = document.getElementById('security-profile-select').value;
+  const path = document.getElementById('security-path-input').value.trim() || '.';
+  if (!profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
+  const btn = document.getElementById('security-scan-btn');
+  const body = document.getElementById('security-results-body');
+  btn.disabled = true;
+  document.getElementById('security-result-meta').textContent = '스캔 중…';
+  body.innerHTML = '<div class="empty">스캔 중…</div>';
+  try {
+    const r = await fetch('/api/security/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile, path }),
+    });
+    if (!r.ok) {
+      const msg = await securityErrorMessage(r, '보안 스캔 실패');
+      showToast(msg, 'err');
+      body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+      return;
+    }
+    const data = await r.json();
+    renderSecurityScan(data);
+    showToast('보안 스캔 완료', 'ok');
+    pushActivity(`security scan · ${profile} · ${path}`);
+  } catch (e) {
+    const msg = `보안 스캔 오류: ${e.message || e}`;
+    showToast(msg, 'err');
+    body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function viewSecurityProfile() {
+  const name = document.getElementById('security-profile-select').value;
+  if (!name) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
+  const card = document.getElementById('security-profile-card');
+  const body = document.getElementById('security-profile-body');
+  const meta = document.getElementById('security-profile-meta');
+  card.hidden = false;
+  meta.textContent = name;
+  body.innerHTML = '<div class="empty">로드 중…</div>';
+  try {
+    const r = await fetch(`/api/security/profile/${encodeURIComponent(name)}`);
+    if (!r.ok) {
+      const msg = await securityErrorMessage(r, '보안 프로파일 로드 실패');
+      showToast(msg, 'err');
+      body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+      return;
+    }
+    const data = await r.json();
+    const rules = Array.isArray(data) ? data : (data.rules || (data.profile && data.profile.rules) || []);
+    meta.textContent = `${name} · ${rules.length}개 규칙`;
+    if (!rules.length) {
+      body.innerHTML = '<div class="empty">규칙 없음</div>';
+      return;
+    }
+    body.innerHTML = `<div class="security-finding-group">${rules.map(rule => {
+      const sev = securitySeverity(rule.severity);
+      const title = rule.title || rule.description || rule.message || '—';
+      const engine = rule.engine || rule.source || '—';
+      return `<div class="security-finding-row">
+        <div class="security-finding-main">
+          ${securitySeverityBadge(sev)}
+          <code>${escapeHtml(securityRuleId(rule))}</code>
+          <span>${escapeHtml(engine)}</span>
+          <span class="security-finding-title">${escapeHtml(title)}</span>
+        </div>
+        <div class="security-finding-detail">
+          <div class="security-standards">${securityStandardChips(rule)}</div>
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+  } catch (e) {
+    const msg = `보안 프로파일 오류: ${e.message || e}`;
+    showToast(msg, 'err');
+    body.innerHTML = `<div class="empty">${escapeHtml(msg)}</div>`;
+  }
+}
+
+document.getElementById('security-scan-btn').onclick = runSecurityScan;
+document.getElementById('security-view-profile-btn').onclick = viewSecurityProfile;
 
 // GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
 async function loadLlmModels() {

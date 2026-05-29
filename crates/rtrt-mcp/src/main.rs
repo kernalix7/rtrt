@@ -215,6 +215,16 @@ struct MemoryProjectArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SecurityScanArgs {
+    /// Security profile name (e.g. `ai-default`, `owasp-top-10`). See the
+    /// builtin set with the `security profile list` CLI command.
+    profile: String,
+    /// Directory to scan. Defaults to the current working directory.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct MemoryRelationsArgs {
     project: String,
     seed_ids: Vec<i64>,
@@ -855,6 +865,23 @@ impl RtrtMcp {
             body.to_string(),
         )]))
     }
+
+    #[tool(
+        description = "Scan a directory for security & license issues in AI-generated code using a named profile (CIS / NIST SSDF / OWASP Top 10 / ASVS / ai-default / ai-strict). Returns a ScanReport: findings with severity, file:line, fix hint, and the standards each rule maps to (CWE/OWASP/NIST/...), plus per-severity counts."
+    )]
+    async fn security_scan(
+        &self,
+        Parameters(args): Parameters<SecurityScanArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let profile = rtrt_security::load_profile(&args.profile)
+            .map_err(|e| McpError::invalid_params(format!("security.scan profile: {e}"), None))?;
+        let path = args.path.unwrap_or_else(|| ".".to_string());
+        let report = rtrt_security::run(&profile, std::path::Path::new(&path))
+            .map_err(|e| McpError::internal_error(format!("security.scan: {e}"), None))?;
+        let body = serde_json::to_string(&report)
+            .map_err(|e| McpError::internal_error(format!("security.scan serialize: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
 }
 
 /// Walk a directory tree, skipping `target/` and dot-prefixed entries.
@@ -954,6 +981,7 @@ impl ServerHandler for RtrtMcp {
                  Code tools: repo_map (tree-sitter signatures). \
                  Project tools: templates_list / templates_scaffold. \
                  LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible). \
+                 Security tools: security_scan (profile-driven secrets / license / dependency / pattern / AI-artifact scan; profiles map to CWE/OWASP/NIST/CIS/SLSA/EU-AI-Act). \
                  Prompts: every entry in the local PromptRegistry (~/.rtrt/prompts) is exposed via prompts/list + prompts/get with handlebars argument substitution. \
                  Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block.",
         )

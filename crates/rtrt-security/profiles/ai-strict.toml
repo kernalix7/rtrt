@@ -1,0 +1,253 @@
+name = "ai-strict"
+description = "Strict superset of ai-default. Threshold = low. Covers secrets, copyleft/missing licenses (with SPDX header enforcement), dependency advisories + yanked crates, AI-generated anti-patterns (base64 blobs, unsafe blocks, hallucinated imports, eval, todo-secrets), and pattern rules for weak crypto, insecure randomness, disabled TLS verification, path traversal, and unsafe deserialization. Standards: CWE, OWASP Top10, ASVS L2/L3, NIST 800-53/SSDF, CIS Controls v8, SLSA, EU AI Act."
+severity_threshold = "low"
+exclude = ["target", ".git", "node_modules", "dist", "build", "vendor", "testdata", "fixtures"]
+
+# ── SECRETS ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "secret.scan"
+engine = "secrets"
+severity = "critical"
+description = "Full built-in secret scan: AWS keys, GitHub tokens, Slack tokens, Stripe keys, Google API keys, private keys, JWTs, and high-entropy assignments. Catches hardcoded credentials introduced by LLM-generated code."
+
+[rules.standards]
+cwe = ["CWE-798", "CWE-259"]
+owasp = ["A02:2021-Cryptographic-Failures", "A07:2021-Identification-and-Authentication-Failures"]
+asvs = ["2.10.1", "2.10.4", "6.4.1"]
+nist = ["IA-5", "SC-12", "SA-15"]
+cis = ["3.11", "16.1"]
+slsa = ["provenance-L2"]
+
+# ── LICENSES ─────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "license.copyleft"
+engine = "licenses"
+severity = "high"
+description = "Flag strong-copyleft licenses (GPL-3.0, AGPL-3.0, LGPL-3.0, EUPL-1.2) incompatible with MIT distribution. LLM-scaffolded projects frequently pull in GPL dependencies without flagging the conflict."
+forbidden = ["GPL-3.0-only", "GPL-3.0-or-later", "AGPL-3.0-only", "AGPL-3.0-or-later", "LGPL-3.0-only", "LGPL-3.0-or-later", "EUPL-1.2", "GPL-2.0-only", "GPL-2.0-or-later"]
+
+[rules.standards]
+cwe = ["CWE-1104"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+nist = ["SA-4", "SR-3"]
+cis = ["16.1"]
+slsa = ["provenance-L2"]
+other = ["SPDX-compliance"]
+
+[[rules]]
+id = "license.require-spdx-header"
+engine = "licenses"
+severity = "low"
+description = "Every source file must carry an SPDX-License-Identifier comment in the first 5 lines. AI code generators routinely omit license headers, creating ambiguous ownership."
+require_header = true
+
+[rules.standards]
+cwe = ["CWE-1104"]
+nist = ["SA-4"]
+cis = ["16.1"]
+slsa = ["provenance-L2"]
+other = ["REUSE-compliance"]
+
+# ── DEPENDENCIES ─────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "deps.advisories"
+engine = "deps"
+severity = "high"
+description = "Check Cargo.lock against the RustSec advisory database (~/.cargo/advisory-db). AI-generated dependency lists frequently include versions with known CVEs."
+db = "rustsec"
+forbid_yanked = true
+
+[rules.standards]
+cwe = ["CWE-1395", "CWE-937"]
+owasp = ["A06:2021-Vulnerable-and-Outdated-Components"]
+asvs = ["14.2.1"]
+nist = ["RA-5", "SI-2", "SA-15"]
+cis = ["7.1", "7.4"]
+slsa = ["dependencies-L2"]
+
+[[rules]]
+id = "deps.git-path"
+engine = "deps"
+severity = "medium"
+description = "Flag git:// or path-based dependencies in Cargo manifests. These bypass the crates.io audit trail and are a common LLM hallucination (invented crate names resolved via git)."
+forbid_git = true
+forbid_wildcard = true
+
+[rules.standards]
+cwe = ["CWE-829", "CWE-494"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+asvs = ["14.2.2"]
+nist = ["SR-4", "SA-12"]
+cis = ["16.6"]
+slsa = ["provenance-L2"]
+
+# ── AI-ARTIFACT PATTERNS ─────────────────────────────────────────────────────
+
+[[rules]]
+id = "ai.hallucinated-import"
+engine = "ai"
+severity = "high"
+description = "Detect imports/use statements that reference crates not declared in Cargo.toml. Slopsquatting risk: LLMs invent plausible-sounding package names that may be squatted by malicious actors."
+check = "hallucinated-import"
+
+[rules.standards]
+cwe = ["CWE-829", "CWE-494"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+asvs = ["14.2.2"]
+nist = ["SR-4", "SA-15"]
+cis = ["16.6"]
+slsa = ["provenance-L2"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+
+[[rules]]
+id = "ai.base64-blob"
+engine = "ai"
+severity = "medium"
+description = "Flag suspiciously long (>=120 char) base64 literals in source. LLMs occasionally embed smuggled payloads or encode secrets inline in generated code."
+check = "base64-blob"
+
+[rules.standards]
+cwe = ["CWE-506", "CWE-116"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+asvs = ["14.3.3"]
+nist = ["SI-3", "SI-7"]
+cis = ["10.1"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+
+[[rules]]
+id = "ai.unsafe-block"
+engine = "ai"
+severity = "medium"
+description = "Flag Rust unsafe blocks. AI models frequently emit unsafe code when a safe alternative exists; every unsafe site must be reviewed for soundness."
+check = "unsafe-block"
+
+[rules.standards]
+cwe = ["CWE-119", "CWE-125", "CWE-787"]
+asvs = ["11.1.7"]
+nist = ["SA-11", "SA-15"]
+cis = ["16.12"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+
+[[rules]]
+id = "ai.eval-usage"
+engine = "ai"
+severity = "high"
+description = "Flag eval/exec/Function/pickle.loads and similar dynamic execution sinks without evident validation. AI-generated glue code often wires user input straight to these APIs."
+check = "eval-usage"
+
+[rules.standards]
+cwe = ["CWE-78", "CWE-95", "CWE-502"]
+owasp = ["A03:2021-Injection"]
+asvs = ["5.3.4", "5.4.1"]
+nist = ["SI-10", "SA-15"]
+cis = ["16.5"]
+
+[[rules]]
+id = "ai.todo-secret"
+engine = "ai"
+severity = "medium"
+description = "Flag TODO/FIXME/XXX comments adjacent to auth/secret/password/token identifiers. LLMs often scaffold stub authentication and leave a TODO as a placeholder that ships to production."
+check = "todo-secret"
+
+[rules.standards]
+cwe = ["CWE-259", "CWE-798"]
+owasp = ["A07:2021-Identification-and-Authentication-Failures"]
+asvs = ["2.10.1"]
+nist = ["IA-5", "SA-15"]
+cis = ["16.1"]
+eu_ai_act = ["Art.15-accuracy-robustness"]
+
+# ── PATTERN RULES ────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "pattern.weak-crypto-md5-sha1"
+engine = "patterns"
+severity = "medium"
+description = "Detect use of MD5 or SHA-1 as a security primitive (password hashing, integrity check). Both are cryptographically broken; AI code generators default to them because they are ubiquitous in training data."
+match = "(?i)(Md5|Sha1|sha_1|md5_hash|DigestAlgorithm::Md5|DigestAlgorithm::Sha1|ring::digest::SHA1|md5::compute|sha1::Sha1)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-327", "CWE-328"]
+owasp = ["A02:2021-Cryptographic-Failures"]
+asvs = ["6.2.2", "6.2.3"]
+nist = ["SC-13"]
+cis = ["16.3"]
+
+[[rules]]
+id = "pattern.weak-crypto-md5-sha1-any"
+engine = "patterns"
+severity = "medium"
+description = "Detect MD5/SHA-1 usage in Python, JavaScript, or TypeScript source."
+match = "(?i)(hashlib\\.md5|hashlib\\.sha1|crypto\\.createHash\\(['\"]md5['\"]\\)|crypto\\.createHash\\(['\"]sha1['\"]\\)|MD5\\(|SHA1\\()"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-327", "CWE-328"]
+owasp = ["A02:2021-Cryptographic-Failures"]
+asvs = ["6.2.2", "6.2.3"]
+nist = ["SC-13"]
+cis = ["16.3"]
+
+[[rules]]
+id = "pattern.insecure-random"
+engine = "patterns"
+severity = "medium"
+description = "Detect use of non-cryptographic RNGs (rand::random, Math.random, random.random) in contexts that suggest security use (token, nonce, salt, secret, key adjacent). LLMs frequently use the wrong RNG for security-critical values."
+match = "(?i)(rand::random|Math\\.random|random\\.random|rand\\.Intn|rand\\.Float).*(?i)(token|nonce|salt|secret|key|otp|csrf|session)"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-338"]
+owasp = ["A02:2021-Cryptographic-Failures"]
+asvs = ["6.3.1", "6.3.2"]
+nist = ["SC-13"]
+cis = ["16.3"]
+
+[[rules]]
+id = "pattern.disabled-tls-verify"
+engine = "patterns"
+severity = "high"
+description = "Detect disabled TLS certificate verification. AI-generated HTTP client code frequently disables certificate checks to avoid test friction and ships the flag to production."
+match = "(?i)(danger_accept_invalid_certs|verify\\s*=\\s*False|rejectUnauthorized\\s*:\\s*false|InsecureSkipVerify\\s*:\\s*true|ssl_verify\\s*=\\s*false|CURLOPT_SSL_VERIFYPEER.*0)"
+lang = "any"
+
+[rules.standards]
+cwe = ["CWE-295"]
+owasp = ["A02:2021-Cryptographic-Failures", "A05:2021-Security-Misconfiguration"]
+asvs = ["9.2.1", "9.2.3"]
+nist = ["SC-8", "SC-23"]
+cis = ["12.8"]
+
+[[rules]]
+id = "pattern.path-traversal"
+engine = "patterns"
+severity = "high"
+description = "Detect unsanitized path construction from variables likely to carry user input (.join, path_buf, PathBuf::from adjacent to request/query/user/param). AI-generated file-serving handlers are frequent offenders."
+match = "(?i)(Path::new|PathBuf::from|path\\.join|fs::read|fs::write|File::open|File::create).*(?i)(param|query|user|input|req|body|arg)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-22", "CWE-23"]
+owasp = ["A01:2021-Broken-Access-Control"]
+asvs = ["12.3.1", "12.3.2"]
+nist = ["SI-10", "AC-3"]
+cis = ["16.5"]
+
+[[rules]]
+id = "pattern.deserialization-untrusted"
+engine = "patterns"
+severity = "high"
+description = "Detect deserialization of potentially untrusted data via serde_json::from_str/from_slice, bincode::deserialize, or ciborium::from_reader applied to a source that may be network-derived. LLMs routinely deserialize raw request bodies into privileged types."
+match = "(?i)(serde_json::from_(str|slice|reader)|bincode::deserialize|rmp_serde::from|ciborium::de::from_reader|serde_yaml::from)"
+lang = "rust"
+
+[rules.standards]
+cwe = ["CWE-502"]
+owasp = ["A08:2021-Software-and-Data-Integrity-Failures"]
+asvs = ["1.5.2", "5.5.3"]
+nist = ["SI-10", "SA-15"]
+cis = ["16.5"]

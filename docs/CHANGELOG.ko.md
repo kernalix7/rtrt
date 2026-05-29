@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### Highlights — AI 산출물 보안 & 라이선스 프로파일
+
+**새 `rtrt-security` 크레이트(11번째 워크스페이스 크레이트): RHEL/OpenSCAP 보안 프로파일을 본뜬 프로파일 기반 보안+라이선스 스캔. 빌트인 프로파일 6개가 모든 룰을 산업 표준(CWE / OWASP Top 10 + ASVS / NIST 800-53 + 800-218 SSDF / CIS Controls v8 / SLSA / EU AI Act)에 매핑하고, 5개 플러그인 엔진이 실행하며, CLI·대시보드·MCP로 노출.**
+
+- 스캔 엔진 5개: `secrets`(빌트인 패턴셋 + Shannon 엔트로피 게이트 + 마스킹), `licenses`(SPDX 매니페스트 정책, allow/forbid, 헤더 검사 옵션, 워크스페이스 상속 인식), `deps`(Cargo.lock / package-lock 위생 — git/wildcard/yanked — + 오프라인 RustSec advisory 매칭 옵션), `patterns`(lang·path 필터 정규식 소스 스캐너), `ai`(AI 산출물 특화: hallucinated-import/슬롭스쿼팅, base64-blob, eval-usage, todo-secret, unsafe-block — 각 소스 파일을 가장 가까운 crate 매니페스트 기준으로 판정해 모노레포 멤버 오탐 방지).
+- 빌트인 프로파일 6개: `ai-default`(권장 baseline, 10룰), `ai-strict`(16), `owasp-top-10`(15), `asvs-l2`(13), `cis-baseline`(13), `nist-ssdf`(12). 선언적 TOML — 사용자는 `~/.rtrt/security/profiles/`에 자기 것 넣어 빌트인 오버라이드/추가. 모든 룰이 `standards` 매핑 보유해 finding이 강제하는 통제 항목을 인용.
+- CLI: `rtrt security scan --profile <name> [--path] [--json]`, `profile list`, `profile show <name>`, `gate`(프로파일 임계치 이상이면 non-zero 종료 — CI 게이트), `init`(빌트인을 사용자 디렉터리로 복사).
+- 대시보드: 보안 페이지(프로파일 선택, 스캔, 심각도별 finding + 표준 칩, 실행/스킵 엔진) — `GET /api/security/profiles`, `GET /api/security/profile/{name}`, `POST /api/security/scan` 기반.
+- MCP: `security_scan(profile, path?)`가 전체 ScanReport 반환 — 에이전트가 커밋 전 자기 산출물 자가 검사 가능.
+
 ### Highlights — 대시보드 백그라운드 서비스 자동 시작
 
 **설치 시 `rtrt-dashboard`를 백그라운드 OS 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동.**

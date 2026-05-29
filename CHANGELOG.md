@@ -9,6 +9,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — security & license profiles for AI-generated artifacts
+
+**New `rtrt-security` crate (11th workspace crate): profile-driven security + license scanning modeled on RHEL/OpenSCAP profiles. Six built-in profiles map every rule to industry standards (CWE / OWASP Top 10 + ASVS / NIST 800-53 + 800-218 SSDF / CIS Controls v8 / SLSA / EU AI Act), run by five pluggable engines, surfaced through the CLI, the dashboard, and MCP.**
+
+- Five scan engines: `secrets` (builtin pattern set + Shannon-entropy gate + redacted excerpts), `licenses` (SPDX manifest policy, allow/forbid lists, optional header check, workspace-inheritance aware), `deps` (Cargo.lock / package-lock hygiene — git/wildcard/yanked — plus optional offline RustSec advisory match), `patterns` (regex source scanner with lang + path filters), and `ai` (AI-artifact-specific: hallucinated-import / slopsquatting, base64-blob, eval-usage, todo-secret, unsafe-block — each source file judged against its nearest crate manifest so monorepo members don't false-positive).
+- Six built-in profiles: `ai-default` (recommended baseline, 10 rules), `ai-strict` (16), `owasp-top-10` (15), `asvs-l2` (13), `cis-baseline` (13), `nist-ssdf` (12). Declarative TOML — users drop their own under `~/.rtrt/security/profiles/` to override built-ins or add new ones. Every rule carries a `standards` mapping so findings cite the control they enforce.
+- CLI: `rtrt security scan --profile <name> [--path] [--json]`, `profile list`, `profile show <name>`, `gate` (non-zero exit at/above the profile threshold — CI gate), `init` (copy built-ins to the user dir for customizing).
+- Dashboard: a 보안 page (profile picker, scan, severity-grouped findings with standards chips, engines run/skipped) backed by `GET /api/security/profiles`, `GET /api/security/profile/{name}`, `POST /api/security/scan`.
+- MCP: `security_scan(profile, path?)` returns the full ScanReport so an agent can self-check its own output before committing.
+
 ### Highlights — dashboard auto-starts as a background service
 
 **The installer now runs `rtrt-dashboard` as a background OS service, so the web UI at <http://127.0.0.1:7311> is always up without launching it by hand — it restarts on crash and comes back on login.**

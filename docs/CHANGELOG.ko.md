@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### Highlights — 엔티티 중심 인터랙티브 메모리 그래프
+
+**메모리 그래프가 흩뿌린 점에서 엔티티 ↔ 메모리 탐색 맵으로.**
+
+- `rtrt-memory` 스키마 v7에 `entities(project, name)` + `memory_entities(memory_id, entity_id)` 추가 — 추출된 엔티티가 1급 노드(기존 메모리↔메모리 `edges` 경로는 유지, 가산적). 새 `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, `graph_bipartite`(메모리 노드 + degree 있는 엔티티 노드 + memory→entity 링크 반환, 각 메모리의 `source_kind` 포함).
+- `GET /api/memory/graph`가 이분 `{nodes, edges}` 반환(메모리 노드 `m<id>` + kind·source_kind, 엔티티 노드 `e<id>` + degree); `POST /api/memory/entities`가 이제 이분 그래프 구축.
+- UI: 엔티티는 큰 녹색 노드(degree 비례 반경), 메모리는 작은 노드(메인 파랑/서브 보라); force-directed 레이아웃에 노드 드래그/고정·휠 줌·팬; 노드 클릭 시 상세 패널 + 이웃 하이라이트; 메모리/엔티티 + 메인/서브 필터 + 검색; 빈 그래프는 엔티티 추출 CTA 표시.
+
 ### Highlights — 팀원/서브에이전트 작업 캡처 + 부모 프로젝트로 그룹핑
 
 **대시보드가 Claude Code transcript를 tail해서 메인 에이전트 transcript에 안 들어오는 팀원(FleetView)·서브에이전트(Task 도구) 작업을 캡처하고, 실제 프로젝트 하위로 묶고, 모든 행을 메인/서브로 분류.**

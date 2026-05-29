@@ -9,6 +9,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — entity-centric interactive memory graph
+
+**The memory graph goes from scattered dots to an explorable entity ↔ memory map.**
+
+- `rtrt-memory` schema v7 adds `entities(project, name)` + `memory_entities(memory_id, entity_id)` so extracted entities are first-class nodes (the old memory-to-memory `edges` path is kept, additive). New `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, and `graph_bipartite` (returns memory nodes, entity nodes with degree, and memory→entity links, with each memory's `source_kind`).
+- `GET /api/memory/graph` emits a bipartite `{nodes, edges}` (memory nodes `m<id>` with kind + source_kind, entity nodes `e<id>` with degree); `POST /api/memory/entities` now builds the bipartite graph.
+- UI: entities render as large green nodes (radius by degree), memories as small nodes (blue main / purple subagent); force-directed layout with node drag/pin, wheel zoom, and pan; clicking a node opens a detail panel and highlights its neighbors; 메모리/엔티티 + 메인/서브 filters and a search box; an empty graph shows a call-to-action to run 엔티티 추출.
+
 ### Highlights — capture teammate/subagent work, grouped under the parent project
 
 **The dashboard tails Claude Code's transcripts to capture teammate (FleetView) and subagent (Task-tool) work that never reaches the main agent's transcript, folds it under the real project, and classifies every row as main vs subagent.**

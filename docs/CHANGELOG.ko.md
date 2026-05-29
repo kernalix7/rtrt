@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### Highlights — 팀원/서브에이전트 작업 캡처 + 부모 프로젝트로 그룹핑
+
+**대시보드가 Claude Code transcript를 tail해서 메인 에이전트 transcript에 안 들어오는 팀원(FleetView)·서브에이전트(Task 도구) 작업을 캡처하고, 실제 프로젝트 하위로 묶고, 모든 행을 메인/서브로 분류.**
+
+- `rtrt-dashboard`에 transcript 워처: `~/.claude/projects/**/*.jsonl`(메인 세션 + 중첩 `<session>/subagents/agent-*.jsonl`) tail, 각 assistant 턴을 `body_sha` 디덥과 함께 저장.
+- 서브에이전트 행은 **부모 세션 프로젝트**로 귀속 — 부모 transcript의 cwd로 도출해 서브에이전트가 git worktree(자기 cwd basename은 `p18-gap` 같은 브랜치명)에서 돌아도 안정. 각 행에 `source_kind = main | subagent` 태그.
+- `rtrt-memory`: `reattribute(id, source_kind, project?)`(단일 `json_set` UPDATE) + `reattribution_candidates()`; 부팅 1회 마이그레이션이 기존 stray 서브에이전트/worktree 버킷을 부모로 접고 메인/서브 분류(idempotent).
+- `/api/projects`가 stray 버킷(`agent-*` / `p<n>-*` / hex 세션 해시)을 셀렉터에서 숨김(등록 프로젝트는 항상 표시); 셀렉터 105 → 실제 프로젝트만.
+- 타임라인 API가 `source_kind` 노출; 메모리 페이지에 🧠 메인 / 🤖 서브 배지 + 전체/메인/서브 필터.
+
 ### Highlights — 프로젝트 중심 대시보드 + 프로젝트별 보안
 
 **대시보드를 flat 13개 메뉴 대신 프로젝트 컨텍스트 중심으로 재구성하고, 보안을 프로젝트 인식형으로 전환.**

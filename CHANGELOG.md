@@ -9,6 +9,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — capture teammate/subagent work, grouped under the parent project
+
+**The dashboard tails Claude Code's transcripts to capture teammate (FleetView) and subagent (Task-tool) work that never reaches the main agent's transcript, folds it under the real project, and classifies every row as main vs subagent.**
+
+- New transcript watcher in `rtrt-dashboard`: tails `~/.claude/projects/**/*.jsonl` (main sessions + nested `<session>/subagents/agent-*.jsonl`), saving each assistant turn with `body_sha` dedup against existing hook captures.
+- Subagent rows are attributed to the **parent session's project**, resolved from the parent transcript's cwd — stable even when the subagent ran in a git worktree (whose own cwd basename is a branch name like `p18-gap`, not the repo). Each row is tagged `source_kind = main | subagent`.
+- `rtrt-memory`: `reattribute(id, source_kind, project?)` (one `json_set` UPDATE) + `reattribution_candidates()`; a boot-time migration folds pre-existing stray subagent/worktree buckets under their parent and classifies main/subagent (idempotent).
+- `/api/projects` hides stray buckets (`agent-*` / `p<n>-*` / hex session hashes) from the project selector (registered projects always show); the selector dropped from 105 to the real project set.
+- Timeline API exposes `source_kind`; the memory page shows 🧠 메인 / 🤖 서브 badges and a 전체 / 메인 / 서브 filter.
+
 ### Highlights — project-centric dashboard + per-project security
 
 **The dashboard is reorganized around a project context instead of a flat 13-item menu, and security becomes project-aware.**

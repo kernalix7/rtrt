@@ -2819,6 +2819,10 @@ function initGraph(data) {
         dominantSource,
         x: rep.x, y: rep.y, vx: 0, vy: 0, fx: null, fy: null,
         r: 9 + Math.sqrt(members.length) * 6,
+        // openT: 0 = fully collapsed bubble, 1 = fully opened members. Eased
+        // each frame toward the logical open state for smooth expand/collapse.
+        openT: members.length <= 1 ? 1 : 0,
+        seeded: members.length <= 1,
       };
       clusters.push(cluster);
       for (const m of members) clusterOf.set(m.id, cluster);
@@ -2837,23 +2841,43 @@ function initGraph(data) {
   function clusterIsOpen(c) {
     return c.size <= 1 || openedClusters.has(c.id) || view.k >= ZOOM_OPEN_K;
   }
-  // Member node renders individually only when its cluster is open AND the
-  // node itself passes the standard visibility filters.
+  // Member node is logically active (pickable / simulated) only when its
+  // cluster is open AND the node passes the standard visibility filters.
   function memberVisible(n) {
     if (!graphNodeVisible(n)) return false;
     if (!clusterMode) return true;
     const c = clusterOf.get(n.id);
     return c ? clusterIsOpen(c) : true;
   }
-  // A cluster bubble is drawn only in cluster mode, when closed, and when at
-  // least one member passes the filters.
+  // Member is RENDERABLE during the open transition too (openT > 0), so it can
+  // fade/glide in and out rather than popping.
+  function memberRenderable(n) {
+    if (!graphNodeVisible(n)) return false;
+    if (!clusterMode) return true;
+    const c = clusterOf.get(n.id);
+    if (!c || c.size <= 1) return true;
+    return c.openT > 0.02;
+  }
+  function memberAlpha(n) {
+    if (!clusterMode) return 1;
+    const c = clusterOf.get(n.id);
+    if (!c || c.size <= 1) return 1;
+    return Math.max(0, Math.min(1, c.openT));
+  }
+  // A cluster bubble is drawn while it is not fully opened (openT < 1) and at
+  // least one member passes the filters — it fades out as members fade in.
   function clusterVisible(c) {
     if (!clusterMode || c.size <= 1) return false;
-    if (clusterIsOpen(c)) return false;
+    if (c.openT >= 0.98) return false;
     return c.members.some(graphNodeVisible);
   }
-  // Re-seed member positions around their bubble when a cluster first opens so
-  // we never run a global 1675-node simulation from scratch.
+  function clusterAlpha(c) {
+    return Math.max(0, Math.min(1, 1 - c.openT));
+  }
+  // Re-seed member layout positions around their bubble when a cluster first
+  // opens so we never run a global 1675-node simulation from scratch. The
+  // members' physics positions (m.x/m.y) start on a ring; rendering eases them
+  // OUT from the bubble center via the cluster's openT, so there is no pop.
   function seedClusterMembers(c) {
     const n = c.members.length;
     for (let i = 0; i < n; i++) {
@@ -2864,11 +2888,43 @@ function initGraph(data) {
       m.y = c.y + Math.sin(ang) * ring + (Math.random() - 0.5) * 8;
       m.vx = 0; m.vy = 0;
     }
+    c.seeded = true;
+  }
+
+  // Rendered member position: interpolate from the bubble center (collapsed)
+  // to the physics layout position (opened) by the eased openT, so members
+  // glide out when opening and back in when closing — never teleport.
+  function memberRenderX(m, c) {
+    if (!c || c.size <= 1) return m.x;
+    return c.x + (m.x - c.x) * c.openT;
+  }
+  function memberRenderY(m, c) {
+    if (!c || c.size <= 1) return m.y;
+    return c.y + (m.y - c.y) * c.openT;
   }
 
   let view = { x: 0, y: 0, k: 1 };
   let alpha = 1;
   let tickCount = 0;
+
+  // ----- Smooth-motion tuning -----
+  const DAMPING = 0.86;            // velocity retained per tick (strong damping → calm settle)
+  const ALPHA_DECAY = 0.94;        // multiplicative cooling of the simulation temperature
+  const ALPHA_MIN = 0.02;          // below this the sim is considered cold
+  const ENERGY_EPSILON = 0.06;     // kinetic energy below this (and cold) → stop the rAF loop
+  const MAX_STEP = 18;             // max world-units a node may move per frame (no teleport)
+  const OPEN_EASE = 0.16;          // per-frame lerp of cluster openT toward its target (≈300ms)
+  const VIEW_EASE = 0.18;          // per-frame lerp of view toward the tween target
+  const ZOOM_LERP = 0.28;          // per-frame lerp of view.k toward the wheel target scale
+  const ZOOM_STEP = 1.18;          // discrete zoom factor applied to the target per wheel tick
+
+  // Smooth view tween (fit / focus): eases view.k/x/y toward a target.
+  let viewTarget = null;           // { k, x, y } or null when idle
+  // Smooth wheel zoom: eases view.k toward targetK while keeping cursor anchored.
+  let zoom = null;                 // { k, sx, sy } target scale + cursor anchor, or null
+  let frameEnergy = 0;             // summed kinetic energy from the latest sim tick
+
+  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
   let hoverId = null;
   let hoverClusterId = null;
   let selectedId = null;
@@ -2902,14 +2958,18 @@ function initGraph(data) {
     return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k };
   }
 
-  // Returns a member node (when its cluster is open / flat mode) under the cursor.
+  // Returns a member node (when its cluster is open / flat mode) under the
+  // cursor — uses the eased render position so hit-testing matches what's drawn.
   function pickNode(sx, sy) {
     const p = screenToWorld(sx, sy);
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
       if (!memberVisible(n)) continue;
+      const c = clusterMode ? clusterOf.get(n.id) : null;
+      const nx = memberRenderX(n, c);
+      const ny = memberRenderY(n, c);
       const r = graphNodeRadius(n) + 6 / view.k;
-      if (Math.hypot(p.x - n.x, p.y - n.y) <= r) return n;
+      if (Math.hypot(p.x - nx, p.y - ny) <= r) return n;
     }
     return null;
   }
@@ -2941,18 +3001,43 @@ function initGraph(data) {
   function reconcileClusterOpenState() {
     if (!clusterMode) return;
     // Zooming well below the threshold re-collapses even explicitly-opened
-    // clusters, so the overview always reads as a handful of bubbles.
-    if (view.k < ZOOM_OPEN_K - 0.15 && openedClusters.size) openedClusters.clear();
+    // clusters, so the overview always reads as a handful of bubbles. Use the
+    // pending tween/zoom target scale when one is active, so a focus that is
+    // still mid-zoom doesn't get its just-opened cluster cleared.
+    const effK = viewTarget ? viewTarget.k : (zoom ? zoom.k : view.k);
+    if (effK < ZOOM_OPEN_K - 0.15 && openedClusters.size) openedClusters.clear();
     for (const c of clusters) {
       if (c.size <= 1) continue;
       const open = clusterIsOpen(c);
       const prev = lastOpenState.get(c.id) || false;
-      if (open && !prev && !openedClusters.has(c.id)) {
-        seedClusterMembers(c);
+      if (open && !prev) {
+        // Seed the member ring once per opening transition, then let openT ease.
+        if (!c.seeded || c.openT <= 0.001) seedClusterMembers(c);
         wakeLayout(0.45);
       }
+      if (open !== prev) wakeLayout(0); // keep loop alive to ease openT (no re-warm)
       lastOpenState.set(c.id, open);
     }
+  }
+
+  // Ease every cluster's openT toward its logical open/closed target. Returns
+  // true while any cluster is still transitioning (so the loop keeps running).
+  function updateClusterOpenT() {
+    if (!clusterMode) return false;
+    let animating = false;
+    for (const c of clusters) {
+      if (c.size <= 1) { c.openT = 1; continue; }
+      const target = clusterIsOpen(c) ? 1 : 0;
+      const diff = target - c.openT;
+      if (Math.abs(diff) > 0.002) {
+        c.openT += diff * OPEN_EASE;
+        if (Math.abs(target - c.openT) <= 0.002) c.openT = target;
+        animating = true;
+      } else {
+        c.openT = target;
+      }
+    }
+    return animating;
   }
 
   // Fit ALL clusters (their bubble bounding box) so the whole graph is visible
@@ -2996,11 +3081,48 @@ function initGraph(data) {
     // Cap zoom below the open threshold so fit-all always shows collapsed bubbles.
     const maxK = clusterMode ? Math.min(4, ZOOM_OPEN_K - 0.05) : 4;
     const k = Math.max(0.02, Math.min(maxK, Math.min(cw / (bbW + margin * 2), ch / (bbH + margin * 2))));
-    view.k = k;
-    view.x = (cw - bbW * k) / 2 - minX * k;
-    view.y = (ch - bbH * k) / 2 - minY * k;
+    // Animate the view to the fit target (ease-in-out) instead of snapping.
+    tweenViewTo({
+      k,
+      x: (cw - bbW * k) / 2 - minX * k,
+      y: (ch - bbH * k) / 2 - minY * k,
+    });
     if (clusterMode) reconcileClusterOpenState();
-    draw();
+  }
+
+  // Start a smooth view tween toward the given target and cancel any pending
+  // wheel-zoom so the two easings never fight.
+  function tweenViewTo(target) {
+    zoom = null;
+    viewTarget = { k: target.k, x: target.x, y: target.y };
+    wakeLayout(0); // drive the view tween without re-warming the layout
+  }
+
+  // Advance the active view tween / wheel-zoom by one frame. Returns true while
+  // either is still in progress so the loop keeps running.
+  function stepView() {
+    let animating = false;
+    if (viewTarget) {
+      view.k += (viewTarget.k - view.k) * VIEW_EASE;
+      view.x += (viewTarget.x - view.x) * VIEW_EASE;
+      view.y += (viewTarget.y - view.y) * VIEW_EASE;
+      const done = Math.abs(viewTarget.k - view.k) < 0.0008
+        && Math.abs(viewTarget.x - view.x) < 0.4
+        && Math.abs(viewTarget.y - view.y) < 0.4;
+      if (done) { view.k = viewTarget.k; view.x = viewTarget.x; view.y = viewTarget.y; viewTarget = null; }
+      else animating = true;
+    }
+    if (zoom) {
+      // Ease scale toward the wheel target, then re-anchor on the cursor so the
+      // point under the pointer stays fixed (centered zoom, no jump).
+      const before = screenToWorld(zoom.sx, zoom.sy);
+      view.k += (zoom.k - view.k) * ZOOM_LERP;
+      view.x = zoom.sx - before.x * view.k;
+      view.y = zoom.sy - before.y * view.k;
+      if (Math.abs(zoom.k - view.k) < 0.0006) { view.k = zoom.k; zoom = null; }
+      else animating = true;
+    }
+    return animating;
   }
 
   function sourceLabel(source) {
@@ -3076,15 +3198,13 @@ function initGraph(data) {
     tip.innerHTML = `<span class="badge">클러스터</span> ${escapeHtml(clusterSourceLabel(c))} · ${c.size}개 — ${escapeHtml(graphNodeLabel(c.rep).slice(0, 90))} <span class="badge">클릭하면 펼침</span>`;
   }
 
-  // Zoom in onto a cluster so its members reveal, then frame them.
+  // Zoom in onto a cluster so its members reveal, then frame them — animated.
   function focusCluster(c) {
     if (!c) return;
-    view.k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
-    view.x = cw / 2 - c.x * view.k;
-    view.y = ch / 2 - c.y * view.k;
+    const k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
     reconcileClusterOpenState();
+    tweenViewTo({ k, x: cw / 2 - c.x * k, y: ch / 2 - c.y * k });
     wakeLayout(0.55);
-    draw();
   }
 
   function isSearchMatch(n) {
@@ -3136,6 +3256,39 @@ function initGraph(data) {
     ctx.fill();
   }
 
+  // Edge drawn at the eased member render positions (so edges track members as
+  // they glide out of / into their cluster bubble).
+  function drawEdgeAt(from, to, edge) {
+    const ca = clusterMode ? clusterOf.get(from.id) : null;
+    const cb = clusterMode ? clusterOf.get(to.id) : null;
+    const fx0 = memberRenderX(from, ca);
+    const fy0 = memberRenderY(from, ca);
+    const tx0 = memberRenderX(to, cb);
+    const ty0 = memberRenderY(to, cb);
+    const fromR = graphNodeRadius(from) + 1;
+    const toR = graphNodeRadius(to) + 2;
+    const dx = tx0 - fx0;
+    const dy = ty0 - fy0;
+    const d = Math.hypot(dx, dy) || 1;
+    const sx = fx0 + (dx / d) * fromR;
+    const sy = fy0 + (dy / d) * fromR;
+    const ex = tx0 - (dx / d) * toR;
+    const ey = ty0 - (dy / d) * toR;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    if (isSimilarity) return;
+    const size = 5;
+    const angle = Math.atan2(dy, dx);
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - Math.cos(angle - 0.45) * size, ey - Math.sin(angle - 0.45) * size);
+    ctx.lineTo(ex - Math.cos(angle + 0.45) * size, ey - Math.sin(angle + 0.45) * size);
+    ctx.closePath();
+    ctx.fill();
+  }
+
   function clusterIsSearchHit(c) {
     const q = graphFilters.search.trim().toLowerCase();
     if (!q) return false;
@@ -3145,45 +3298,48 @@ function initGraph(data) {
   function drawClusterBubble(c) {
     const searchHit = clusterIsSearchHit(c);
     const hovered = c.id === hoverClusterId;
-    ctx.globalAlpha = 0.9;
+    const fade = clusterAlpha(c);            // fades out as the cluster opens
+    if (fade <= 0.01) return;
+    const r = c.r * (0.82 + 0.18 * fade);    // subtle shrink while opening
+    ctx.globalAlpha = 0.9 * fade;
     ctx.beginPath();
-    ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
     ctx.fillStyle = clusterColor(c);
     ctx.fill();
     // Lighter inner halo to read as a "group" rather than a single node.
-    ctx.globalAlpha = 0.16;
+    ctx.globalAlpha = 0.16 * fade;
     ctx.beginPath();
-    ctx.arc(c.x, c.y, c.r + 4 / view.k, 0, Math.PI * 2);
+    ctx.arc(c.x, c.y, r + 4 / view.k, 0, Math.PI * 2);
     ctx.fillStyle = clusterColor(c);
     ctx.fill();
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = fade;
     if (searchHit || hovered) {
       ctx.strokeStyle = searchHit ? '#fbbf24' : fg;
       ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
       ctx.beginPath();
-      ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
       ctx.stroke();
     }
     // Count badge centered in the bubble.
+    ctx.globalAlpha = fade;
     ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.max(8, c.r * 0.6)}px system-ui`;
+    ctx.font = `bold ${Math.max(8, r * 0.6)}px system-ui`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(String(c.size), c.x, c.y);
     ctx.textBaseline = 'alphabetic';
     // Representative label + count beneath the bubble.
     if (view.k > 0.18) {
-      ctx.globalAlpha = 0.9;
+      ctx.globalAlpha = 0.9 * fade;
       ctx.fillStyle = fg;
       ctx.font = `${Math.max(7, 9 / Math.sqrt(view.k))}px system-ui`;
       const lbl = graphNodeLabel(c.rep).slice(0, 18) + ` ·${c.size}`;
-      ctx.fillText(lbl, c.x, c.y + c.r + 11 / view.k);
-      ctx.globalAlpha = 1;
+      ctx.fillText(lbl, c.x, c.y + r + 11 / view.k);
     }
+    ctx.globalAlpha = 1;
   }
 
   function draw() {
-    if (clusterMode) reconcileClusterOpenState();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cw, ch);
     ctx.fillStyle = bg;
@@ -3194,53 +3350,61 @@ function initGraph(data) {
     ctx.lineWidth = 1 / Math.sqrt(view.k);
     ctx.strokeStyle = muted;
     ctx.fillStyle = muted;
-    // Edges: both endpoints must be rendered as individual members.
+    // Edges: drawn at the eased render positions; faded by the cluster open
+    // progress so they appear with their members rather than popping in.
     for (const e of edges) {
       const [from, to] = edgeDirection(e);
-      if (!memberVisible(from) || !memberVisible(to)) continue;
+      if (!memberRenderable(from) || !memberRenderable(to)) continue;
+      const openFade = Math.min(memberAlpha(from), memberAlpha(to));
+      if (openFade <= 0.01) continue;
       const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
       if (isSimilarity) {
         const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
         ctx.lineWidth = (0.5 + weight * 2.5) / Math.sqrt(view.k);
-        ctx.globalAlpha = selectedId
+        ctx.globalAlpha = (selectedId
           ? (activeEdge ? 0.18 + weight * 0.58 : 0.025 + weight * 0.08)
-          : 0.035 + weight * 0.5;
+          : 0.035 + weight * 0.5) * openFade;
       } else {
         ctx.lineWidth = 1 / Math.sqrt(view.k);
-        ctx.globalAlpha = selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22;
+        ctx.globalAlpha = (selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22) * openFade;
       }
-      drawEdge(from, to, e);
+      drawEdgeAt(from, to, e);
     }
     ctx.globalAlpha = 1;
-    // Collapsed cluster bubbles (overview).
+    // Cluster bubbles (fade out as their cluster opens).
     if (clusterMode) {
       for (const c of clusters) {
         if (clusterVisible(c)) drawClusterBubble(c);
       }
     }
-    // Individual member nodes (opened clusters / singletons / entity mode).
+    // Individual member nodes — eased out from the bubble center as openT rises.
     for (const n of nodes) {
-      if (!memberVisible(n)) continue;
+      if (!memberRenderable(n)) continue;
+      const c = clusterMode ? clusterOf.get(n.id) : null;
+      const nx = memberRenderX(n, c);
+      const ny = memberRenderY(n, c);
+      const fade = memberAlpha(n);
+      if (fade <= 0.01) continue;
       const dim = selectedId && !isRelated(n);
       const searchHit = isSearchMatch(n);
       const r = graphNodeRadius(n);
-      ctx.globalAlpha = dim ? 0.18 : 1;
+      ctx.globalAlpha = (dim ? 0.18 : 1) * fade;
       ctx.beginPath();
-      ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.arc(nx, ny, r, 0, Math.PI * 2);
       ctx.fillStyle = n.node_type === 'entity' ? entityColor : graphNodeSource(n) === 'subagent' ? subagentColor : accent;
       ctx.fill();
       if (n.id === selectedId || n.id === hoverId || searchHit) {
-        ctx.globalAlpha = dim ? 0.35 : 1;
+        ctx.globalAlpha = (dim ? 0.35 : 1) * fade;
         ctx.strokeStyle = searchHit ? '#fbbf24' : fg;
         ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
         ctx.stroke();
       }
       if (shouldLabelNode(n) && view.k > 0.45) {
-        ctx.globalAlpha = dim ? 0.22 : 0.85;
+        ctx.globalAlpha = (dim ? 0.22 : 0.85) * fade;
         ctx.fillStyle = fg;
         ctx.font = `${Math.max(6.5, 8 / Math.sqrt(view.k))}px system-ui`;
         ctx.textAlign = 'center';
-        ctx.fillText(graphNodeLabel(n).slice(0, 22), n.x, n.y + r + 9);
+        ctx.fillText(graphNodeLabel(n).slice(0, 22), nx, ny + r + 9);
       }
     }
     ctx.restore();
@@ -3282,10 +3446,16 @@ function initGraph(data) {
       } else {
         c.vx += (centerX - c.x) * 0.012 * alpha;
         c.vy += (centerY - c.y) * 0.012 * alpha;
+        c.vx *= DAMPING; c.vy *= DAMPING;
         const speed = Math.hypot(c.vx, c.vy);
         if (speed > maxSpeed) { c.vx = (c.vx / speed) * maxSpeed; c.vy = (c.vy / speed) * maxSpeed; }
-        c.vx *= 0.72; c.vy *= 0.72;
-        c.x += c.vx; c.y += c.vy;
+        // Clamp displacement so a bubble never teleports across the canvas.
+        let mx = c.vx;
+        let my = c.vy;
+        const m = Math.hypot(mx, my);
+        if (m > MAX_STEP) { mx = (mx / m) * MAX_STEP; my = (my / m) * MAX_STEP; }
+        c.x += mx; c.y += my;
+        frameEnergy += c.vx * c.vx + c.vy * c.vy;
       }
       // Closed (or singleton) clusters drag their member(s) along so reopening
       // stays local and singletons render where their bubble sits.
@@ -3352,23 +3522,30 @@ function initGraph(data) {
         // Gentle pull toward the cluster's bubble anchor keeps members local.
         m.vx += (c.x - m.x) * 0.02 * alpha;
         m.vy += (c.y - m.y) * 0.02 * alpha;
+        m.vx *= DAMPING; m.vy *= DAMPING;
         const speed = Math.hypot(m.vx, m.vy);
         if (speed > maxSpeed) { m.vx = (m.vx / speed) * maxSpeed; m.vy = (m.vy / speed) * maxSpeed; }
-        m.vx *= 0.74; m.vy *= 0.74;
-        m.x += m.vx; m.y += m.vy;
+        let dx = m.vx;
+        let dy = m.vy;
+        const mag = Math.hypot(dx, dy);
+        if (mag > MAX_STEP) { dx = (dx / mag) * MAX_STEP; dy = (dy / mag) * MAX_STEP; }
+        m.x += dx; m.y += dy;
+        frameEnergy += m.vx * m.vx + m.vy * m.vy;
       }
     }
   }
 
   function simulate() {
     tickCount += 1;
+    frameEnergy = 0;
     if (clusterMode) {
       simulateClusters();
       simulateOpenMembers();
-      alpha = tickCount > 360 ? 0 : Math.max(0, alpha * 0.982 - 0.0015);
+      // Cool the temperature multiplicatively so the layout settles and stops.
+      alpha = alpha * ALPHA_DECAY;
       return;
     }
-    // Entity mode: legacy global force layout (unchanged).
+    // Entity mode: legacy global force layout (damped + cooled like clusters).
     const centerX = cw / 2;
     const centerY = ch / 2;
     const visibleCount = Math.max(1, nodes.filter(graphNodeVisible).length);
@@ -3425,38 +3602,69 @@ function initGraph(data) {
       if (n.x > cw - pad) n.vx -= (n.x - (cw - pad)) * 0.025 * alpha;
       if (n.y < pad) n.vy += (pad - n.y) * 0.025 * alpha;
       if (n.y > ch - pad) n.vy -= (n.y - (ch - pad)) * 0.025 * alpha;
+      n.vx *= DAMPING;
+      n.vy *= DAMPING;
       const speed = Math.hypot(n.vx, n.vy);
       if (speed > maxSpeed) {
         n.vx = (n.vx / speed) * maxSpeed;
         n.vy = (n.vy / speed) * maxSpeed;
       }
-      n.vx *= 0.74;
-      n.vy *= 0.74;
-      n.x += n.vx;
-      n.y += n.vy;
+      let dx = n.vx;
+      let dy = n.vy;
+      const mag = Math.hypot(dx, dy);
+      if (mag > MAX_STEP) { dx = (dx / mag) * MAX_STEP; dy = (dy / mag) * MAX_STEP; }
+      n.x += dx;
+      n.y += dy;
+      frameEnergy += n.vx * n.vx + n.vy * n.vy;
     }
-    alpha = tickCount > 360 ? 0 : Math.max(0, alpha * 0.982 - 0.0015);
+    alpha = alpha * ALPHA_DECAY;
   }
 
   function loop() {
     raf = null;
-    if (alpha > 0.03 || dragNode) {
-      // Cluster mode simulates only bubbles + open members, so it stays cheap.
+    const dragging = !!(dragNode || dragCluster);
+
+    // 1. Advance smooth view tween / wheel zoom (also re-anchors cursor zoom).
+    const viewBusy = stepView();
+    if (clusterMode) reconcileClusterOpenState();
+
+    // 2. Run the force sim while the temperature is warm or a drag is active.
+    let simBusy = false;
+    if (alpha > ALPHA_MIN || dragging) {
       const iterations = clusterMode ? 2 : (nodes.length > 80 ? 1 : 2);
       for (let i = 0; i < iterations; i++) simulate();
+      // Stop the sim once kinetic energy is below epsilon (no resting jitter).
+      if (!dragging && alpha <= ALPHA_MIN && frameEnergy < ENERGY_EPSILON) {
+        alpha = 0;
+        simBusy = false;
+      } else {
+        simBusy = alpha > ALPHA_MIN || dragging;
+      }
     }
-    if (initialFitPending && !dragNode && (tickCount >= 220 || alpha <= 0.035)) {
+
+    // 3. Ease cluster open/close transitions (expand/collapse glide).
+    const openBusy = updateClusterOpenT();
+
+    // 4. Initial framing once the layout has roughly settled.
+    if (initialFitPending && !dragging && (tickCount >= 160 || alpha <= ALPHA_MIN)) {
       initialFitPending = false;
       fitView();
-    } else {
-      draw();
     }
-    if (alpha > 0.03 || dragNode) raf = requestAnimationFrame(loop);
+    draw();
+
+    // 5. Keep the rAF alive only while something is actually animating.
+    if (simBusy || viewBusy || openBusy || dragging || viewTarget || zoom) {
+      raf = requestAnimationFrame(loop);
+    }
   }
 
+  // Wake the animation loop. Optionally inject simulation temperature; pass 0 to
+  // only drive view/open-state animations without re-warming the layout.
   function wakeLayout(nextAlpha) {
-    alpha = Math.max(alpha, nextAlpha);
-    tickCount = 0;
+    if (typeof nextAlpha === 'number' && nextAlpha > 0) {
+      alpha = Math.max(alpha, nextAlpha);
+      tickCount = 0;
+    }
     if (!raf) raf = requestAnimationFrame(loop);
   }
 
@@ -3474,6 +3682,7 @@ function initGraph(data) {
     downAt = { sx: p.sx, sy: p.sy };
     lastPointer = { sx: p.sx, sy: p.sy };
     moved = false;
+    if (node || cluster) { viewTarget = null; zoom = null; } // interaction cancels view tweens
     if (node) {
       dragNode = node;
       dragNode.fx = world.x;
@@ -3514,6 +3723,7 @@ function initGraph(data) {
       return;
     }
     if (panning && lastPointer) {
+      viewTarget = null; zoom = null; // manual pan overrides any in-flight tween
       view.x += p.sx - lastPointer.sx;
       view.y += p.sy - lastPointer.sy;
       lastPointer = { sx: p.sx, sy: p.sy };
@@ -3539,6 +3749,7 @@ function initGraph(data) {
       node.fy = null;
       dragNode = null;
       if (!moved) selectNode(node);
+      else wakeLayout(0.18); // let the released node ease back into the layout
     } else if (dragCluster) {
       const c = dragCluster;
       c.fx = null;
@@ -3548,6 +3759,8 @@ function initGraph(data) {
       if (!moved) {
         openCluster(c);
         focusCluster(c);
+      } else {
+        wakeLayout(0.18); // settle neighboring bubbles after a drag
       }
     } else if (panning && !moved) {
       selectNode(null);
@@ -3573,14 +3786,14 @@ function initGraph(data) {
   on(canvas, 'wheel', (ev) => {
     ev.preventDefault();
     const p = eventPoint(ev);
-    const before = screenToWorld(p.sx, p.sy);
-    const factor = ev.deltaY < 0 ? 1.12 : 0.89;
-    view.k = Math.max(0.12, Math.min(4, view.k * factor));
-    view.x = p.sx - before.x * view.k;
-    view.y = p.sy - before.y * view.k;
-    // Crossing ZOOM_OPEN_K opens/collapses clusters; reconcile + wake layout.
-    if (clusterMode) { reconcileClusterOpenState(); wakeLayout(0.2); }
-    draw();
+    // Ease toward a target scale instead of jumping; stepView() re-anchors the
+    // cursor each frame so the zoom stays centered under the pointer.
+    viewTarget = null; // an in-flight fit/focus tween yields to manual zoom
+    const baseK = zoom ? zoom.k : view.k;
+    const factor = ev.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
+    const targetK = Math.max(0.12, Math.min(4, baseK * factor));
+    zoom = { k: targetK, sx: p.sx, sy: p.sy };
+    wakeLayout(0); // ease the zoom without re-warming the layout
   }, { passive: false });
 
   on(canvas, 'dblclick', (ev) => {
@@ -3620,19 +3833,19 @@ function initGraph(data) {
       if (!q) { draw(); return; }
       const match = nodes.find(n => graphNodeVisible(n) && graphNodeLabel(n).toLowerCase().includes(q));
       if (!match) { draw(); return; }
+      let k = view.k;
       if (clusterMode) {
         const c = clusterOf.get(match.id);
         if (c) {
           openCluster(c);
-          view.k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
+          k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
         }
         reconcileClusterOpenState();
       }
-      view.x = cw / 2 - match.x * view.k;
-      view.y = ch / 2 - match.y * view.k;
+      // Animate the view to center the match instead of snapping.
+      tweenViewTo({ k, x: cw / 2 - match.x * k, y: ch / 2 - match.y * k });
       hoverId = match.id;
       wakeLayout(0.4);
-      draw();
     },
     applyFilters() {
       const selected = selectedId ? nodes[idIdx.get(selectedId)] : null;

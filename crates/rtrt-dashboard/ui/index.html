@@ -3666,7 +3666,9 @@ async function loadGraph(project) {
       project,
       mode: graphIsSimilarityMode() ? 'similarity' : 'entity',
     });
-    if (graphLimit !== 'all') params.set('limit', graphLimit);
+    // '전체' must send a very large limit, otherwise the server falls back to
+    // its default (80) and 전체 looks identical to 80.
+    params.set('limit', graphLimit === 'all' ? '100000' : graphLimit);
     const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();

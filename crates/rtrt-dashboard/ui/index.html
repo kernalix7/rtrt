@@ -145,25 +145,13 @@
   details[open] > summary.muted-summary::before { content: '⇱ '; }
   details > .adv { padding-top: 0.5rem; display: grid; gap: 0.5rem; }
 
-  /* Knowledge map — cluster cards (plain DOM, no canvas) */
+  /* Knowledge map — Cytoscape.js node graph (#cy) + plain-list fallback */
   .memmap-head { font-size: 0.9em; color: var(--muted); margin: 0.65rem 0 0.5rem; }
-  .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin-bottom: 0.65rem; }
+  .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0; }
   .memmap-controls .sort-row { margin: 0; }
   .memmap-search { min-width: min(260px, 100%); flex: 1 1 220px; }
-  .memmap-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.75rem; }
-  .cluster-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.85rem 0.95rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; display: flex; flex-direction: column; gap: 0.5rem; }
-  .cluster-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: var(--shadow); }
-  .cluster-card .cc-label { font-weight: 600; font-size: 0.98rem; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-  .cluster-card .cc-foot { display: flex; align-items: center; gap: 0.45rem; }
-  .cluster-card .cc-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
-  .cluster-card.misc { border-style: dashed; opacity: 0.62; cursor: default; }
-  .cluster-card.misc:hover { transform: none; border-color: var(--border); box-shadow: none; }
-  .cc-dot.main { background: var(--accent); }
-  .cc-dot.subagent { background: #7c3aed; }
-  .cc-dot.mixed { background: var(--muted); }
-  .memmap-cluster-head { display: flex; align-items: center; gap: 0.65rem; margin: 0.65rem 0 0.75rem; flex-wrap: wrap; }
-  .memmap-cluster-head h3 { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
-  .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 60vh; overflow: auto; }
+  .memmap-cy { width: 100%; height: 70vh; min-height: 360px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; }
+  .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
   .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
   .member-row:hover { border-color: var(--accent); }
   .member-row .mr-badge { flex-shrink: 0; font-size: 0.8em; white-space: nowrap; }
@@ -340,6 +328,10 @@
     .security-profile-tools { grid-template-columns: 1fr; }
   }
 </style>
+<!-- Knowledge-map graph rendering: Cytoscape.js owns layout/zoom/pan/drag.
+     If the CDN is unreachable (offline), window.cytoscape stays undefined and
+     the memmap subtab falls back to a plain list — see loadGraph(). -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -639,36 +631,30 @@
           <div class="card">
             <div class="head">
               <h2>지식 맵</h2>
-              <span class="hint">의미가 비슷한 메모리를 클러스터 카드로 묶어 보여줍니다.</span>
+              <span class="hint">의미가 비슷한 메모리를 클러스터 노드로 묶어 그래프로 보여줍니다. 휠로 확대, 배경 드래그로 이동, 노드 클릭으로 펼치기.</span>
             </div>
             <form id="graph-form" style="grid-template-columns:1fr auto;">
               <input id="graph-project" type="hidden">
               <button class="primary" type="submit">새로고침</button>
             </form>
 
-            <!-- OVERVIEW: cluster card grid -->
-            <div id="memmap-overview">
-              <div id="memmap-overview-head" class="memmap-head"></div>
-              <div class="memmap-controls">
-                <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
-                <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
-                  <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
-                  <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
-                  <button class="sort-btn" type="button" data-memmap-source="subagent">서브</button>
-                </div>
+            <div class="memmap-controls">
+              <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
+              <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
+                <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
+                <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
+                <button class="sort-btn" type="button" data-memmap-source="subagent">서브</button>
               </div>
-              <div id="memmap-grid" class="memmap-grid"></div>
-              <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
+              <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
+              <button id="memmap-fit" class="ghost" type="button">맞춤</button>
             </div>
+            <div id="memmap-overview-head" class="memmap-head"></div>
 
-            <!-- DRILL-DOWN: cluster member list -->
-            <div id="memmap-cluster" hidden>
-              <div class="memmap-cluster-head">
-                <button id="memmap-back" class="ghost" type="button">← 뒤로</button>
-                <h3 id="memmap-cluster-title"></h3>
-              </div>
-              <div id="memmap-member-list" class="memmap-member-list"></div>
-            </div>
+            <!-- Cytoscape renders the node graph into this container. -->
+            <div id="cy" class="memmap-cy"></div>
+            <!-- Fallback when the graph library fails to load (offline) or no data. -->
+            <div id="memmap-fallback" class="memmap-member-list" hidden></div>
+            <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
           </div>
         </div>
 
@@ -2550,19 +2536,30 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory knowledge map — plain DOM cluster cards (no canvas, no physics).
+// Memory knowledge map — Cytoscape.js node graph (library owns layout/zoom/pan/drag).
 // Drives the #sub-memmap subtab using the server LOD API:
-//   GET /api/memory/graph?project=X&mode=overview  -> { clusters, total_nodes, ... }
+//   GET /api/memory/graph?project=X&mode=overview  -> { clusters, cluster_edges, total_nodes, ... }
 //   GET /api/memory/graph?project=X&cluster=<id>   -> { root, nodes, edges }
+// We never hand-roll a force simulation: Cytoscape's built-in 'cose' layout
+// positions nodes, and the cy instance handles wheel-zoom / background-pan /
+// node-drag natively. If the CDN failed to load (offline), window.cytoscape is
+// undefined and we fall back to a plain list instead of crashing.
 let memmapOverview = null;           // last overview payload for the current project
 let memmapProject = '';              // project the overview belongs to
 let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
 let memmapSearch = '';               // cluster label filter substring
+let memmapMode = 'overview';         // 'overview' | 'cluster'
+let memmapCy = null;                 // the single Cytoscape instance, lazily created
 // Drill-down cache: cluster id -> { nodes, edges }. Fetched at most once.
 const memmapClusterCache = new Map();
 
 function memmapSourceLabelKo(source) {
   return source === 'subagent' ? '🤖서브' : '🧠메인';
+}
+
+// True only when the Cytoscape CDN script actually loaded.
+function memmapHasCy() {
+  return typeof window !== 'undefined' && typeof window.cytoscape === 'function';
 }
 
 // Flag the catch-all/misc cluster: the lone bucket that is huge versus the rest
@@ -2579,94 +2576,314 @@ function memmapCatchAllId(clusters) {
   return null;
 }
 
-function memmapShowOverview() {
-  document.getElementById('memmap-overview').hidden = false;
-  document.getElementById('memmap-cluster').hidden = true;
+// Cytoscape style sheet: node size scaled (clamped) by cluster size, colour by
+// dominant_source, the catch-all/misc cluster muted + dashed + small. Reuses the
+// dashboard CSS vars by reading them off :root at init time.
+function memmapCyStyle() {
+  const css = getComputedStyle(document.documentElement);
+  const accent = (css.getPropertyValue('--accent') || '#2962FF').trim();
+  const muted = (css.getPropertyValue('--muted') || '#64748b').trim();
+  const border = (css.getPropertyValue('--border') || '#e5e7eb').trim();
+  const fg = (css.getPropertyValue('--fg') || '#0f172a').trim();
+  return [
+    {
+      selector: 'node',
+      style: {
+        'background-color': muted,
+        'label': 'data(label)',
+        'width': 'data(size)',
+        'height': 'data(size)',
+        'font-size': '10px',
+        'color': fg,
+        'text-valign': 'bottom',
+        'text-halign': 'center',
+        'text-margin-y': 4,
+        'text-wrap': 'ellipsis',
+        'text-max-width': '120px',
+        'border-width': 1,
+        'border-color': border,
+        'min-zoomed-font-size': 6,
+      },
+    },
+    { selector: 'node[src = "main"]', style: { 'background-color': accent } },
+    { selector: 'node[src = "subagent"]', style: { 'background-color': '#7c3aed' } },
+    { selector: 'node[src = "mixed"]', style: { 'background-color': muted } },
+    {
+      selector: 'node[?misc]',
+      style: { 'background-color': muted, 'border-style': 'dashed', 'opacity': 0.55 },
+    },
+    {
+      selector: 'node.dim',          // hidden by source filter / search miss
+      style: { 'opacity': 0.12, 'text-opacity': 0.12 },
+    },
+    {
+      selector: 'node.hit',          // search match highlight
+      style: { 'border-width': 3, 'border-color': accent },
+    },
+    {
+      selector: 'edge',
+      style: {
+        'width': 'data(w)',
+        'line-color': border,
+        'opacity': 0.6,
+        'curve-style': 'haystack',
+      },
+    },
+  ];
 }
 
-function memmapShowCluster() {
-  document.getElementById('memmap-overview').hidden = true;
-  document.getElementById('memmap-cluster').hidden = false;
+// Create (once) or return the shared Cytoscape instance bound to #cy.
+function memmapEnsureCy() {
+  if (memmapCy) return memmapCy;
+  if (!memmapHasCy()) return null;
+  const container = document.getElementById('cy');
+  if (!container) return null;
+  memmapCy = window.cytoscape({
+    container,
+    style: memmapCyStyle(),
+    minZoom: 0.1,
+    maxZoom: 3,
+    wheelSensitivity: 0.2,
+  });
+  // Tap on a node: cluster node drills down; member node opens the detail modal.
+  memmapCy.on('tap', 'node', (ev) => {
+    const data = ev.target.data();
+    if (data.kindType === 'cluster') {
+      if (!data.misc) openMemmapCluster(data.clusterId);
+    } else if (data.kindType === 'member') {
+      const num = String(data.memId || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    }
+  });
+  return memmapCy;
 }
 
-// Render the cluster card grid from the cached overview, honouring the active
-// source filter + search box. Pure DOM — instant, never lags.
-function renderMemmapGrid() {
-  const grid = document.getElementById('memmap-grid');
+// Toggle the controls that only make sense in overview vs drill-down.
+function memmapSetMode(mode) {
+  memmapMode = mode;
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = mode !== 'cluster';
+  // Source filter + search only apply to the overview cluster graph.
+  const filter = document.getElementById('memmap-source-filter');
+  if (filter) filter.style.display = mode === 'overview' ? '' : 'none';
+  const search = document.getElementById('memmap-search');
+  if (search) search.style.display = mode === 'overview' ? '' : 'none';
+}
+
+// Clear the offline/no-cy fallback list + empty notice + the cy container.
+function memmapResetViews() {
+  const fb = document.getElementById('memmap-fallback');
+  if (fb) { fb.hidden = true; fb.innerHTML = ''; }
   const empty = document.getElementById('memmap-empty');
+  if (empty) empty.hidden = true;
+}
+
+// Build the Cytoscape elements for the cluster overview from the cached payload.
+function memmapOverviewElements() {
+  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
+  const edges = Array.isArray(memmapOverview.cluster_edges) ? memmapOverview.cluster_edges : [];
+  const catchAllId = memmapCatchAllId(clusters);
+  // Size scaling: clamp node diameter so the biggest cluster never dwarfs the rest.
+  const sizes = clusters.map(c => Number(c.size || 0));
+  const maxSize = Math.max(1, ...sizes);
+  const SCALE_MIN = 22, SCALE_MAX = 80;
+  const ids = new Set();
+  const nodes = clusters.map(c => {
+    const id = String(c.id);
+    ids.add(id);
+    const size = Number(c.size || 0);
+    const isMisc = c.id === catchAllId;
+    const dom = c.dominant_source || 'mixed';
+    // sqrt scale keeps small clusters visible; misc forced small.
+    let diam = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.sqrt(size / maxSize);
+    if (isMisc) diam = SCALE_MIN;
+    const label = isMisc
+      ? `미분류 (${size.toLocaleString()})`
+      : `${String(c.label || '(이름 없음)')} (${size.toLocaleString()})`;
+    return {
+      data: {
+        id, label, size: Math.round(diam), src: dom,
+        misc: isMisc ? 1 : undefined,
+        kindType: 'cluster', clusterId: id, dom,
+        rawLabel: String(c.label || ''),
+      },
+    };
+  });
+  const edgeEls = edges
+    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)))
+    .map((e, i) => ({
+      data: {
+        id: `ce${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(6, Number(e.weight || 1))),
+      },
+    }));
+  return nodes.concat(edgeEls);
+}
+
+// Build the Cytoscape elements for one cluster's members (drill-down).
+function memmapMemberElements(payload) {
+  const members = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  );
+  const ids = new Set(members.map(n => String(n.id)));
+  const nodes = members.map(n => {
+    const source = n.source_kind || 'main';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    return {
+      data: {
+        id: String(n.id), label: preview, size: 30, src: source,
+        kindType: 'member', memId: String(n.id || ''),
+      },
+    };
+  });
+  const edges = (payload.edges || [])
+    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)))
+    .map((e, i) => ({
+      data: {
+        id: `me${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(4, Number(e.weight || 1))),
+      },
+    }));
+  return nodes.concat(edges);
+}
+
+// Run cose layout + fit. Wrapped so a layout failure never bubbles up.
+function memmapRunLayout() {
+  if (!memmapCy) return;
+  try {
+    memmapCy.layout({
+      name: 'cose',
+      animate: false,
+      nodeRepulsion: 6000,
+      idealEdgeLength: 90,
+      fit: true,
+      padding: 30,
+    }).run();
+  } catch (e) {
+    // cose unavailable for some reason — fall back to a deterministic concentric.
+    try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_) { /* ignore */ }
+  }
+}
+
+// Render the overview cluster graph (or fallback list when cy is unavailable).
+function renderMemmapOverview() {
   const head = document.getElementById('memmap-overview-head');
-  if (!grid) return;
+  memmapSetMode('overview');
+  memmapResetViews();
   if (!memmapOverview) {
-    grid.innerHTML = '';
     if (head) head.textContent = '';
-    if (empty) empty.hidden = true;
+    if (memmapCy) memmapCy.elements().remove();
     return;
   }
   const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
   const total = Number(memmapOverview.total_nodes || 0);
-  if (head) {
-    head.textContent = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 클러스터`;
-  }
-  const catchAllId = memmapCatchAllId(clusters);
-  const needle = memmapSearch.trim().toLowerCase();
-  let list = clusters.filter(c => {
-    if (memmapSource !== 'all') {
-      const dom = c.dominant_source || 'mixed';
-      // mixed clusters contain both, so they always pass a main/sub filter.
-      if (dom !== 'mixed' && dom !== memmapSource) return false;
-    }
-    if (needle && !String(c.label || '').toLowerCase().includes(needle)) return false;
-    return true;
-  });
-  // Size desc, but always sink the catch-all/misc card to the end.
-  list.sort((a, b) => {
-    const am = a.id === catchAllId ? 1 : 0;
-    const bm = b.id === catchAllId ? 1 : 0;
-    if (am !== bm) return am - bm;
-    return Number(b.size || 0) - Number(a.size || 0);
-  });
-  if (!list.length) {
-    grid.innerHTML = '';
+  if (head) head.textContent = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 클러스터`;
+  if (!clusters.length) {
+    const empty = document.getElementById('memmap-empty');
     if (empty) empty.hidden = false;
+    if (memmapCy) memmapCy.elements().remove();
     return;
   }
-  if (empty) empty.hidden = true;
-  grid.innerHTML = list.map(c => {
-    const size = Number(c.size || 0);
-    const isMisc = c.id === catchAllId;
-    const dom = c.dominant_source || 'mixed';
-    if (isMisc) {
-      return `<div class="cluster-card misc" data-cluster="${escapeHtml(String(c.id))}" data-misc="1">`
-        + `<div class="cc-label">미분류 ${size.toLocaleString()}건</div>`
-        + `<div class="cc-foot"><span class="cc-dot mixed"></span><span class="badge">${size.toLocaleString()}건</span></div>`
-        + `</div>`;
-    }
-    return `<div class="cluster-card" data-cluster="${escapeHtml(String(c.id))}">`
-      + `<div class="cc-label">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
-      + `<div class="cc-foot"><span class="cc-dot ${dom}"></span><span class="badge">${size.toLocaleString()}건</span></div>`
-      + `</div>`;
-  }).join('');
-  grid.querySelectorAll('.cluster-card').forEach(el => {
-    if (el.dataset.misc) return; // misc card is de-emphasized + not clickable
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapFallback(clusters); return; }
+  cy.elements().remove();
+  cy.add(memmapOverviewElements());
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Apply the source filter + search highlight to the overview using cy selectors.
+function memmapApplyFilters() {
+  if (!memmapCy || memmapMode !== 'overview') return;
+  const needle = memmapSearch.trim().toLowerCase();
+  memmapCy.nodes().removeClass('dim hit');
+  // Source filter: dim nodes whose dominant_source doesn't match (mixed always shows).
+  if (memmapSource !== 'all') {
+    memmapCy.nodes().filter(n => {
+      const dom = n.data('dom') || 'mixed';
+      return dom !== 'mixed' && dom !== memmapSource;
+    }).addClass('dim');
+  }
+  // Search: highlight matching cluster labels.
+  if (needle) {
+    memmapCy.nodes().filter(n => !String(n.data('rawLabel') || '').toLowerCase().includes(needle)).addClass('dim');
+    memmapCy.nodes().filter(n => String(n.data('rawLabel') || '').toLowerCase().includes(needle)).removeClass('dim').addClass('hit');
+  }
+}
+
+// Offline / library-load failure: render clusters as a plain clickable list.
+function renderMemmapFallback(clusters) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const catchAllId = memmapCatchAllId(clusters);
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  const rows = clusters
+    .filter(c => c.id !== catchAllId)
+    .sort((a, b) => Number(b.size || 0) - Number(a.size || 0))
+    .map(c => {
+      const size = Number(c.size || 0);
+      const dom = c.dominant_source || 'mixed';
+      const badge = dom === 'subagent' ? 'badge source-subagent' : 'badge';
+      return `<div class="member-row" data-cluster="${escapeHtml(String(c.id))}">`
+        + `<span class="mr-badge ${badge}">${memmapSourceLabelKo(dom === 'subagent' ? 'subagent' : 'main')}</span>`
+        + `<div class="mr-body"><div class="mr-preview">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
+        + `<div class="mr-kind">${size.toLocaleString()}건</div></div></div>`;
+    }).join('');
+  fb.innerHTML = note + rows;
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
     el.onclick = () => openMemmapCluster(el.dataset.cluster);
   });
 }
 
-// Drill into one cluster: fetch (once, cached) its members and render the list.
+// Offline member fallback list for drill-down.
+function renderMemmapMemberFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (payload.nodes || []).filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (!nodes.length) {
+    fb.innerHTML = '<div class="empty">이 클러스터에 메모리가 없습니다.</div>';
+    fb.hidden = false;
+    return;
+  }
+  fb.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    return `<div class="member-row" data-id="${escapeHtml(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      const num = String(el.dataset.id || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Drill into one cluster: fetch (once, cached) its members, then expand them in
+// the same cy instance (replace-and-back). Clicking a member opens the modal.
 async function openMemmapCluster(clusterId) {
   const project = memmapProject || currentProject();
   if (!project) return;
-  const titleEl = document.getElementById('memmap-cluster-title');
-  const listEl = document.getElementById('memmap-member-list');
-  // Find the label from the overview for the header.
+  const head = document.getElementById('memmap-overview-head');
+  // Resolve a friendly label from the overview for the caption.
   let label = String(clusterId);
   if (memmapOverview && Array.isArray(memmapOverview.clusters)) {
     const c = memmapOverview.clusters.find(x => String(x.id) === String(clusterId));
     if (c && c.label) label = c.label;
   }
-  if (titleEl) titleEl.textContent = label;
-  if (listEl) listEl.innerHTML = '<div class="empty">불러오는 중…</div>';
-  memmapShowCluster();
+  memmapSetMode('cluster');
+  memmapResetViews();
+  if (head) head.textContent = `${label} · 불러오는 중…`;
 
   let payload = memmapClusterCache.get(String(clusterId));
   if (!payload) {
@@ -2675,7 +2892,7 @@ async function openMemmapCluster(clusterId) {
       const r = await fetch(`/api/memory/graph?${params.toString()}`);
       if (!r.ok) {
         showToast(`클러스터 로드 실패 ${r.status}`, 'err');
-        if (listEl) listEl.innerHTML = `<div class="empty" style="color:var(--err);">오류 ${r.status}</div>`;
+        if (head) head.textContent = `${label} · 오류 ${r.status}`;
         return;
       }
       const d = await r.json();
@@ -2686,58 +2903,33 @@ async function openMemmapCluster(clusterId) {
       memmapClusterCache.set(String(clusterId), payload);
     } catch (e) {
       showToast(`네트워크 오류: ${e.message || e}`, 'err');
-      if (listEl) listEl.innerHTML = `<div class="empty" style="color:var(--err);">네트워크 오류</div>`;
+      if (head) head.textContent = `${label} · 네트워크 오류`;
       return;
     }
   }
-  renderMemmapMembers(payload);
+  const memberCount = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  ).length;
+  if (head) head.textContent = `${label} · ${memberCount.toLocaleString()}개 메모리`;
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapMemberFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(memmapMemberElements(payload));
+  memmapRunLayout();
 }
 
-function renderMemmapMembers(payload) {
-  const listEl = document.getElementById('memmap-member-list');
-  if (!listEl) return;
-  const nodes = (payload.nodes || []).filter(n => n.node_type === 'memory' || n.node_type === undefined);
-  if (!nodes.length) {
-    listEl.innerHTML = '<div class="empty">이 클러스터에 메모리가 없습니다.</div>';
-    return;
-  }
-  listEl.innerHTML = nodes.map(n => {
-    const source = n.source_kind || 'main';
-    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
-    const preview = String(n.label || n.preview || n.body || n.id || '');
-    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
-    // node id looks like "m123" — keep raw for detail lookup.
-    return `<div class="member-row" data-id="${escapeHtml(String(n.id || ''))}">`
-      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>`
-      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
-      + `</div>`;
-  }).join('');
-  listEl.querySelectorAll('.member-row').forEach(el => {
-    el.onclick = () => {
-      // node id is "m<numeric>" — strip the prefix to reuse the detail modal.
-      const raw = String(el.dataset.id || '');
-      const num = raw.replace(/^m/, '');
-      if (/^\d+$/.test(num)) openDetailModal(Number(num));
-    };
-  });
-}
-
-// Load the overview cards for a project. Always lands on the card grid.
+// Load the overview graph for a project. Always lands on the overview.
 async function loadGraph(project) {
-  memmapShowOverview();
-  const grid = document.getElementById('memmap-grid');
-  const empty = document.getElementById('memmap-empty');
+  memmapSetMode('overview');
+  memmapResetViews();
   const head = document.getElementById('memmap-overview-head');
+  if (memmapCy) memmapCy.elements().remove();
   if (isGlobalScope() || isGlobalProjectValue(project)) {
     if (head) head.textContent = GLOBAL_SCOPE_MESSAGE;
-    if (grid) grid.innerHTML = '';
-    if (empty) empty.hidden = true;
     memmapOverview = null;
     return;
   }
   if (head) head.textContent = '불러오는 중…';
-  if (grid) grid.innerHTML = '';
-  if (empty) empty.hidden = true;
   try {
     const params = new URLSearchParams({ project, mode: 'overview' });
     const r = await fetch(`/api/memory/graph?${params.toString()}`);
@@ -2750,11 +2942,12 @@ async function loadGraph(project) {
     }
     const d = await r.json();
     d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
+    d.cluster_edges = Array.isArray(d.cluster_edges) ? d.cluster_edges : [];
     d.total_nodes = Number(d.total_nodes || 0);
     memmapOverview = d;
     memmapProject = project;
     memmapClusterCache.clear();
-    renderMemmapGrid();
+    renderMemmapOverview();
   } catch (e) {
     showToast(`네트워크 오류: ${e.message || e}`, 'err');
     if (head) head.textContent = '네트워크 오류';
@@ -2762,21 +2955,23 @@ async function loadGraph(project) {
   }
 }
 
-// Wire up the overview controls: search box, source filter, back button, refresh.
+// Wire up the controls: search box, source filter, back button, fit button.
 (function wireMemmap() {
   const search = document.getElementById('memmap-search');
-  if (search) search.oninput = () => { memmapSearch = search.value || ''; renderMemmapGrid(); };
+  if (search) search.oninput = () => { memmapSearch = search.value || ''; memmapApplyFilters(); };
   document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {
       memmapSource = btn.dataset.memmapSource || 'all';
       document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.memmapSource === memmapSource);
       });
-      renderMemmapGrid();
+      memmapApplyFilters();
     };
   });
   const back = document.getElementById('memmap-back');
-  if (back) back.onclick = () => { memmapShowOverview(); renderMemmapGrid(); };
+  if (back) back.onclick = () => renderMemmapOverview();
+  const fit = document.getElementById('memmap-fit');
+  if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
 })();
 
 document.getElementById('graph-form').onsubmit = async (ev) => {

@@ -2766,10 +2766,14 @@ function initGraph(data) {
   // (or on explicit open) clusters reveal their individual member nodes.
   const ZOOM_OPEN_K = 0.9;
   const CLUSTER_UNION_THRESHOLD = 0.2; // weak edges below this don't merge clusters
+  // Keep the overview readable + the O(clusters) sim cheap: merge tiny/singleton
+  // clusters into neighbors until the cluster count is at most this target.
+  const CLUSTER_COUNT_TARGET = 220;
+  const SMALL_CLUSTER_SIZE = 3;        // clusters this small are merge candidates
   const clusterMode = isSimilarity; // entity mode keeps the legacy flat rendering
   let clusters = [];               // [{ id, members:[node], rep, size, dominantSource, x,y,vx,vy,fx,fy, r }]
   let clusterOf = new Map();       // node.id -> cluster
-  const openedClusters = new Set();// cluster ids the user has expanded
+  const openedClusters = new Set();// cluster ids the user has explicitly expanded
 
   function buildClusters() {
     // Union-find over edges (weight >= threshold) to get connected components.
@@ -2788,6 +2792,65 @@ function initGraph(data) {
     for (const e of edges) {
       if (e.weight >= CLUSTER_UNION_THRESHOLD) union(nodes[e.s].id, nodes[e.d].id);
     }
+
+    // --- Merge pass: collapse the singleton explosion ---
+    // Tiny clusters (incl. singletons) are absorbed into the neighbor they
+    // share the strongest edge with — using ANY edge, even below the union
+    // threshold — so ~1747 mostly-singleton nodes become a few hundred bubbles.
+    function groupSizes() {
+      const sizes = new Map();
+      for (const n of nodes) {
+        const root = find(n.id);
+        sizes.set(root, (sizes.get(root) || 0) + 1);
+      }
+      return sizes;
+    }
+    let sizes = groupSizes();
+    // Best neighbor edge per node-root, strongest weight first, so the merge is
+    // deterministic and pulls small fragments into their most-similar neighbor.
+    const sortedEdges = edges.slice().sort((a, b) => b.weight - a.weight);
+    // Pass 1: absorb small clusters into a larger/most-similar adjacent cluster.
+    let smallThreshold = SMALL_CLUSTER_SIZE;
+    for (let guard = 0; guard < 6; guard++) {
+      let merged = false;
+      for (const e of sortedEdges) {
+        const ra = find(nodes[e.s].id);
+        const rb = find(nodes[e.d].id);
+        if (ra === rb) continue;
+        const sa = sizes.get(ra) || 1;
+        const sb = sizes.get(rb) || 1;
+        // Only merge when at least one side is still a small fragment.
+        if (sa > smallThreshold && sb > smallThreshold) continue;
+        parent.set(ra, rb);
+        sizes.set(rb, sa + sb);
+        sizes.delete(ra);
+        merged = true;
+      }
+      const count = sizes.size;
+      if (count <= CLUSTER_COUNT_TARGET) break;
+      // Still too many clusters: relax the "small" bar each pass so progressively
+      // larger fragments consolidate (linked ones only — disjoint stay separate).
+      smallThreshold = Math.min(smallThreshold * 3, 400);
+      if (!merged && count <= CLUSTER_COUNT_TARGET * 2) break; // nothing left that's linked
+    }
+    // Pass 2: if a flood of edge-less singletons remains, fold them into the
+    // largest cluster so the bubble count never blows past the target.
+    if (sizes.size > CLUSTER_COUNT_TARGET * 2) {
+      let bestRoot = null;
+      let bestSize = -1;
+      for (const [root, sz] of sizes) { if (sz > bestSize) { bestSize = sz; bestRoot = root; } }
+      if (bestRoot) {
+        for (const n of nodes) {
+          const root = find(n.id);
+          if (root !== bestRoot && (sizes.get(root) || 1) === 1) {
+            parent.set(root, bestRoot);
+            sizes.set(bestRoot, (sizes.get(bestRoot) || 0) + 1);
+            sizes.delete(root);
+          }
+        }
+      }
+    }
+
     const groups = new Map();
     for (const n of nodes) {
       const root = find(n.id);
@@ -2956,6 +3019,18 @@ function initGraph(data) {
 
   function screenToWorld(sx, sy) {
     return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k };
+  }
+
+  // Current world-space viewport (with a margin so things ease in just off the
+  // edge). Used ONLY for render + sim culling — never for open/close decisions.
+  function viewportBounds(marginPx = 120) {
+    const m = marginPx / view.k;
+    const tl = screenToWorld(0, 0);
+    const br = screenToWorld(cw, ch);
+    return { minX: tl.x - m, minY: tl.y - m, maxX: br.x + m, maxY: br.y + m };
+  }
+  function inViewport(x, y, vp) {
+    return x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY;
   }
 
   // Returns a member node (when its cluster is open / flat mode) under the
@@ -3350,11 +3425,15 @@ function initGraph(data) {
     ctx.lineWidth = 1 / Math.sqrt(view.k);
     ctx.strokeStyle = muted;
     ctx.fillStyle = muted;
+    // Viewport for render culling — skip anything fully off-screen so 전체's
+    // thousands of open nodes never cost a draw pass when scrolled out of view.
+    const vp = viewportBounds(80);
     // Edges: drawn at the eased render positions; faded by the cluster open
     // progress so they appear with their members rather than popping in.
     for (const e of edges) {
       const [from, to] = edgeDirection(e);
       if (!memberRenderable(from) || !memberRenderable(to)) continue;
+      if (!inViewport(from.x, from.y, vp) && !inViewport(to.x, to.y, vp)) continue;
       const openFade = Math.min(memberAlpha(from), memberAlpha(to));
       if (openFade <= 0.01) continue;
       const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
@@ -3371,10 +3450,12 @@ function initGraph(data) {
       drawEdgeAt(from, to, e);
     }
     ctx.globalAlpha = 1;
-    // Cluster bubbles (fade out as their cluster opens).
+    // Cluster bubbles (fade out as their cluster opens) — viewport-culled by AABB.
     if (clusterMode) {
       for (const c of clusters) {
-        if (clusterVisible(c)) drawClusterBubble(c);
+        if (!clusterVisible(c)) continue;
+        if (c.x - c.r > vp.maxX || c.x + c.r < vp.minX || c.y - c.r > vp.maxY || c.y + c.r < vp.minY) continue;
+        drawClusterBubble(c);
       }
     }
     // Individual member nodes — eased out from the bubble center as openT rises.
@@ -3383,6 +3464,7 @@ function initGraph(data) {
       const c = clusterMode ? clusterOf.get(n.id) : null;
       const nx = memberRenderX(n, c);
       const ny = memberRenderY(n, c);
+      if (!inViewport(nx, ny, vp)) continue; // cull off-screen members
       const fade = memberAlpha(n);
       if (fade <= 0.01) continue;
       const dim = selectedId && !isRelated(n);
@@ -3411,33 +3493,57 @@ function initGraph(data) {
     ctx.globalAlpha = 1;
   }
 
-  // Cluster-bubble layout: O(clusters²), cheap even with thousands of nodes
-  // because we only ever simulate the dozens of cluster representatives.
+  // Cluster-bubble layout. Repulsion uses a SPATIAL GRID so it stays O(clusters)
+  // instead of O(clusters²) — essential for 전체 (2000+ clusters) not to freeze:
+  // each bubble only repels against neighbors in its own + 8 adjacent cells.
   function simulateClusters() {
     const centerX = cw / 2;
     const centerY = ch / 2;
     const active = clusters.filter(c => c.members.some(graphNodeVisible));
     const repel = active.length > 60 ? 6000 : 9000;
     const maxSpeed = 12;
-    for (let i = 0; i < active.length; i++) {
-      const a = active[i];
-      for (let j = i + 1; j < active.length; j++) {
-        const b = active[j];
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-          dx = (Math.random() - 0.5) * 0.8;
-          dy = (Math.random() - 0.5) * 0.8;
+
+    // Grid cell ≈ largest interaction distance, so neighbors can only matter
+    // within one cell in each direction. Stable index dedups each pair once.
+    let maxR = 24;
+    for (let i = 0; i < active.length; i++) { active[i]._si = i; if (active[i].r > maxR) maxR = active[i].r; }
+    const cell = Math.max(48, maxR * 2 + 28);
+    const grid = new Map(); // "gx,gy" -> [clusters]
+    const keyOf = (x, y) => `${Math.floor(x / cell)},${Math.floor(y / cell)}`;
+    for (const c of active) {
+      const k = keyOf(c.x, c.y);
+      let bucket = grid.get(k);
+      if (!bucket) { bucket = []; grid.set(k, bucket); }
+      bucket.push(c);
+    }
+    const RANGE2 = (cell * 1.5) * (cell * 1.5); // skip pairs clearly out of reach
+    for (const c of active) {
+      const gx = Math.floor(c.x / cell);
+      const gy = Math.floor(c.y / cell);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const bucket = grid.get(`${gx + ox},${gy + oy}`);
+          if (!bucket) continue;
+          for (const b of bucket) {
+            if (b._si <= c._si) continue; // each unordered pair processed once
+            let dx = b.x - c.x;
+            let dy = b.y - c.y;
+            if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
+              dx = (Math.random() - 0.5) * 0.8;
+              dy = (Math.random() - 0.5) * 0.8;
+            }
+            const d2 = dx * dx + dy * dy + 0.5;
+            if (d2 > RANGE2) continue;
+            const minD = c.r + b.r + 28;
+            const d = Math.sqrt(d2);
+            const collision = d < minD ? (minD - d) * 0.16 : 0;
+            const force = (repel / d2 + collision) * alpha;
+            const fx = (dx / d) * force;
+            const fy = (dy / d) * force;
+            c.vx -= fx; c.vy -= fy;
+            b.vx += fx; b.vy += fy;
+          }
         }
-        const minD = a.r + b.r + 28;
-        const d2 = dx * dx + dy * dy + 0.5;
-        const d = Math.sqrt(d2);
-        const collision = d < minD ? (minD - d) * 0.16 : 0;
-        const force = (repel / d2 + collision) * alpha;
-        const fx = (dx / d) * force;
-        const fy = (dy / d) * force;
-        a.vx -= fx; a.vy -= fy;
-        b.vx += fx; b.vy += fy;
       }
     }
     for (const c of active) {
@@ -3465,13 +3571,23 @@ function initGraph(data) {
     }
   }
 
-  // Local member layout: only iterate members of OPEN clusters (overview never
-  // pays for closed clusters), so a 1675-node global sim never runs.
+  // Local member layout. At high zoom EVERY cluster is open, so we VIEWPORT-CULL:
+  // only clusters that overlap the visible area (plus a margin) are simulated, and
+  // within them only members near the viewport. This keeps ~1747 open nodes smooth
+  // because we never simulate the thousands that are scrolled off-screen.
   function simulateOpenMembers() {
     const maxSpeed = 10;
-    const openList = clusters.filter(c => clusterIsOpen(c) && c.members.some(graphNodeVisible));
+    const vp = viewportBounds(160);
+    // Only open clusters whose bubble bounding box intersects the viewport.
+    const openList = clusters.filter(c => {
+      if (!clusterIsOpen(c) || !c.members.some(graphNodeVisible)) return false;
+      const reach = c.r + 60 + Math.sqrt(c.members.length) * 6;
+      return c.x + reach >= vp.minX && c.x - reach <= vp.maxX
+        && c.y + reach >= vp.minY && c.y - reach <= vp.maxY;
+    });
     for (const c of openList) {
-      const mem = c.members.filter(graphNodeVisible);
+      // Members near the viewport are the only ones we push around this frame.
+      const mem = c.members.filter(m => graphNodeVisible(m) && inViewport(m.x, m.y, vp));
       const repel = mem.length > 90 ? 2400 : 3100;
       for (let i = 0; i < mem.length; i++) {
         const a = mem[i];
@@ -3495,12 +3611,13 @@ function initGraph(data) {
         }
       }
     }
-    // Spring along intra-cluster edges of open clusters.
+    // Spring along intra-cluster edges of open clusters (viewport-culled).
     for (const e of edges) {
       const a = nodes[e.s];
       const b = nodes[e.d];
       if (!memberVisible(a) || !memberVisible(b)) continue;
       if (clusterOf.get(a.id) !== clusterOf.get(b.id)) continue;
+      if (!inViewport(a.x, a.y, vp) && !inViewport(b.x, b.y, vp)) continue;
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const d = Math.hypot(dx, dy) || 1;
@@ -3519,6 +3636,7 @@ function initGraph(data) {
           m.x = m.fx; m.y = m.fy; m.vx = 0; m.vy = 0;
           continue;
         }
+        if (!inViewport(m.x, m.y, vp)) { m.vx = 0; m.vy = 0; continue; } // frozen off-screen
         // Gentle pull toward the cluster's bubble anchor keeps members local.
         m.vx += (c.x - m.x) * 0.02 * alpha;
         m.vy += (c.y - m.y) * 0.02 * alpha;
@@ -3727,7 +3845,10 @@ function initGraph(data) {
       view.x += p.sx - lastPointer.sx;
       view.y += p.sy - lastPointer.sy;
       lastPointer = { sx: p.sx, sy: p.sy };
-      draw();
+      // When zoomed in (everything open), nudge the sim so freshly-revealed
+      // off-screen clusters relax their seeded ring as they scroll into view.
+      if (clusterMode && view.k >= ZOOM_OPEN_K) wakeLayout(0.12);
+      else draw();
       return;
     }
     const node = pickNode(p.sx, p.sy);

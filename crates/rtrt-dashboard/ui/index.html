@@ -145,25 +145,31 @@
   details[open] > summary.muted-summary::before { content: '⇱ '; }
   details > .adv { padding-top: 0.5rem; display: grid; gap: 0.5rem; }
 
-  /* Graph canvas */
-  #graph-canvas { cursor: grab; }
-  .graph-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0 0.5rem; }
-  .graph-controls .sort-row { margin: 0; }
-  .graph-search { min-width: min(260px, 100%); flex: 1 1 220px; }
-  .graph-shell { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 0.75rem; align-items: stretch; }
-  .graph-canvas-wrap { position: relative; min-height: 420px; }
-  #graph-canvas { display: block; width: 100%; height: 420px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
-  .graph-empty-state { position: absolute; inset: 1px; display: grid; place-items: center; padding: 1.2rem; background: var(--bg); border-radius: 8px; text-align: center; color: var(--muted); pointer-events: none; }
-  .graph-empty-state[hidden] { display: none; }
-  .graph-detail-panel { min-height: 420px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem; overflow: auto; }
-  .graph-detail-panel h3 { margin: 0 0 0.45rem; font-size: 0.98rem; }
-  .graph-detail-panel .label-preview { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 0.55rem; padding: 0.65rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); font-size: 0.88em; }
-  .graph-detail-panel ul { margin: 0.55rem 0 0; padding-left: 1rem; }
-  .graph-detail-panel li { margin-bottom: 0.35rem; overflow-wrap: anywhere; }
-  @media (max-width: 860px) {
-    .graph-shell { grid-template-columns: 1fr; }
-    .graph-detail-panel { min-height: 180px; }
-  }
+  /* Knowledge map — cluster cards (plain DOM, no canvas) */
+  .memmap-head { font-size: 0.9em; color: var(--muted); margin: 0.65rem 0 0.5rem; }
+  .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin-bottom: 0.65rem; }
+  .memmap-controls .sort-row { margin: 0; }
+  .memmap-search { min-width: min(260px, 100%); flex: 1 1 220px; }
+  .memmap-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 0.75rem; }
+  .cluster-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0.85rem 0.95rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; display: flex; flex-direction: column; gap: 0.5rem; }
+  .cluster-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: var(--shadow); }
+  .cluster-card .cc-label { font-weight: 600; font-size: 0.98rem; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .cluster-card .cc-foot { display: flex; align-items: center; gap: 0.45rem; }
+  .cluster-card .cc-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .cluster-card.misc { border-style: dashed; opacity: 0.62; cursor: default; }
+  .cluster-card.misc:hover { transform: none; border-color: var(--border); box-shadow: none; }
+  .cc-dot.main { background: var(--accent); }
+  .cc-dot.subagent { background: #7c3aed; }
+  .cc-dot.mixed { background: var(--muted); }
+  .memmap-cluster-head { display: flex; align-items: center; gap: 0.65rem; margin: 0.65rem 0 0.75rem; flex-wrap: wrap; }
+  .memmap-cluster-head h3 { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
+  .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 60vh; overflow: auto; }
+  .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
+  .member-row:hover { border-color: var(--accent); }
+  .member-row .mr-badge { flex-shrink: 0; font-size: 0.8em; white-space: nowrap; }
+  .member-row .mr-body { flex: 1; min-width: 0; }
+  .member-row .mr-preview { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9em; }
+  .member-row .mr-kind { color: var(--muted); font-size: 0.78em; margin-top: 0.2rem; }
 
   /* Memory project picker */
   .proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }
@@ -288,11 +294,6 @@
   .toast.ok { border-left: 3px solid var(--ok); }
   .toast.err { border-left: 3px solid var(--err); }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-
-  /* Graph entity-type color legend */
-  .graph-legend { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.4rem; }
-  .graph-legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.79em; color: var(--muted); }
-  .graph-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 
   /* Savings % badge — used in compress, proxy, queue rows */
   .badge.save { color: var(--ok); border-color: var(--ok); font-variant-numeric: tabular-nums; }
@@ -638,64 +639,36 @@
           <div class="card">
             <div class="head">
               <h2>지식 맵</h2>
-              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
-                <button id="entity-extract-btn" class="ghost" type="button" style="font-size:0.85em;" title="메모리에서 엔티티 및 관계를 추출하여 그래프를 풍부하게 합니다">엔티티 추출</button>
-                <span class="hint">노드 = 메모리/엔티티, 선 = 연결</span>
-              </div>
+              <span class="hint">의미가 비슷한 메모리를 클러스터 카드로 묶어 보여줍니다.</span>
             </div>
             <form id="graph-form" style="grid-template-columns:1fr auto;">
               <input id="graph-project" type="hidden">
-              <button class="primary" type="submit">맵 새로고침</button>
+              <button class="primary" type="submit">새로고침</button>
             </form>
-            <div id="graph-meta" class="out-meta"></div>
-            <div class="graph-controls" aria-label="그래프 모드">
-              <div class="mode-toggle" id="graph-mode-toggle" title="그래프 모드">
-                <button id="graph-mode-similarity" class="active" type="button" data-graph-mode="similarity">유사도</button>
-                <button id="graph-mode-entity" type="button" data-graph-mode="entity">엔티티</button>
-              </div>
-              <span id="graph-mode-note" class="hint">LLM 추출 없이 메모리 간 유사도를 표시합니다.</span>
-            </div>
-            <div class="graph-controls" aria-label="그래프 필터">
-              <div class="sort-row" aria-label="노드 표시">
-                <button id="graph-toggle-memory" class="sort-btn active" type="button" aria-pressed="true">메모리</button>
-                <button id="graph-toggle-entity" class="sort-btn active" type="button" aria-pressed="true">엔티티</button>
-              </div>
-              <div id="graph-source-filter" class="sort-row" aria-label="메모리 출처 필터">
-                <button class="sort-btn active" type="button" data-graph-source="all">전체</button>
-                <button class="sort-btn" type="button" data-graph-source="main">메인</button>
-                <button class="sort-btn" type="button" data-graph-source="subagent">서브</button>
-              </div>
-              <input id="graph-search" class="graph-search" type="search" placeholder="엔티티 또는 메모리 검색">
-              <label class="ctrl-field" style="min-width:96px;">
-                <span>표시 수</span>
-                <select id="graph-limit">
-                  <option value="80" selected>80</option>
-                  <option value="200">200</option>
-                  <option value="500">500</option>
-                  <option value="all">전체</option>
-                </select>
-              </label>
-              <button id="graph-fit" class="ghost" type="button">전체 보기</button>
-            </div>
-            <div id="graph-sample-caption" class="out-meta">표시 0개 · 최신순</div>
-            <div class="graph-shell">
-              <div class="graph-canvas-wrap">
-                <canvas id="graph-canvas" width="800" height="420"></canvas>
-                <div id="graph-empty-state" class="graph-empty-state" hidden>
-                  <div>아직 엔티티가 없습니다.<br>상단의 <strong>엔티티 추출</strong> 버튼으로 메모리에서 엔티티를 생성하세요.</div>
+
+            <!-- OVERVIEW: cluster card grid -->
+            <div id="memmap-overview">
+              <div id="memmap-overview-head" class="memmap-head"></div>
+              <div class="memmap-controls">
+                <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
+                <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
+                  <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
+                  <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
+                  <button class="sort-btn" type="button" data-memmap-source="subagent">서브</button>
                 </div>
               </div>
-              <div id="graph-detail-panel" class="graph-detail-panel" aria-live="polite">
-                <div class="empty">노드를 클릭하면 상세 정보가 표시됩니다.</div>
+              <div id="memmap-grid" class="memmap-grid"></div>
+              <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
+            </div>
+
+            <!-- DRILL-DOWN: cluster member list -->
+            <div id="memmap-cluster" hidden>
+              <div class="memmap-cluster-head">
+                <button id="memmap-back" class="ghost" type="button">← 뒤로</button>
+                <h3 id="memmap-cluster-title"></h3>
               </div>
+              <div id="memmap-member-list" class="memmap-member-list"></div>
             </div>
-            <div id="graph-basis-caption" class="out-meta"></div>
-            <div id="graph-legend" class="graph-legend">
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티 · 크기 = 연결 수</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>메모리 · 서브</div>
-            </div>
-            <div id="graph-tip" class="out-meta">드래그로 노드 이동, 배경 드래그로 이동, 휠로 확대/축소.</div>
           </div>
         </div>
 
@@ -2364,8 +2337,6 @@ async function loadMemStats(project) {
 
   // KPI tiles: total, compressed count, saved chars, compression ratio
   const ratio = d.total ? ((d.compressed_count || 0) / d.total * 100).toFixed(1) : '0';
-  graphMemoryTotals.set(project, Number(d.total || 0));
-  updateGraphCaption();
   const savedK = (d.saved_chars || 0) >= 1000 ? `${((d.saved_chars || 0) / 1000).toFixed(1)}K` : String(d.saved_chars || 0);
   // saved_pct from server is the authoritative compression savings rate.
   const savedPctTile = d.saved_pct != null
@@ -2449,8 +2420,6 @@ async function loadGovStats(project) {
     const r = await fetch(`/api/memory/stats?project=${encodeURIComponent(project)}`);
     if (!r.ok) return;
     const d = await r.json();
-    graphMemoryTotals.set(project, Number(d.total || 0));
-    updateGraphCaption();
     document.getElementById('gov-total').textContent = (d.total || 0).toLocaleString();
     const comp = d.compressed_count || 0;
     const uncomp = (d.total || 0) - comp;
@@ -2581,1886 +2550,233 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory graph — similarity and entity canvas layout.
-const GRAPH_DEFAULT_LIMIT = '80';
-const GRAPH_MODE_KEY = 'rtrt.graph.mode';
-let graphState = null;
-let graphMode = localStorage.getItem(GRAPH_MODE_KEY) === 'entity' ? 'entity' : 'similarity';
-let graphEntityExtractUnavailable = false;
-let graphLimit = GRAPH_DEFAULT_LIMIT;
-let graphFilters = { showMemory: true, showEntity: true, source: 'all', search: '' };
-const graphMemoryTotals = new Map();
-let graphCaptionState = { project: '', nodeCount: 0, memoryCount: 0 };
-// LOD drill-down cache: `${project}#${rootId}` -> { nodes, edges }. Members of a
-// cluster are fetched at most once; re-opening a cluster is instant.
-const graphClusterCache = new Map();
+// Memory knowledge map — plain DOM cluster cards (no canvas, no physics).
+// Drives the #sub-memmap subtab using the server LOD API:
+//   GET /api/memory/graph?project=X&mode=overview  -> { clusters, total_nodes, ... }
+//   GET /api/memory/graph?project=X&cluster=<id>   -> { root, nodes, edges }
+let memmapOverview = null;           // last overview payload for the current project
+let memmapProject = '';              // project the overview belongs to
+let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
+let memmapSearch = '';               // cluster label filter substring
+// Drill-down cache: cluster id -> { nodes, edges }. Fetched at most once.
+const memmapClusterCache = new Map();
 
-// Fetch (and cache) the members + intra-cluster edges of one cluster. Returns
-// { nodes, edges } or null on error. Only ever called when a cluster is opened,
-// so the client never holds the whole 100k-node project at once.
-async function fetchClusterMembers(project, rootId) {
-  const key = `${project}#${rootId}`;
-  if (graphClusterCache.has(key)) return graphClusterCache.get(key);
-  try {
-    const params = new URLSearchParams({ project, cluster: String(rootId) });
-    const r = await fetch(`/api/memory/graph?${params.toString()}`);
-    if (!r.ok) {
-      showToast(`클러스터 로드 실패 ${r.status}`, 'err');
-      return null;
-    }
-    const d = await r.json();
-    const payload = {
-      nodes: Array.isArray(d.nodes) ? d.nodes : [],
-      edges: Array.isArray(d.edges) ? d.edges : [],
-    };
-    graphClusterCache.set(key, payload);
-    return payload;
-  } catch (e) {
-    showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    return null;
+function memmapSourceLabelKo(source) {
+  return source === 'subagent' ? '🤖서브' : '🧠메인';
+}
+
+// Flag the catch-all/misc cluster: the lone bucket that is huge versus the rest
+// (>= 8x the median size). Returns its id, or null when no cluster dominates.
+function memmapCatchAllId(clusters) {
+  if (clusters.length < 3) return null;
+  const sizes = clusters.map(c => Number(c.size || 0)).sort((a, b) => a - b);
+  const median = sizes[Math.floor(sizes.length / 2)] || 1;
+  let biggest = null;
+  for (const c of clusters) {
+    if (!biggest || Number(c.size || 0) > Number(biggest.size || 0)) biggest = c;
   }
+  if (biggest && Number(biggest.size || 0) >= median * 8) return biggest.id;
+  return null;
 }
 
-function graphIsSimilarityMode() {
-  return graphMode === 'similarity';
+function memmapShowOverview() {
+  document.getElementById('memmap-overview').hidden = false;
+  document.getElementById('memmap-cluster').hidden = true;
 }
 
-function updateGraphCaption(project = graphCaptionState.project, nodeCount = graphCaptionState.nodeCount, memoryCount = graphCaptionState.memoryCount) {
-  const caption = document.getElementById('graph-sample-caption');
-  if (!caption) return;
-  graphCaptionState = { project: project || '', nodeCount: Number(nodeCount || 0), memoryCount: Number(memoryCount || 0) };
-  const total = graphMemoryTotals.get(graphCaptionState.project);
-  if (Number.isFinite(total)) {
-    const shown = graphCaptionState.memoryCount || graphCaptionState.nodeCount;
-    caption.textContent = `전체 ${total.toLocaleString()}개 중 ${shown.toLocaleString()}개 표시`;
+function memmapShowCluster() {
+  document.getElementById('memmap-overview').hidden = true;
+  document.getElementById('memmap-cluster').hidden = false;
+}
+
+// Render the cluster card grid from the cached overview, honouring the active
+// source filter + search box. Pure DOM — instant, never lags.
+function renderMemmapGrid() {
+  const grid = document.getElementById('memmap-grid');
+  const empty = document.getElementById('memmap-empty');
+  const head = document.getElementById('memmap-overview-head');
+  if (!grid) return;
+  if (!memmapOverview) {
+    grid.innerHTML = '';
+    if (head) head.textContent = '';
+    if (empty) empty.hidden = true;
     return;
   }
-  caption.textContent = `표시 ${graphCaptionState.nodeCount.toLocaleString()}개 · 최신순`;
-}
-
-function fitView() {
-  if (graphState && graphState.fitView) graphState.fitView();
-}
-
-function graphBasisLabel(basis) {
-  return basis === 'bm25' ? '어휘(BM25)' : '임베딩';
-}
-
-function renderGraphLegend() {
-  const legend = document.getElementById('graph-legend');
-  if (!legend) return;
-  if (graphIsSimilarityMode()) {
-    legend.innerHTML = `
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>클러스터/메모리 · 메인</div>
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>클러스터/메모리 · 서브</div>
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:var(--muted);"></div>혼합 클러스터 · 크기 = 노드 수</div>
-      <div class="graph-legend-item">확대하면 클러스터가 펼쳐집니다</div>
-    `;
-  } else {
-    legend.innerHTML = `
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티 · 크기 = 연결 수</div>
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 · 메인</div>
-      <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>메모리 · 서브</div>
-    `;
+  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
+  const total = Number(memmapOverview.total_nodes || 0);
+  if (head) {
+    head.textContent = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 클러스터`;
   }
-}
-
-function syncGraphModeUi() {
-  const simBtn = document.getElementById('graph-mode-similarity');
-  const entityModeBtn = document.getElementById('graph-mode-entity');
-  const entityToggle = document.getElementById('graph-toggle-entity');
-  const extractBtn = document.getElementById('entity-extract-btn');
-  const note = document.getElementById('graph-mode-note');
-  const search = document.getElementById('graph-search');
-  const basis = document.getElementById('graph-basis-caption');
-  if (simBtn) {
-    simBtn.classList.toggle('active', graphIsSimilarityMode());
-    simBtn.setAttribute('aria-pressed', String(graphIsSimilarityMode()));
-  }
-  if (entityModeBtn) {
-    entityModeBtn.classList.toggle('active', !graphIsSimilarityMode());
-    entityModeBtn.setAttribute('aria-pressed', String(!graphIsSimilarityMode()));
-  }
-  if (entityToggle) entityToggle.hidden = graphIsSimilarityMode();
-  if (extractBtn) extractBtn.hidden = graphIsSimilarityMode() || graphEntityExtractUnavailable;
-  // The 표시 수 limit only governs entity mode; similarity uses the server-side
-  // LOD overview (full project, clustered) so 전체 no longer freezes.
-  const limitField = document.getElementById('graph-limit');
-  if (limitField && limitField.closest('.ctrl-field')) {
-    limitField.closest('.ctrl-field').hidden = graphIsSimilarityMode();
-  }
-  if (note) note.textContent = graphIsSimilarityMode()
-    ? 'LLM 추출 없이 메모리 간 유사도를 표시합니다.'
-    : '엔티티 추출 결과로 메모리와 엔티티 연결을 표시합니다.';
-  if (search) search.placeholder = graphIsSimilarityMode() ? '메모리 검색' : '엔티티 또는 메모리 검색';
-  if (basis && !graphIsSimilarityMode()) basis.textContent = '';
-  renderGraphLegend();
-}
-
-function graphNodeLabel(n) {
-  return String(n.label || n.preview || n.body || n.name || n.id || '');
-}
-
-function graphNodeSource(n) {
-  return n.source_kind || 'main';
-}
-
-function graphNodeRadius(n) {
-  if (n.node_type === 'entity') {
-    const degree = Math.max(1, Number(n.degree || 1));
-    return 11 + Math.min(20, Math.sqrt(degree) * 3.5);
-  }
-  return 8;
-}
-
-function graphNodeVisible(n) {
-  if (graphIsSimilarityMode() && n.node_type === 'entity') return false;
-  if (n.node_type === 'memory') {
-    if (!graphFilters.showMemory) return false;
-    if (graphFilters.source === 'main' && graphNodeSource(n) === 'subagent') return false;
-    if (graphFilters.source === 'subagent' && graphNodeSource(n) !== 'subagent') return false;
+  const catchAllId = memmapCatchAllId(clusters);
+  const needle = memmapSearch.trim().toLowerCase();
+  let list = clusters.filter(c => {
+    if (memmapSource !== 'all') {
+      const dom = c.dominant_source || 'mixed';
+      // mixed clusters contain both, so they always pass a main/sub filter.
+      if (dom !== 'mixed' && dom !== memmapSource) return false;
+    }
+    if (needle && !String(c.label || '').toLowerCase().includes(needle)) return false;
     return true;
-  }
-  if (n.node_type === 'entity') return graphFilters.showEntity;
-  return true;
-}
-
-function initGraph(data) {
-  const canvas = document.getElementById('graph-canvas');
-  const ctx = canvas.getContext('2d');
-  const detail = document.getElementById('graph-detail-panel');
-  const tip = document.getElementById('graph-tip');
-  const emptyState = document.getElementById('graph-empty-state');
-  const fitBtn = document.getElementById('graph-fit');
-  const styles = getComputedStyle(document.documentElement);
-  const accent = styles.getPropertyValue('--accent').trim() || '#2962FF';
-  const muted = styles.getPropertyValue('--muted').trim() || '#666';
-  const fg = styles.getPropertyValue('--fg').trim() || '#000';
-  const bg = styles.getPropertyValue('--bg').trim() || '#fff';
-  const entityColor = '#16a34a';
-  const subagentColor = '#7c3aed';
-  // LOD: 'overview' is similarity-mode data where the server already clustered
-  // the whole project; we render its cluster summaries as bubbles and pull each
-  // cluster's member nodes in lazily on drill-down.
-  const isOverview = data.mode === 'overview';
-  const isSimilarity = data.mode === 'similarity' || isOverview;
-  const lodProject = data.project || graphCaptionState.project || '';
-
-  if (graphState && graphState.cleanup) graphState.cleanup();
-
-  const dpr = window.devicePixelRatio || 1;
-  let cw = 1;
-  let ch = 1;
-  function resizeCanvas() {
-    cw = Math.max(1, canvas.clientWidth);
-    ch = Math.max(1, canvas.clientHeight);
-    canvas.width = Math.floor(cw * dpr);
-    canvas.height = Math.floor(ch * dpr);
-  }
-  resizeCanvas();
-
-  // `nodes`/`edges`/`idIdx`/`adjacency` are MUTABLE in overview mode: drill-down
-  // appends a cluster's freshly-fetched member nodes + intra edges into them.
-  const nodes = (data.nodes || []).map((raw, i) => {
-    const node_type = raw.node_type === 'entity' ? 'entity' : 'memory';
-    const angle = (i / Math.max(1, (data.nodes || []).length)) * Math.PI * 2;
-    const ring = node_type === 'entity' ? Math.min(cw, ch) * 0.22 : Math.min(cw, ch) * 0.34;
-    return {
-      ...raw,
-      node_type,
-      label: graphNodeLabel(raw),
-      degree: Number(raw.degree || 0),
-      x: cw / 2 + Math.cos(angle) * ring + (Math.random() - 0.5) * 30,
-      y: ch / 2 + Math.sin(angle) * ring + (Math.random() - 0.5) * 30,
-      vx: 0,
-      vy: 0,
-      fx: null,
-      fy: null,
-    };
   });
-  const idIdx = new Map(nodes.map((n, i) => [n.id, i]));
-  const edges = (data.edges || [])
-    .map(e => {
-      const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
-      return { s: idIdx.get(e.src), d: idIdx.get(e.dst), src: e.src, dst: e.dst, weight };
-    })
-    .filter(e => e.s !== undefined && e.d !== undefined);
-  const adjacency = new Map(nodes.map(n => [n.id, new Set()]));
-  const linkedMemoryByEntity = new Map();
-  for (const e of edges) {
-    const a = nodes[e.s];
-    const b = nodes[e.d];
-    adjacency.get(a.id).add(b.id);
-    adjacency.get(b.id).add(a.id);
-    const entity = a.node_type === 'entity' ? a : b.node_type === 'entity' ? b : null;
-    const memory = a.node_type === 'memory' ? a : b.node_type === 'memory' ? b : null;
-    if (entity && memory) {
-      if (!linkedMemoryByEntity.has(entity.id)) linkedMemoryByEntity.set(entity.id, []);
-      linkedMemoryByEntity.get(entity.id).push(memory);
-    }
-  }
-  for (const n of nodes) {
-    n.degree = Math.max(Number(n.degree || 0), adjacency.get(n.id)?.size || 0);
-  }
-
-  // ----- Clustering + semantic zoom (similarity mode only) -----
-  // ZOOM_OPEN_K: below this scale we draw collapsed cluster bubbles; at/above it
-  // (or on explicit open) clusters reveal their individual member nodes.
-  const ZOOM_OPEN_K = 0.9;
-  const CLUSTER_UNION_THRESHOLD = 0.2; // weak edges below this don't merge clusters
-  // Keep the overview readable + the O(clusters) sim cheap: merge tiny/singleton
-  // clusters into neighbors until the cluster count is at most this target.
-  const CLUSTER_COUNT_TARGET = 220;
-  const SMALL_CLUSTER_SIZE = 3;        // clusters this small are merge candidates
-  // Bubble radius is √size-scaled but CLAMPED so a huge catch-all never balloons
-  // into a canvas-filling circle that dwarfs the real clusters.
-  const CLUSTER_R_MIN = 12;            // smallest bubble radius
-  const CLUSTER_R_MAX = 46;            // hard cap (≈ a few× the median real bubble)
-  const clusterMode = isSimilarity; // entity mode keeps the legacy flat rendering
-  let clusters = [];               // [{ id, members:[node], rep, size, dominantSource, x,y,vx,vy,fx,fy, r, isCatchAll }]
-  let clusterOf = new Map();       // node.id -> cluster
-  let clusterByRoot = new Map();   // server root id -> cluster (LOD overview only)
-  const openedClusters = new Set();// cluster ids the user has explicitly expanded
-  // LOD inter-cluster edges (server-aggregated): [{ a:cluster, b:cluster, weight }].
-  let interClusterEdges = [];
-
-  // Bubble radius ∝ √size but clamped to [MIN, MAX]. The catch-all is pinned at
-  // a small muted size so it reads as a "junk drawer", not the focus.
-  function clusterRadius(size, isCatchAll) {
-    if (isCatchAll) return CLUSTER_R_MIN + 4;
-    const r = 9 + Math.sqrt(Math.max(1, size)) * 6;
-    return Math.max(CLUSTER_R_MIN, Math.min(CLUSTER_R_MAX, r));
-  }
-
-  // Flag the catch-all / misc cluster: the single outlier whose size dwarfs the
-  // rest (≫ median and a large share of all nodes). It's the unclustered junk
-  // drawer, so we de-emphasize it instead of drawing a giant bubble.
-  function markCatchAll() {
-    if (clusters.length < 3) return;
-    const sizes = clusters.map(c => c.size).slice().sort((a, b) => a - b);
-    const median = sizes[Math.floor(sizes.length / 2)] || 1;
-    const total = clusters.reduce((s, c) => s + c.size, 0) || 1;
-    let big = null;
-    for (const c of clusters) if (!big || c.size > big.size) big = c;
-    // Outlier test: far above the median AND a meaningful share of everything.
-    if (big && big.size >= Math.max(median * 8, 50) && big.size >= total * 0.25) {
-      big.isCatchAll = true;
-      big.r = clusterRadius(big.size, true);
-    }
-  }
-
-  function buildClusters() {
-    // Union-find over edges (weight >= threshold) to get connected components.
-    const parent = new Map(nodes.map(n => [n.id, n.id]));
-    function find(a) {
-      let r = a;
-      while (parent.get(r) !== r) r = parent.get(r);
-      while (parent.get(a) !== r) { const next = parent.get(a); parent.set(a, r); a = next; }
-      return r;
-    }
-    function union(a, b) {
-      const ra = find(a);
-      const rb = find(b);
-      if (ra !== rb) parent.set(ra, rb);
-    }
-    for (const e of edges) {
-      if (e.weight >= CLUSTER_UNION_THRESHOLD) union(nodes[e.s].id, nodes[e.d].id);
-    }
-
-    // --- Merge pass: collapse the singleton explosion ---
-    // Tiny clusters (incl. singletons) are absorbed into the neighbor they
-    // share the strongest edge with — using ANY edge, even below the union
-    // threshold — so ~1747 mostly-singleton nodes become a few hundred bubbles.
-    function groupSizes() {
-      const sizes = new Map();
-      for (const n of nodes) {
-        const root = find(n.id);
-        sizes.set(root, (sizes.get(root) || 0) + 1);
-      }
-      return sizes;
-    }
-    let sizes = groupSizes();
-    // Best neighbor edge per node-root, strongest weight first, so the merge is
-    // deterministic and pulls small fragments into their most-similar neighbor.
-    const sortedEdges = edges.slice().sort((a, b) => b.weight - a.weight);
-    // Pass 1: absorb small clusters into a larger/most-similar adjacent cluster.
-    let smallThreshold = SMALL_CLUSTER_SIZE;
-    for (let guard = 0; guard < 6; guard++) {
-      let merged = false;
-      for (const e of sortedEdges) {
-        const ra = find(nodes[e.s].id);
-        const rb = find(nodes[e.d].id);
-        if (ra === rb) continue;
-        const sa = sizes.get(ra) || 1;
-        const sb = sizes.get(rb) || 1;
-        // Only merge when at least one side is still a small fragment.
-        if (sa > smallThreshold && sb > smallThreshold) continue;
-        parent.set(ra, rb);
-        sizes.set(rb, sa + sb);
-        sizes.delete(ra);
-        merged = true;
-      }
-      const count = sizes.size;
-      if (count <= CLUSTER_COUNT_TARGET) break;
-      // Still too many clusters: relax the "small" bar each pass so progressively
-      // larger fragments consolidate (linked ones only — disjoint stay separate).
-      smallThreshold = Math.min(smallThreshold * 3, 400);
-      if (!merged && count <= CLUSTER_COUNT_TARGET * 2) break; // nothing left that's linked
-    }
-    // Pass 2: if a flood of edge-less singletons remains, fold them into the
-    // largest cluster so the bubble count never blows past the target.
-    if (sizes.size > CLUSTER_COUNT_TARGET * 2) {
-      let bestRoot = null;
-      let bestSize = -1;
-      for (const [root, sz] of sizes) { if (sz > bestSize) { bestSize = sz; bestRoot = root; } }
-      if (bestRoot) {
-        for (const n of nodes) {
-          const root = find(n.id);
-          if (root !== bestRoot && (sizes.get(root) || 1) === 1) {
-            parent.set(root, bestRoot);
-            sizes.set(bestRoot, (sizes.get(bestRoot) || 0) + 1);
-            sizes.delete(root);
-          }
-        }
-      }
-    }
-
-    const groups = new Map();
-    for (const n of nodes) {
-      const root = find(n.id);
-      if (!groups.has(root)) groups.set(root, []);
-      groups.get(root).push(n);
-    }
-    clusters = [];
-    clusterOf = new Map();
-    let ci = 0;
-    for (const members of groups.values()) {
-      // Representative: highest degree, tiebreak by longest label.
-      let rep = members[0];
-      for (const m of members) {
-        const dm = Number(m.degree || 0);
-        const dr = Number(rep.degree || 0);
-        if (dm > dr || (dm === dr && graphNodeLabel(m).length > graphNodeLabel(rep).length)) rep = m;
-      }
-      let mainCount = 0;
-      let subCount = 0;
-      for (const m of members) {
-        if (graphNodeSource(m) === 'subagent') subCount++; else mainCount++;
-      }
-      const dominantSource = subCount && mainCount ? 'mixed' : (subCount ? 'subagent' : 'main');
-      const cluster = {
-        id: `c${ci++}`,
-        members,
-        rep,
-        size: members.length,
-        dominantSource,
-        isCatchAll: false,
-        x: rep.x, y: rep.y, vx: 0, vy: 0, fx: null, fy: null,
-        r: clusterRadius(members.length, false),
-        // openT: 0 = fully collapsed bubble, 1 = fully opened members. Eased
-        // each frame toward the logical open state for smooth expand/collapse.
-        openT: members.length <= 1 ? 1 : 0,
-        seeded: members.length <= 1,
-      };
-      clusters.push(cluster);
-      for (const m of members) clusterOf.set(m.id, cluster);
-    }
-    markCatchAll();
-  }
-
-  // LOD: build cluster bubbles straight from the server's overview summaries —
-  // NO client-side O(n²) clustering. Each bubble starts with EMPTY members; the
-  // member nodes are fetched + injected on drill-down (addClusterMembers).
-  function buildOverviewClusters() {
-    clusters = [];
-    clusterOf = new Map();
-    clusterByRoot = new Map();
-    const angBase = Math.PI * 2 / Math.max(1, (data.clusters || []).length);
-    (data.clusters || []).forEach((cs, i) => {
-      const size = Math.max(1, Number(cs.size || 1));
-      const ang = i * angBase;
-      const ring = Math.min(cw, ch) * 0.34;
-      // Synthetic representative node so existing rep-based label/tip code works.
-      const rep = {
-        id: `cr${cs.id}`,
-        node_type: 'memory',
-        label: String(cs.label || ''),
-        source_kind: cs.dominant_source === 'subagent' ? 'subagent' : 'main',
-        degree: 0,
-      };
-      const cluster = {
-        id: `c${cs.id}`,
-        root: Number(cs.id),
-        members: [],
-        rep,
-        size,
-        dominantSource: cs.dominant_source === 'subagent' ? 'subagent'
-          : cs.dominant_source === 'mixed' ? 'mixed' : 'main',
-        isCatchAll: false,
-        x: cw / 2 + Math.cos(ang) * ring + (Math.random() - 0.5) * 30,
-        y: ch / 2 + Math.sin(ang) * ring + (Math.random() - 0.5) * 30,
-        vx: 0, vy: 0, fx: null, fy: null,
-        // Radius ∝ √size but clamped (see clusterRadius) so a huge catch-all
-        // never balloons into a canvas-filling circle.
-        r: clusterRadius(size, false),
-        openT: 0,
-        seeded: false,
-        loaded: false,   // members fetched yet?
-        loading: false,  // fetch in-flight?
-      };
-      clusters.push(cluster);
-      clusterByRoot.set(cluster.root, cluster);
-    });
-    markCatchAll();
-  }
-
-  if (isOverview) buildOverviewClusters();
-  else if (clusterMode) buildClusters();
-
-  // LOD: resolve server cluster_edges (root_a, root_b, weight) into bubble pairs.
-  if (isOverview) {
-    interClusterEdges = (data.cluster_edges || [])
-      .map(e => {
-        const a = clusterByRoot.get(Number(e.src));
-        const b = clusterByRoot.get(Number(e.dst));
-        if (!a || !b || a === b) return null;
-        return { a, b, weight: Math.max(0, Math.min(1, Number(e.weight ?? 0.5))) };
-      })
-      .filter(Boolean);
-  }
-
-  function clusterColor(c) {
-    if (c.dominantSource === 'subagent') return subagentColor;
-    if (c.dominantSource === 'mixed') return muted;
-    return accent;
-  }
-
-  // A cluster shows its members when it is a singleton, has been explicitly
-  // opened, or the view is zoomed past the semantic-zoom threshold.
-  // Logical intent to open (explicit click or zoom past the threshold),
-  // independent of whether members are loaded yet.
-  function clusterShouldOpen(c) {
-    return c.size <= 1 || openedClusters.has(c.id) || view.k >= ZOOM_OPEN_K;
-  }
-  function clusterIsOpen(c) {
-    // Overview bubbles cannot actually "open" (reveal members + fade the bubble)
-    // until their members have been fetched — otherwise we'd fade a bubble out
-    // into nothing. The intent is tracked separately by clusterShouldOpen().
-    if (isOverview && !c.loaded) return false;
-    return clusterShouldOpen(c);
-  }
-  // Member node is logically active (pickable / simulated) only when its
-  // cluster is open AND the node passes the standard visibility filters.
-  function memberVisible(n) {
-    if (!graphNodeVisible(n)) return false;
-    if (!clusterMode) return true;
-    const c = clusterOf.get(n.id);
-    return c ? clusterIsOpen(c) : true;
-  }
-  // Member is RENDERABLE during the open transition too (openT > 0), so it can
-  // fade/glide in and out rather than popping.
-  function memberRenderable(n) {
-    if (!graphNodeVisible(n)) return false;
-    if (!clusterMode) return true;
-    const c = clusterOf.get(n.id);
-    if (!c || c.size <= 1) return true;
-    return c.openT > 0.02;
-  }
-  function memberAlpha(n) {
-    if (!clusterMode) return 1;
-    const c = clusterOf.get(n.id);
-    if (!c || c.size <= 1) return 1;
-    return Math.max(0, Math.min(1, c.openT));
-  }
-  // A cluster bubble is drawn while it is not fully opened (openT < 1) and at
-  // least one member passes the filters — it fades out as members fade in.
-  function clusterVisible(c) {
-    if (!clusterMode) return false;
-    if (c.openT >= 0.98) return false;
-    // Overview bubbles are always drawable before drill-down (members empty),
-    // INCLUDING singletons — they only reveal their member once loaded. Honour
-    // the source filter via the cluster's dominant source.
-    if (isOverview && !c.loaded) return clusterPassesSourceFilter(c);
-    if (c.size <= 1) return false;
-    return c.members.some(graphNodeVisible);
-  }
-  // Source-filter check for a not-yet-loaded overview bubble (no members to
-  // inspect): a 'main'/'subagent' filter keeps bubbles of that dominant source
-  // plus 'mixed' (which contain both); 'all' keeps everything.
-  function clusterPassesSourceFilter(c) {
-    if (!graphFilters.showMemory) return false;
-    if (graphFilters.source === 'all') return true;
-    if (c.dominantSource === 'mixed') return true;
-    return c.dominantSource === graphFilters.source;
-  }
-  function clusterAlpha(c) {
-    return Math.max(0, Math.min(1, 1 - c.openT));
-  }
-  // Is this cluster part of the current layout/fit? Overview bubbles count
-  // before their members load (use the dominant-source filter instead).
-  function clusterActive(c) {
-    if (isOverview && !c.loaded) return clusterPassesSourceFilter(c);
-    return c.members.some(graphNodeVisible);
-  }
-  // Re-seed member layout positions around their bubble when a cluster first
-  // opens so we never run a global 1675-node simulation from scratch. The
-  // members' physics positions (m.x/m.y) start on a ring; rendering eases them
-  // OUT from the bubble center via the cluster's openT, so there is no pop.
-  function seedClusterMembers(c) {
-    const n = c.members.length;
-    for (let i = 0; i < n; i++) {
-      const m = c.members[i];
-      const ang = (i / Math.max(1, n)) * Math.PI * 2;
-      const ring = c.r + 18 + Math.sqrt(n) * 6;
-      m.x = c.x + Math.cos(ang) * ring + (Math.random() - 0.5) * 8;
-      m.y = c.y + Math.sin(ang) * ring + (Math.random() - 0.5) * 8;
-      m.vx = 0; m.vy = 0;
-    }
-    c.seeded = true;
-  }
-
-  // Rendered member position: interpolate from the bubble center (collapsed)
-  // to the physics layout position (opened) by the eased openT, so members
-  // glide out when opening and back in when closing — never teleport.
-  function memberRenderX(m, c) {
-    if (!c || c.size <= 1) return m.x;
-    return c.x + (m.x - c.x) * c.openT;
-  }
-  function memberRenderY(m, c) {
-    if (!c || c.size <= 1) return m.y;
-    return c.y + (m.y - c.y) * c.openT;
-  }
-
-  let view = { x: 0, y: 0, k: 1 };
-  let alpha = 1;
-  let tickCount = 0;
-
-  // ----- Smooth-motion tuning -----
-  const DAMPING = 0.86;            // velocity retained per tick (strong damping → calm settle)
-  const ALPHA_DECAY = 0.94;        // multiplicative cooling of the simulation temperature
-  const ALPHA_MIN = 0.02;          // below this the sim is considered cold
-  const ENERGY_EPSILON = 0.06;     // kinetic energy below this (and cold) → stop the rAF loop
-  const MAX_STEP = 18;             // max world-units a node may move per frame (no teleport)
-  const OPEN_EASE = 0.16;          // per-frame lerp of cluster openT toward its target (≈300ms)
-  const VIEW_EASE = 0.18;          // per-frame lerp of view toward the tween target
-  const ZOOM_LERP = 0.34;          // per-frame lerp of view.k toward the wheel target scale
-  const ZOOM_STEP = 1.25;          // discrete zoom factor applied to the target per wheel tick
-
-  // Smooth view tween (fit / focus): eases view.k/x/y toward a target.
-  let viewTarget = null;           // { k, x, y } or null when idle
-  // Smooth wheel zoom: eases view.k toward targetK while keeping cursor anchored.
-  let zoom = null;                 // { k, sx, sy } target scale + cursor anchor, or null
-  let frameEnergy = 0;             // summed kinetic energy from the latest sim tick
-
-  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-  let hoverId = null;
-  let hoverClusterId = null;
-  let selectedId = null;
-  let dragNode = null;
-  let dragCluster = null;
-  let panning = false;
-  let initialFitPending = true;
-  let downAt = null;
-  let lastPointer = null;
-  let moved = false;
-  let raf = null;
-  const listeners = [];
-  const hasVisibleNodes = nodes.some(n => graphNodeVisible(n));
-  const hasEntities = nodes.some(n => n.node_type === 'entity');
-  // Overview: the graph is non-empty when there is at least one cluster bubble.
-  const hasContent = isOverview ? clusters.length > 0 : (isSimilarity ? hasVisibleNodes : hasEntities);
-  emptyState.hidden = hasContent;
-  emptyState.innerHTML = isSimilarity
-    ? '<div>표시할 유사도 그래프가 없습니다.<br>메모리가 충분히 쌓이면 연결이 표시됩니다.</div>'
-    : '<div>아직 엔티티가 없습니다.<br>상단의 <strong>엔티티 추출</strong> 버튼으로 메모리에서 엔티티를 생성하세요.</div>';
-
-  function on(target, type, fn, opts) {
-    target.addEventListener(type, fn, opts);
-    listeners.push([target, type, fn, opts]);
-  }
-
-  function eventPoint(ev) {
-    const rect = canvas.getBoundingClientRect();
-    return { sx: ev.clientX - rect.left, sy: ev.clientY - rect.top };
-  }
-
-  function screenToWorld(sx, sy) {
-    return { x: (sx - view.x) / view.k, y: (sy - view.y) / view.k };
-  }
-
-  // Current world-space viewport (with a margin so things ease in just off the
-  // edge). Used ONLY for render + sim culling — never for open/close decisions.
-  function viewportBounds(marginPx = 120) {
-    const m = marginPx / view.k;
-    const tl = screenToWorld(0, 0);
-    const br = screenToWorld(cw, ch);
-    return { minX: tl.x - m, minY: tl.y - m, maxX: br.x + m, maxY: br.y + m };
-  }
-  function inViewport(x, y, vp) {
-    return x >= vp.minX && x <= vp.maxX && y >= vp.minY && y <= vp.maxY;
-  }
-
-  // Returns a member node (when its cluster is open / flat mode) under the
-  // cursor — uses the eased render position so hit-testing matches what's drawn.
-  function pickNode(sx, sy) {
-    const p = screenToWorld(sx, sy);
-    for (let i = nodes.length - 1; i >= 0; i--) {
-      const n = nodes[i];
-      if (!memberVisible(n)) continue;
-      const c = clusterMode ? clusterOf.get(n.id) : null;
-      const nx = memberRenderX(n, c);
-      const ny = memberRenderY(n, c);
-      const r = graphNodeRadius(n) + 6 / view.k;
-      if (Math.hypot(p.x - nx, p.y - ny) <= r) return n;
-    }
-    return null;
-  }
-
-  // Returns a collapsed cluster bubble under the cursor (cluster mode only).
-  function pickCluster(sx, sy) {
-    if (!clusterMode) return null;
-    const p = screenToWorld(sx, sy);
-    for (let i = clusters.length - 1; i >= 0; i--) {
-      const c = clusters[i];
-      if (!clusterVisible(c)) continue;
-      const r = c.r + 6 / view.k;
-      if (Math.hypot(p.x - c.x, p.y - c.y) <= r) return c;
-    }
-    return null;
-  }
-
-  // LOD drill-down: inject one cluster's freshly-fetched member nodes + intra
-  // edges into the LIVE graph (nodes / idIdx / edges / adjacency / clusterOf),
-  // then seed + ease them out of the bubble. Runs once per cluster.
-  function addClusterMembers(c, payload) {
-    if (!c || c.loaded) return;
-    const memberNodes = (payload.nodes || []).map(raw => ({
-      ...raw,
-      node_type: 'memory',
-      label: graphNodeLabel(raw),
-      degree: 0,
-      // Start at the bubble center; the eased openT glides them outward.
-      x: c.x, y: c.y, vx: 0, vy: 0, fx: null, fy: null,
-    }));
-    for (const m of memberNodes) {
-      idIdx.set(m.id, nodes.length);
-      nodes.push(m);
-      if (!adjacency.has(m.id)) adjacency.set(m.id, new Set());
-      clusterOf.set(m.id, c);
-    }
-    for (const e of (payload.edges || [])) {
-      const s = idIdx.get(e.src);
-      const d = idIdx.get(e.dst);
-      if (s === undefined || d === undefined) continue;
-      const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
-      edges.push({ s, d, src: e.src, dst: e.dst, weight });
-      const a = nodes[s], b = nodes[d];
-      adjacency.get(a.id).add(b.id);
-      adjacency.get(b.id).add(a.id);
-    }
-    for (const m of memberNodes) {
-      m.degree = adjacency.get(m.id)?.size || 0;
-    }
-    c.members = memberNodes;
-    // Keep size honest: trust the server count, but never claim fewer than the
-    // members we actually received.
-    c.size = Math.max(c.size, memberNodes.length);
-    c.r = clusterRadius(c.size, c.isCatchAll);
-    // Pick a representative from the real members (highest degree, longest label).
-    if (memberNodes.length) {
-      let rep = memberNodes[0];
-      for (const m of memberNodes) {
-        if (m.degree > rep.degree
-          || (m.degree === rep.degree && graphNodeLabel(m).length > graphNodeLabel(rep).length)) rep = m;
-      }
-      c.rep = rep;
-    }
-    c.loaded = true;
-    c.loading = false;
-    if (memberNodes.length <= 1) { c.openT = 1; }
-    seedClusterMembers(c);
-    wakeLayout(0.6);
-  }
-
-  // Ensure a cluster's members are loaded (overview lazy-fetch). Non-overview
-  // clusters already hold their members, so this is a no-op there.
-  function ensureClusterMembers(c) {
-    if (!c || !isOverview || c.loaded || c.loading) return;
-    c.loading = true;
-    fetchClusterMembers(lodProject, c.root).then(payload => {
-      c.loading = false;
-      if (!payload) return;
-      // The graph may have been torn down (mode switch / reload) meanwhile.
-      if (graphState && graphState.canvas !== canvas) return;
-      addClusterMembers(c, payload);
-    });
-  }
-
-  // Open a cluster (reveal members), seeding member layout once and waking sim.
-  // In overview mode this also lazily fetches the cluster's member nodes —
-  // including singleton bubbles, whose single member is only loaded on demand.
-  function openCluster(c) {
-    if (!c) return;
-    if (isOverview && !c.loaded) { openedClusters.add(c.id); ensureClusterMembers(c); return; }
-    if (c.size <= 1 || openedClusters.has(c.id)) return;
-    openedClusters.add(c.id);
-    seedClusterMembers(c);
-    wakeLayout(0.6);
-  }
-
-  // Sync transient open-state when the user crosses the zoom threshold so member
-  // positions are seeded exactly once per opening (avoids stacked nodes).
-  let lastOpenState = new Map();
-  function reconcileClusterOpenState() {
-    if (!clusterMode) return;
-    // Zooming well below the threshold re-collapses even explicitly-opened
-    // clusters, so the overview always reads as a handful of bubbles. Use the
-    // pending tween/zoom target scale when one is active, so a focus that is
-    // still mid-zoom doesn't get its just-opened cluster cleared.
-    const effK = viewTarget ? viewTarget.k : (zoom ? zoom.k : view.k);
-    if (effK < ZOOM_OPEN_K - 0.15 && openedClusters.size) openedClusters.clear();
-    // Overview: only auto-fetch members of bubbles the user is actually looking
-    // at. Without this guard, crossing the zoom threshold would mass-fetch EVERY
-    // cluster at once and defeat the LOD scaling.
-    const vp = isOverview ? viewportBounds(160) : null;
-    for (const c of clusters) {
-      if (c.size <= 1) continue;
-      // Overview: a bubble whose OPEN INTENT (zoom threshold) is set but whose
-      // members aren't loaded lazily fetches them — but only when it's in view,
-      // so crossing the threshold never mass-fetches every cluster at once.
-      if (isOverview && !c.loaded && clusterShouldOpen(c) && inViewport(c.x, c.y, vp)) {
-        ensureClusterMembers(c);
-      }
-      const open = clusterIsOpen(c);
-      const prev = lastOpenState.get(c.id) || false;
-      if (open && !prev) {
-        // Seed the member ring once per opening transition, then let openT ease.
-        if (!c.seeded || c.openT <= 0.001) seedClusterMembers(c);
-        wakeLayout(0.45);
-      }
-      if (open !== prev) wakeLayout(0); // keep loop alive to ease openT (no re-warm)
-      lastOpenState.set(c.id, open);
-    }
-  }
-
-  // Ease every cluster's openT toward its logical open/closed target. Returns
-  // true while any cluster is still transitioning (so the loop keeps running).
-  function updateClusterOpenT() {
-    if (!clusterMode) return false;
-    let animating = false;
-    for (const c of clusters) {
-      if (c.size <= 1) { c.openT = 1; continue; }
-      const target = clusterIsOpen(c) ? 1 : 0;
-      const diff = target - c.openT;
-      if (Math.abs(diff) > 0.002) {
-        c.openT += diff * OPEN_EASE;
-        if (Math.abs(target - c.openT) <= 0.002) c.openT = target;
-        animating = true;
-      } else {
-        c.openT = target;
-      }
-    }
-    return animating;
-  }
-
-  // Fit ALL clusters (their bubble bounding box) so the whole graph is visible
-  // as a handful of bubbles — this is the fix for "전체 안 보여". In entity mode
-  // (no clusters) it falls back to fitting individual nodes.
-  function fitView() {
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-    let any = false;
-    if (clusterMode) {
-      // Collapse the view first so the threshold-based open state matches a
-      // genuine overview, then frame the bubble bounding box. EXCLUDE the
-      // catch-all so the real clusters aren't shrunk to dots around it.
-      openedClusters.clear();
-      for (const c of clusters) {
-        if (!clusterActive(c) || c.isCatchAll) continue;
-        any = true;
-        minX = Math.min(minX, c.x - c.r);
-        maxX = Math.max(maxX, c.x + c.r);
-        minY = Math.min(minY, c.y - c.r);
-        maxY = Math.max(maxY, c.y + c.r);
-      }
-      // Degenerate fallback: catch-all was the only active cluster — frame it.
-      if (!any) {
-        for (const c of clusters) {
-          if (!clusterActive(c)) continue;
-          any = true;
-          minX = Math.min(minX, c.x - c.r);
-          maxX = Math.max(maxX, c.x + c.r);
-          minY = Math.min(minY, c.y - c.r);
-          maxY = Math.max(maxY, c.y + c.r);
-        }
-      }
-    } else {
-      for (const n of nodes) {
-        if (!graphNodeVisible(n)) continue;
-        any = true;
-        minX = Math.min(minX, n.x);
-        maxX = Math.max(maxX, n.x);
-        minY = Math.min(minY, n.y);
-        maxY = Math.max(maxY, n.y);
-      }
-    }
-    if (!any) {
-      draw();
-      return;
-    }
-    const margin = 48;
-    const bbW = Math.max(1, maxX - minX);
-    const bbH = Math.max(1, maxY - minY);
-    // Cap zoom below the open threshold so fit-all always shows collapsed bubbles.
-    const maxK = clusterMode ? Math.min(4, ZOOM_OPEN_K - 0.05) : 4;
-    const k = Math.max(0.02, Math.min(maxK, Math.min(cw / (bbW + margin * 2), ch / (bbH + margin * 2))));
-    // Animate the view to the fit target (ease-in-out) instead of snapping.
-    tweenViewTo({
-      k,
-      x: (cw - bbW * k) / 2 - minX * k,
-      y: (ch - bbH * k) / 2 - minY * k,
-    });
-    if (clusterMode) reconcileClusterOpenState();
-  }
-
-  // Start a smooth view tween toward the given target and cancel any pending
-  // wheel-zoom so the two easings never fight.
-  function tweenViewTo(target) {
-    zoom = null;
-    viewTarget = { k: target.k, x: target.x, y: target.y };
-    wakeLayout(0); // drive the view tween without re-warming the layout
-  }
-
-  // Advance the active view tween / wheel-zoom by one frame. Returns true while
-  // either is still in progress so the loop keeps running.
-  function stepView() {
-    let animating = false;
-    if (viewTarget) {
-      view.k += (viewTarget.k - view.k) * VIEW_EASE;
-      view.x += (viewTarget.x - view.x) * VIEW_EASE;
-      view.y += (viewTarget.y - view.y) * VIEW_EASE;
-      const done = Math.abs(viewTarget.k - view.k) < 0.0008
-        && Math.abs(viewTarget.x - view.x) < 0.4
-        && Math.abs(viewTarget.y - view.y) < 0.4;
-      if (done) { view.k = viewTarget.k; view.x = viewTarget.x; view.y = viewTarget.y; viewTarget = null; }
-      else animating = true;
-    }
-    if (zoom) {
-      // Ease scale toward the wheel target, then re-anchor on the cursor so the
-      // point under the pointer stays fixed (centered zoom, no jump).
-      const before = screenToWorld(zoom.sx, zoom.sy);
-      view.k += (zoom.k - view.k) * ZOOM_LERP;
-      view.x = zoom.sx - before.x * view.k;
-      view.y = zoom.sy - before.y * view.k;
-      if (Math.abs(zoom.k - view.k) < 0.0006) { view.k = zoom.k; zoom = null; }
-      else animating = true;
-    }
-    return animating;
-  }
-
-  function sourceLabel(source) {
-    return source === 'subagent' ? '서브' : '메인';
-  }
-
-  function memoryBadges(n) {
-    return `<span class="badge">${escapeHtml(n.kind || '?')}</span> <span class="badge${graphNodeSource(n) === 'subagent' ? ' source-subagent' : ''}">${sourceLabel(graphNodeSource(n))}</span>`;
-  }
-
-  function switchToHistory() {
-    document.querySelectorAll('#memory-subtabs a').forEach(x => x.classList.remove('active'));
-    const tab = document.querySelector('#memory-subtabs a[data-sub="memhistory"]');
-    if (tab) tab.classList.add('active');
-    document.querySelectorAll('#mem-detail .subpage').forEach(x => x.hidden = true);
-    const page = document.getElementById('sub-memhistory');
-    if (page) page.hidden = false;
-    const project = currentProject();
-    if (project && !isGlobalScope()) loadHistory(project, 0);
-  }
-
-  function renderDetail(n) {
-    if (!n) {
-      detail.innerHTML = '<div class="empty">노드를 클릭하면 상세 정보가 표시됩니다.</div>';
-      return;
-    }
-    if (n.node_type === 'memory') {
-      const linkedNeighbors = Array.from(adjacency.get(n.id) || [])
-        .map(id => nodes[idIdx.get(id)])
-        .filter(Boolean);
-      const linkedEntities = linkedNeighbors.filter(x => x.node_type === 'entity');
-      const linkedMemories = linkedNeighbors.filter(x => x.node_type === 'memory');
-      detail.innerHTML = `
-        <h3>메모리</h3>
-        <div>${memoryBadges(n)}</div>
-        <div class="label-preview">${escapeHtml(graphNodeLabel(n).slice(0, 700))}</div>
-        <button id="graph-history-link" class="ghost" type="button" style="margin-top:0.65rem;font-size:0.85em;">히스토리에서 보기</button>
-        ${isSimilarity && linkedMemories.length ? `<div class="out-meta">유사한 메모리</div><ul>${linkedMemories.slice(0, 16).map(m => `<li>${escapeHtml(graphNodeLabel(m).slice(0, 140))}</li>`).join('')}</ul>` : ''}
-        ${!isSimilarity && linkedEntities.length ? `<div class="out-meta">연결된 엔티티</div><ul>${linkedEntities.slice(0, 16).map(e => `<li>${escapeHtml(graphNodeLabel(e))}</li>`).join('')}</ul>` : ''}
-      `;
-      const link = document.getElementById('graph-history-link');
-      if (link) link.onclick = switchToHistory;
-      return;
-    }
-    const linkedMemories = (linkedMemoryByEntity.get(n.id) || []).filter(Boolean);
-    detail.innerHTML = `
-      <h3>${escapeHtml(graphNodeLabel(n))}</h3>
-      <div><span class="badge ok">엔티티</span> <span class="badge">${linkedMemories.length} 연결</span></div>
-      ${n.kind ? `<div class="out-meta">kind: <code>${escapeHtml(n.kind)}</code></div>` : ''}
-      <div class="out-meta">연결된 메모리</div>
-      ${linkedMemories.length ? `<ul>${linkedMemories.slice(0, 30).map(m => `<li>${escapeHtml(graphNodeLabel(m).slice(0, 140))}</li>`).join('')}</ul>` : '<div class="empty">연결된 메모리가 없습니다.</div>'}
-    `;
-  }
-
-  function setTip(n) {
-    if (!n) {
-      tip.textContent = clusterMode
-        ? '클러스터를 클릭/더블클릭하면 펼쳐집니다. 확대하면 자동으로 펼쳐집니다.'
-        : '드래그로 노드 이동, 배경 드래그로 이동, 휠로 확대/축소.';
-      return;
-    }
-    const type = n.node_type === 'entity' ? '엔티티' : `메모리/${sourceLabel(graphNodeSource(n))}`;
-    tip.innerHTML = `<code>${escapeHtml(n.id)}</code> ${escapeHtml(type)} — ${escapeHtml(graphNodeLabel(n).slice(0, 100))}`;
-  }
-
-  function clusterSourceLabel(c) {
-    if (c.dominantSource === 'mixed') return '혼합';
-    return c.dominantSource === 'subagent' ? '서브' : '메인';
-  }
-
-  function setClusterTip(c) {
-    if (!c) { setTip(null); return; }
-    if (c.isCatchAll) {
-      tip.innerHTML = `<span class="badge">미분류</span> 군집되지 않은 메모리 ${c.size.toLocaleString()}개 <span class="badge">클릭하면 펼침</span>`;
-      return;
-    }
-    tip.innerHTML = `<span class="badge">클러스터</span> ${escapeHtml(clusterSourceLabel(c))} · ${c.size}개 — ${escapeHtml(graphNodeLabel(c.rep).slice(0, 90))} <span class="badge">클릭하면 펼침</span>`;
-  }
-
-  // Zoom in onto a cluster so its members reveal, then frame them — animated.
-  function focusCluster(c) {
-    if (!c) return;
-    const k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
-    reconcileClusterOpenState();
-    tweenViewTo({ k, x: cw / 2 - c.x * k, y: ch / 2 - c.y * k });
-    wakeLayout(0.55);
-  }
-
-  function isSearchMatch(n) {
-    const q = graphFilters.search.trim().toLowerCase();
-    return q && graphNodeLabel(n).toLowerCase().includes(q);
-  }
-
-  function isRelated(n) {
-    if (!selectedId) return true;
-    return n.id === selectedId || (adjacency.get(selectedId) && adjacency.get(selectedId).has(n.id));
-  }
-
-  function shouldLabelNode(n) {
-    if (n.id === hoverId || n.id === selectedId || isSearchMatch(n)) return true;
-    const degree = Number(n.degree || 0);
-    return degree >= (isSimilarity ? 5 : 3);
-  }
-
-  function edgeDirection(edge) {
-    const a = nodes[edge.s];
-    const b = nodes[edge.d];
-    if (a.node_type === 'memory' && b.node_type === 'entity') return [a, b];
-    if (b.node_type === 'memory' && a.node_type === 'entity') return [b, a];
-    return [a, b];
-  }
-
-  function drawEdge(from, to, edge) {
-    const fromR = graphNodeRadius(from) + 1;
-    const toR = graphNodeRadius(to) + 2;
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const d = Math.hypot(dx, dy) || 1;
-    const sx = from.x + (dx / d) * fromR;
-    const sy = from.y + (dy / d) * fromR;
-    const ex = to.x - (dx / d) * toR;
-    const ey = to.y - (dy / d) * toR;
-    ctx.beginPath();
-    ctx.moveTo(sx, sy);
-    ctx.lineTo(ex, ey);
-    ctx.stroke();
-    if (isSimilarity) return;
-    const size = 5;
-    const angle = Math.atan2(dy, dx);
-    ctx.beginPath();
-    ctx.moveTo(ex, ey);
-    ctx.lineTo(ex - Math.cos(angle - 0.45) * size, ey - Math.sin(angle - 0.45) * size);
-    ctx.lineTo(ex - Math.cos(angle + 0.45) * size, ey - Math.sin(angle + 0.45) * size);
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  // Edge drawn at the eased member render positions (so edges track members as
-  // they glide out of / into their cluster bubble).
-  function drawEdgeAt(from, to, edge) {
-    const ca = clusterMode ? clusterOf.get(from.id) : null;
-    const cb = clusterMode ? clusterOf.get(to.id) : null;
-    const fx0 = memberRenderX(from, ca);
-    const fy0 = memberRenderY(from, ca);
-    const tx0 = memberRenderX(to, cb);
-    const ty0 = memberRenderY(to, cb);
-    const fromR = graphNodeRadius(from) + 1;
-    const toR = graphNodeRadius(to) + 2;
-    const dx = tx0 - fx0;
-    const dy = ty0 - fy0;
-    const d = Math.hypot(dx, dy) || 1;
-    const sx = fx0 + (dx / d) * fromR;
-    const sy = fy0 + (dy / d) * fromR;
-    const ex = tx0 - (dx / d) * toR;
-    const ey = ty0 - (dy / d) * toR;
-    ctx.beginPath();
-    ctx.moveTo(sx, sy);
-    ctx.lineTo(ex, ey);
-    ctx.stroke();
-    if (isSimilarity) return;
-    const size = 5;
-    const angle = Math.atan2(dy, dx);
-    ctx.beginPath();
-    ctx.moveTo(ex, ey);
-    ctx.lineTo(ex - Math.cos(angle - 0.45) * size, ey - Math.sin(angle - 0.45) * size);
-    ctx.lineTo(ex - Math.cos(angle + 0.45) * size, ey - Math.sin(angle + 0.45) * size);
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  function clusterIsSearchHit(c) {
-    const q = graphFilters.search.trim().toLowerCase();
-    if (!q) return false;
-    // Overview bubbles match on their server label (rep) too — members may not
-    // be loaded yet, so we can't rely on member previews alone.
-    if (c.rep && graphNodeLabel(c.rep).toLowerCase().includes(q)) return true;
-    return c.members.some(m => graphNodeLabel(m).toLowerCase().includes(q));
-  }
-
-  function drawClusterBubble(c) {
-    const searchHit = clusterIsSearchHit(c);
-    const hovered = c.id === hoverClusterId;
-    const fade = clusterAlpha(c);            // fades out as the cluster opens
-    if (fade <= 0.01) return;
-    const r = c.r * (0.82 + 0.18 * fade);    // subtle shrink while opening
-
-    if (c.isCatchAll) {
-      // Junk drawer: small, muted, DASHED outline + very low fill so it never
-      // competes with the real clusters. Still clickable to drill in.
-      ctx.save();
-      ctx.globalAlpha = (hovered ? 0.16 : 0.10) * fade;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = muted;
-      ctx.fill();
-      ctx.globalAlpha = (hovered ? 0.7 : 0.45) * fade;
-      ctx.setLineDash([5 / view.k, 4 / view.k]);
-      ctx.strokeStyle = searchHit ? '#fbbf24' : muted;
-      ctx.lineWidth = (searchHit ? 2.5 : 1.5) / view.k;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-      if (view.k > 0.18) {
-        ctx.globalAlpha = 0.6 * fade;
-        ctx.fillStyle = muted;
-        ctx.font = `${Math.max(7, 9 / Math.sqrt(view.k))}px system-ui`;
-        ctx.textAlign = 'center';
-        ctx.fillText(`미분류 ${c.size.toLocaleString()}`, c.x, c.y + r + 11 / view.k);
-        ctx.globalAlpha = 1;
-      }
-      return;
-    }
-
-    ctx.globalAlpha = 0.9 * fade;
-    ctx.beginPath();
-    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = clusterColor(c);
-    ctx.fill();
-    // Lighter inner halo to read as a "group" rather than a single node.
-    ctx.globalAlpha = 0.16 * fade;
-    ctx.beginPath();
-    ctx.arc(c.x, c.y, r + 4 / view.k, 0, Math.PI * 2);
-    ctx.fillStyle = clusterColor(c);
-    ctx.fill();
-    ctx.globalAlpha = fade;
-    if (searchHit || hovered) {
-      ctx.strokeStyle = searchHit ? '#fbbf24' : fg;
-      ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-    // Count badge centered in the bubble.
-    ctx.globalAlpha = fade;
-    ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.max(8, r * 0.6)}px system-ui`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(String(c.size), c.x, c.y);
-    ctx.textBaseline = 'alphabetic';
-    // Representative label + count beneath the bubble.
-    if (view.k > 0.18) {
-      ctx.globalAlpha = 0.9 * fade;
-      ctx.fillStyle = fg;
-      ctx.font = `${Math.max(7, 9 / Math.sqrt(view.k))}px system-ui`;
-      const lbl = graphNodeLabel(c.rep).slice(0, 18) + ` ·${c.size}`;
-      ctx.fillText(lbl, c.x, c.y + r + 11 / view.k);
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  function draw() {
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, cw, ch);
-    ctx.save();
-    ctx.translate(view.x, view.y);
-    ctx.scale(view.k, view.k);
-    ctx.lineWidth = 1 / Math.sqrt(view.k);
-    ctx.strokeStyle = muted;
-    ctx.fillStyle = muted;
-    // Viewport for render culling — skip anything fully off-screen so 전체's
-    // thousands of open nodes never cost a draw pass when scrolled out of view.
-    const vp = viewportBounds(80);
-    // Edges: drawn at the eased render positions; faded by the cluster open
-    // progress so they appear with their members rather than popping in.
-    for (const e of edges) {
-      const [from, to] = edgeDirection(e);
-      if (!memberRenderable(from) || !memberRenderable(to)) continue;
-      if (!inViewport(from.x, from.y, vp) && !inViewport(to.x, to.y, vp)) continue;
-      const openFade = Math.min(memberAlpha(from), memberAlpha(to));
-      if (openFade <= 0.01) continue;
-      const activeEdge = selectedId && (from.id === selectedId || to.id === selectedId);
-      if (isSimilarity) {
-        const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
-        ctx.lineWidth = (0.5 + weight * 2.5) / Math.sqrt(view.k);
-        ctx.globalAlpha = (selectedId
-          ? (activeEdge ? 0.18 + weight * 0.58 : 0.025 + weight * 0.08)
-          : 0.035 + weight * 0.5) * openFade;
-      } else {
-        ctx.lineWidth = 1 / Math.sqrt(view.k);
-        ctx.globalAlpha = (selectedId ? (activeEdge ? 0.55 : 0.08) : 0.22) * openFade;
-      }
-      drawEdgeAt(from, to, e);
-    }
-    ctx.globalAlpha = 1;
-    // LOD: server-aggregated inter-cluster edges between bubble centers. Faded by
-    // both bubbles' collapse alpha so they vanish as clusters open into members.
-    if (isOverview && interClusterEdges.length) {
-      for (const ie of interClusterEdges) {
-        const a = ie.a, b = ie.b;
-        const fade = Math.min(clusterAlpha(a), clusterAlpha(b));
-        if (fade <= 0.02) continue;
-        if (!inViewport(a.x, a.y, vp) && !inViewport(b.x, b.y, vp)) continue;
-        ctx.lineWidth = (0.5 + ie.weight * 2.5) / Math.sqrt(view.k);
-        ctx.globalAlpha = (0.05 + ie.weight * 0.4) * fade;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    }
-    // Cluster bubbles (fade out as their cluster opens) — viewport-culled by AABB.
-    if (clusterMode) {
-      for (const c of clusters) {
-        if (!clusterVisible(c)) continue;
-        if (c.x - c.r > vp.maxX || c.x + c.r < vp.minX || c.y - c.r > vp.maxY || c.y + c.r < vp.minY) continue;
-        drawClusterBubble(c);
-      }
-    }
-    // Individual member nodes — eased out from the bubble center as openT rises.
-    for (const n of nodes) {
-      if (!memberRenderable(n)) continue;
-      const c = clusterMode ? clusterOf.get(n.id) : null;
-      const nx = memberRenderX(n, c);
-      const ny = memberRenderY(n, c);
-      if (!inViewport(nx, ny, vp)) continue; // cull off-screen members
-      const fade = memberAlpha(n);
-      if (fade <= 0.01) continue;
-      const dim = selectedId && !isRelated(n);
-      const searchHit = isSearchMatch(n);
-      const r = graphNodeRadius(n);
-      ctx.globalAlpha = (dim ? 0.18 : 1) * fade;
-      ctx.beginPath();
-      ctx.arc(nx, ny, r, 0, Math.PI * 2);
-      ctx.fillStyle = n.node_type === 'entity' ? entityColor : graphNodeSource(n) === 'subagent' ? subagentColor : accent;
-      ctx.fill();
-      if (n.id === selectedId || n.id === hoverId || searchHit) {
-        ctx.globalAlpha = (dim ? 0.35 : 1) * fade;
-        ctx.strokeStyle = searchHit ? '#fbbf24' : fg;
-        ctx.lineWidth = (searchHit ? 3 : 2) / view.k;
-        ctx.stroke();
-      }
-      if (shouldLabelNode(n) && view.k > 0.45) {
-        ctx.globalAlpha = (dim ? 0.22 : 0.85) * fade;
-        ctx.fillStyle = fg;
-        ctx.font = `${Math.max(6.5, 8 / Math.sqrt(view.k))}px system-ui`;
-        ctx.textAlign = 'center';
-        ctx.fillText(graphNodeLabel(n).slice(0, 22), nx, ny + r + 9);
-      }
-    }
-    ctx.restore();
-    ctx.globalAlpha = 1;
-  }
-
-  // Cluster-bubble layout. Repulsion uses a SPATIAL GRID so it stays O(clusters)
-  // instead of O(clusters²) — essential for 전체 (2000+ clusters) not to freeze:
-  // each bubble only repels against neighbors in its own + 8 adjacent cells.
-  function simulateClusters() {
-    const centerX = cw / 2;
-    const centerY = ch / 2;
-    const active = clusters.filter(clusterActive);
-    const repel = active.length > 60 ? 6000 : 9000;
-    const maxSpeed = 12;
-
-    // Grid cell ≈ largest interaction distance, so neighbors can only matter
-    // within one cell in each direction. Stable index dedups each pair once.
-    let maxR = 24;
-    for (let i = 0; i < active.length; i++) { active[i]._si = i; if (active[i].r > maxR) maxR = active[i].r; }
-    const cell = Math.max(48, maxR * 2 + 28);
-    const grid = new Map(); // "gx,gy" -> [clusters]
-    const keyOf = (x, y) => `${Math.floor(x / cell)},${Math.floor(y / cell)}`;
-    for (const c of active) {
-      const k = keyOf(c.x, c.y);
-      let bucket = grid.get(k);
-      if (!bucket) { bucket = []; grid.set(k, bucket); }
-      bucket.push(c);
-    }
-    const RANGE2 = (cell * 1.5) * (cell * 1.5); // skip pairs clearly out of reach
-    for (const c of active) {
-      const gx = Math.floor(c.x / cell);
-      const gy = Math.floor(c.y / cell);
-      for (let ox = -1; ox <= 1; ox++) {
-        for (let oy = -1; oy <= 1; oy++) {
-          const bucket = grid.get(`${gx + ox},${gy + oy}`);
-          if (!bucket) continue;
-          for (const b of bucket) {
-            if (b._si <= c._si) continue; // each unordered pair processed once
-            let dx = b.x - c.x;
-            let dy = b.y - c.y;
-            if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-              dx = (Math.random() - 0.5) * 0.8;
-              dy = (Math.random() - 0.5) * 0.8;
-            }
-            const d2 = dx * dx + dy * dy + 0.5;
-            if (d2 > RANGE2) continue;
-            const minD = c.r + b.r + 28;
-            const d = Math.sqrt(d2);
-            const collision = d < minD ? (minD - d) * 0.16 : 0;
-            // The catch-all is a junk drawer — let it barely repel so it never
-            // shoves the real clusters into a corner.
-            const damp = (c.isCatchAll || b.isCatchAll) ? 0.25 : 1;
-            const force = (repel / d2 + collision) * alpha * damp;
-            const fx = (dx / d) * force;
-            const fy = (dy / d) * force;
-            c.vx -= fx; c.vy -= fy;
-            b.vx += fx; b.vy += fy;
-          }
-        }
-      }
-    }
-    // LOD: gentle spring along server-aggregated inter-cluster edges so similar
-    // bubbles drift together (a few thousand edges max — cheap, O(edges)).
-    if (isOverview) {
-      for (const ie of interClusterEdges) {
-        const a = ie.a, b = ie.b;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const wanted = a.r + b.r + 120 - ie.weight * 60;
-        const force = (d - wanted) * (0.006 + ie.weight * 0.01) * alpha;
-        const fx = (dx / d) * force;
-        const fy = (dy / d) * force;
-        a.vx += fx; a.vy += fy;
-        b.vx -= fx; b.vy -= fy;
-      }
-    }
-    for (const c of active) {
-      if (c.fx !== null && c.fy !== null) {
-        c.x = c.fx; c.y = c.fy; c.vx = 0; c.vy = 0;
-      } else {
-        // Real clusters gather at center; the catch-all drifts to a corner so it
-        // stays out of the way and the real bubbles own the canvas.
-        const anchorX = c.isCatchAll ? cw * 0.12 : centerX;
-        const anchorY = c.isCatchAll ? ch * 0.12 : centerY;
-        const pull = c.isCatchAll ? 0.02 : 0.012;
-        c.vx += (anchorX - c.x) * pull * alpha;
-        c.vy += (anchorY - c.y) * pull * alpha;
-        c.vx *= DAMPING; c.vy *= DAMPING;
-        const speed = Math.hypot(c.vx, c.vy);
-        if (speed > maxSpeed) { c.vx = (c.vx / speed) * maxSpeed; c.vy = (c.vy / speed) * maxSpeed; }
-        // Clamp displacement so a bubble never teleports across the canvas.
-        let mx = c.vx;
-        let my = c.vy;
-        const m = Math.hypot(mx, my);
-        if (m > MAX_STEP) { mx = (mx / m) * MAX_STEP; my = (my / m) * MAX_STEP; }
-        c.x += mx; c.y += my;
-        frameEnergy += c.vx * c.vx + c.vy * c.vy;
-      }
-      // Closed (or singleton) clusters drag their member(s) along so reopening
-      // stays local and singletons render where their bubble sits.
-      if (c.size <= 1 || !clusterIsOpen(c)) {
-        for (const m of c.members) { m.x = c.x; m.y = c.y; }
-      }
-    }
-  }
-
-  // Local member layout. At high zoom EVERY cluster is open, so we VIEWPORT-CULL:
-  // only clusters that overlap the visible area (plus a margin) are simulated, and
-  // within them only members near the viewport. This keeps ~1747 open nodes smooth
-  // because we never simulate the thousands that are scrolled off-screen.
-  function simulateOpenMembers() {
-    const maxSpeed = 10;
-    const vp = viewportBounds(160);
-    // Only open clusters whose bubble bounding box intersects the viewport.
-    const openList = clusters.filter(c => {
-      if (!clusterIsOpen(c) || !c.members.some(graphNodeVisible)) return false; // open members exist
-      const reach = c.r + 60 + Math.sqrt(c.members.length) * 6;
-      return c.x + reach >= vp.minX && c.x - reach <= vp.maxX
-        && c.y + reach >= vp.minY && c.y - reach <= vp.maxY;
-    });
-    for (const c of openList) {
-      // Members near the viewport are the only ones we push around this frame.
-      const mem = c.members.filter(m => graphNodeVisible(m) && inViewport(m.x, m.y, vp));
-      const repel = mem.length > 90 ? 2400 : 3100;
-      for (let i = 0; i < mem.length; i++) {
-        const a = mem[i];
-        for (let j = i + 1; j < mem.length; j++) {
-          const b = mem[j];
-          let dx = b.x - a.x;
-          let dy = b.y - a.y;
-          if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-            dx = (Math.random() - 0.5) * 0.8;
-            dy = (Math.random() - 0.5) * 0.8;
-          }
-          const minD = graphNodeRadius(a) + graphNodeRadius(b) + 20;
-          const d2 = dx * dx + dy * dy + 0.5;
-          const d = Math.sqrt(d2);
-          const collision = d < minD ? (minD - d) * 0.12 : 0;
-          const force = (repel / d2 + collision) * alpha;
-          const fx = (dx / d) * force;
-          const fy = (dy / d) * force;
-          a.vx -= fx; a.vy -= fy;
-          b.vx += fx; b.vy += fy;
-        }
-      }
-    }
-    // Spring along intra-cluster edges of open clusters (viewport-culled).
-    for (const e of edges) {
-      const a = nodes[e.s];
-      const b = nodes[e.d];
-      if (!memberVisible(a) || !memberVisible(b)) continue;
-      if (clusterOf.get(a.id) !== clusterOf.get(b.id)) continue;
-      if (!inViewport(a.x, a.y, vp) && !inViewport(b.x, b.y, vp)) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const d = Math.hypot(dx, dy) || 1;
-      const weight = e.weight;
-      const wanted = 150 - weight * 70;
-      const force = (d - wanted) * (0.012 + weight * 0.012) * alpha;
-      const fx = (dx / d) * force;
-      const fy = (dy / d) * force;
-      a.vx += fx; a.vy += fy;
-      b.vx -= fx; b.vy -= fy;
-    }
-    for (const c of openList) {
-      for (const m of c.members) {
-        if (!graphNodeVisible(m)) continue;
-        if (m.fx !== null && m.fy !== null) {
-          m.x = m.fx; m.y = m.fy; m.vx = 0; m.vy = 0;
-          continue;
-        }
-        if (!inViewport(m.x, m.y, vp)) { m.vx = 0; m.vy = 0; continue; } // frozen off-screen
-        // Gentle pull toward the cluster's bubble anchor keeps members local.
-        m.vx += (c.x - m.x) * 0.02 * alpha;
-        m.vy += (c.y - m.y) * 0.02 * alpha;
-        m.vx *= DAMPING; m.vy *= DAMPING;
-        const speed = Math.hypot(m.vx, m.vy);
-        if (speed > maxSpeed) { m.vx = (m.vx / speed) * maxSpeed; m.vy = (m.vy / speed) * maxSpeed; }
-        let dx = m.vx;
-        let dy = m.vy;
-        const mag = Math.hypot(dx, dy);
-        if (mag > MAX_STEP) { dx = (dx / mag) * MAX_STEP; dy = (dy / mag) * MAX_STEP; }
-        m.x += dx; m.y += dy;
-        frameEnergy += m.vx * m.vx + m.vy * m.vy;
-      }
-    }
-  }
-
-  function simulate() {
-    tickCount += 1;
-    frameEnergy = 0;
-    if (clusterMode) {
-      simulateClusters();
-      simulateOpenMembers();
-      // Cool the temperature multiplicatively so the layout settles and stops.
-      alpha = alpha * ALPHA_DECAY;
-      return;
-    }
-    // Entity mode: legacy global force layout (damped + cooled like clusters).
-    const centerX = cw / 2;
-    const centerY = ch / 2;
-    const visibleCount = Math.max(1, nodes.filter(graphNodeVisible).length);
-    const repel = visibleCount > 160 ? 1800 : visibleCount > 90 ? 2400 : 3100;
-    const centerStrength = visibleCount > 120 ? 0.010 : 0.014;
-    const maxSpeed = 10;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      if (!graphNodeVisible(a)) continue;
-      for (let j = i + 1; j < nodes.length; j++) {
-        const b = nodes[j];
-        if (!graphNodeVisible(b)) continue;
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) {
-          dx = (Math.random() - 0.5) * 0.8;
-          dy = (Math.random() - 0.5) * 0.8;
-        }
-        const minD = graphNodeRadius(a) + graphNodeRadius(b) + 20;
-        const d2 = dx * dx + dy * dy + 0.5;
-        const d = Math.sqrt(d2);
-        const collision = d < minD ? (minD - d) * 0.12 : 0;
-        const force = (repel / d2 + collision) * alpha;
-        const fx = (dx / d) * force;
-        const fy = (dy / d) * force;
-        a.vx -= fx; a.vy -= fy;
-        b.vx += fx; b.vy += fy;
-      }
-    }
-    for (const e of edges) {
-      const [a, b] = edgeDirection(e);
-      if (!graphNodeVisible(a) || !graphNodeVisible(b)) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const d = Math.hypot(dx, dy) || 1;
-      const weight = Math.max(0, Math.min(1, Number(e.weight ?? 1)));
-      const wanted = isSimilarity ? 170 - weight * 70 : a.node_type === b.node_type ? 155 : 120;
-      const force = (d - wanted) * (isSimilarity ? 0.012 + weight * 0.012 : 0.018) * alpha;
-      const fx = (dx / d) * force;
-      const fy = (dy / d) * force;
-      a.vx += fx; a.vy += fy;
-      b.vx -= fx; b.vy -= fy;
-    }
-    for (const n of nodes) {
-      if (!graphNodeVisible(n)) continue;
-      if (n.fx !== null && n.fy !== null) {
-        n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0;
-        continue;
-      }
-      n.vx += (centerX - n.x) * centerStrength * alpha;
-      n.vy += (centerY - n.y) * centerStrength * alpha;
-      const pad = Math.max(60, graphNodeRadius(n) + 34);
-      if (n.x < pad) n.vx += (pad - n.x) * 0.025 * alpha;
-      if (n.x > cw - pad) n.vx -= (n.x - (cw - pad)) * 0.025 * alpha;
-      if (n.y < pad) n.vy += (pad - n.y) * 0.025 * alpha;
-      if (n.y > ch - pad) n.vy -= (n.y - (ch - pad)) * 0.025 * alpha;
-      n.vx *= DAMPING;
-      n.vy *= DAMPING;
-      const speed = Math.hypot(n.vx, n.vy);
-      if (speed > maxSpeed) {
-        n.vx = (n.vx / speed) * maxSpeed;
-        n.vy = (n.vy / speed) * maxSpeed;
-      }
-      let dx = n.vx;
-      let dy = n.vy;
-      const mag = Math.hypot(dx, dy);
-      if (mag > MAX_STEP) { dx = (dx / mag) * MAX_STEP; dy = (dy / mag) * MAX_STEP; }
-      n.x += dx;
-      n.y += dy;
-      frameEnergy += n.vx * n.vx + n.vy * n.vy;
-    }
-    alpha = alpha * ALPHA_DECAY;
-  }
-
-  function loop() {
-    raf = null;
-    const dragging = !!(dragNode || dragCluster);
-
-    // 1. Advance smooth view tween / wheel zoom (also re-anchors cursor zoom).
-    const viewBusy = stepView();
-    if (clusterMode) reconcileClusterOpenState();
-
-    // 2. Run the force sim while the temperature is warm or a drag is active.
-    let simBusy = false;
-    if (alpha > ALPHA_MIN || dragging) {
-      const iterations = clusterMode ? 2 : (nodes.length > 80 ? 1 : 2);
-      for (let i = 0; i < iterations; i++) simulate();
-      // Stop the sim once kinetic energy is below epsilon (no resting jitter).
-      if (!dragging && alpha <= ALPHA_MIN && frameEnergy < ENERGY_EPSILON) {
-        alpha = 0;
-        simBusy = false;
-      } else {
-        simBusy = alpha > ALPHA_MIN || dragging;
-      }
-    }
-
-    // 3. Ease cluster open/close transitions (expand/collapse glide).
-    const openBusy = updateClusterOpenT();
-
-    // 4. Initial framing once the layout has roughly settled.
-    if (initialFitPending && !dragging && (tickCount >= 160 || alpha <= ALPHA_MIN)) {
-      initialFitPending = false;
-      fitView();
-    }
-    draw();
-
-    // 5. Keep the rAF alive only while something is actually animating.
-    if (simBusy || viewBusy || openBusy || dragging || viewTarget || zoom) {
-      raf = requestAnimationFrame(loop);
-    }
-  }
-
-  // Wake the animation loop. Optionally inject simulation temperature; pass 0 to
-  // only drive view/open-state animations without re-warming the layout.
-  function wakeLayout(nextAlpha) {
-    if (typeof nextAlpha === 'number' && nextAlpha > 0) {
-      alpha = Math.max(alpha, nextAlpha);
-      tickCount = 0;
-    }
-    if (!raf) raf = requestAnimationFrame(loop);
-  }
-
-  function selectNode(n) {
-    selectedId = n ? n.id : null;
-    renderDetail(n);
-    draw();
-  }
-
-  on(canvas, 'mousedown', (ev) => {
-    const p = eventPoint(ev);
-    const world = screenToWorld(p.sx, p.sy);
-    const node = pickNode(p.sx, p.sy);
-    const cluster = node ? null : pickCluster(p.sx, p.sy);
-    downAt = { sx: p.sx, sy: p.sy };
-    lastPointer = { sx: p.sx, sy: p.sy };
-    moved = false;
-    if (node || cluster) { viewTarget = null; zoom = null; } // interaction cancels view tweens
-    if (node) {
-      dragNode = node;
-      dragNode.fx = world.x;
-      dragNode.fy = world.y;
-      wakeLayout(0.7);
-      canvas.style.cursor = 'grabbing';
-    } else if (cluster) {
-      dragCluster = cluster;
-      dragCluster.fx = world.x;
-      dragCluster.fy = world.y;
-      wakeLayout(0.55);
-      canvas.style.cursor = 'grabbing';
-    } else {
-      panning = true;
-      canvas.style.cursor = 'grabbing';
-    }
+  // Size desc, but always sink the catch-all/misc card to the end.
+  list.sort((a, b) => {
+    const am = a.id === catchAllId ? 1 : 0;
+    const bm = b.id === catchAllId ? 1 : 0;
+    if (am !== bm) return am - bm;
+    return Number(b.size || 0) - Number(a.size || 0);
   });
-
-  on(canvas, 'mousemove', (ev) => {
-    const p = eventPoint(ev);
-    if (downAt && Math.hypot(p.sx - downAt.sx, p.sy - downAt.sy) > 3) moved = true;
-    if (dragNode) {
-      const world = screenToWorld(p.sx, p.sy);
-      dragNode.fx = world.x;
-      dragNode.fy = world.y;
-      dragNode.x = world.x;
-      dragNode.y = world.y;
-      setTip(dragNode);
-      return;
-    }
-    if (dragCluster) {
-      const world = screenToWorld(p.sx, p.sy);
-      dragCluster.fx = world.x;
-      dragCluster.fy = world.y;
-      dragCluster.x = world.x;
-      dragCluster.y = world.y;
-      setClusterTip(dragCluster);
-      return;
-    }
-    if (panning && lastPointer) {
-      viewTarget = null; zoom = null; // manual pan overrides any in-flight tween
-      view.x += p.sx - lastPointer.sx;
-      view.y += p.sy - lastPointer.sy;
-      lastPointer = { sx: p.sx, sy: p.sy };
-      // When zoomed in (everything open), nudge the sim so freshly-revealed
-      // off-screen clusters relax their seeded ring as they scroll into view.
-      if (clusterMode && view.k >= ZOOM_OPEN_K) wakeLayout(0.12);
-      else draw();
-      return;
-    }
-    const node = pickNode(p.sx, p.sy);
-    const cluster = node ? null : pickCluster(p.sx, p.sy);
-    hoverId = node ? node.id : null;
-    hoverClusterId = cluster ? cluster.id : null;
-    if (node) setTip(node);
-    else if (cluster) setClusterTip(cluster);
-    else setTip(null);
-    canvas.style.cursor = (node || cluster) ? 'pointer' : 'grab';
-    draw();
-  });
-
-  on(canvas, 'mouseup', (ev) => {
-    const p = eventPoint(ev);
-    if (dragNode) {
-      const node = dragNode;
-      node.fx = null;
-      node.fy = null;
-      dragNode = null;
-      if (!moved) selectNode(node);
-      else wakeLayout(0.18); // let the released node ease back into the layout
-    } else if (dragCluster) {
-      const c = dragCluster;
-      c.fx = null;
-      c.fy = null;
-      dragCluster = null;
-      // Click (no drag) on a closed bubble opens the cluster and frames it.
-      if (!moved) {
-        openCluster(c);
-        focusCluster(c);
-      } else {
-        wakeLayout(0.18); // settle neighboring bubbles after a drag
-      }
-    } else if (panning && !moved) {
-      selectNode(null);
-    }
-    panning = false;
-    downAt = null;
-    lastPointer = { sx: p.sx, sy: p.sy };
-    canvas.style.cursor = 'grab';
-  });
-
-  on(canvas, 'mouseleave', () => {
-    if (dragNode) { dragNode.fx = null; dragNode.fy = null; }
-    if (dragCluster) { dragCluster.fx = null; dragCluster.fy = null; }
-    dragNode = null;
-    dragCluster = null;
-    panning = false;
-    hoverId = null;
-    hoverClusterId = null;
-    setTip(null);
-    canvas.style.cursor = 'grab';
-  });
-
-  on(canvas, 'wheel', (ev) => {
-    ev.preventDefault();
-    const p = eventPoint(ev);
-    // Ease toward a target scale instead of jumping; stepView() re-anchors the
-    // cursor each frame so the zoom stays centered under the pointer.
-    viewTarget = null; // an in-flight fit/focus tween yields to manual zoom
-    const baseK = zoom ? zoom.k : view.k;
-    const factor = ev.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
-    const targetK = Math.max(0.12, Math.min(4, baseK * factor));
-    zoom = { k: targetK, sx: p.sx, sy: p.sy };
-    wakeLayout(0); // ease the zoom without re-warming the layout
-  }, { passive: false });
-
-  on(canvas, 'dblclick', (ev) => {
-    const p = eventPoint(ev);
-    const cluster = pickNode(p.sx, p.sy) ? null : pickCluster(p.sx, p.sy);
-    if (cluster) {
-      ev.preventDefault();
-      openCluster(cluster);
-      focusCluster(cluster);
-      return;
-    }
-    if (!pickNode(p.sx, p.sy)) {
-      ev.preventDefault();
-      fitView();
-    }
-  });
-
-  if (fitBtn) on(fitBtn, 'click', fitView);
-
-  on(window, 'resize', () => {
-    resizeCanvas();
-    wakeLayout(0.5);
-  });
-
-  graphState = {
-    canvas,
-    nodes,
-    edges,
-    draw,
-    fitView,
-    clusterMode,
-    isOverview,
-    clusterCount: clusterMode ? clusters.filter(c => c.size > 1).length : 0,
-    singletonCount: clusterMode ? clusters.filter(c => c.size <= 1).length : 0,
-    // Search opens the matching member's cluster and pans to it. In overview the
-    // match comes from cluster labels (members aren't loaded yet) — open the
-    // matching bubble (lazy drill-in) and frame it.
-    focusSearch(query) {
-      const q = String(query || '').trim().toLowerCase();
-      if (!q) { draw(); return; }
-      if (isOverview) {
-        // Prefer a member match (loaded clusters), else fall back to a bubble
-        // whose label/representative matches — opening it drills in.
-        const memberMatch = nodes.find(n => graphNodeVisible(n) && graphNodeLabel(n).toLowerCase().includes(q));
-        const cluster = memberMatch ? clusterOf.get(memberMatch.id)
-          : clusters.find(c => clusterIsSearchHit(c));
-        if (!cluster) { draw(); return; }
-        openCluster(cluster);
-        const k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
-        reconcileClusterOpenState();
-        tweenViewTo({ k, x: cw / 2 - cluster.x * k, y: ch / 2 - cluster.y * k });
-        if (memberMatch) hoverId = memberMatch.id;
-        wakeLayout(0.4);
-        return;
-      }
-      const match = nodes.find(n => graphNodeVisible(n) && graphNodeLabel(n).toLowerCase().includes(q));
-      if (!match) { draw(); return; }
-      let k = view.k;
-      if (clusterMode) {
-        const c = clusterOf.get(match.id);
-        if (c) {
-          openCluster(c);
-          k = Math.max(view.k, ZOOM_OPEN_K + 0.25);
-        }
-        reconcileClusterOpenState();
-      }
-      // Animate the view to center the match instead of snapping.
-      tweenViewTo({ k, x: cw / 2 - match.x * k, y: ch / 2 - match.y * k });
-      hoverId = match.id;
-      wakeLayout(0.4);
-    },
-    applyFilters() {
-      const selected = selectedId ? nodes[idIdx.get(selectedId)] : null;
-      if (selected && !graphNodeVisible(selected)) selectNode(null);
-      draw();
-    },
-    cleanup() {
-      if (raf) cancelAnimationFrame(raf);
-      for (const [target, type, fn, opts] of listeners) target.removeEventListener(type, fn, opts);
-    },
-  };
-  renderDetail(null);
-  wakeLayout(1);
-}
-
-async function loadGraph(project) {
-  if (isGlobalScope() || isGlobalProjectValue(project)) {
-    document.getElementById('graph-meta').textContent = GLOBAL_SCOPE_MESSAGE;
-    document.getElementById('graph-empty-state').hidden = false;
-    document.getElementById('graph-empty-state').innerHTML = `<div>${GLOBAL_SCOPE_MESSAGE}</div>`;
-    updateGraphCaption(project, 0, 0);
+  if (!list.length) {
+    grid.innerHTML = '';
+    if (empty) empty.hidden = false;
     return;
   }
-  const meta = document.getElementById('graph-meta');
-  const basis = document.getElementById('graph-basis-caption');
-  syncGraphModeUi();
-  meta.textContent = '불러오는 중…';
-  if (basis) basis.textContent = '';
-  try {
-    if (graphIsSimilarityMode()) {
-      // LOD overview: the server clusters the WHOLE project and returns only a
-      // few hundred cluster summaries (never the 100k+ nodes). Members of one
-      // cluster are fetched lazily on drill-down — see fetchClusterMembers().
-      const params = new URLSearchParams({ project, mode: 'overview' });
+  if (empty) empty.hidden = true;
+  grid.innerHTML = list.map(c => {
+    const size = Number(c.size || 0);
+    const isMisc = c.id === catchAllId;
+    const dom = c.dominant_source || 'mixed';
+    if (isMisc) {
+      return `<div class="cluster-card misc" data-cluster="${escapeHtml(String(c.id))}" data-misc="1">`
+        + `<div class="cc-label">미분류 ${size.toLocaleString()}건</div>`
+        + `<div class="cc-foot"><span class="cc-dot mixed"></span><span class="badge">${size.toLocaleString()}건</span></div>`
+        + `</div>`;
+    }
+    return `<div class="cluster-card" data-cluster="${escapeHtml(String(c.id))}">`
+      + `<div class="cc-label">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
+      + `<div class="cc-foot"><span class="cc-dot ${dom}"></span><span class="badge">${size.toLocaleString()}건</span></div>`
+      + `</div>`;
+  }).join('');
+  grid.querySelectorAll('.cluster-card').forEach(el => {
+    if (el.dataset.misc) return; // misc card is de-emphasized + not clickable
+    el.onclick = () => openMemmapCluster(el.dataset.cluster);
+  });
+}
+
+// Drill into one cluster: fetch (once, cached) its members and render the list.
+async function openMemmapCluster(clusterId) {
+  const project = memmapProject || currentProject();
+  if (!project) return;
+  const titleEl = document.getElementById('memmap-cluster-title');
+  const listEl = document.getElementById('memmap-member-list');
+  // Find the label from the overview for the header.
+  let label = String(clusterId);
+  if (memmapOverview && Array.isArray(memmapOverview.clusters)) {
+    const c = memmapOverview.clusters.find(x => String(x.id) === String(clusterId));
+    if (c && c.label) label = c.label;
+  }
+  if (titleEl) titleEl.textContent = label;
+  if (listEl) listEl.innerHTML = '<div class="empty">불러오는 중…</div>';
+  memmapShowCluster();
+
+  let payload = memmapClusterCache.get(String(clusterId));
+  if (!payload) {
+    try {
+      const params = new URLSearchParams({ project, cluster: String(clusterId) });
       const r = await fetch(`/api/memory/graph?${params.toString()}`);
       if (!r.ok) {
-        const text = await r.text();
-        showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
-        meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
-        updateGraphCaption(project, 0, 0);
+        showToast(`클러스터 로드 실패 ${r.status}`, 'err');
+        if (listEl) listEl.innerHTML = `<div class="empty" style="color:var(--err);">오류 ${r.status}</div>`;
         return;
       }
       const d = await r.json();
-      d.mode = 'overview';
-      d.project = project;
-      d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
-      d.cluster_edges = Array.isArray(d.cluster_edges) ? d.cluster_edges : [];
-      const totalNodes = Number(d.total_nodes || 0);
-      // Cache the project total so the caption / meta can show "전체 N개 중 …".
-      graphMemoryTotals.set(project, totalNodes);
-      graphCaptionState = { project, nodeCount: d.clusters.length, memoryCount: totalNodes };
-      const clusterCount = d.clusters.length;
-      meta.innerHTML = `<span class="badge ok">유사도</span> <span class="badge">${clusterCount.toLocaleString()} 클러스터</span> <span class="badge">${totalNodes.toLocaleString()} 메모리</span> <span class="badge">${d.cluster_edges.length} 연결</span>`;
-      if (basis) basis.textContent = '';
-      initGraph(d);
-      const caption = document.getElementById('graph-sample-caption');
-      if (caption) {
-        caption.textContent = `전체 ${totalNodes.toLocaleString()}개 중 ${clusterCount.toLocaleString()}개 클러스터 — 클러스터를 클릭/확대하면 펼쳐집니다`;
-      }
+      payload = {
+        nodes: Array.isArray(d.nodes) ? d.nodes : [],
+        edges: Array.isArray(d.edges) ? d.edges : [],
+      };
+      memmapClusterCache.set(String(clusterId), payload);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+      if (listEl) listEl.innerHTML = `<div class="empty" style="color:var(--err);">네트워크 오류</div>`;
       return;
     }
-    // Entity mode keeps the legacy full-node bipartite path.
-    const params = new URLSearchParams({ project, mode: 'entity' });
-    params.set('limit', graphLimit === 'all' ? '100000' : graphLimit);
+  }
+  renderMemmapMembers(payload);
+}
+
+function renderMemmapMembers(payload) {
+  const listEl = document.getElementById('memmap-member-list');
+  if (!listEl) return;
+  const nodes = (payload.nodes || []).filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (!nodes.length) {
+    listEl.innerHTML = '<div class="empty">이 클러스터에 메모리가 없습니다.</div>';
+    return;
+  }
+  listEl.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    // node id looks like "m123" — keep raw for detail lookup.
+    return `<div class="member-row" data-id="${escapeHtml(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  listEl.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      // node id is "m<numeric>" — strip the prefix to reuse the detail modal.
+      const raw = String(el.dataset.id || '');
+      const num = raw.replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Load the overview cards for a project. Always lands on the card grid.
+async function loadGraph(project) {
+  memmapShowOverview();
+  const grid = document.getElementById('memmap-grid');
+  const empty = document.getElementById('memmap-empty');
+  const head = document.getElementById('memmap-overview-head');
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    if (head) head.textContent = GLOBAL_SCOPE_MESSAGE;
+    if (grid) grid.innerHTML = '';
+    if (empty) empty.hidden = true;
+    memmapOverview = null;
+    return;
+  }
+  if (head) head.textContent = '불러오는 중…';
+  if (grid) grid.innerHTML = '';
+  if (empty) empty.hidden = true;
+  try {
+    const params = new URLSearchParams({ project, mode: 'overview' });
     const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();
       showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
-      meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
-      updateGraphCaption(project, 0, 0);
+      if (head) head.textContent = `오류 ${r.status}`;
+      memmapOverview = null;
       return;
     }
     const d = await r.json();
-    d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
-    d.edges = Array.isArray(d.edges) ? d.edges : [];
-    d.mode = 'entity';
-    const entityCount = d.nodes.filter(n => n.node_type === 'entity').length;
-    const memoryCount = d.nodes.filter(n => n.node_type === 'memory').length;
-    updateGraphCaption(project, d.nodes.length, memoryCount);
-    meta.innerHTML = `<span class="badge ok">${entityCount} 엔티티</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
-    if (basis) basis.textContent = '';
-    initGraph(d);
+    d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
+    d.total_nodes = Number(d.total_nodes || 0);
+    memmapOverview = d;
+    memmapProject = project;
+    memmapClusterCache.clear();
+    renderMemmapGrid();
   } catch (e) {
-    meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
-    updateGraphCaption(project, 0, 0);
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = '네트워크 오류';
+    memmapOverview = null;
   }
 }
 
-(function wireGraphFilters() {
-  const memBtn = document.getElementById('graph-toggle-memory');
-  const entityBtn = document.getElementById('graph-toggle-entity');
-  const search = document.getElementById('graph-search');
-  const limit = document.getElementById('graph-limit');
-  const modeBtns = document.querySelectorAll('#graph-mode-toggle [data-graph-mode]');
-  function sync() {
-    syncGraphModeUi();
-    if (memBtn) {
-      memBtn.classList.toggle('active', graphFilters.showMemory);
-      memBtn.setAttribute('aria-pressed', String(graphFilters.showMemory));
-    }
-    if (entityBtn) {
-      entityBtn.classList.toggle('active', graphFilters.showEntity);
-      entityBtn.setAttribute('aria-pressed', String(graphFilters.showEntity));
-    }
-    document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.graphSource === graphFilters.source);
-    });
-    if (graphState && graphState.applyFilters) graphState.applyFilters();
-  }
-  if (memBtn) memBtn.onclick = () => { graphFilters.showMemory = !graphFilters.showMemory; sync(); };
-  if (entityBtn) entityBtn.onclick = () => { graphFilters.showEntity = !graphFilters.showEntity; sync(); };
-  modeBtns.forEach(btn => {
-    btn.onclick = async () => {
-      const nextMode = btn.dataset.graphMode === 'entity' ? 'entity' : 'similarity';
-      if (graphMode === nextMode) return;
-      graphMode = nextMode;
-      localStorage.setItem(GRAPH_MODE_KEY, graphMode);
-      sync();
-      const project = currentProject();
-      if (project && !isGlobalScope()) await loadGraph(project);
-    };
-  });
-  document.querySelectorAll('#graph-source-filter .sort-btn').forEach(btn => {
+// Wire up the overview controls: search box, source filter, back button, refresh.
+(function wireMemmap() {
+  const search = document.getElementById('memmap-search');
+  if (search) search.oninput = () => { memmapSearch = search.value || ''; renderMemmapGrid(); };
+  document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {
-      graphFilters.source = btn.dataset.graphSource || 'all';
-      sync();
+      memmapSource = btn.dataset.memmapSource || 'all';
+      document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.memmapSource === memmapSource);
+      });
+      renderMemmapGrid();
     };
   });
-  if (search) search.oninput = () => {
-    graphFilters.search = search.value || '';
-    if (graphState && graphState.focusSearch) graphState.focusSearch(graphFilters.search);
-    else if (graphState && graphState.draw) graphState.draw();
-  };
-  if (limit) limit.onchange = async () => {
-    graphLimit = limit.value || GRAPH_DEFAULT_LIMIT;
-    const project = currentProject();
-    if (project && !isGlobalScope()) await loadGraph(project);
-  };
-  sync();
+  const back = document.getElementById('memmap-back');
+  if (back) back.onclick = () => { memmapShowOverview(); renderMemmapGrid(); };
 })();
 
 document.getElementById('graph-form').onsubmit = async (ev) => {
@@ -4470,49 +2786,6 @@ document.getElementById('graph-form').onsubmit = async (ev) => {
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   await loadGraph(project);
 };
-
-// Entity extraction button — POST /api/memory/entities {project}.
-// Hidden on 404 (feature not compiled in).
-(function wireEntityExtract() {
-  const btn = document.getElementById('entity-extract-btn');
-  if (!btn) return;
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '추출 중…';
-    try {
-      const r = await fetch('/api/memory/entities', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
-      });
-      if (r.status === 404) {
-        // Entity extraction not built into this binary; hide the button.
-        graphEntityExtractUnavailable = true;
-        syncGraphModeUi();
-        return;
-      }
-      if (!r.ok) {
-        const text = await r.text();
-        showToast(`엔티티 추출 오류 ${r.status}: ${text}`, 'err');
-        return;
-      }
-      const d = await r.json();
-      showToast(`엔티티 추출 완료 · ${d.edges}개 관계 추가됨`, 'ok');
-      pushActivity(`entity extract · ${project} · ${d.edges}개 관계`);
-      // Refresh the graph to show newly extracted entities.
-      await loadGraph(project);
-    } catch (e) {
-      showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
-  };
-})();
 
 // Show/hide LLM model dropdown when engine switches.
 document.getElementById('compress-mode').addEventListener('change', function () {

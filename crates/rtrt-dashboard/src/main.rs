@@ -342,12 +342,19 @@ async fn main() -> Result<()> {
 /// `RTRT_CONSOLIDATE_KEEP` (default 1000) using the LLM-free archive path.
 /// Disabled when `RTRT_CONSOLIDATE_INTERVAL_SEC=0`.
 fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
+    // OFF by default: this daemon DELETES the oldest rows beyond `keep` (no LLM
+    // summary), which conflicts with rtrt's permanent-memory promise. Opt in
+    // explicitly with RTRT_CONSOLIDATE_INTERVAL_SEC > 0 if you want a hard cap.
+    // Token growth is handled by the auto-compress daemon, which shrinks bodies
+    // while keeping every row (and the original in body_full).
     let interval_sec: u64 = std::env::var("RTRT_CONSOLIDATE_INTERVAL_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
+        .unwrap_or(0);
     if interval_sec == 0 {
-        tracing::info!("consolidation daemon off (RTRT_CONSOLIDATE_INTERVAL_SEC=0)");
+        tracing::info!(
+            "consolidation daemon off (permanent memory; set RTRT_CONSOLIDATE_INTERVAL_SEC>0 to cap)"
+        );
         return;
     }
     let keep: usize = std::env::var("RTRT_CONSOLIDATE_KEEP")

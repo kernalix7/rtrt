@@ -666,7 +666,18 @@
                 <button class="sort-btn" type="button" data-graph-source="subagent">서브</button>
               </div>
               <input id="graph-search" class="graph-search" type="search" placeholder="엔티티 또는 메모리 검색">
+              <label class="ctrl-field" style="min-width:96px;">
+                <span>표시 수</span>
+                <select id="graph-limit">
+                  <option value="80" selected>80</option>
+                  <option value="200">200</option>
+                  <option value="500">500</option>
+                  <option value="all">전체</option>
+                </select>
+              </label>
+              <button id="graph-fit" class="ghost" type="button">전체 보기</button>
             </div>
+            <div id="graph-sample-caption" class="out-meta">표시 0개 · 최신순</div>
             <div class="graph-shell">
               <div class="graph-canvas-wrap">
                 <canvas id="graph-canvas" width="800" height="420"></canvas>
@@ -2353,6 +2364,8 @@ async function loadMemStats(project) {
 
   // KPI tiles: total, compressed count, saved chars, compression ratio
   const ratio = d.total ? ((d.compressed_count || 0) / d.total * 100).toFixed(1) : '0';
+  graphMemoryTotals.set(project, Number(d.total || 0));
+  updateGraphCaption();
   const savedK = (d.saved_chars || 0) >= 1000 ? `${((d.saved_chars || 0) / 1000).toFixed(1)}K` : String(d.saved_chars || 0);
   // saved_pct from server is the authoritative compression savings rate.
   const savedPctTile = d.saved_pct != null
@@ -2436,6 +2449,8 @@ async function loadGovStats(project) {
     const r = await fetch(`/api/memory/stats?project=${encodeURIComponent(project)}`);
     if (!r.ok) return;
     const d = await r.json();
+    graphMemoryTotals.set(project, Number(d.total || 0));
+    updateGraphCaption();
     document.getElementById('gov-total').textContent = (d.total || 0).toLocaleString();
     const comp = d.compressed_count || 0;
     const uncomp = (d.total || 0) - comp;
@@ -2567,15 +2582,35 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
 };
 
 // Memory graph — similarity and entity canvas layout.
-const GRAPH_LIMIT = 300;
+const GRAPH_DEFAULT_LIMIT = '80';
 const GRAPH_MODE_KEY = 'rtrt.graph.mode';
 let graphState = null;
 let graphMode = localStorage.getItem(GRAPH_MODE_KEY) === 'entity' ? 'entity' : 'similarity';
 let graphEntityExtractUnavailable = false;
+let graphLimit = GRAPH_DEFAULT_LIMIT;
 let graphFilters = { showMemory: true, showEntity: true, source: 'all', search: '' };
+const graphMemoryTotals = new Map();
+let graphCaptionState = { project: '', nodeCount: 0, memoryCount: 0 };
 
 function graphIsSimilarityMode() {
   return graphMode === 'similarity';
+}
+
+function updateGraphCaption(project = graphCaptionState.project, nodeCount = graphCaptionState.nodeCount, memoryCount = graphCaptionState.memoryCount) {
+  const caption = document.getElementById('graph-sample-caption');
+  if (!caption) return;
+  graphCaptionState = { project: project || '', nodeCount: Number(nodeCount || 0), memoryCount: Number(memoryCount || 0) };
+  const total = graphMemoryTotals.get(graphCaptionState.project);
+  if (Number.isFinite(total)) {
+    const shown = graphCaptionState.memoryCount || graphCaptionState.nodeCount;
+    caption.textContent = `전체 ${total.toLocaleString()}개 중 ${shown.toLocaleString()}개 표시`;
+    return;
+  }
+  caption.textContent = `표시 ${graphCaptionState.nodeCount.toLocaleString()}개 · 최신순`;
+}
+
+function fitView() {
+  if (graphState && graphState.fitView) graphState.fitView();
 }
 
 function graphBasisLabel(basis) {
@@ -2660,6 +2695,7 @@ function initGraph(data) {
   const detail = document.getElementById('graph-detail-panel');
   const tip = document.getElementById('graph-tip');
   const emptyState = document.getElementById('graph-empty-state');
+  const fitBtn = document.getElementById('graph-fit');
   const styles = getComputedStyle(document.documentElement);
   const accent = styles.getPropertyValue('--accent').trim() || '#2962FF';
   const muted = styles.getPropertyValue('--muted').trim() || '#666';
@@ -2731,6 +2767,7 @@ function initGraph(data) {
   let selectedId = null;
   let dragNode = null;
   let panning = false;
+  let initialFitPending = true;
   let downAt = null;
   let lastPointer = null;
   let moved = false;
@@ -2766,6 +2803,32 @@ function initGraph(data) {
       if (Math.hypot(p.x - n.x, p.y - n.y) <= r) return n;
     }
     return null;
+  }
+
+  function fitView() {
+    const visible = nodes.filter(graphNodeVisible);
+    if (!visible.length) {
+      draw();
+      return;
+    }
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const n of visible) {
+      minX = Math.min(minX, n.x);
+      maxX = Math.max(maxX, n.x);
+      minY = Math.min(minY, n.y);
+      maxY = Math.max(maxY, n.y);
+    }
+    const margin = 36;
+    const bbW = Math.max(1, maxX - minX);
+    const bbH = Math.max(1, maxY - minY);
+    const k = Math.max(0.02, Math.min(4, Math.min(cw / (bbW + margin * 2), ch / (bbH + margin * 2))));
+    view.k = k;
+    view.x = (cw - bbW * k) / 2 - minX * k;
+    view.y = (ch - bbH * k) / 2 - minY * k;
+    draw();
   }
 
   function sourceLabel(source) {
@@ -3011,7 +3074,12 @@ function initGraph(data) {
       const iterations = nodes.length > 80 ? 1 : 2;
       for (let i = 0; i < iterations; i++) simulate();
     }
-    draw();
+    if (initialFitPending && !dragNode && (tickCount >= 220 || alpha <= 0.035)) {
+      initialFitPending = false;
+      fitView();
+    } else {
+      draw();
+    }
     if (alpha > 0.03 || dragNode) raf = requestAnimationFrame(loop);
   }
 
@@ -3109,6 +3177,16 @@ function initGraph(data) {
     draw();
   }, { passive: false });
 
+  on(canvas, 'dblclick', (ev) => {
+    const p = eventPoint(ev);
+    if (!pickNode(p.sx, p.sy)) {
+      ev.preventDefault();
+      fitView();
+    }
+  });
+
+  if (fitBtn) on(fitBtn, 'click', fitView);
+
   on(window, 'resize', () => {
     resizeCanvas();
     wakeLayout(0.5);
@@ -3119,6 +3197,7 @@ function initGraph(data) {
     nodes,
     edges,
     draw,
+    fitView,
     applyFilters() {
       const selected = selectedId ? nodes[idIdx.get(selectedId)] : null;
       if (selected && !graphNodeVisible(selected)) selectNode(null);
@@ -3138,6 +3217,7 @@ async function loadGraph(project) {
     document.getElementById('graph-meta').textContent = GLOBAL_SCOPE_MESSAGE;
     document.getElementById('graph-empty-state').hidden = false;
     document.getElementById('graph-empty-state').innerHTML = `<div>${GLOBAL_SCOPE_MESSAGE}</div>`;
+    updateGraphCaption(project, 0, 0);
     return;
   }
   const meta = document.getElementById('graph-meta');
@@ -3146,12 +3226,17 @@ async function loadGraph(project) {
   meta.textContent = '불러오는 중…';
   if (basis) basis.textContent = '';
   try {
-    const modeParam = graphIsSimilarityMode() ? 'mode=similarity' : 'mode=entity';
-    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}&${modeParam}&limit=${GRAPH_LIMIT}`);
+    const params = new URLSearchParams({
+      project,
+      mode: graphIsSimilarityMode() ? 'similarity' : 'entity',
+    });
+    if (graphLimit !== 'all') params.set('limit', graphLimit);
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();
       showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
       meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+      updateGraphCaption(project, 0, 0);
       return;
     }
     const d = await r.json();
@@ -3160,6 +3245,7 @@ async function loadGraph(project) {
     d.mode = d.mode === 'entity' ? 'entity' : 'similarity';
     const entityCount = d.nodes.filter(n => n.node_type === 'entity').length;
     const memoryCount = d.nodes.filter(n => n.node_type === 'memory').length;
+    updateGraphCaption(project, d.nodes.length, memoryCount);
     if (d.mode === 'similarity') {
       meta.innerHTML = `<span class="badge ok">유사도</span> <span class="badge">${memoryCount} 메모리</span> <span class="badge">${d.edges.length} 연결</span>`;
       if (basis) basis.textContent = `유사도 기준: ${graphBasisLabel(d.basis)}`;
@@ -3170,6 +3256,7 @@ async function loadGraph(project) {
     initGraph(d);
   } catch (e) {
     meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
+    updateGraphCaption(project, 0, 0);
   }
 }
 
@@ -3177,6 +3264,7 @@ async function loadGraph(project) {
   const memBtn = document.getElementById('graph-toggle-memory');
   const entityBtn = document.getElementById('graph-toggle-entity');
   const search = document.getElementById('graph-search');
+  const limit = document.getElementById('graph-limit');
   const modeBtns = document.querySelectorAll('#graph-mode-toggle [data-graph-mode]');
   function sync() {
     syncGraphModeUi();
@@ -3215,6 +3303,11 @@ async function loadGraph(project) {
   if (search) search.oninput = () => {
     graphFilters.search = search.value || '';
     if (graphState && graphState.draw) graphState.draw();
+  };
+  if (limit) limit.onchange = async () => {
+    graphLimit = limit.value || GRAPH_DEFAULT_LIMIT;
+    const project = currentProject();
+    if (project && !isGlobalScope()) await loadGraph(project);
   };
   sync();
 })();

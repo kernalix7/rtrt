@@ -29,11 +29,12 @@ use walkdir::WalkDir;
 /// JSONL files, not walking the whole tree (mtime check filters out idle ones).
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// One-shot migration: fold stray subagent / worktree project buckets back
-/// under their parent project, by reading each mis-bucketed row's
-/// `transcript_file` and resolving the parent session's cwd. Idempotent —
-/// re-attributed rows no longer match the candidate pattern, so the set shrinks
-/// to zero across runs. Spawned at boot; logs how many rows it moved.
+/// Boot migration: re-home every transcript row onto the project of its
+/// `<encoded>` dir (Claude Code's per-project session dir), folding rows that a
+/// per-line worktree cwd had scattered into bogus buckets (feat-*, wf_*,
+/// agent-*, p<n>-*) back under their real project. No name patterns — purely
+/// the file's encoded dir. Idempotent: a settled row is skipped, so the work
+/// shrinks to zero across runs.
 pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
     let Some(memory) = memory else { return };
     tokio::spawn(async move {
@@ -50,31 +51,40 @@ pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
         if candidates.is_empty() {
             return;
         }
-        // Resolve parent project per subagent transcript file once (cache by file).
-        let mut cache: HashMap<String, Option<String>> = HashMap::new();
-        let mut subagent = 0usize;
-        let mut main = 0usize;
-        for (id, tf) in candidates {
+        // A row's project is decided purely by the `<encoded>` dir of its
+        // transcript file (Claude Code's per-project session dir) — no name
+        // patterns. So worktree-scattered main rows (feat-*, p<n>-*) and
+        // subagent / workflow rows (agent-*, wf_*) all fold to the real project.
+        let Some(base) = transcripts_base_dir() else {
+            return;
+        };
+        let mut cache: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut moved = 0usize;
+        let mut tagged = 0usize;
+        for (id, tf, project, source_kind) in candidates {
             let is_subagent = tf.contains("/subagents/");
-            if is_subagent {
-                let parent = cache
-                    .entry(tf.clone())
-                    .or_insert_with(|| subagent_parent_project(Path::new(&tf)))
-                    .clone();
-                let guard = memory.lock().await;
-                // Move to the parent project (when resolved) and tag subagent.
-                if guard.reattribute(id, "subagent", parent.as_deref()).is_ok() {
-                    subagent += 1;
-                }
-            } else {
-                // Main-agent capture — already in the right project; just tag.
-                let guard = memory.lock().await;
-                if guard.reattribute(id, "main", None).is_ok() {
-                    main += 1;
+            let kind = if is_subagent { "subagent" } else { "main" };
+            let resolved = project_for_transcript(Path::new(&tf), &base, &mut cache);
+            let move_to = match &resolved {
+                Some(p) if *p != project => Some(p.as_str()),
+                _ => None,
+            };
+            // Skip the row entirely when it's already in the right project and
+            // already classified — no wasted UPDATE on a settled store.
+            if move_to.is_none() && source_kind.as_deref() == Some(kind) {
+                continue;
+            }
+            let guard = memory.lock().await;
+            if guard.reattribute(id, kind, move_to).is_ok() {
+                tagged += 1;
+                if move_to.is_some() {
+                    moved += 1;
                 }
             }
         }
-        tracing::info!("reattribution: tagged {subagent} subagent + {main} main transcript rows");
+        tracing::info!(
+            "reattribution: {tagged} transcript rows tagged, {moved} moved to real project"
+        );
     });
 }
 
@@ -104,10 +114,11 @@ pub fn spawn_transcript_watcher(memory: Option<Arc<Mutex<MemoryStore>>>) {
     tracing::info!("transcript watcher on: {}", base.display());
     tokio::spawn(async move {
         let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
+        let mut proj_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut tick = tokio::time::interval(DEFAULT_INTERVAL);
         loop {
             tick.tick().await;
-            if let Err(e) = sweep(&base, &memory, &mut offsets).await {
+            if let Err(e) = sweep(&base, &memory, &mut offsets, &mut proj_cache).await {
                 tracing::warn!("transcript sweep failed: {e}");
             }
         }
@@ -125,6 +136,7 @@ async fn sweep(
     base: &Path,
     memory: &Arc<Mutex<MemoryStore>>,
     offsets: &mut HashMap<PathBuf, u64>,
+    proj_cache: &mut HashMap<PathBuf, Option<String>>,
 ) -> anyhow::Result<()> {
     let files: Vec<PathBuf> = WalkDir::new(base)
         .into_iter()
@@ -149,10 +161,9 @@ async fn sweep(
             Ok(b) => b,
             Err(_) => continue,
         };
-        // For a subagent transcript, resolve the parent session's project once
-        // per file — that's the real project, stable even when the subagent ran
-        // in a git worktree (whose cwd basename is a branch name, not the repo).
-        let parent_project = subagent_parent_project(&path);
+        // Resolve the project from the file's `<encoded>` dir (the real project,
+        // worktree-stable), computed once per file and cached per encoded dir.
+        let resolved_project = project_for_transcript(&path, base, proj_cache);
         // Track the offset of the *last full* line so we resume cleanly even
         // when the writer is mid-write at the EOF (partial trailing line).
         let mut consumed = start;
@@ -166,7 +177,7 @@ async fn sweep(
                 Ok(s) if !s.trim().is_empty() => s,
                 _ => continue,
             };
-            if let Some(turn) = parse_assistant_turn(s, &path, parent_project.as_deref()) {
+            if let Some(turn) = parse_assistant_turn(s, &path, resolved_project.as_deref()) {
                 if let Err(e) = save_turn(memory, &turn).await {
                     tracing::warn!("transcript save {}: {e}", path.display());
                 }
@@ -196,28 +207,49 @@ struct AssistantTurn {
     is_subagent: bool,
 }
 
-/// For a `<encoded>/<session>/subagents/agent-*.jsonl` file, read the parent
-/// session transcript's cwd and return its basename — the real project. Stable
-/// even when the subagent ran in a git worktree, whose own cwd basename is a
-/// branch name (e.g. `p0-fixes`) rather than the project. Returns `None` for
-/// non-subagent files (the caller falls back to the line's own cwd).
-fn subagent_parent_project(file: &Path) -> Option<String> {
-    let is_subagent = file
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"));
-    if !is_subagent {
-        return None;
+/// The project a transcript file belongs to. Claude Code stores every session
+/// of one project under a single `~/.claude/projects/<encoded>/` directory
+/// (keyed by the session's starting cwd). We derive the project from that
+/// `<encoded>` dir's representative cwd basename — NOT the per-line cwd, which
+/// can switch to a git-worktree path (a branch name like `feat-discovery-core`)
+/// mid-session and scatter rows into bogus buckets. Subagent / workflow
+/// transcripts live under the same `<encoded>` dir, so they resolve to the same
+/// real project automatically. Result is cached per `<encoded>` dir.
+fn project_for_transcript(
+    file: &Path,
+    base: &Path,
+    cache: &mut HashMap<PathBuf, Option<String>>,
+) -> Option<String> {
+    let rel = file.strip_prefix(base).ok()?;
+    let encoded = rel.components().next()?.as_os_str();
+    let encoded_dir = base.join(encoded);
+    cache
+        .entry(encoded_dir.clone())
+        .or_insert_with(|| representative_project(&encoded_dir))
+        .clone()
+}
+
+/// Representative project name for an `<encoded>` dir: the basename of the cwd
+/// found in its first top-level session transcript (deterministic by sorted
+/// filename). Top-level only — we skip the `subagents/` subtree, whose cwds may
+/// be worktrees.
+fn representative_project(encoded_dir: &Path) -> Option<String> {
+    let rd = std::fs::read_dir(encoded_dir).ok()?;
+    let mut sessions: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    sessions.sort();
+    for s in &sessions {
+        if let Some(cwd) = first_cwd_in(s) {
+            return Path::new(&cwd)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from);
+        }
     }
-    // file = <encoded>/<session>/subagents/agent-*.jsonl
-    let session_dir = file.parent()?.parent()?; // <encoded>/<session>
-    let encoded = session_dir.parent()?; // <encoded>
-    let session_id = session_dir.file_name()?.to_str()?;
-    let session_jsonl = encoded.join(format!("{session_id}.jsonl"));
-    let cwd = first_cwd_in(&session_jsonl)?;
-    Path::new(&cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(String::from)
+    None
 }
 
 /// Read the first `cwd` field from a transcript file (scanning the first lines).
@@ -236,11 +268,12 @@ fn first_cwd_in(jsonl: &Path) -> Option<String> {
 
 /// Returns `Some` only for lines that look like an `assistant` turn carrying
 /// non-empty visible text. Skips thinking-only, tool-use-only, or partial lines.
-/// `parent_project` overrides the line's own cwd for subagent transcripts.
+/// `resolved_project` (the file's `<encoded>` dir project) is authoritative and
+/// overrides the line's own cwd for BOTH main and subagent rows.
 fn parse_assistant_turn(
     line: &str,
     file: &Path,
-    parent_project: Option<&str>,
+    resolved_project: Option<&str>,
 ) -> Option<AssistantTurn> {
     let v: Value = serde_json::from_str(line).ok()?;
     // Top-level `type` is "assistant" on every Claude transcript line that
@@ -278,21 +311,16 @@ fn parse_assistant_turn(
         .components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"));
 
-    // Project: for subagents, the parent session's project (worktree-stable);
-    // otherwise the line's own `cwd` basename. Require one — the old directory
-    // fallback bucketed cwd-less / worktree lines under junk names like an
-    // `agent-<id>` segment or a branch name, so skip when neither resolves.
+    // Project: the file's `<encoded>` dir project is authoritative (one project
+    // per dir, worktree-stable) for both main and subagent rows. Fall back to
+    // the line's own cwd basename only if the dir couldn't be resolved.
     let line_project = v
         .get("cwd")
         .and_then(|c| c.as_str())
         .and_then(|p| Path::new(p).file_name())
         .and_then(|n| n.to_str())
         .map(String::from);
-    let project = if is_subagent {
-        parent_project.map(String::from).or(line_project)?
-    } else {
-        line_project?
-    };
+    let project = resolved_project.map(String::from).or(line_project)?;
 
     let session_id = v
         .get("sessionId")

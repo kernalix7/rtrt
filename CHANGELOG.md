@@ -9,6 +9,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — interactive memory graph (no-LLM similarity by default)
+
+**The memory graph goes from scattered dots to an explorable map. The default mode needs no entity extraction and no generative LLM.**
+
+- **Similarity mode (default)**: `graph_similarity` links each memory to its most-similar peers with weighted edges — cosine over already-stored embeddings (no inference call) or, when none exist, BM25 lexical overlap via FTS5 (fully model-free). `GET /api/memory/graph` returns `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. The UI defaults to this — the graph populates immediately, no 추출 step.
+- **Entity mode (opt-in, `mode=entity`)**: the bipartite memory↔entity graph (entities as first-class nodes), built by the LLM entity-extraction pass for users who want concept-level structure.
+- UI: a 유사도/엔티티 mode toggle; similarity edges scaled by weight with a basis caption; the 엔티티 추출 button lives only in entity mode.
+
+- `rtrt-memory` schema v7 adds `entities(project, name)` + `memory_entities(memory_id, entity_id)` so extracted entities are first-class nodes (the old memory-to-memory `edges` path is kept, additive). New `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, and `graph_bipartite` (returns memory nodes, entity nodes with degree, and memory→entity links, with each memory's `source_kind`).
+- `GET /api/memory/graph` emits a bipartite `{nodes, edges}` (memory nodes `m<id>` with kind + source_kind, entity nodes `e<id>` with degree); `POST /api/memory/entities` now builds the bipartite graph.
+- UI: entities render as large green nodes (radius by degree), memories as small nodes (blue main / purple subagent); force-directed layout with node drag/pin, wheel zoom, and pan; clicking a node opens a detail panel and highlights its neighbors; 메모리/엔티티 + 메인/서브 filters and a search box; an empty graph shows a call-to-action to run 엔티티 추출.
+
 ### Highlights — capture teammate/subagent work, grouped under the parent project
 
 **The dashboard tails Claude Code's transcripts to capture teammate (FleetView) and subagent (Task-tool) work that never reaches the main agent's transcript, folds it under the real project, and classifies every row as main vs subagent.**

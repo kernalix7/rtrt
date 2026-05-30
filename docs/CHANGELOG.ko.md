@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### Highlights — 인터랙티브 메모리 그래프 (기본: 무-LLM 유사도)
+
+**메모리 그래프가 흩뿌린 점에서 탐색 맵으로. 기본 모드는 엔티티 추출도 생성 LLM도 불필요.**
+
+- **유사도 모드(기본)**: `graph_similarity`가 각 메모리를 가장 유사한 이웃과 가중 엣지로 연결 — 이미 저장된 임베딩 코사인(추론 호출 0) 또는 임베딩 없으면 FTS5 BM25 어휘 유사도(완전 무모델). `GET /api/memory/graph` → `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. UI 기본값 — 추출 단계 없이 그래프 즉시 표시.
+- **엔티티 모드(옵션, `mode=entity`)**: 이분 메모리↔엔티티 그래프(엔티티 1급 노드), 개념 수준 구조 원하는 사용자용 LLM 엔티티 추출.
+- UI: 유사도/엔티티 모드 토글; 유사도 엣지는 weight 비례, basis 캡션; 엔티티 추출 버튼은 엔티티 모드에만.
+
+- `rtrt-memory` 스키마 v7에 `entities(project, name)` + `memory_entities(memory_id, entity_id)` 추가 — 추출된 엔티티가 1급 노드(기존 메모리↔메모리 `edges` 경로는 유지, 가산적). 새 `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, `graph_bipartite`(메모리 노드 + degree 있는 엔티티 노드 + memory→entity 링크 반환, 각 메모리의 `source_kind` 포함).
+- `GET /api/memory/graph`가 이분 `{nodes, edges}` 반환(메모리 노드 `m<id>` + kind·source_kind, 엔티티 노드 `e<id>` + degree); `POST /api/memory/entities`가 이제 이분 그래프 구축.
+- UI: 엔티티는 큰 녹색 노드(degree 비례 반경), 메모리는 작은 노드(메인 파랑/서브 보라); force-directed 레이아웃에 노드 드래그/고정·휠 줌·팬; 노드 클릭 시 상세 패널 + 이웃 하이라이트; 메모리/엔티티 + 메인/서브 필터 + 검색; 빈 그래프는 엔티티 추출 CTA 표시.
+
 ### Highlights — 팀원/서브에이전트 작업 캡처 + 부모 프로젝트로 그룹핑
 
 **대시보드가 Claude Code transcript를 tail해서 메인 에이전트 transcript에 안 들어오는 팀원(FleetView)·서브에이전트(Task 도구) 작업을 캡처하고, 실제 프로젝트 하위로 묶고, 모든 행을 메인/서브로 분류.**

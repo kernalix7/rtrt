@@ -21,7 +21,32 @@ pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+}
+
+/// Global security defaults applied before any per-project binding. A project
+/// without its own `security_profile` (and any ad-hoc scan) falls back to
+/// `default_profile`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Profile name used when a project has no bound profile. Defaults to
+    /// `ai-default`.
+    #[serde(default = "default_security_profile")]
+    pub default_profile: String,
+}
+
+fn default_security_profile() -> String {
+    "ai-default".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            default_profile: default_security_profile(),
+        }
+    }
 }
 
 /// A registered project. Either a real repo on disk (`path` set) or a

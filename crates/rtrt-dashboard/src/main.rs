@@ -13,6 +13,9 @@
 //! - `/api/prompts/{name}` — list versions for a single prompt.
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
+//! - `/api/memory/graph`  — `GET` memory graph: `mode=similarity`/`entity` for
+//!   small graphs, `mode=overview` for LOD cluster bubbles, and `cluster=<root>`
+//!   to drill into one cluster's members (cached `ClusterIndex`, 60s TTL).
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
 //! - `/api/memory/stats`  — `GET` aggregate stats for a project (total, by_kind, compressed).
 //! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
@@ -40,7 +43,7 @@ use axum::{
     response::Html,
     routing::{delete, get, post},
 };
-use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
+use rtrt_memory::{ClusterIndex, DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
 };
@@ -65,7 +68,15 @@ struct AppState {
     /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
     /// paths working without an Ollama instance.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Per-project LOD cluster index cache (`project -> (built_at, index)`),
+    /// TTL [`CLUSTER_INDEX_TTL`]. The `overview` mode builds + caches; `cluster`
+    /// drill-down reads the cache (rebuilding if missing/expired).
+    cluster_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
 }
+
+/// Time-to-live for a cached [`ClusterIndex`] before it is rebuilt.
+const CLUSTER_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
@@ -260,6 +271,7 @@ async fn main() -> Result<()> {
         dedup_window_sec,
         events: events_tx,
         embedder,
+        cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
@@ -342,12 +354,19 @@ async fn main() -> Result<()> {
 /// `RTRT_CONSOLIDATE_KEEP` (default 1000) using the LLM-free archive path.
 /// Disabled when `RTRT_CONSOLIDATE_INTERVAL_SEC=0`.
 fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
+    // OFF by default: this daemon DELETES the oldest rows beyond `keep` (no LLM
+    // summary), which conflicts with rtrt's permanent-memory promise. Opt in
+    // explicitly with RTRT_CONSOLIDATE_INTERVAL_SEC > 0 if you want a hard cap.
+    // Token growth is handled by the auto-compress daemon, which shrinks bodies
+    // while keeping every row (and the original in body_full).
     let interval_sec: u64 = std::env::var("RTRT_CONSOLIDATE_INTERVAL_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
+        .unwrap_or(0);
     if interval_sec == 0 {
-        tracing::info!("consolidation daemon off (RTRT_CONSOLIDATE_INTERVAL_SEC=0)");
+        tracing::info!(
+            "consolidation daemon off (permanent memory; set RTRT_CONSOLIDATE_INTERVAL_SEC>0 to cap)"
+        );
         return;
     }
     let keep: usize = std::env::var("RTRT_CONSOLIDATE_KEEP")
@@ -639,28 +658,6 @@ struct ProjectView {
 
 /// `GET /api/projects` — union of registered config entries (path /
 /// security_profile) and memory buckets (mem_count), merged by name.
-/// True when a bucket name looks like a stray subagent / git-worktree artifact
-/// rather than a real project: `agent-<hex>`, `p<n>-<branch>` (worktree branch),
-/// or a long `<hex>-<hex>` session hash. Used to keep the project selector clean.
-fn is_stray_bucket(name: &str) -> bool {
-    let b = name.as_bytes();
-    // agent-a...
-    if let Some(rest) = name.strip_prefix("agent-") {
-        if rest.starts_with('a') {
-            return true;
-        }
-    }
-    // p<digit>...-...  (worktree branch dirs like p18-gap)
-    if b.first() == Some(&b'p')
-        && b.get(1).is_some_and(|c| c.is_ascii_digit())
-        && name.contains('-')
-    {
-        return true;
-    }
-    // long hex-...-hex session hash
-    name.len() >= 24 && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 async fn list_projects(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
@@ -691,13 +688,10 @@ async fn list_projects(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         drop(guard);
         for (name, count, _last) in projects {
-            // A registered project always shows; an unregistered memory bucket
-            // that looks like a stray subagent / worktree name is hidden from
-            // the selector (its rows are folded under the parent via the
-            // reattribution migration, but the empty bucket name lingers).
-            if !cfg.projects.iter().any(|p| p.name == name) && is_stray_bucket(&name) {
-                continue;
-            }
+            // No name-pattern filtering: a row's project is decided by the
+            // reattribution pass (transcript parent cwd), which folds stray
+            // subagent / workflow captures under their real project, leaving
+            // those buckets empty so they don't appear here at all.
             views
                 .entry(name.clone())
                 .and_modify(|v| v.mem_count = count)
@@ -1167,10 +1161,21 @@ struct MemoryGraphQuery {
     project: String,
     #[serde(default = "default_graph_limit")]
     limit: usize,
+    /// `similarity` (default — memory↔memory, no LLM), `entity` (bipartite
+    /// memory↔entity, requires entity extraction), or `overview` (LOD cluster
+    /// bubbles for large graphs).
+    #[serde(default)]
+    mode: Option<String>,
+    /// Drill-down: when set, return the members of the cluster with this root id
+    /// (reuses the cached `ClusterIndex`). Takes precedence over `mode`.
+    #[serde(default)]
+    cluster: Option<i64>,
 }
 
 fn default_graph_limit() -> usize {
-    200
+    // Keep the default modest: a force-directed graph past ~80 nodes is a
+    // hairball, and the BM25 fallback path costs one FTS query per node.
+    80
 }
 
 async fn memory_graph(
@@ -1181,33 +1186,191 @@ async fn memory_graph(
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    // LOD drill-down (`cluster=<root>`): return the members of one cluster from
+    // the cached index. Rebuilds the index if missing/expired. Checked before
+    // `mode` so a drill-down request needs no extra `mode=` param. Resolved
+    // before the long-lived store guard below so the `!Send` store reference is
+    // never held across an `.await`.
+    if let Some(root_id) = q.cluster {
+        let index = cluster_index_cached(&state, store, &q.project).await?;
+        let members = {
+            let guard = store.lock().await;
+            guard
+                .cluster_members(&q.project, root_id, &index)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
+        let nodes: Vec<serde_json::Value> = members
+            .nodes
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": format!("m{}", m.id),
+                    "node_type": "memory",
+                    "label": m.preview,
+                    "kind": m.kind,
+                    "source_kind": m.source_kind,
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = members
+            .edges
+            .iter()
+            .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "cluster",
+            "root": root_id,
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // LOD overview (`mode=overview`): server-side clustering of the whole
+    // project. Returns ONLY cluster summaries + aggregated inter-cluster edges,
+    // never the individual nodes — this scales to hundreds of thousands of rows.
+    if q.mode.as_deref() == Some("overview") {
+        let index = cluster_index_cached(&state, store, &q.project).await?;
+        let total_nodes: usize = index.node_cluster.len();
+        let clusters: Vec<serde_json::Value> = index
+            .clusters
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                })
+            })
+            .collect();
+        let cluster_edges: Vec<serde_json::Value> = index
+            .cluster_edges
+            .iter()
+            .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "overview",
+            "clusters": clusters,
+            "cluster_edges": cluster_edges,
+            "total_nodes": total_nodes,
+        })));
+    }
+
     let guard = store.lock().await;
-    let records = guard
-        .list_by_project(&q.project, q.limit)
+
+    // Entity mode: bipartite memory↔entity graph (needs extracted entities).
+    if q.mode.as_deref() == Some("entity") {
+        let graph = guard
+            .graph_bipartite(&q.project, q.limit)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut nodes: Vec<serde_json::Value> =
+            Vec::with_capacity(graph.memories.len() + graph.entities.len());
+        for m in &graph.memories {
+            nodes.push(serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+            }));
+        }
+        for e in &graph.entities {
+            nodes.push(serde_json::json!({
+                "id": format!("e{}", e.id),
+                "node_type": "entity",
+                "label": e.name,
+                "degree": e.degree,
+            }));
+        }
+        let edges: Vec<serde_json::Value> = graph
+            .links
+            .iter()
+            .map(|(mem_id, ent_id)| serde_json::json!({"src": format!("m{mem_id}"), "dst": format!("e{ent_id}")}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "entity",
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // Default similarity mode: memory↔memory, no generative LLM (cosine over
+    // stored embeddings, or BM25 lexical fallback).
+    let graph = guard
+        .graph_similarity(&q.project, q.limit, 4, 0.15)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let edges = guard
-        .project_edges(&q.project)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let nodes: Vec<serde_json::Value> = records
-        .into_iter()
-        .map(|r| {
-            let preview: String = r.body.chars().take(60).collect();
+    let nodes: Vec<serde_json::Value> = graph
+        .memories
+        .iter()
+        .map(|m| {
             serde_json::json!({
-                "id": r.id,
-                "kind": r.kind,
-                "scope": r.scope,
-                "preview": preview,
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
             })
         })
         .collect();
-    let edges: Vec<serde_json::Value> = edges
-        .into_iter()
-        .map(|(s, d, rel)| serde_json::json!({"src": s, "dst": d, "relation": rel}))
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
         .collect();
     Ok(Json(serde_json::json!({
+        "mode": "similarity",
+        "basis": graph.basis,
         "nodes": nodes,
         "edges": edges,
     })))
+}
+
+/// LOD parameters for whole-project clustering. `max_nodes` is a safety bound
+/// (newest first); `top_k` peers per node feed union-find; `min_weight` is the
+/// candidate-edge threshold for joining two nodes into one cluster.
+const CLUSTER_MAX_NODES: usize = 200_000;
+const CLUSTER_TOP_K: usize = 4;
+const CLUSTER_MIN_WEIGHT: f32 = 0.15;
+
+/// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
+/// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
+/// it via [`MemoryStore::graph_clusters`] and refresh the cache.
+///
+/// The store is `!Send` (it wraps a `rusqlite::Connection`), so the build runs
+/// inside a synchronous block with no `.await` while the store guard is held —
+/// keeping the returned future `Send` for axum.
+async fn cluster_index_cached(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+) -> std::result::Result<ClusterIndex, (StatusCode, String)> {
+    // Fast path: serve a still-fresh cached index.
+    {
+        let cache = state.cluster_cache.lock().await;
+        if let Some((built_at, index)) = cache.get(project)
+            && built_at.elapsed() < CLUSTER_INDEX_TTL
+        {
+            return Ok(index.clone());
+        }
+    }
+    // Miss / expired: rebuild under the store lock (no await inside this block).
+    let index = {
+        let guard = store.lock().await;
+        guard
+            .graph_clusters(
+                project,
+                CLUSTER_MAX_NODES,
+                CLUSTER_TOP_K,
+                CLUSTER_MIN_WEIGHT,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let mut cache = state.cluster_cache.lock().await;
+    cache.insert(
+        project.to_string(),
+        (std::time::Instant::now(), index.clone()),
+    );
+    Ok(index)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2073,6 +2236,7 @@ struct ConfigResponse {
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
     embeddings: rtrt_core::config::EmbeddingsConfig,
+    security: rtrt_core::config::SecurityConfig,
     path: String,
 }
 
@@ -2086,6 +2250,7 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
         capture: cfg.capture,
         auto_compress: cfg.auto_compress,
         embeddings: cfg.embeddings,
+        security: cfg.security,
         path,
     }))
 }
@@ -2102,6 +2267,9 @@ struct ConfigWriteRequest {
     /// when absent the on-disk embeddings section is preserved untouched.
     #[serde(default)]
     embeddings: Option<rtrt_core::config::EmbeddingsConfig>,
+    /// Optional global security defaults (default profile). Preserved when absent.
+    #[serde(default)]
+    security: Option<rtrt_core::config::SecurityConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2120,6 +2288,9 @@ async fn post_config(
     cfg.auto_compress = req.auto_compress;
     if let Some(emb) = req.embeddings {
         cfg.embeddings = emb;
+    }
+    if let Some(sec) = req.security {
+        cfg.security = sec;
     }
 
     let path = rtrt_core::Config::default_path().ok_or((
@@ -2766,7 +2937,6 @@ async fn memory_entities(
     };
 
     let summariser = rtrt_memory::LlmSummariser::new(Box::new(GatewayAdapter(llm_gateway)), model);
-    let relation = "mentions";
 
     // `MemoryStore` is `!Sync` (rusqlite `Connection`), so no `&MemoryStore`
     // borrow may live across an `.await`. Mirror the auto-compress daemon: do
@@ -2794,7 +2964,7 @@ async fn memory_entities(
     let new_edges = {
         let guard = store.lock().await;
         guard
-            .link_extracted(&req.project, &extracted, relation)
+            .link_extracted_bipartite(&req.project, &extracted)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "edges": new_edges })))

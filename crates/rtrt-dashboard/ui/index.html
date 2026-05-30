@@ -145,8 +145,19 @@
   details[open] > summary.muted-summary::before { content: '⇱ '; }
   details > .adv { padding-top: 0.5rem; display: grid; gap: 0.5rem; }
 
-  /* Graph canvas */
-  #graph-canvas { cursor: grab; }
+  /* Knowledge map — Cytoscape.js node graph (#cy) + plain-list fallback */
+  .memmap-head { font-size: 0.9em; color: var(--muted); margin: 0.65rem 0 0.5rem; }
+  .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0; }
+  .memmap-controls .sort-row { margin: 0; }
+  .memmap-search { min-width: min(260px, 100%); flex: 1 1 220px; }
+  .memmap-cy { width: 100%; height: 70vh; min-height: 360px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; }
+  .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
+  .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
+  .member-row:hover { border-color: var(--accent); }
+  .member-row .mr-badge { flex-shrink: 0; font-size: 0.8em; white-space: nowrap; }
+  .member-row .mr-body { flex: 1; min-width: 0; }
+  .member-row .mr-preview { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9em; }
+  .member-row .mr-kind { color: var(--muted); font-size: 0.78em; margin-top: 0.2rem; }
 
   /* Memory project picker */
   .proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }
@@ -272,11 +283,6 @@
   .toast.err { border-left: 3px solid var(--err); }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
-  /* Graph entity-type color legend */
-  .graph-legend { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.4rem; }
-  .graph-legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.79em; color: var(--muted); }
-  .graph-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-
   /* Savings % badge — used in compress, proxy, queue rows */
   .badge.save { color: var(--ok); border-color: var(--ok); font-variant-numeric: tabular-nums; }
 
@@ -322,6 +328,16 @@
     .security-profile-tools { grid-template-columns: 1fr; }
   }
 </style>
+<!-- Knowledge-map graph rendering: Cytoscape.js owns layout/zoom/pan/drag.
+     If the CDN is unreachable (offline), window.cytoscape stays undefined and
+     the memmap subtab falls back to a plain list — see loadGraph(). -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<!-- fcose layout (better overlap avoidance + component packing than built-in cose).
+     Order matters: layout-base -> cose-base -> cytoscape-fcose. If any fails to load
+     the graph falls back to cose then concentric (see memmapRunLayout). -->
+<script src="https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -621,23 +637,30 @@
           <div class="card">
             <div class="head">
               <h2>지식 맵</h2>
-              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
-                <button id="entity-extract-btn" class="ghost" type="button" style="font-size:0.85em;" title="메모리에서 엔티티 및 관계를 추출하여 그래프를 풍부하게 합니다">엔티티 추출</button>
-                <span class="hint">노드 = 메모리/엔티티, 선 = 연결</span>
-              </div>
+              <span class="hint">의미가 비슷한 메모리를 클러스터 노드로 묶어 그래프로 보여줍니다. 휠로 확대, 배경 드래그로 이동, 노드 클릭으로 펼치기.</span>
             </div>
             <form id="graph-form" style="grid-template-columns:1fr auto;">
               <input id="graph-project" type="hidden">
-              <button class="primary" type="submit">맵 새로고침</button>
+              <button class="primary" type="submit">새로고침</button>
             </form>
-            <div id="graph-meta" class="out-meta"></div>
-            <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
-            <div id="graph-legend" class="graph-legend">
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 노드</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>블록</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티</div>
+
+            <div class="memmap-controls">
+              <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
+              <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
+                <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
+                <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
+                <button class="sort-btn" type="button" data-memmap-source="subagent">서브</button>
+              </div>
+              <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
+              <button id="memmap-fit" class="ghost" type="button">맞춤</button>
             </div>
-            <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+            <div id="memmap-overview-head" class="memmap-head"></div>
+
+            <!-- Cytoscape renders the node graph into this container. -->
+            <div id="cy" class="memmap-cy"></div>
+            <!-- Fallback when the graph library fails to load (offline) or no data. -->
+            <div id="memmap-fallback" class="memmap-member-list" hidden></div>
+            <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
           </div>
         </div>
 
@@ -868,8 +891,8 @@
     <!-- 설정 -->
     <section id="page-settings" class="page" hidden>
       <div class="section-head">
-        <h1>설정</h1>
-        <div class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
+        <h1 id="settings-title">설정 <span id="settings-global-badge" class="badge ok" hidden>전역 기본</span></h1>
+        <div id="settings-lede" class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
       </div>
       <div class="card">
         <div class="head"><h2>구성</h2><span class="hint">GET /api/config 로드</span></div>
@@ -955,6 +978,16 @@
               임베딩이 활성화되면 벡터 검색, 비활성이면 BM25로 폴백합니다.
             </div>
           </div>
+          <!-- Security -->
+          <div class="settings-section">
+            <h3>보안</h3>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label" for="setting-default-security-profile">
+                <span>기본 보안 프로파일</span>
+                <select id="setting-default-security-profile"><option value="">로딩 중…</option></select>
+              </label>
+            </div>
+          </div>
           <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
             <button type="submit" class="primary">저장</button>
             <span id="settings-save-result" class="out-meta"></span>
@@ -1037,6 +1070,17 @@
         </div>
       </div>
       <div id="sub-securityprofiles" class="subpage" hidden>
+        <div id="security-global-default-card" class="card" hidden>
+          <div class="head"><h2>전역 기본 보안</h2><span class="hint">새 프로젝트와 미지정 프로젝트의 기본값</span></div>
+          <div class="field-row" style="margin-top:0.5rem;">
+            <label class="field-label" for="security-global-default-profile-select">
+              <span>전역 기본 보안 프로파일</span>
+              <select id="security-global-default-profile-select"><option value="">로딩 중…</option></select>
+            </label>
+            <button id="security-global-default-save-btn" class="primary" type="button">전역 기본 저장</button>
+          </div>
+          <div id="security-global-default-result" class="out-meta"></div>
+        </div>
         <div class="card">
           <div class="head"><h2>프로파일 설정</h2><span class="hint">프로파일 조회 · 복제 · 저장</span></div>
           <div class="security-profile-tools">
@@ -1119,9 +1163,20 @@ document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate
 // Global project selector
 let PROJECTS_CACHE = [];
 let SECURITY_PROFILES_CACHE = [];
+let GLOBAL_DEFAULT_PROFILE = 'ai-default';
+const GLOBAL_PROJECT_VALUE = '__global__';
+const GLOBAL_SCOPE_MESSAGE = '전역 모드입니다 — 개별 프로젝트를 선택하세요';
 
 function currentProject() {
   return document.getElementById('project-selector').value;
+}
+
+function isGlobalScope() {
+  return document.getElementById('project-selector').value === GLOBAL_PROJECT_VALUE;
+}
+
+function isGlobalProjectValue(value) {
+  return value === GLOBAL_PROJECT_VALUE;
 }
 
 function escapeAttr(s) {
@@ -1152,6 +1207,7 @@ function syncProjectInputs(value) {
 }
 
 function projectScopeMessage(needsPath) {
+  if (isGlobalScope()) return GLOBAL_SCOPE_MESSAGE;
   if (!currentProject()) return '프로젝트를 선택하거나 추가하세요';
   if (needsPath && !projectPath()) return '경로 미설정 — 프로젝트 편집에서 추가하세요';
   return '';
@@ -1167,6 +1223,29 @@ function setScopeState(emptyId, cardSelector, needsPath) {
   }
   if (card) card.hidden = !!msg;
   return !msg;
+}
+
+function updateGlobalScopeIndicators() {
+  const global = isGlobalScope();
+  const settingsTitle = document.getElementById('settings-title');
+  const settingsLede = document.getElementById('settings-lede');
+  const settingsBadge = document.getElementById('settings-global-badge');
+  if (settingsTitle) {
+    settingsTitle.childNodes[0].nodeValue = global ? '전역 기본 설정 ' : '설정 ';
+  }
+  if (settingsLede) {
+    settingsLede.textContent = global
+      ? '보안 기본 프로파일 · 압축 · 임베딩 · 캡처 전역 기본값을 관리합니다.'
+      : '캡처 · 자동 압축 설정을 보고 저장합니다.';
+  }
+  if (settingsBadge) settingsBadge.hidden = !global;
+  const securityGlobalCard = document.getElementById('security-global-default-card');
+  if (securityGlobalCard) securityGlobalCard.hidden = !global;
+}
+
+function showGlobalScopeEmpty(targetId) {
+  const el = document.getElementById(targetId);
+  if (el) el.innerHTML = `<div class="empty">${GLOBAL_SCOPE_MESSAGE}</div>`;
 }
 
 async function fetchSecurityProfiles() {
@@ -1193,7 +1272,7 @@ async function populateSecurityProfileSelect(selectId, selected) {
     select.innerHTML = '<option value="">프로파일 없음</option>';
     return [];
   }
-  const desired = profiles.includes(selected) ? selected : (profiles.includes('ai-default') ? 'ai-default' : profiles[0]);
+  const desired = profiles.includes(selected) ? selected : (profiles.includes(GLOBAL_DEFAULT_PROFILE) ? GLOBAL_DEFAULT_PROFILE : profiles[0]);
   select.innerHTML = profiles.map(name =>
     `<option value="${escapeAttr(name)}"${name === desired ? ' selected' : ''}>${escapeHtml(name)}</option>`
   ).join('');
@@ -1204,38 +1283,40 @@ async function populateSecurityProfileSelect(selectId, selected) {
 async function loadProjects() {
   const select = document.getElementById('project-selector');
   const saved = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project') || '';
-  const previous = currentProject() || saved;
+  const previous = currentProject() || saved || GLOBAL_PROJECT_VALUE;
+  const globalOption = `<option value="${GLOBAL_PROJECT_VALUE}">🌐 글로벌 · 전역 기본</option>`;
   try {
     const r = await fetch('/api/projects');
     if (!r.ok) {
       showToast(await securityErrorMessage(r, '프로젝트 로드 실패'), 'err');
-      select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+      select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+      select.value = GLOBAL_PROJECT_VALUE;
       PROJECTS_CACHE = [];
       syncProjectInputs('');
       refreshProjectScopePage();
+      navigate('settings');
       return;
     }
     const projects = await r.json();
     PROJECTS_CACHE = Array.isArray(projects) ? projects : [];
-    if (!PROJECTS_CACHE.length) {
-      select.innerHTML = '<option value="">프로젝트 없음</option>';
-      syncProjectInputs('');
-      refreshProjectScopePage();
-      return;
-    }
-    select.innerHTML = '<option value="">프로젝트 선택</option>' + PROJECTS_CACHE.map(p =>
+    const projectOptions = PROJECTS_CACHE.length ? PROJECTS_CACHE.map(p =>
       `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
-    ).join('');
-    select.value = PROJECTS_CACHE.some(p => p.name === previous) ? previous : '';
-    syncProjectInputs(select.value);
-    if (select.value) localStorage.setItem('rtrt.project', select.value);
+    ).join('') : '<option value="">프로젝트 없음</option>';
+    select.innerHTML = globalOption + projectOptions;
+    select.value = previous === GLOBAL_PROJECT_VALUE || PROJECTS_CACHE.some(p => p.name === previous) ? previous : GLOBAL_PROJECT_VALUE;
+    syncProjectInputs(isGlobalScope() ? '' : select.value);
+    localStorage.setItem('rtrt.project', select.value);
+    localStorage.setItem('rtrt-project', select.value);
     refreshProjectScopePage();
+    if (isGlobalScope()) navigate('settings');
   } catch (e) {
     showToast(`프로젝트 로드 오류: ${e.message || e}`, 'err');
-    select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+    select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+    select.value = GLOBAL_PROJECT_VALUE;
     PROJECTS_CACHE = [];
     syncProjectInputs('');
     refreshProjectScopePage();
+    navigate('settings');
   }
 }
 
@@ -1247,7 +1328,7 @@ async function openProjectModal(forceNew) {
   const project = forceNew ? null : selectedProject();
   document.getElementById('project-name-input').value = project ? project.name : '';
   document.getElementById('project-path-input').value = project && project.path ? project.path : '';
-  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : 'ai-default');
+  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : GLOBAL_DEFAULT_PROFILE);
   document.getElementById('project-modal').hidden = false;
   setTimeout(() => document.getElementById('project-name-input').focus(), 0);
 }
@@ -1259,15 +1340,21 @@ document.getElementById('project-selector').onchange = () => {
   const name = currentProject();
   localStorage.setItem('rtrt.project', name);
   localStorage.setItem('rtrt-project', name);
-  syncProjectInputs(name);
+  syncProjectInputs(isGlobalScope() ? '' : name);
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) {
+    navigate('settings');
+    return;
+  }
   refreshProjectScopePage();
 };
 document.getElementById('project-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const name = document.getElementById('project-name-input').value.trim();
   const path = document.getElementById('project-path-input').value.trim();
-  const security_profile = document.getElementById('project-security-profile-select').value || 'ai-default';
+  const security_profile = document.getElementById('project-security-profile-select').value || GLOBAL_DEFAULT_PROFILE;
   if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
+  if (isGlobalProjectValue(name)) { showToast('예약된 전역 항목 이름입니다.', 'err'); return; }
   try {
     const r = await fetch('/api/projects', {
       method: 'PUT',
@@ -1281,6 +1368,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
     await r.json().catch(() => ({}));
     closeProjectModal();
     localStorage.setItem('rtrt.project', name);
+    document.getElementById('project-selector').value = name;
     await loadProjects();
     document.getElementById('project-selector').value = name;
     syncProjectInputs(name);
@@ -1306,6 +1394,7 @@ function wireSubtabs(navId, onActivate) {
 }
 wireSubtabs('memory-subtabs', (sub) => {
   const project = currentProject();
+  if (isGlobalScope()) { refreshMemoryScope(); return; }
   // Auto-load stats + compression queue when the stats tab is activated.
   if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
   // Auto-load governance stats when governance tab opens.
@@ -1333,8 +1422,17 @@ let CURRENT_PROJECT = null;
 const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
 
 function openProject(name) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) {
+    CURRENT_PROJECT = null;
+    syncProjectInputs('');
+    document.getElementById('mem-empty').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('mem-empty').hidden = false;
+    document.getElementById('mem-detail').hidden = true;
+    return;
+  }
   if (!name) {
     CURRENT_PROJECT = null;
+    document.getElementById('mem-empty').textContent = '프로젝트를 선택하거나 추가하세요';
     document.getElementById('mem-empty').hidden = false;
     document.getElementById('mem-detail').hidden = true;
     return;
@@ -1448,6 +1546,7 @@ function syncBulkBar() {
 }
 
 async function loadHistory(name, offset) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) { showGlobalScopeEmpty('history-list'); return; }
   if (offset === undefined) offset = 0;
   HISTORY_OFFSET = offset;
   // Reset selection on each page load.
@@ -1536,6 +1635,7 @@ async function loadHistory(name, offset) {
       ev.stopPropagation();
       const row = btn.closest('.recompress-row');
       const project = row.dataset.proj;
+      if (isGlobalScope() || isGlobalProjectValue(project)) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
       const model = row.querySelector('.row-model-sel').value || undefined;
       const result = row.querySelector('.row-recompress-result');
       btn.disabled = true;
@@ -1573,6 +1673,7 @@ async function loadHistory(name, offset) {
 
 // Detail modal: fetch GET /api/memory/{id} and render.
 async function openDetailModal(id) {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   const modal = document.getElementById('mem-detail-modal');
   const body = document.getElementById('detail-modal-body');
   document.getElementById('detail-modal-title').textContent = `메모리 #${id}`;
@@ -1639,12 +1740,12 @@ document.addEventListener('keydown', (ev) => {
 });
 document.getElementById('history-prev').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
 };
 document.getElementById('history-next').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
 };
 
@@ -1654,14 +1755,14 @@ document.getElementById('sort-recent').onclick = () => {
   document.getElementById('sort-recent').classList.add('active');
   document.getElementById('sort-importance').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.getElementById('sort-importance').onclick = () => {
   HISTORY_SORT = 'importance';
   document.getElementById('sort-importance').classList.add('active');
   document.getElementById('sort-recent').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
   btn.onclick = () => {
@@ -1674,12 +1775,13 @@ document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
     // Reload from page 0 with the server-side source filter so it spans the
     // whole project rather than only the rows already on screen.
     const project = currentProject();
-    if (project) loadHistory(project, 0);
+    if (project && !isGlobalScope()) loadHistory(project, 0);
   };
 });
 
 // Bulk delete — confirm dialog before sending.
 document.getElementById('bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!SELECTED_IDS.size) return;
   const ids = Array.from(SELECTED_IDS);
   const ok = confirm(`선택한 ${ids.length}건을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
@@ -1701,7 +1803,7 @@ document.getElementById('bulk-delete-btn').onclick = async () => {
     SELECTED_IDS.clear();
     syncBulkBar();
     const project = currentProject();
-    if (project) loadHistory(project, HISTORY_OFFSET);
+    if (project && !isGlobalScope()) loadHistory(project, HISTORY_OFFSET);
   } catch (e) { pushActivity(`삭제 오류: ${e.message || e}`); }
 };
 document.getElementById('bulk-clear-btn').onclick = () => {
@@ -1715,7 +1817,7 @@ document.getElementById('bulk-clear-btn').onclick = () => {
 const originalSaveHandler = () => {};
 
 const savedProject = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project');
-if (savedProject) syncProjectInputs(savedProject);
+if (savedProject && !isGlobalProjectValue(savedProject)) syncProjectInputs(savedProject);
 
 // Sample data — one-click form fillers so the user can try a tool without
 // digging up an example. Each entry is a function so it can vary per call.
@@ -1769,7 +1871,7 @@ function refreshRepomapScope() {
   const ok = setScopeState('repomap-scope-empty', '#page-repomap .card', true);
   const path = projectPath();
   document.getElementById('repomap-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
-  document.getElementById('repomap-root').value = path;
+  document.getElementById('repomap-root').value = ok ? path : '';
 }
 function refreshDiagnoseScope() {
   const ok = setScopeState('diagnose-scope-empty', '#page-diagnose .card', true);
@@ -1784,6 +1886,7 @@ function refreshProjectScopePage() {
   if (page === 'diagnose') refreshDiagnoseScope();
 }
 function navigate(page) {
+  updateGlobalScopeIndicators();
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
   const link = document.querySelector(`aside a.nav[data-page="${page}"]`);
@@ -1800,6 +1903,7 @@ function navigate(page) {
     refreshDiagnoseScope();
   }
   if (page === 'settings') {
+    updateGlobalScopeIndicators();
     // Reload config each time the panel opens so it stays current.
     populateModelSelects();
     loadConfig();
@@ -2002,6 +2106,7 @@ document.getElementById('overview-refresh').onclick = () => { loadOverview(); pu
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('recall-results'); showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
@@ -2084,6 +2189,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   if (!btn) return;
   btn.onclick = async () => {
     const project = currentProject();
+    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
     if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
     btn.disabled = true;
     const origText = btn.textContent;
@@ -2118,6 +2224,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('save-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   let metadata = {};
   const raw = document.getElementById('save-metadata').value.trim();
@@ -2143,6 +2250,7 @@ document.getElementById('save-form').onsubmit = async (ev) => {
 document.getElementById('blocks-list-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.querySelector('#blocks-tbl tbody').innerHTML = `<tr><td colspan="2" class="empty">${GLOBAL_SCOPE_MESSAGE}</td></tr>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const tbody = document.querySelector('#blocks-tbl tbody');
   tbody.innerHTML = `<tr><td colspan="2" class="empty">불러오는 중…</td></tr>`;
@@ -2161,6 +2269,7 @@ document.getElementById('blocks-list-form').onsubmit = async (ev) => {
 document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('block-set-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const body = {
     project,
@@ -2181,6 +2290,7 @@ document.getElementById('blocks-set-form').onsubmit = async (ev) => {
 document.getElementById('export-form').onsubmit = (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
@@ -2188,6 +2298,12 @@ document.getElementById('export-form').onsubmit = (ev) => {
 
 // Memory stats subtab — calls GET /api/memory/stats?project=
 async function loadMemStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('memstats-loading').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('memstats-loading').hidden = false;
+    document.getElementById('memstats-body').hidden = true;
+    return;
+  }
   if (!project) return;
   const loading = document.getElementById('memstats-loading');
   const body = document.getElementById('memstats-body');
@@ -2245,11 +2361,16 @@ async function loadMemStats(project) {
 
 document.getElementById('memstats-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadMemStats(project); loadQueue(project); }
+  if (project && !isGlobalScope()) { loadMemStats(project); loadQueue(project); }
 };
 
 // Compression queue — GET /api/memory/queue?project=
 async function loadQueue(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('queue-summary').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('queue-list').innerHTML = '';
+    return;
+  }
   if (!project) return;
   const summary = document.getElementById('queue-summary');
   const list = document.getElementById('queue-list');
@@ -2284,6 +2405,7 @@ async function loadQueue(project) {
 let GOV_PREVIEW_IDS = [];
 
 async function loadGovStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) return;
   if (!project) return;
   // Reuse the existing stats endpoint to populate the summary boxes.
   try {
@@ -2304,6 +2426,7 @@ async function loadGovStats(project) {
 
 async function runGovPreview() {
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('gov-preview-result'); return; }
   if (!project) return;
   const kind = document.getElementById('gov-kind').value;
   const compFilter = document.getElementById('gov-compress-filter').value;
@@ -2367,10 +2490,11 @@ async function runGovPreview() {
 document.getElementById('gov-preview-btn').onclick = runGovPreview;
 document.getElementById('gov-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadGovStats(project); runGovPreview(); }
+  if (project && !isGlobalScope()) { loadGovStats(project); runGovPreview(); }
 };
 
 document.getElementById('gov-bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!GOV_PREVIEW_IDS.length) return;
   const ok = confirm(`필터 조건에 해당하는 ${GOV_PREVIEW_IDS.length}건을 모두 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
   if (!ok) return;
@@ -2394,7 +2518,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
     document.getElementById('gov-preview-result').innerHTML = '<div class="empty">삭제 완료. 미리보기를 다시 실행하세요.</div>';
     document.getElementById('gov-danger-zone').hidden = true;
     const project = currentProject();
-    if (project) loadGovStats(project);
+    if (project && !isGlobalScope()) loadGovStats(project);
   } catch (e) {
     resultEl.innerHTML = `<span style="color:var(--err);">오류: ${e.message || e}</span>`;
   }
@@ -2402,6 +2526,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
 
 document.getElementById('queue-compress-all').onclick = async (ev) => {
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) return;
   const btn = ev.currentTarget;
   btn.disabled = true; btn.textContent = '압축 중…';
@@ -2417,212 +2542,509 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory graph — force-directed canvas layout
-let graphState = null;
-function initGraph(data) {
-  const canvas = document.getElementById('graph-canvas');
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth; const h = canvas.clientHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+// Memory knowledge map — Cytoscape.js node graph (library owns layout/zoom/pan/drag).
+// Drives the #sub-memmap subtab using the server LOD API:
+//   GET /api/memory/graph?project=X&mode=overview  -> { clusters, cluster_edges, total_nodes, ... }
+//   GET /api/memory/graph?project=X&cluster=<id>   -> { root, nodes, edges }
+// We never hand-roll a force simulation: Cytoscape's built-in 'cose' layout
+// positions nodes, and the cy instance handles wheel-zoom / background-pan /
+// node-drag natively. If the CDN failed to load (offline), window.cytoscape is
+// undefined and we fall back to a plain list instead of crashing.
+let memmapOverview = null;           // last overview payload for the current project
+let memmapProject = '';              // project the overview belongs to
+let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
+let memmapSearch = '';               // cluster label filter substring
+let memmapMode = 'overview';         // 'overview' | 'cluster'
+let memmapCy = null;                 // the single Cytoscape instance, lazily created
+// Drill-down cache: cluster id -> { nodes, edges }. Fetched at most once.
+const memmapClusterCache = new Map();
 
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2962FF';
-  const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#666';
-  const fg = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim() || '#000';
-  // Entity nodes rendered in green to distinguish from memory nodes (blue) and blocks (purple).
-  const entityColor = '#16a34a';
-
-  // Initialise nodes with random positions; edges reference node ids.
-  const idIdx = new Map();
-  const nodes = data.nodes.map((n, i) => {
-    idIdx.set(n.id, i);
-    return { ...n, x: w/2 + (Math.random()-0.5)*w*0.6, y: h/2 + (Math.random()-0.5)*h*0.6, vx: 0, vy: 0 };
-  });
-  const edges = data.edges
-    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), rel: e.relation }))
-    .filter(e => e.s !== undefined && e.d !== undefined);
-
-  let hover = -1;
-  let drag = -1;
-  function getXY(ev) {
-    const rect = canvas.getBoundingClientRect();
-    return [ev.clientX - rect.left, ev.clientY - rect.top];
-  }
-  function pick(x, y) {
-    for (let i = nodes.length-1; i >= 0; i--) {
-      const n = nodes[i];
-      const dx = x - n.x; const dy = y - n.y;
-      if (dx*dx + dy*dy < 100) return i;
-    }
-    return -1;
-  }
-  canvas.onmousemove = (ev) => {
-    const [x, y] = getXY(ev);
-    if (drag >= 0) { nodes[drag].x = x; nodes[drag].y = y; nodes[drag].vx = 0; nodes[drag].vy = 0; }
-    const h2 = pick(x, y);
-    if (h2 !== hover) {
-      hover = h2;
-      const tip = document.getElementById('graph-tip');
-      if (hover >= 0) {
-        const n = nodes[hover];
-        const label = n.entity_type ? `[${escapeHtml(n.entity_type)}] ` : '';
-        tip.innerHTML = `<code>#${n.id}</code> ${escapeHtml(n.kind || '')} ${label}— ${escapeHtml((n.preview || '').slice(0, 80))}`;
-      } else {
-        tip.textContent = '노드 위에 마우스를 올리면 내용 미리보기.';
-      }
-    }
-  };
-  canvas.onmousedown = (ev) => { const [x, y] = getXY(ev); drag = pick(x, y); canvas.style.cursor = drag >= 0 ? 'grabbing' : 'grab'; };
-  canvas.onmouseup = () => { drag = -1; canvas.style.cursor = 'grab'; };
-  canvas.onmouseleave = () => { drag = -1; hover = -1; };
-
-  function step() {
-    // Spring-electric layout: edges pull, nodes repel.
-    const cw = canvas.clientWidth; const ch = canvas.clientHeight;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      for (let j = i+1; j < nodes.length; j++) {
-        const b = nodes[j];
-        const dx = b.x - a.x; const dy = b.y - a.y;
-        const d2 = dx*dx + dy*dy + 0.01;
-        const f = 1200 / d2;
-        const fx = (dx / Math.sqrt(d2)) * f;
-        const fy = (dy / Math.sqrt(d2)) * f;
-        a.vx -= fx; a.vy -= fy;
-        b.vx += fx; b.vy += fy;
-      }
-    }
-    for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      const dx = b.x - a.x; const dy = b.y - a.y;
-      const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
-      const f = (d - 100) * 0.02;
-      const fx = (dx/d) * f; const fy = (dy/d) * f;
-      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-    }
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      if (i === drag) continue;
-      n.vx *= 0.82; n.vy *= 0.82;
-      n.x += n.vx * 0.5; n.y += n.vy * 0.5;
-      // Centre attractor + bounds.
-      n.vx += (cw/2 - n.x) * 0.0008;
-      n.vy += (ch/2 - n.y) * 0.0008;
-      n.x = Math.max(12, Math.min(cw-12, n.x));
-      n.y = Math.max(12, Math.min(ch-12, n.y));
-    }
-
-    ctx.clearRect(0, 0, cw, ch);
-    // Edges — draw relation labels on longer edges when there is room.
-    ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
-    for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      // Colour edges by type: entity relations in green, others in muted.
-      ctx.strokeStyle = e.rel ? entityColor : muted;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-      // Show relation label mid-edge when the edge is long enough.
-      if (e.rel) {
-        const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
-        const edgeLen = Math.hypot(b.x - a.x, b.y - a.y);
-        if (edgeLen > 60) {
-          ctx.globalAlpha = 0.75;
-          ctx.fillStyle = muted;
-          ctx.font = '9px system-ui';
-          ctx.textAlign = 'center';
-          ctx.fillText(e.rel, mx, my - 3);
-        }
-      }
-    }
-    ctx.globalAlpha = 1;
-    ctx.textAlign = 'left';
-    // Nodes.
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      const isBlock = (n.kind || '').startsWith('block:');
-      const isEntity = n.node_type === 'entity';
-      const r = isBlock ? 8 : isEntity ? 7 : 6;
-      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = isBlock ? '#7c3aed' : isEntity ? entityColor : accent;
-      ctx.fill();
-      if (i === hover) {
-        ctx.strokeStyle = fg; ctx.lineWidth = 2; ctx.stroke();
-      }
-    }
-  }
-  if (graphState && graphState.raf) cancelAnimationFrame(graphState.raf);
-  graphState = { canvas, nodes, edges };
-  function loop() { step(); graphState.raf = requestAnimationFrame(loop); }
-  loop();
+function memmapSourceLabelKo(source) {
+  return source === 'subagent' ? '🤖서브' : '🧠메인';
 }
 
-async function loadGraph(project) {
-  const meta = document.getElementById('graph-meta');
-  meta.textContent = '불러오는 중…';
+// True only when the Cytoscape CDN script actually loaded.
+function memmapHasCy() {
+  return typeof window !== 'undefined' && typeof window.cytoscape === 'function';
+}
+
+// Flag the catch-all/misc cluster: the lone bucket that is huge versus the rest
+// (>= 8x the median size). Returns its id, or null when no cluster dominates.
+function memmapCatchAllId(clusters) {
+  if (clusters.length < 3) return null;
+  const sizes = clusters.map(c => Number(c.size || 0)).sort((a, b) => a - b);
+  const median = sizes[Math.floor(sizes.length / 2)] || 1;
+  let biggest = null;
+  for (const c of clusters) {
+    if (!biggest || Number(c.size || 0) > Number(biggest.size || 0)) biggest = c;
+  }
+  if (biggest && Number(biggest.size || 0) >= median * 8) return biggest.id;
+  return null;
+}
+
+// Cytoscape style sheet: node size scaled (clamped) by cluster size, colour by
+// dominant_source, the catch-all/misc cluster muted + dashed + small. Reuses the
+// dashboard CSS vars by reading them off :root at init time.
+function memmapCyStyle() {
+  const css = getComputedStyle(document.documentElement);
+  const accent = (css.getPropertyValue('--accent') || '#2962FF').trim();
+  const muted = (css.getPropertyValue('--muted') || '#64748b').trim();
+  const border = (css.getPropertyValue('--border') || '#e5e7eb').trim();
+  const fg = (css.getPropertyValue('--fg') || '#0f172a').trim();
+  return [
+    {
+      selector: 'node',
+      style: {
+        'background-color': muted,
+        'label': 'data(label)',
+        'width': 'data(size)',
+        'height': 'data(size)',
+        'font-size': '10px',
+        'color': fg,
+        'text-valign': 'bottom',
+        'text-halign': 'center',
+        'text-margin-y': 4,
+        'text-wrap': 'ellipsis',
+        'text-max-width': '120px',
+        'border-width': 1,
+        'border-color': border,
+        'min-zoomed-font-size': 6,
+      },
+    },
+    { selector: 'node[src = "main"]', style: { 'background-color': accent } },
+    { selector: 'node[src = "subagent"]', style: { 'background-color': '#7c3aed' } },
+    { selector: 'node[src = "mixed"]', style: { 'background-color': muted } },
+    {
+      selector: 'node[?misc]',
+      style: { 'background-color': muted, 'border-style': 'dashed', 'opacity': 0.55 },
+    },
+    {
+      selector: 'node.dim',          // hidden by source filter / search miss
+      style: { 'opacity': 0.12, 'text-opacity': 0.12 },
+    },
+    {
+      selector: 'node.hit',          // search match highlight
+      style: { 'border-width': 3, 'border-color': accent },
+    },
+    {
+      selector: 'edge',
+      style: {
+        'width': 'data(w)',
+        'line-color': border,
+        'opacity': 0.6,
+        'curve-style': 'haystack',
+      },
+    },
+  ];
+}
+
+// Create (once) or return the shared Cytoscape instance bound to #cy.
+let memmapFcoseReady = false;
+function memmapRegisterFcose() {
+  if (memmapFcoseReady) return true;
+  if (!memmapHasCy() || typeof window.cytoscapeFcose !== 'function') return false;
+  try { window.cytoscape.use(window.cytoscapeFcose); memmapFcoseReady = true; }
+  catch (_) { memmapFcoseReady = false; }
+  return memmapFcoseReady;
+}
+
+function memmapEnsureCy() {
+  if (memmapCy) return memmapCy;
+  if (!memmapHasCy()) return null;
+  memmapRegisterFcose();
+  const container = document.getElementById('cy');
+  if (!container) return null;
+  memmapCy = window.cytoscape({
+    container,
+    style: memmapCyStyle(),
+    minZoom: 0.1,
+    maxZoom: 3,
+    wheelSensitivity: 0.2,
+  });
+  // Tap on a node: cluster node drills down; member node opens the detail modal.
+  memmapCy.on('tap', 'node', (ev) => {
+    const data = ev.target.data();
+    if (data.kindType === 'cluster') {
+      if (!data.misc) openMemmapCluster(data.clusterId);
+    } else if (data.kindType === 'member') {
+      const num = String(data.memId || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    }
+  });
+  return memmapCy;
+}
+
+// Toggle the controls that only make sense in overview vs drill-down.
+function memmapSetMode(mode) {
+  memmapMode = mode;
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = mode !== 'cluster';
+  // Source filter + search only apply to the overview cluster graph.
+  const filter = document.getElementById('memmap-source-filter');
+  if (filter) filter.style.display = mode === 'overview' ? '' : 'none';
+  const search = document.getElementById('memmap-search');
+  if (search) search.style.display = mode === 'overview' ? '' : 'none';
+}
+
+// Clear the offline/no-cy fallback list + empty notice + the cy container.
+function memmapResetViews() {
+  const fb = document.getElementById('memmap-fallback');
+  if (fb) { fb.hidden = true; fb.innerHTML = ''; }
+  const empty = document.getElementById('memmap-empty');
+  if (empty) empty.hidden = true;
+}
+
+// Thin a dense edge set down to a "backbone": keep, for every node, only its
+// single strongest edge (dedup by edge). A full 2000-edge / 4000-edge set forms a
+// hairball that the force layout collapses into overlapping blobs; the backbone
+// keeps the map connected without the clutter.
+function memmapBackboneEdges(rawEdges, validIds) {
+  const best = new Map();   // nodeId -> {src,dst,w}
+  for (const e of rawEdges) {
+    const s = String(e.src), d = String(e.dst);
+    if (!validIds.has(s) || !validIds.has(d) || s === d) continue;
+    const w = Number(e.weight || 0);
+    const bs = best.get(s);
+    if (!bs || w > bs.w) best.set(s, { src: s, dst: d, w });
+    const bd = best.get(d);
+    if (!bd || w > bd.w) best.set(d, { src: s, dst: d, w });
+  }
+  const seen = new Set(), out = [];
+  for (const e of best.values()) {
+    const key = e.src < e.dst ? `${e.src}|${e.dst}` : `${e.dst}|${e.src}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+// Build the Cytoscape elements for the cluster overview from the cached payload.
+function memmapOverviewElements() {
+  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
+  const edges = Array.isArray(memmapOverview.cluster_edges) ? memmapOverview.cluster_edges : [];
+  const catchAllId = memmapCatchAllId(clusters);
+  // Size scaling: clamp node diameter so the biggest cluster never dwarfs the rest.
+  const sizes = clusters.map(c => Number(c.size || 0));
+  const maxSize = Math.max(1, ...sizes);
+  const SCALE_MIN = 22, SCALE_MAX = 80;
+  const ids = new Set();
+  const nodes = clusters.map(c => {
+    const id = String(c.id);
+    ids.add(id);
+    const size = Number(c.size || 0);
+    const isMisc = c.id === catchAllId;
+    const dom = c.dominant_source || 'mixed';
+    // sqrt scale keeps small clusters visible; misc forced small.
+    let diam = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.sqrt(size / maxSize);
+    if (isMisc) diam = SCALE_MIN;
+    const label = isMisc
+      ? `미분류 (${size.toLocaleString()})`
+      : `${String(c.label || '(이름 없음)')} (${size.toLocaleString()})`;
+    return {
+      data: {
+        id, label, size: Math.round(diam), src: dom,
+        misc: isMisc ? 1 : undefined,
+        kindType: 'cluster', clusterId: id, dom,
+        rawLabel: String(c.label || ''),
+      },
+    };
+  });
+  const edgeEls = memmapBackboneEdges(edges, ids)
+    .map((e, i) => ({
+      data: {
+        id: `ce${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(4, Number(e.w || 1))),
+      },
+    }));
+  return nodes.concat(edgeEls);
+}
+
+// Build the Cytoscape elements for one cluster's members (drill-down).
+function memmapMemberElements(payload) {
+  const members = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  );
+  const ids = new Set(members.map(n => String(n.id)));
+  const nodes = members.map(n => {
+    const source = n.source_kind || 'main';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    return {
+      data: {
+        id: String(n.id), label: preview, size: 30, src: source,
+        kindType: 'member', memId: String(n.id || ''),
+      },
+    };
+  });
+  const edges = memmapBackboneEdges(payload.edges || [], ids)
+    .map((e, i) => ({
+      data: {
+        id: `me${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(3, Number(e.w || 1))),
+      },
+    }));
+  return nodes.concat(edges);
+}
+
+// Run the layout + fit. Prefers fcose (strong overlap avoidance + component
+// packing) and degrades to cose then concentric so a load/layout failure never
+// bubbles up.
+function memmapRunLayout() {
+  if (!memmapCy) return;
+  const n = memmapCy.nodes().length;
+  if (memmapRegisterFcose()) {
+    try {
+      memmapCy.layout({
+        name: 'fcose',
+        quality: 'default',
+        randomize: true,
+        animate: false,
+        packComponents: true,        // pack disconnected islands instead of overlapping them
+        nodeRepulsion: 9000,
+        idealEdgeLength: 110,
+        nodeSeparation: 90,          // hard min gap between nodes
+        gravity: 0.2,
+        gravityRange: 3.0,
+        numIter: n > 600 ? 1500 : 2500,
+        fit: true,
+        padding: 36,
+      }).run();
+      return;
+    } catch (_) { /* fall through to cose */ }
+  }
   try {
-    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
+    memmapCy.layout({
+      name: 'cose',
+      animate: false,
+      nodeRepulsion: 12000,
+      nodeOverlap: 24,
+      componentSpacing: 140,
+      idealEdgeLength: 110,
+      gravity: 0.2,
+      fit: true,
+      padding: 36,
+    }).run();
+  } catch (_) {
+    try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_e) { /* ignore */ }
+  }
+}
+
+// Render the overview cluster graph (or fallback list when cy is unavailable).
+function renderMemmapOverview() {
+  const head = document.getElementById('memmap-overview-head');
+  memmapSetMode('overview');
+  memmapResetViews();
+  if (!memmapOverview) {
+    if (head) head.textContent = '';
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
+  const total = Number(memmapOverview.total_nodes || 0);
+  if (head) head.textContent = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 클러스터`;
+  if (!clusters.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) empty.hidden = false;
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapFallback(clusters); return; }
+  cy.elements().remove();
+  cy.add(memmapOverviewElements());
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Apply the source filter + search highlight to the overview using cy selectors.
+function memmapApplyFilters() {
+  if (!memmapCy || memmapMode !== 'overview') return;
+  const needle = memmapSearch.trim().toLowerCase();
+  memmapCy.nodes().removeClass('dim hit');
+  // Source filter: dim nodes whose dominant_source doesn't match (mixed always shows).
+  if (memmapSource !== 'all') {
+    memmapCy.nodes().filter(n => {
+      const dom = n.data('dom') || 'mixed';
+      return dom !== 'mixed' && dom !== memmapSource;
+    }).addClass('dim');
+  }
+  // Search: highlight matching cluster labels.
+  if (needle) {
+    memmapCy.nodes().filter(n => !String(n.data('rawLabel') || '').toLowerCase().includes(needle)).addClass('dim');
+    memmapCy.nodes().filter(n => String(n.data('rawLabel') || '').toLowerCase().includes(needle)).removeClass('dim').addClass('hit');
+  }
+}
+
+// Offline / library-load failure: render clusters as a plain clickable list.
+function renderMemmapFallback(clusters) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const catchAllId = memmapCatchAllId(clusters);
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  const rows = clusters
+    .filter(c => c.id !== catchAllId)
+    .sort((a, b) => Number(b.size || 0) - Number(a.size || 0))
+    .map(c => {
+      const size = Number(c.size || 0);
+      const dom = c.dominant_source || 'mixed';
+      const badge = dom === 'subagent' ? 'badge source-subagent' : 'badge';
+      return `<div class="member-row" data-cluster="${escapeHtml(String(c.id))}">`
+        + `<span class="mr-badge ${badge}">${memmapSourceLabelKo(dom === 'subagent' ? 'subagent' : 'main')}</span>`
+        + `<div class="mr-body"><div class="mr-preview">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
+        + `<div class="mr-kind">${size.toLocaleString()}건</div></div></div>`;
+    }).join('');
+  fb.innerHTML = note + rows;
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => openMemmapCluster(el.dataset.cluster);
+  });
+}
+
+// Offline member fallback list for drill-down.
+function renderMemmapMemberFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (payload.nodes || []).filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (!nodes.length) {
+    fb.innerHTML = '<div class="empty">이 클러스터에 메모리가 없습니다.</div>';
+    fb.hidden = false;
+    return;
+  }
+  fb.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    return `<div class="member-row" data-id="${escapeHtml(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      const num = String(el.dataset.id || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Drill into one cluster: fetch (once, cached) its members, then expand them in
+// the same cy instance (replace-and-back). Clicking a member opens the modal.
+async function openMemmapCluster(clusterId) {
+  const project = memmapProject || currentProject();
+  if (!project) return;
+  const head = document.getElementById('memmap-overview-head');
+  // Resolve a friendly label from the overview for the caption.
+  let label = String(clusterId);
+  if (memmapOverview && Array.isArray(memmapOverview.clusters)) {
+    const c = memmapOverview.clusters.find(x => String(x.id) === String(clusterId));
+    if (c && c.label) label = c.label;
+  }
+  memmapSetMode('cluster');
+  memmapResetViews();
+  if (head) head.textContent = `${label} · 불러오는 중…`;
+
+  let payload = memmapClusterCache.get(String(clusterId));
+  if (!payload) {
+    try {
+      const params = new URLSearchParams({ project, cluster: String(clusterId) });
+      const r = await fetch(`/api/memory/graph?${params.toString()}`);
+      if (!r.ok) {
+        showToast(`클러스터 로드 실패 ${r.status}`, 'err');
+        if (head) head.textContent = `${label} · 오류 ${r.status}`;
+        return;
+      }
+      const d = await r.json();
+      payload = {
+        nodes: Array.isArray(d.nodes) ? d.nodes : [],
+        edges: Array.isArray(d.edges) ? d.edges : [],
+      };
+      memmapClusterCache.set(String(clusterId), payload);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+      if (head) head.textContent = `${label} · 네트워크 오류`;
+      return;
+    }
+  }
+  const memberCount = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  ).length;
+  if (head) head.textContent = `${label} · ${memberCount.toLocaleString()}개 메모리`;
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapMemberFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(memmapMemberElements(payload));
+  memmapRunLayout();
+}
+
+// Load the overview graph for a project. Always lands on the overview.
+async function loadGraph(project) {
+  memmapSetMode('overview');
+  memmapResetViews();
+  const head = document.getElementById('memmap-overview-head');
+  if (memmapCy) memmapCy.elements().remove();
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    if (head) head.textContent = GLOBAL_SCOPE_MESSAGE;
+    memmapOverview = null;
+    return;
+  }
+  if (head) head.textContent = '불러오는 중…';
+  try {
+    const params = new URLSearchParams({ project, mode: 'overview' });
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();
       showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
-      meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
+      if (head) head.textContent = `오류 ${r.status}`;
+      memmapOverview = null;
       return;
     }
     const d = await r.json();
-    meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
-    if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
-    initGraph(d);
+    d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
+    d.cluster_edges = Array.isArray(d.cluster_edges) ? d.cluster_edges : [];
+    d.total_nodes = Number(d.total_nodes || 0);
+    memmapOverview = d;
+    memmapProject = project;
+    memmapClusterCache.clear();
+    renderMemmapOverview();
   } catch (e) {
-    meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = '네트워크 오류';
+    memmapOverview = null;
   }
 }
+
+// Wire up the controls: search box, source filter, back button, fit button.
+(function wireMemmap() {
+  const search = document.getElementById('memmap-search');
+  if (search) search.oninput = () => { memmapSearch = search.value || ''; memmapApplyFilters(); };
+  document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
+    btn.onclick = () => {
+      memmapSource = btn.dataset.memmapSource || 'all';
+      document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.memmapSource === memmapSource);
+      });
+      memmapApplyFilters();
+    };
+  });
+  const back = document.getElementById('memmap-back');
+  if (back) back.onclick = () => renderMemmapOverview();
+  const fit = document.getElementById('memmap-fit');
+  if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
+})();
 
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); await loadGraph(project); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   await loadGraph(project);
 };
-
-// Entity extraction button — POST /api/memory/entities {project}.
-// Hidden on 404 (feature not compiled in).
-(function wireEntityExtract() {
-  const btn = document.getElementById('entity-extract-btn');
-  if (!btn) return;
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '추출 중…';
-    try {
-      const r = await fetch('/api/memory/entities', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
-      });
-      if (r.status === 404) {
-        // Entity extraction not built into this binary; hide the button.
-        btn.hidden = true;
-        return;
-      }
-      if (!r.ok) {
-        const text = await r.text();
-        showToast(`엔티티 추출 오류 ${r.status}: ${text}`, 'err');
-        return;
-      }
-      const d = await r.json();
-      showToast(`엔티티 추출 완료 · ${d.edges}개 관계 추가됨`, 'ok');
-      pushActivity(`entity extract · ${project} · ${d.edges}개 관계`);
-      // Refresh the graph to show newly extracted entities.
-      await loadGraph(project);
-    } catch (e) {
-      showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
-  };
-})();
 
 // Show/hide LLM model dropdown when engine switches.
 document.getElementById('compress-mode').addEventListener('change', function () {
@@ -2699,6 +3121,7 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshDiagnoseScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!projectPath()) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshDiagnoseScope(); return; }
   const body = {
@@ -2723,6 +3146,7 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
 };
 document.getElementById('repomap-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshRepomapScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const root = projectPath();
   if (!root) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshRepomapScope(); return; }
@@ -2890,6 +3314,10 @@ async function loadConfig() {
   const cap = d.capture || {};
   const ac = d.auto_compress || {};
   const emb = d.embeddings || {};
+  const securityDefaultProfile = d.security?.default_profile;
+  if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+    GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+  }
   const bool = (v) => !!v;
   document.getElementById('cfg-capture-enabled').checked = bool(cap.enabled);
   document.getElementById('cfg-capture-redact').checked = bool(cap.redact);
@@ -2909,6 +3337,7 @@ async function loadConfig() {
   document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
   document.getElementById('cfg-emb-model').value = emb.model || '';
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
+  await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {
@@ -2933,6 +3362,9 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       model: document.getElementById('cfg-emb-model').value || null,
       base_url: document.getElementById('cfg-emb-base-url').value || null,
     },
+    security: {
+      default_profile: document.getElementById('setting-default-security-profile').value,
+    },
   };
   const result = document.getElementById('settings-save-result');
   result.textContent = '저장 중…';
@@ -2946,13 +3378,19 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
     return;
   }
   result.innerHTML = '<span class="badge ok">✓ 저장됨</span>';
+  GLOBAL_DEFAULT_PROFILE = body.security.default_profile || GLOBAL_DEFAULT_PROFILE;
   pushActivity('설정 저장 완료');
+  showToast('설정 저장 완료', 'ok');
 };
 
 document.getElementById('compress-now-btn').onclick = async () => {
   const project = document.getElementById('compress-now-project').value.trim();
   if (!project) {
     document.getElementById('compress-now-result').innerHTML = '<span style="color:var(--err);">프로젝트 이름을 입력하세요.</span>';
+    return;
+  }
+  if (isGlobalProjectValue(project)) {
+    document.getElementById('compress-now-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`;
     return;
   }
   const model = document.getElementById('compress-now-model').value || undefined;
@@ -3312,11 +3750,12 @@ function renderSecurityProfileSummary(profile) {
 }
 
 async function loadSecurityProfiles(selected) {
-  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : 'ai-default';
+  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : GLOBAL_DEFAULT_PROFILE;
   await populateSecurityProfileSelect('security-profile-select', selected || bound);
 }
 
 function refreshSecurityScope() {
+  updateGlobalScopeIndicators();
   const msg = projectScopeMessage(true);
   const empty = document.getElementById('security-scope-empty');
   const cards = document.querySelectorAll('#sub-securityscan > .card');
@@ -3327,13 +3766,19 @@ function refreshSecurityScope() {
   cards.forEach(card => { card.hidden = !!msg; });
   const meta = document.getElementById('security-project-meta');
   if (meta) meta.textContent = msg ? '' : `${currentProject()} · ${projectPath()}`;
+  if (isGlobalScope()) {
+    subClick('security-subtabs', 'securityprofiles');
+    loadSecurityGlobalDefaultCard();
+    return;
+  }
   if (!msg) {
     const p = selectedProject();
-    loadSecurityProfiles(p && p.security_profile ? p.security_profile : 'ai-default');
+    loadSecurityProfiles(p && p.security_profile ? p.security_profile : GLOBAL_DEFAULT_PROFILE);
   }
 }
 
 async function runSecurityScan() {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); refreshSecurityScope(); return; }
   const path = projectPath();
   if (!path) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshSecurityScope(); return; }
@@ -3372,6 +3817,7 @@ async function runSecurityScan() {
 async function applySecurityProfileToProject() {
   const name = currentProject();
   const security_profile = document.getElementById('security-profile-select').value;
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!name) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!security_profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
   try {
@@ -3420,7 +3866,60 @@ async function viewSecurityProfile() {
 
 let ACTIVE_SECURITY_PROFILE = null;
 
+async function loadSecurityGlobalDefaultCard() {
+  const card = document.getElementById('security-global-default-card');
+  if (card) card.hidden = !isGlobalScope();
+  if (!isGlobalScope()) return;
+  try {
+    const r = await fetch('/api/config');
+    if (r.ok) {
+      const d = await r.json();
+      const securityDefaultProfile = d.security?.default_profile;
+      if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+        GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+      }
+    }
+  } catch (_) { /* keep cached default */ }
+  await populateSecurityProfileSelect('security-global-default-profile-select', GLOBAL_DEFAULT_PROFILE);
+}
+
+async function saveSecurityGlobalDefaultProfile() {
+  if (!isGlobalScope()) return;
+  const select = document.getElementById('security-global-default-profile-select');
+  const result = document.getElementById('security-global-default-result');
+  const defaultProfile = select ? select.value : '';
+  if (!defaultProfile) { showToast('전역 기본 보안 프로파일을 선택하세요.', 'err'); return; }
+  result.textContent = '저장 중…';
+  try {
+    const cur = await fetch('/api/config');
+    if (!cur.ok) {
+      result.innerHTML = `<span style="color:var(--err);">설정 로드 실패 ${cur.status}</span>`;
+      return;
+    }
+    const body = await cur.json();
+    body.security = { ...(body.security || {}), default_profile: defaultProfile };
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      result.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`;
+      return;
+    }
+    GLOBAL_DEFAULT_PROFILE = defaultProfile;
+    await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
+    result.innerHTML = '<span class="badge ok">✓ 전역 기본 저장됨</span>';
+    pushActivity('전역 기본 보안 프로파일 저장 완료');
+    showToast('전역 기본 저장 완료', 'ok');
+  } catch (e) {
+    result.innerHTML = `<span style="color:var(--err);">오류: ${escapeHtml(e.message || String(e))}</span>`;
+  }
+}
+
 async function loadSecurityProfileSettings() {
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) loadSecurityGlobalDefaultCard();
   const list = document.getElementById('security-profile-list');
   list.innerHTML = '<div class="empty">로드 중…</div>';
   const profiles = await fetchSecurityProfiles();
@@ -3518,6 +4017,7 @@ document.getElementById('security-view-profile-btn').onclick = viewSecurityProfi
 document.getElementById('security-apply-profile-btn').onclick = applySecurityProfileToProject;
 document.getElementById('security-profile-clone-btn').onclick = cloneSecurityProfileToml;
 document.getElementById('security-profile-save-btn').onclick = saveSecurityProfileToml;
+document.getElementById('security-global-default-save-btn').onclick = saveSecurityGlobalDefaultProfile;
 
 // GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
 async function loadLlmModels() {

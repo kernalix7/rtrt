@@ -2331,13 +2331,25 @@ impl MemoryStore {
 
         // 4. Score candidates by Jaccard, keep each node's top_k peers.
         // peers[i] collects (other_pos, weight); we truncate per node afterwards.
-        // We ALSO retain every candidate pair (even below `min_weight`) in
-        // `cand_edges`: the strong union-find only links high-similarity pairs and
-        // leaves most rows as singletons, so the merge passes below need the weak
-        // edges as the rails along which singletons get absorbed into a neighbour.
+        // We ALSO retain, per node, its single strongest candidate neighbour
+        // regardless of weight (`best_peer`). The strong union-find only links
+        // high-similarity pairs and leaves most rows as singletons, so the merge
+        // passes below need these weak "best" edges as the rails along which
+        // singletons get absorbed into a neighbour. Keeping only the best edge
+        // per node bounds the merge edge set at O(n) — not O(n·sqrt(n)) — so the
+        // fold stays cheap even with millions of candidate pairs.
         let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
         let mut peers: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
-        let mut cand_edges: Vec<(u32, u32, f32)> = Vec::with_capacity(shared.len());
+        // best_peer[i] = (other_pos, weight) of i's strongest candidate edge.
+        let mut best_peer: Vec<Option<(u32, f32)>> = vec![None; n];
+        #[inline]
+        fn consider_best(slot: &mut Option<(u32, f32)>, other: u32, w: f32) {
+            match *slot {
+                // Strongest wins; deterministic tiebreak on the smaller position.
+                Some((bo, bw)) if bw > w || (bw == w && bo <= other) => {}
+                _ => *slot = Some((other, w)),
+            }
+        }
         for (&key, inter) in &shared {
             let (x, y) = unpack(key);
             let (xi, yi) = (x as usize, y as usize);
@@ -2346,13 +2358,29 @@ impl MemoryStore {
                 continue;
             }
             let w = *inter as f32 / union as f32;
-            cand_edges.push((x, y, w));
+            consider_best(&mut best_peer[xi], y, w);
+            consider_best(&mut best_peer[yi], x, w);
             if w < min_weight {
                 continue;
             }
             peers[xi].push((y, w));
             peers[yi].push((x, w));
         }
+        // Flatten best-peer edges into a compact, deduped merge-rail list (one
+        // per node that has any candidate neighbour, direction a < b). O(n).
+        let mut cand_edges: Vec<(u32, u32, f32)> = Vec::with_capacity(n);
+        for (i, bp) in best_peer.iter().enumerate() {
+            if let Some((other, w)) = *bp {
+                let (a, b) = if (i as u32) < other {
+                    (i as u32, other)
+                } else {
+                    (other, i as u32)
+                };
+                cand_edges.push((a, b, w));
+            }
+        }
+        cand_edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        cand_edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
         // 5. Union-find over each node's top_k strongest peer edges.
         let mut uf = UnionFind::new(n);
@@ -2620,6 +2648,9 @@ impl MemoryStore {
         root_id: i64,
         index: &ClusterIndex,
     ) -> Result<ClusterMembers> {
+        // Max member nodes returned to the client per drill-down — keeps the
+        // canvas renderable even for a huge catch-all cluster.
+        const MEMBER_RENDER_CAP: usize = 800;
         // Member ids = nodes mapped to this root in the cached index.
         let member_ids: std::collections::HashSet<i64> = index
             .node_cluster
@@ -2663,31 +2694,74 @@ impl MemoryStore {
                 Ok(_) => None,
                 Err(e) => Some(Err(e)),
             })
+            // Cap the members streamed to the client: a catch-all / large cluster
+            // can hold tens of thousands of rows, which would freeze the canvas.
+            // Rows are newest-first, so this drills into the most recent members;
+            // the summary's `size` still reports the true total.
+            .take(MEMBER_RENDER_CAP)
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         let nodes: Vec<MemNode> = rows.iter().map(|(node, _)| node.clone()).collect();
 
-        // Intra-cluster edges: pairwise Jaccard within this (small) cluster.
-        let mut edges: Vec<(i64, i64, f32)> = Vec::new();
-        for i in 0..rows.len() {
-            if rows[i].1.is_empty() {
+        // Intra-cluster edges via the same inverted-index candidate generation as
+        // `graph_clusters` — NOT a naive O(m²) double loop. Most clusters are
+        // small, but the "misc/unclustered" catch-all can hold thousands of rows;
+        // a quadratic pass over it would take tens of seconds. The shared-posting
+        // approach scores only pairs that actually share a (non-stop) token, so
+        // drill-down stays fast for clusters of any size.
+        let m = rows.len();
+        let tok_len: Vec<usize> = rows.iter().map(|(_, t)| t.len()).collect();
+
+        // Posting cap: drop common ("stop") tokens whose postings would make the
+        // candidate-pair count quadratic (same knob/derivation as graph_clusters).
+        const STOP_TOKEN_K: f64 = 0.35;
+        const STOP_TOKEN_MIN: usize = 24;
+        const STOP_TOKEN_MAX: usize = 48;
+        let posting_cap = ((m as f64).sqrt() * STOP_TOKEN_K) as usize;
+        let posting_cap = posting_cap.clamp(STOP_TOKEN_MIN, STOP_TOKEN_MAX);
+
+        let mut inverted: std::collections::HashMap<&str, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, (_, tokens)) in rows.iter().enumerate() {
+            for tok in tokens {
+                inverted.entry(tok.as_str()).or_default().push(i as u32);
+            }
+        }
+
+        let pack = |x: u32, y: u32| -> u64 {
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            ((hi as u64) << 32) | lo as u64
+        };
+        let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
+        let mut shared: FxHashMap<u64, u32> = FxHashMap::default();
+        for postings in inverted.values() {
+            if postings.len() < 2 || postings.len() > posting_cap {
                 continue;
             }
-            for j in (i + 1)..rows.len() {
-                if rows[j].1.is_empty() {
-                    continue;
+            for a in 0..postings.len() {
+                for b in (a + 1)..postings.len() {
+                    *shared.entry(pack(postings[a], postings[b])).or_insert(0) += 1;
                 }
-                let inter = rows[i].1.intersection(&rows[j].1).count();
-                if inter == 0 {
-                    continue;
-                }
-                let union = rows[i].1.union(&rows[j].1).count().max(1);
-                let w = inter as f32 / union as f32;
-                let (a, b) = (rows[i].0.id, rows[j].0.id);
-                let (a, b) = if a < b { (a, b) } else { (b, a) };
-                edges.push((a, b, w));
             }
+        }
+
+        // Edge cap mirrors the inter-cluster cap: the UI only ever draws the
+        // strongest intra-cluster links, so an unbounded edge list on the
+        // catch-all would waste memory and sort time for no visual gain.
+        const INTRA_EDGE_CAP: usize = 4000;
+        let mut edges: Vec<(i64, i64, f32)> = Vec::with_capacity(shared.len());
+        for (&key, inter) in &shared {
+            let (x, y) = unpack(key);
+            let (xi, yi) = (x as usize, y as usize);
+            let union = tok_len[xi] + tok_len[yi] - *inter as usize;
+            if union == 0 {
+                continue;
+            }
+            let w = *inter as f32 / union as f32;
+            let (a, b) = (rows[xi].0.id, rows[yi].0.id);
+            let (a, b) = if a < b { (a, b) } else { (b, a) };
+            edges.push((a, b, w));
         }
         edges.sort_by(|x, y| {
             y.2.partial_cmp(&x.2)
@@ -2695,6 +2769,7 @@ impl MemoryStore {
                 .then(x.0.cmp(&y.0))
                 .then(x.1.cmp(&y.1))
         });
+        edges.truncate(INTRA_EDGE_CAP);
 
         Ok(ClusterMembers { nodes, edges })
     }

@@ -332,6 +332,12 @@
      If the CDN is unreachable (offline), window.cytoscape stays undefined and
      the memmap subtab falls back to a plain list — see loadGraph(). -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+<!-- fcose layout (better overlap avoidance + component packing than built-in cose).
+     Order matters: layout-base -> cose-base -> cytoscape-fcose. If any fails to load
+     the graph falls back to cose then concentric (see memmapRunLayout). -->
+<script src="https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -2633,9 +2639,19 @@ function memmapCyStyle() {
 }
 
 // Create (once) or return the shared Cytoscape instance bound to #cy.
+let memmapFcoseReady = false;
+function memmapRegisterFcose() {
+  if (memmapFcoseReady) return true;
+  if (!memmapHasCy() || typeof window.cytoscapeFcose !== 'function') return false;
+  try { window.cytoscape.use(window.cytoscapeFcose); memmapFcoseReady = true; }
+  catch (_) { memmapFcoseReady = false; }
+  return memmapFcoseReady;
+}
+
 function memmapEnsureCy() {
   if (memmapCy) return memmapCy;
   if (!memmapHasCy()) return null;
+  memmapRegisterFcose();
   const container = document.getElementById('cy');
   if (!container) return null;
   memmapCy = window.cytoscape({
@@ -2678,6 +2694,31 @@ function memmapResetViews() {
   if (empty) empty.hidden = true;
 }
 
+// Thin a dense edge set down to a "backbone": keep, for every node, only its
+// single strongest edge (dedup by edge). A full 2000-edge / 4000-edge set forms a
+// hairball that the force layout collapses into overlapping blobs; the backbone
+// keeps the map connected without the clutter.
+function memmapBackboneEdges(rawEdges, validIds) {
+  const best = new Map();   // nodeId -> {src,dst,w}
+  for (const e of rawEdges) {
+    const s = String(e.src), d = String(e.dst);
+    if (!validIds.has(s) || !validIds.has(d) || s === d) continue;
+    const w = Number(e.weight || 0);
+    const bs = best.get(s);
+    if (!bs || w > bs.w) best.set(s, { src: s, dst: d, w });
+    const bd = best.get(d);
+    if (!bd || w > bd.w) best.set(d, { src: s, dst: d, w });
+  }
+  const seen = new Set(), out = [];
+  for (const e of best.values()) {
+    const key = e.src < e.dst ? `${e.src}|${e.dst}` : `${e.dst}|${e.src}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
 // Build the Cytoscape elements for the cluster overview from the cached payload.
 function memmapOverviewElements() {
   const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
@@ -2709,14 +2750,13 @@ function memmapOverviewElements() {
       },
     };
   });
-  const edgeEls = edges
-    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)))
+  const edgeEls = memmapBackboneEdges(edges, ids)
     .map((e, i) => ({
       data: {
         id: `ce${i}`,
         source: String(e.src),
         target: String(e.dst),
-        w: Math.max(1, Math.min(6, Number(e.weight || 1))),
+        w: Math.max(1, Math.min(4, Number(e.w || 1))),
       },
     }));
   return nodes.concat(edgeEls);
@@ -2738,34 +2778,58 @@ function memmapMemberElements(payload) {
       },
     };
   });
-  const edges = (payload.edges || [])
-    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)))
+  const edges = memmapBackboneEdges(payload.edges || [], ids)
     .map((e, i) => ({
       data: {
         id: `me${i}`,
         source: String(e.src),
         target: String(e.dst),
-        w: Math.max(1, Math.min(4, Number(e.weight || 1))),
+        w: Math.max(1, Math.min(3, Number(e.w || 1))),
       },
     }));
   return nodes.concat(edges);
 }
 
-// Run cose layout + fit. Wrapped so a layout failure never bubbles up.
+// Run the layout + fit. Prefers fcose (strong overlap avoidance + component
+// packing) and degrades to cose then concentric so a load/layout failure never
+// bubbles up.
 function memmapRunLayout() {
   if (!memmapCy) return;
+  const n = memmapCy.nodes().length;
+  if (memmapRegisterFcose()) {
+    try {
+      memmapCy.layout({
+        name: 'fcose',
+        quality: 'default',
+        randomize: true,
+        animate: false,
+        packComponents: true,        // pack disconnected islands instead of overlapping them
+        nodeRepulsion: 9000,
+        idealEdgeLength: 110,
+        nodeSeparation: 90,          // hard min gap between nodes
+        gravity: 0.2,
+        gravityRange: 3.0,
+        numIter: n > 600 ? 1500 : 2500,
+        fit: true,
+        padding: 36,
+      }).run();
+      return;
+    } catch (_) { /* fall through to cose */ }
+  }
   try {
     memmapCy.layout({
       name: 'cose',
       animate: false,
-      nodeRepulsion: 6000,
-      idealEdgeLength: 90,
+      nodeRepulsion: 12000,
+      nodeOverlap: 24,
+      componentSpacing: 140,
+      idealEdgeLength: 110,
+      gravity: 0.2,
       fit: true,
-      padding: 30,
+      padding: 36,
     }).run();
-  } catch (e) {
-    // cose unavailable for some reason — fall back to a deterministic concentric.
-    try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_) { /* ignore */ }
+  } catch (_) {
+    try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_e) { /* ignore */ }
   }
 }
 

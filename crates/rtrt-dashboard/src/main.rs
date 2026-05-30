@@ -13,6 +13,9 @@
 //! - `/api/prompts/{name}` — list versions for a single prompt.
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
+//! - `/api/memory/graph`  — `GET` memory graph: `mode=similarity`/`entity` for
+//!   small graphs, `mode=overview` for LOD cluster bubbles, and `cluster=<root>`
+//!   to drill into one cluster's members (cached `ClusterIndex`, 60s TTL).
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
 //! - `/api/memory/stats`  — `GET` aggregate stats for a project (total, by_kind, compressed).
 //! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
@@ -40,7 +43,7 @@ use axum::{
     response::Html,
     routing::{delete, get, post},
 };
-use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
+use rtrt_memory::{ClusterIndex, DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
 };
@@ -65,7 +68,15 @@ struct AppState {
     /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
     /// paths working without an Ollama instance.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Per-project LOD cluster index cache (`project -> (built_at, index)`),
+    /// TTL [`CLUSTER_INDEX_TTL`]. The `overview` mode builds + caches; `cluster`
+    /// drill-down reads the cache (rebuilding if missing/expired).
+    cluster_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
 }
+
+/// Time-to-live for a cached [`ClusterIndex`] before it is rebuilt.
+const CLUSTER_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
@@ -260,6 +271,7 @@ async fn main() -> Result<()> {
         dedup_window_sec,
         events: events_tx,
         embedder,
+        cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
@@ -1149,10 +1161,15 @@ struct MemoryGraphQuery {
     project: String,
     #[serde(default = "default_graph_limit")]
     limit: usize,
-    /// `similarity` (default — memory↔memory, no LLM) or `entity` (bipartite
-    /// memory↔entity, requires entity extraction).
+    /// `similarity` (default — memory↔memory, no LLM), `entity` (bipartite
+    /// memory↔entity, requires entity extraction), or `overview` (LOD cluster
+    /// bubbles for large graphs).
     #[serde(default)]
     mode: Option<String>,
+    /// Drill-down: when set, return the members of the cluster with this root id
+    /// (reuses the cached `ClusterIndex`). Takes precedence over `mode`.
+    #[serde(default)]
+    cluster: Option<i64>,
 }
 
 fn default_graph_limit() -> usize {
@@ -1169,6 +1186,76 @@ async fn memory_graph(
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    // LOD drill-down (`cluster=<root>`): return the members of one cluster from
+    // the cached index. Rebuilds the index if missing/expired. Checked before
+    // `mode` so a drill-down request needs no extra `mode=` param. Resolved
+    // before the long-lived store guard below so the `!Send` store reference is
+    // never held across an `.await`.
+    if let Some(root_id) = q.cluster {
+        let index = cluster_index_cached(&state, store, &q.project).await?;
+        let members = {
+            let guard = store.lock().await;
+            guard
+                .cluster_members(&q.project, root_id, &index)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
+        let nodes: Vec<serde_json::Value> = members
+            .nodes
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": format!("m{}", m.id),
+                    "node_type": "memory",
+                    "label": m.preview,
+                    "kind": m.kind,
+                    "source_kind": m.source_kind,
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = members
+            .edges
+            .iter()
+            .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "cluster",
+            "root": root_id,
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // LOD overview (`mode=overview`): server-side clustering of the whole
+    // project. Returns ONLY cluster summaries + aggregated inter-cluster edges,
+    // never the individual nodes — this scales to hundreds of thousands of rows.
+    if q.mode.as_deref() == Some("overview") {
+        let index = cluster_index_cached(&state, store, &q.project).await?;
+        let total_nodes: usize = index.node_cluster.len();
+        let clusters: Vec<serde_json::Value> = index
+            .clusters
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                })
+            })
+            .collect();
+        let cluster_edges: Vec<serde_json::Value> = index
+            .cluster_edges
+            .iter()
+            .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "overview",
+            "clusters": clusters,
+            "cluster_edges": cluster_edges,
+            "total_nodes": total_nodes,
+        })));
+    }
+
     let guard = store.lock().await;
 
     // Entity mode: bipartite memory↔entity graph (needs extracted entities).
@@ -1236,6 +1323,54 @@ async fn memory_graph(
         "nodes": nodes,
         "edges": edges,
     })))
+}
+
+/// LOD parameters for whole-project clustering. `max_nodes` is a safety bound
+/// (newest first); `top_k` peers per node feed union-find; `min_weight` is the
+/// candidate-edge threshold for joining two nodes into one cluster.
+const CLUSTER_MAX_NODES: usize = 200_000;
+const CLUSTER_TOP_K: usize = 4;
+const CLUSTER_MIN_WEIGHT: f32 = 0.15;
+
+/// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
+/// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
+/// it via [`MemoryStore::graph_clusters`] and refresh the cache.
+///
+/// The store is `!Send` (it wraps a `rusqlite::Connection`), so the build runs
+/// inside a synchronous block with no `.await` while the store guard is held —
+/// keeping the returned future `Send` for axum.
+async fn cluster_index_cached(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+) -> std::result::Result<ClusterIndex, (StatusCode, String)> {
+    // Fast path: serve a still-fresh cached index.
+    {
+        let cache = state.cluster_cache.lock().await;
+        if let Some((built_at, index)) = cache.get(project)
+            && built_at.elapsed() < CLUSTER_INDEX_TTL
+        {
+            return Ok(index.clone());
+        }
+    }
+    // Miss / expired: rebuild under the store lock (no await inside this block).
+    let index = {
+        let guard = store.lock().await;
+        guard
+            .graph_clusters(
+                project,
+                CLUSTER_MAX_NODES,
+                CLUSTER_TOP_K,
+                CLUSTER_MIN_WEIGHT,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let mut cache = state.cluster_cache.lock().await;
+    cache.insert(
+        project.to_string(),
+        (std::time::Instant::now(), index.clone()),
+    );
+    Ok(index)
 }
 
 #[derive(Debug, Deserialize)]

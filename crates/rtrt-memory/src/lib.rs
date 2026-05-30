@@ -161,6 +161,45 @@ pub struct SimilarityGraph {
     pub basis: String,
 }
 
+/// Level-of-detail (LOD) overview: one bubble per cluster. Scales to hundreds
+/// of thousands of nodes because the client only ever sees these summaries plus,
+/// on demand, the members of a single cluster ([`ClusterMembers`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterSummary {
+    /// Deterministic cluster root = minimum member id.
+    pub id: i64,
+    /// Number of memories in the cluster.
+    pub size: usize,
+    /// Representative member preview (the root member's preview).
+    pub label: String,
+    /// `"main"` / `"subagent"` when a single source dominates, else `"mixed"`.
+    pub dominant_source: String,
+}
+
+/// Whole-project clustering for the LOD overview. Built without any O(n²) pass:
+/// an inverted token index yields candidate pairs, top-k peers per node are
+/// union-found into clusters, and inter-cluster edges are aggregated + capped.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterIndex {
+    /// Cluster summaries, sorted by size descending (ties by root id ascending).
+    pub clusters: Vec<ClusterSummary>,
+    /// Aggregated `(root_a, root_b, weight)` edges between clusters, capped at
+    /// the strongest ~2000.
+    pub cluster_edges: Vec<(i64, i64, f32)>,
+    /// `memory_id -> cluster root`. Used by drill-down; not serialised.
+    #[serde(skip)]
+    pub node_cluster: std::collections::HashMap<i64, i64>,
+}
+
+/// Drill-down payload: the members of one cluster plus their intra-cluster
+/// similarity edges.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterMembers {
+    pub nodes: Vec<MemNode>,
+    /// `(memory_a, memory_b, weight)`, undirected (a < b), strongest first.
+    pub edges: Vec<(i64, i64, f32)>,
+}
+
 /// One row from [`MemoryStore::reattribution_candidates`]:
 /// `(id, transcript_file, current_project, source_kind)`.
 pub type ReattributionRow = (i64, String, String, Option<String>);
@@ -181,6 +220,93 @@ fn token_set(text: &str) -> std::collections::HashSet<String> {
         .filter(|t| t.chars().count() >= 3)
         .map(|t| t.to_lowercase())
         .collect()
+}
+
+/// Fast, deterministic hasher for integer keys (FxHash-style: one multiply +
+/// rotate per word). The LOD clusterer hashes millions of packed `u64`
+/// candidate-pair keys; the default SipHash makes that the dominant cost, so we
+/// use this for those integer-keyed maps only. Not for untrusted/DoS-sensitive
+/// keys — it is used purely on internal node-position integers.
+#[derive(Default)]
+struct FxHasher {
+    state: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Process whole u64 words where possible; the clusterer only ever feeds
+        // u64 / u32 / usize keys, so this hot path dominates.
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let word = u64::from_le_bytes(c.try_into().unwrap());
+            self.state = (self.state.rotate_left(5) ^ word).wrapping_mul(SEED);
+        }
+        for &b in chunks.remainder() {
+            self.state = (self.state.rotate_left(5) ^ b as u64).wrapping_mul(SEED);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.state = (self.state.rotate_left(5) ^ i).wrapping_mul(SEED);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
+
+/// Disjoint-set (union-find) with path compression + union by rank. Used by the
+/// LOD clusterer to merge candidate edges into connected components in near
+/// constant amortised time per operation.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]]; // path halving
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        match self.rank[ra].cmp(&self.rank[rb]) {
+            std::cmp::Ordering::Less => self.parent[ra] = rb,
+            std::cmp::Ordering::Greater => self.parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                self.parent[rb] = ra;
+                self.rank[ra] += 1;
+            }
+        }
+    }
 }
 
 impl MemoryStore {
@@ -2091,6 +2217,488 @@ impl MemoryStore {
         })
     }
 
+    /// Build a level-of-detail [`ClusterIndex`] for one project with **no O(n²)
+    /// pass**, so it stays fast at hundreds of thousands of rows.
+    ///
+    /// Pipeline:
+    /// 1. Load up to `max_nodes` newest rows; tokenise each body with
+    ///    [`token_set`].
+    /// 2. Build an inverted index `token -> [memory_id]`. Postings larger than
+    ///    a cap (`sqrt(n) * STOP_TOKEN_K`, floored at `STOP_TOKEN_MIN`) are
+    ///    dropped as stop-tokens so common words never generate quadratic
+    ///    candidate pairs.
+    /// 3. From the surviving postings, generate candidate pairs and count
+    ///    shared tokens — only nodes that share a posting are ever compared.
+    /// 4. Score each candidate by Jaccard, keep each node's `top_k` strongest
+    ///    peers at/above `min_weight`.
+    /// 5. Union-find those edges into clusters; the cluster root is the
+    ///    **minimum member id** (deterministic).
+    /// 6. Build summaries (label = root member preview, dominant source from
+    ///    member source kinds) sorted by size desc, and aggregate inter-cluster
+    ///    edge weights capped at the strongest ~2000.
+    pub fn graph_clusters(
+        &self,
+        project: &str,
+        max_nodes: usize,
+        top_k: usize,
+        min_weight: f32,
+    ) -> Result<ClusterIndex> {
+        // 1. Load newest rows (capped). Keep token sets alongside node metadata.
+        let mut mem_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind') \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC \
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows: Vec<(MemNode, std::collections::HashSet<String>)> = mem_stmt
+            .query_map(rusqlite::params![project, max_nodes as i64], |r| {
+                let body: String = r.get(2)?;
+                let tokens = token_set(&body);
+                let node = MemNode {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    preview: body.chars().take(60).collect(),
+                    source_kind: r.get(3)?,
+                };
+                Ok((node, tokens))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let n = rows.len();
+
+        // Index nodes 0..n for compact union-find / posting lists. `id_of[i]`
+        // is the memory id of position `i`; `pos_of` maps id -> position.
+        let id_of: Vec<i64> = rows.iter().map(|(node, _)| node.id).collect();
+        let mut pos_of: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::with_capacity(n);
+        for (i, id) in id_of.iter().enumerate() {
+            pos_of.insert(*id, i);
+        }
+
+        // 2. Inverted index token -> positions. Drop oversized postings.
+        // The posting cap is the single most important scaling knob: a posting
+        // of length p contributes O(p²) candidate pairs, so common ("stop")
+        // tokens must be excluded. We cap at `sqrt(n) * STOP_TOKEN_K` (floored at
+        // STOP_TOKEN_MIN, hard-ceilinged at STOP_TOKEN_MAX) which keeps the total
+        // candidate-pair count ~O(n · sqrt(n)) instead of O(n²) — and on real
+        // data the surviving postings are far smaller than the cap.
+        const STOP_TOKEN_K: f64 = 0.35;
+        const STOP_TOKEN_MIN: usize = 24;
+        const STOP_TOKEN_MAX: usize = 48;
+        let posting_cap = ((n as f64).sqrt() * STOP_TOKEN_K) as usize;
+        let posting_cap = posting_cap.clamp(STOP_TOKEN_MIN, STOP_TOKEN_MAX);
+
+        let mut inverted: std::collections::HashMap<&str, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, (_, tokens)) in rows.iter().enumerate() {
+            for tok in tokens {
+                inverted.entry(tok.as_str()).or_default().push(i as u32);
+            }
+        }
+
+        // 3. Candidate generation: only pairs that share a surviving posting.
+        // Shared-token counts are keyed on a single packed u64 (`hi<<32 | lo`)
+        // so the map probes one integer instead of a tuple — markedly cheaper at
+        // millions of candidate pairs. The FxHashMap avoids SipHash, which would
+        // otherwise dominate this multi-million-insert hot loop.
+        let pack = |x: u32, y: u32| -> u64 {
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            ((hi as u64) << 32) | lo as u64
+        };
+        let mut shared: FxHashMap<u64, u32> = FxHashMap::default();
+        for postings in inverted.values() {
+            if postings.len() < 2 || postings.len() > posting_cap {
+                // Singletons add no pairs; oversized postings are stop-tokens.
+                continue;
+            }
+            for a in 0..postings.len() {
+                for b in (a + 1)..postings.len() {
+                    *shared.entry(pack(postings[a], postings[b])).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Precompute token-set sizes once: the scoring + aggregation loops each
+        // touch millions of pairs, and recomputing `HashSet::len()` per touch is
+        // a measurable cost.
+        let tok_len: Vec<usize> = rows.iter().map(|(_, t)| t.len()).collect();
+
+        // 4. Score candidates by Jaccard, keep each node's top_k peers.
+        // peers[i] collects (other_pos, weight); we truncate per node afterwards.
+        // We ALSO retain every candidate pair (even below `min_weight`) in
+        // `cand_edges`: the strong union-find only links high-similarity pairs and
+        // leaves most rows as singletons, so the merge passes below need the weak
+        // edges as the rails along which singletons get absorbed into a neighbour.
+        let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
+        let mut peers: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
+        let mut cand_edges: Vec<(u32, u32, f32)> = Vec::with_capacity(shared.len());
+        for (&key, inter) in &shared {
+            let (x, y) = unpack(key);
+            let (xi, yi) = (x as usize, y as usize);
+            let union = tok_len[xi] + tok_len[yi] - *inter as usize;
+            if union == 0 {
+                continue;
+            }
+            let w = *inter as f32 / union as f32;
+            cand_edges.push((x, y, w));
+            if w < min_weight {
+                continue;
+            }
+            peers[xi].push((y, w));
+            peers[yi].push((x, w));
+        }
+
+        // 5. Union-find over each node's top_k strongest peer edges.
+        let mut uf = UnionFind::new(n);
+        for (i, plist) in peers.iter_mut().enumerate() {
+            plist.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            plist.truncate(top_k);
+            for (j, _w) in plist.iter() {
+                uf.union(i, *j as usize);
+            }
+        }
+
+        // 5b. Fold the singleton explosion down to a manageable bubble count.
+        //
+        // The strong union-find above merges only high-similarity pairs, so on
+        // real projects most rows survive as size-1 components (00G_winpodx:
+        // ~17k singletons of ~18k rows). The LOD overview must stay in the low
+        // hundreds, so we absorb singleton/tiny clusters into the neighbour they
+        // share their strongest *candidate* edge with — using ANY edge, even one
+        // below the union threshold — over several passes, mirroring the
+        // client-side `buildClusters` merge. `comp_min_id` is recomputed AFTER
+        // all merges, so every cluster root stays the deterministic min member id
+        // regardless of union-find's rank-based representative choice.
+        const CLUSTER_TARGET: usize = 320;
+        if n > 0 {
+            // Candidate edges, strongest first (deterministic tiebreak on the
+            // packed endpoints) so fragments pull toward their best neighbour.
+            cand_edges.sort_by(|a, b| {
+                b.2.partial_cmp(&a.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+                    .then(a.1.cmp(&b.1))
+            });
+
+            // Live component size, indexed by current union-find root position.
+            let mut comp_size: Vec<usize> = vec![0; n];
+            for i in 0..n {
+                comp_size[uf.find(i)] += 1;
+            }
+            let mut cluster_count = comp_size.iter().filter(|&&s| s > 0).count();
+
+            // Pass 1..k: absorb fragments whose size is at or below `small_bar`
+            // into their best-candidate-edge neighbour. Relax `small_bar` each
+            // pass so progressively larger linked fragments consolidate, while
+            // genuinely disjoint clusters (no shared candidate edge) stay apart.
+            let mut small_bar = 3usize;
+            for _ in 0..6 {
+                if cluster_count <= CLUSTER_TARGET {
+                    break;
+                }
+                let mut merged_any = false;
+                for &(x, y, _w) in &cand_edges {
+                    let ra = uf.find(x as usize);
+                    let rb = uf.find(y as usize);
+                    if ra == rb {
+                        continue;
+                    }
+                    let (sa, sb) = (comp_size[ra], comp_size[rb]);
+                    // Merge only when at least one side is still a small fragment.
+                    if sa > small_bar && sb > small_bar {
+                        continue;
+                    }
+                    uf.union(ra, rb);
+                    let merged_root = uf.find(ra);
+                    let other = if merged_root == ra { rb } else { ra };
+                    comp_size[merged_root] = sa + sb;
+                    comp_size[other] = 0;
+                    cluster_count -= 1;
+                    merged_any = true;
+                    if cluster_count <= CLUSTER_TARGET {
+                        break;
+                    }
+                }
+                if !merged_any {
+                    // Nothing left that is linked at this bar; relaxing further
+                    // would not help — the remainder is genuinely disjoint.
+                    break;
+                }
+                small_bar = (small_bar * 3).min(400);
+            }
+
+            // Pass 2 (catch-all fallback): if disjoint singletons/tiny fragments
+            // still blow past the target, fold every remaining cluster of size
+            // <= `fold_bar` into one "misc/unclustered" catch-all so the overview
+            // never explodes. The catch-all's members are real memory ids, so
+            // `cluster_members` can still drill into it. We seed the catch-all on
+            // the smallest leftover root (its min member id becomes the bubble's
+            // deterministic id once `comp_min_id` is recomputed below).
+            if cluster_count > CLUSTER_TARGET {
+                // Order leftover roots by size desc; keep the largest, fold the
+                // rest. Deterministic: tiebreak roots by their min member id.
+                let mut min_id_of_root: Vec<i64> = vec![i64::MAX; n];
+                for (i, &id) in id_of.iter().enumerate() {
+                    let r = uf.find(i);
+                    if id < min_id_of_root[r] {
+                        min_id_of_root[r] = id;
+                    }
+                }
+                let mut roots: Vec<usize> = (0..n).filter(|&r| comp_size[r] > 0).collect();
+                roots.sort_by(|&a, &b| {
+                    comp_size[b]
+                        .cmp(&comp_size[a])
+                        .then(min_id_of_root[a].cmp(&min_id_of_root[b]))
+                });
+                // Keep the largest (CLUSTER_TARGET - 1) clusters intact, leaving
+                // one slot for the catch-all bubble.
+                let keep = CLUSTER_TARGET.saturating_sub(1);
+                let mut catch_all: Option<usize> = None;
+                for &r in roots.iter().skip(keep) {
+                    match catch_all {
+                        None => catch_all = Some(r),
+                        Some(c) => {
+                            let cr = uf.find(c);
+                            let rr = uf.find(r);
+                            if cr != rr {
+                                let sz = comp_size[cr] + comp_size[rr];
+                                uf.union(cr, rr);
+                                let merged_root = uf.find(cr);
+                                let other = if merged_root == cr { rr } else { cr };
+                                comp_size[merged_root] = sz;
+                                comp_size[other] = 0;
+                                catch_all = Some(merged_root);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve every node to its cluster root expressed as a *memory id* (the
+        // minimum member id of the union-find component — deterministic), once,
+        // into a flat array. Downstream loops then index this array instead of
+        // calling `uf.find` + a HashMap lookup per touch (millions of touches in
+        // the inter-cluster aggregation).
+        let mut comp_of_pos: Vec<usize> = vec![0; n];
+        let mut comp_min_id: FxHashMap<usize, i64> = FxHashMap::default();
+        for (i, slot) in comp_of_pos.iter_mut().enumerate() {
+            let comp = uf.find(i);
+            *slot = comp;
+            let id = id_of[i];
+            comp_min_id
+                .entry(comp)
+                .and_modify(|m| {
+                    if id < *m {
+                        *m = id;
+                    }
+                })
+                .or_insert(id);
+        }
+        // pos -> cluster root id (memory id), flat.
+        let root_of_pos: Vec<i64> = comp_of_pos.iter().map(|c| comp_min_id[c]).collect();
+
+        let mut node_cluster: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::with_capacity(n);
+        for i in 0..n {
+            node_cluster.insert(id_of[i], root_of_pos[i]);
+        }
+
+        // 6a. Cluster summaries: size, label (root member preview), dominant
+        // source. Group members by cluster root id.
+        let mut members_by_root: std::collections::HashMap<i64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, &root_id) in root_of_pos.iter().enumerate() {
+            members_by_root.entry(root_id).or_default().push(i);
+        }
+
+        let mut clusters: Vec<ClusterSummary> = members_by_root
+            .iter()
+            .map(|(root_id, positions)| {
+                // Label = preview of the root member (min id).
+                let root_pos = *pos_of.get(root_id).unwrap_or(&positions[0]);
+                let label = rows[root_pos].0.preview.clone();
+                // Dominant source: "main"/"subagent" if a single non-empty kind
+                // covers every labelled member; "mixed" otherwise.
+                let mut seen_source: Option<String> = None;
+                let mut mixed = false;
+                for &p in positions {
+                    if let Some(src) = rows[p].0.source_kind.as_deref() {
+                        match &seen_source {
+                            None => seen_source = Some(src.to_string()),
+                            Some(prev) if prev == src => {}
+                            Some(_) => {
+                                mixed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let dominant_source = if mixed {
+                    "mixed".to_string()
+                } else {
+                    seen_source.unwrap_or_else(|| "mixed".to_string())
+                };
+                ClusterSummary {
+                    id: *root_id,
+                    size: positions.len(),
+                    label,
+                    dominant_source,
+                }
+            })
+            .collect();
+        clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+
+        // 6b. Inter-cluster aggregated edges. Reuse the candidate `shared` map:
+        // every cross-cluster shared-token pair contributes its Jaccard weight
+        // (summed). Cluster roots come from the flat `root_of_pos` array (no
+        // `uf.find`/HashMap per touch), and the aggregation map is keyed on a
+        // packed pair of *cluster indices* via the same FxHashMap as `shared`.
+        // Cap at the strongest CLUSTER_EDGE_CAP.
+        const CLUSTER_EDGE_CAP: usize = 2000;
+        let mut agg: FxHashMap<u64, f32> = FxHashMap::default();
+        for (&key, inter) in &shared {
+            let (x, y) = unpack(key);
+            let (xi, yi) = (x as usize, y as usize);
+            // Pack on union-find component index (compact, fits u32) rather than
+            // the i64 root id, so the key is a single u64.
+            let (ca, cb) = (comp_of_pos[xi], comp_of_pos[yi]);
+            if ca == cb {
+                continue;
+            }
+            let union = tok_len[xi] + tok_len[yi] - *inter as usize;
+            if union == 0 {
+                continue;
+            }
+            let w = *inter as f32 / union as f32;
+            *agg.entry(pack(ca as u32, cb as u32)).or_insert(0.0) += w;
+        }
+        let mut cluster_edges: Vec<(i64, i64, f32)> = agg
+            .into_iter()
+            .map(|(key, w)| {
+                let (ca, cb) = unpack(key);
+                // Map component indices back to deterministic root ids, ordered.
+                let ra = comp_min_id[&(ca as usize)];
+                let rb = comp_min_id[&(cb as usize)];
+                let (a, b) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                (a, b, w)
+            })
+            .collect();
+        cluster_edges.sort_by(|x, y| {
+            y.2.partial_cmp(&x.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(x.0.cmp(&y.0))
+                .then(x.1.cmp(&y.1))
+        });
+        cluster_edges.truncate(CLUSTER_EDGE_CAP);
+
+        Ok(ClusterIndex {
+            clusters,
+            cluster_edges,
+            node_cluster,
+        })
+    }
+
+    /// Drill-down: the members of one cluster (by root id) plus their
+    /// intra-cluster similarity edges. Reuses a prebuilt [`ClusterIndex`]
+    /// (`index.node_cluster`) to decide membership, then recomputes the
+    /// lexical similarity *within* the cluster only — cheap because a single
+    /// cluster is a small slice of the project.
+    pub fn cluster_members(
+        &self,
+        project: &str,
+        root_id: i64,
+        index: &ClusterIndex,
+    ) -> Result<ClusterMembers> {
+        // Member ids = nodes mapped to this root in the cached index.
+        let member_ids: std::collections::HashSet<i64> = index
+            .node_cluster
+            .iter()
+            .filter_map(|(&mid, &root)| (root == root_id).then_some(mid))
+            .collect();
+        if member_ids.is_empty() {
+            return Ok(ClusterMembers {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+
+        // Load member rows (newest first) + their token sets for intra edges.
+        let mut mem_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind') \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows: Vec<(MemNode, std::collections::HashSet<String>)> = mem_stmt
+            .query_map(rusqlite::params![project], |r| {
+                let id: i64 = r.get(0)?;
+                let body: String = r.get(2)?;
+                let node = MemNode {
+                    id,
+                    kind: r.get(1)?,
+                    preview: body.chars().take(60).collect(),
+                    source_kind: r.get(3)?,
+                };
+                Ok((node, body))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .filter_map(|res| match res {
+                Ok((node, body)) if member_ids.contains(&node.id) => {
+                    Some(Ok((node, token_set(&body))))
+                }
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let nodes: Vec<MemNode> = rows.iter().map(|(node, _)| node.clone()).collect();
+
+        // Intra-cluster edges: pairwise Jaccard within this (small) cluster.
+        let mut edges: Vec<(i64, i64, f32)> = Vec::new();
+        for i in 0..rows.len() {
+            if rows[i].1.is_empty() {
+                continue;
+            }
+            for j in (i + 1)..rows.len() {
+                if rows[j].1.is_empty() {
+                    continue;
+                }
+                let inter = rows[i].1.intersection(&rows[j].1).count();
+                if inter == 0 {
+                    continue;
+                }
+                let union = rows[i].1.union(&rows[j].1).count().max(1);
+                let w = inter as f32 / union as f32;
+                let (a, b) = (rows[i].0.id, rows[j].0.id);
+                let (a, b) = if a < b { (a, b) } else { (b, a) };
+                edges.push((a, b, w));
+            }
+        }
+        edges.sort_by(|x, y| {
+            y.2.partial_cmp(&x.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(x.0.cmp(&y.0))
+                .then(x.1.cmp(&y.1))
+        });
+
+        Ok(ClusterMembers { nodes, edges })
+    }
+
     /// Letta / MemGPT-style alias for [`compress_project`]: archives the
     /// oldest entries beyond `hot_limit` into a single summary while keeping
     /// the hot context intact. Returns the new archival entry id, if any.
@@ -2804,5 +3412,283 @@ mod tests {
         assert_eq!(mem1.source_kind.as_deref(), Some("main"));
         let mem2 = graph.memories.iter().find(|m| m.id == m2).unwrap();
         assert_eq!(mem2.source_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn graph_clusters_groups_shared_tokens_and_separates_unrelated() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Two clearly-related families plus one lone row.
+        // Family A: authentication / token rotation.
+        let a1 = store
+            .save("p1", "note", "authentication token rotation policy")
+            .unwrap();
+        let a2 = store
+            .save("p1", "note", "rotation authentication token expiry policy")
+            .unwrap();
+        let a3 = store
+            .save("p1", "note", "token authentication rotation refresh")
+            .unwrap();
+        // Family B: database migration / schema.
+        let b1 = store
+            .save("p1", "note", "database migration schema versioning")
+            .unwrap();
+        let b2 = store
+            .save(
+                "p1",
+                "note",
+                "schema migration database rollback versioning",
+            )
+            .unwrap();
+        // Lone row: shares no salient tokens with either family.
+        let lone = store
+            .save("p1", "note", "weather forecast tomorrow sunny")
+            .unwrap();
+
+        let idx = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+
+        // node_cluster maps every loaded node.
+        assert_eq!(idx.node_cluster.len(), 6);
+
+        // Family A rows share a root; family B rows share a (different) root.
+        let root_a = idx.node_cluster[&a1];
+        assert_eq!(idx.node_cluster[&a2], root_a, "a2 with a1");
+        assert_eq!(idx.node_cluster[&a3], root_a, "a3 with a1");
+        let root_b = idx.node_cluster[&b1];
+        assert_eq!(idx.node_cluster[&b2], root_b, "b2 with b1");
+        assert_ne!(root_a, root_b, "the two families are distinct clusters");
+
+        // The lone row is its own cluster, separate from both families.
+        let root_lone = idx.node_cluster[&lone];
+        assert_ne!(root_lone, root_a);
+        assert_ne!(root_lone, root_b);
+
+        // Deterministic root = min member id within each family.
+        assert_eq!(root_a, a1.min(a2).min(a3), "family A root is its min id");
+        assert_eq!(root_b, b1.min(b2), "family B root is its min id");
+
+        // Summaries: family A (size 3) sorts before family B (size 2), and the
+        // largest cluster is first.
+        assert_eq!(idx.clusters[0].size, 3, "{:?}", idx.clusters);
+        assert_eq!(idx.clusters[0].id, root_a);
+        let summary_b = idx
+            .clusters
+            .iter()
+            .find(|c| c.id == root_b)
+            .expect("family B summary present");
+        assert_eq!(summary_b.size, 2);
+        // The lone row is a size-1 cluster.
+        let summary_lone = idx
+            .clusters
+            .iter()
+            .find(|c| c.id == root_lone)
+            .expect("lone summary present");
+        assert_eq!(summary_lone.size, 1);
+    }
+
+    #[test]
+    fn graph_clusters_dominant_source_main_subagent_mixed() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Family where every member is "main".
+        let m1 = store
+            .save("p1", "note", "deploy pipeline release stage")
+            .unwrap();
+        let m2 = store
+            .save("p1", "note", "release deploy pipeline rollback stage")
+            .unwrap();
+        store.reattribute(m1, "main", None).unwrap();
+        store.reattribute(m2, "main", None).unwrap();
+        // Family with a mix of main + subagent.
+        let x1 = store
+            .save("p1", "note", "kubernetes cluster scaling autoscaler")
+            .unwrap();
+        let x2 = store
+            .save("p1", "note", "autoscaler kubernetes cluster scaling pods")
+            .unwrap();
+        store.reattribute(x1, "main", None).unwrap();
+        store.reattribute(x2, "subagent", None).unwrap();
+
+        let idx = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+
+        let root_main = idx.node_cluster[&m1];
+        let summary_main = idx.clusters.iter().find(|c| c.id == root_main).unwrap();
+        assert_eq!(summary_main.dominant_source, "main");
+
+        let root_mixed = idx.node_cluster[&x1];
+        let summary_mixed = idx.clusters.iter().find(|c| c.id == root_mixed).unwrap();
+        assert_eq!(summary_mixed.dominant_source, "mixed");
+    }
+
+    #[test]
+    fn cluster_members_returns_members_and_intra_edges() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a1 = store
+            .save("p1", "note", "indexing inverted posting list")
+            .unwrap();
+        let a2 = store
+            .save("p1", "note", "posting list inverted indexing merge")
+            .unwrap();
+        let a3 = store
+            .save("p1", "note", "inverted indexing posting compression")
+            .unwrap();
+        // Unrelated row that must NOT appear in the cluster drill-down.
+        let _other = store
+            .save("p1", "note", "guacamole avocado lime recipe")
+            .unwrap();
+
+        let idx = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+        let root = idx.node_cluster[&a1];
+
+        let members = store.cluster_members("p1", root, &idx).unwrap();
+        let ids: std::collections::HashSet<i64> = members.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), 3, "exactly the three related rows");
+        assert!(ids.contains(&a1) && ids.contains(&a2) && ids.contains(&a3));
+
+        // Intra-cluster edges exist (the three share tokens) and are undirected
+        // a < b, strongest first.
+        assert!(!members.edges.is_empty(), "members are similar -> edges");
+        for (a, b, w) in &members.edges {
+            assert!(a < b, "undirected a<b");
+            assert!(*w > 0.0);
+            assert!(ids.contains(a) && ids.contains(b), "edge within cluster");
+        }
+        let weights: Vec<f32> = members.edges.iter().map(|e| e.2).collect();
+        assert!(
+            weights.windows(2).all(|w| w[0] >= w[1]),
+            "edges sorted strongest first"
+        );
+    }
+
+    /// Many mutually-unrelated rows must NOT explode into thousands of singleton
+    /// bubbles. The merge passes fold the singleton explosion down to at most the
+    /// internal CLUSTER_TARGET, and the leftover disjoint rows collapse into one
+    /// "misc/unclustered" catch-all that `cluster_members` can still drill into.
+    /// A handful of genuinely related rows still cluster together on the side.
+    #[test]
+    fn graph_clusters_folds_singletons_under_target() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // 900 rows that share no salient tokens with each other: each is a
+        // distinct three-word "topic". With the old strong-only union-find these
+        // would be ~900 singleton clusters; the fold passes must crush that down.
+        for i in 0..900 {
+            let body = format!("alphaword{i}xx betaword{i}yy gammaword{i}zz");
+            store.save("big", "note", &body).unwrap();
+        }
+        // One clearly-related family that must stay clustered together.
+        let r1 = store
+            .save("big", "note", "shared anchor topic recurring phrase one")
+            .unwrap();
+        let r2 = store
+            .save("big", "note", "shared anchor topic recurring phrase two")
+            .unwrap();
+        let r3 = store
+            .save("big", "note", "shared anchor topic recurring phrase three")
+            .unwrap();
+
+        let idx = store.graph_clusters("big", 100_000, 6, 0.1).unwrap();
+
+        // Every loaded node is still mapped.
+        assert_eq!(idx.node_cluster.len(), 903);
+
+        // The whole point: a manageable bubble count, never thousands.
+        const TARGET: usize = 320;
+        assert!(
+            idx.clusters.len() <= TARGET,
+            "cluster count must stay <= target, got {}",
+            idx.clusters.len()
+        );
+
+        // The related family is still grouped into a single cluster.
+        let root_fam = idx.node_cluster[&r1];
+        assert_eq!(idx.node_cluster[&r2], root_fam, "r2 with r1");
+        assert_eq!(idx.node_cluster[&r3], root_fam, "r3 with r1");
+
+        // Every cluster root drills down successfully (incl. the catch-all),
+        // and its members are real memory ids present in node_cluster.
+        for c in &idx.clusters {
+            let members = store.cluster_members("big", c.id, &idx).unwrap();
+            assert_eq!(
+                members.nodes.len(),
+                c.size,
+                "cluster {} drill-down returns all members",
+                c.id
+            );
+            for node in &members.nodes {
+                assert!(
+                    idx.node_cluster.contains_key(&node.id),
+                    "member {} is a real memory id",
+                    node.id
+                );
+            }
+        }
+
+        // A catch-all bubble exists (the disjoint singletons folded together)
+        // and is itself a real cluster that drills into many members.
+        let biggest = idx.clusters.first().expect("at least one cluster");
+        let catch = store.cluster_members("big", biggest.id, &idx).unwrap();
+        assert_eq!(catch.nodes.len(), biggest.size);
+        assert!(
+            biggest.size > 1,
+            "the catch-all absorbed many singletons, got size {}",
+            biggest.size
+        );
+    }
+
+    /// Performance probe against the real on-disk store. Ignored by default;
+    /// run with `--ignored` after setting `RTRT_MEMORY_PATH` (defaults to
+    /// `~/.rtrt/memory.sqlite`). The 18k-row `00G_winpodx` project timed the old
+    /// O(n²) path out at >30s; the LOD path must clear it in well under a second.
+    ///
+    /// We run once to warm the OS page cache (the 95 MB sqlite file's first read
+    /// is one-time disk I/O, not algorithmic), then time the steady-state build
+    /// — which is what the dashboard's per-project cache actually serves.
+    #[test]
+    #[ignore = "needs the real on-disk memory store"]
+    fn graph_clusters_winpodx_perf() {
+        let path = std::env::var("RTRT_MEMORY_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.rtrt/memory.sqlite")
+        });
+        let store = MemoryStore::open(&path).unwrap();
+        // Warm-up (page cache + query plan); not measured.
+        let _ = store
+            .graph_clusters("00G_winpodx", 100_000, 6, 0.1)
+            .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let idx = store
+            .graph_clusters("00G_winpodx", 100_000, 6, 0.1)
+            .unwrap();
+        let elapsed = t0.elapsed();
+        let singletons = idx.clusters.iter().filter(|c| c.size == 1).count();
+        eprintln!(
+            "graph_clusters(00G_winpodx): {} nodes -> {} clusters ({} singletons), {} cluster_edges in {:?}",
+            idx.node_cluster.len(),
+            idx.clusters.len(),
+            singletons,
+            idx.cluster_edges.len(),
+            elapsed
+        );
+        // The fold passes must keep the bubble count manageable for the overview.
+        assert!(
+            idx.clusters.len() <= 320,
+            "cluster count must stay <= target, got {}",
+            idx.clusters.len()
+        );
+        // Drill-down on the biggest cluster must also be fast.
+        if let Some(top) = idx.clusters.first() {
+            let dt0 = std::time::Instant::now();
+            let members = store.cluster_members("00G_winpodx", top.id, &idx).unwrap();
+            eprintln!(
+                "cluster_members(root={}): {} nodes, {} edges in {:?}",
+                top.id,
+                members.nodes.len(),
+                members.edges.len(),
+                dt0.elapsed()
+            );
+        }
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "graph_clusters too slow: {elapsed:?}"
+        );
     }
 }

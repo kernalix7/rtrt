@@ -2812,13 +2812,42 @@ function initGraph(data) {
   // clusters into neighbors until the cluster count is at most this target.
   const CLUSTER_COUNT_TARGET = 220;
   const SMALL_CLUSTER_SIZE = 3;        // clusters this small are merge candidates
+  // Bubble radius is √size-scaled but CLAMPED so a huge catch-all never balloons
+  // into a canvas-filling circle that dwarfs the real clusters.
+  const CLUSTER_R_MIN = 12;            // smallest bubble radius
+  const CLUSTER_R_MAX = 46;            // hard cap (≈ a few× the median real bubble)
   const clusterMode = isSimilarity; // entity mode keeps the legacy flat rendering
-  let clusters = [];               // [{ id, members:[node], rep, size, dominantSource, x,y,vx,vy,fx,fy, r }]
+  let clusters = [];               // [{ id, members:[node], rep, size, dominantSource, x,y,vx,vy,fx,fy, r, isCatchAll }]
   let clusterOf = new Map();       // node.id -> cluster
   let clusterByRoot = new Map();   // server root id -> cluster (LOD overview only)
   const openedClusters = new Set();// cluster ids the user has explicitly expanded
   // LOD inter-cluster edges (server-aggregated): [{ a:cluster, b:cluster, weight }].
   let interClusterEdges = [];
+
+  // Bubble radius ∝ √size but clamped to [MIN, MAX]. The catch-all is pinned at
+  // a small muted size so it reads as a "junk drawer", not the focus.
+  function clusterRadius(size, isCatchAll) {
+    if (isCatchAll) return CLUSTER_R_MIN + 4;
+    const r = 9 + Math.sqrt(Math.max(1, size)) * 6;
+    return Math.max(CLUSTER_R_MIN, Math.min(CLUSTER_R_MAX, r));
+  }
+
+  // Flag the catch-all / misc cluster: the single outlier whose size dwarfs the
+  // rest (≫ median and a large share of all nodes). It's the unclustered junk
+  // drawer, so we de-emphasize it instead of drawing a giant bubble.
+  function markCatchAll() {
+    if (clusters.length < 3) return;
+    const sizes = clusters.map(c => c.size).slice().sort((a, b) => a - b);
+    const median = sizes[Math.floor(sizes.length / 2)] || 1;
+    const total = clusters.reduce((s, c) => s + c.size, 0) || 1;
+    let big = null;
+    for (const c of clusters) if (!big || c.size > big.size) big = c;
+    // Outlier test: far above the median AND a meaningful share of everything.
+    if (big && big.size >= Math.max(median * 8, 50) && big.size >= total * 0.25) {
+      big.isCatchAll = true;
+      big.r = clusterRadius(big.size, true);
+    }
+  }
 
   function buildClusters() {
     // Union-find over edges (weight >= threshold) to get connected components.
@@ -2925,8 +2954,9 @@ function initGraph(data) {
         rep,
         size: members.length,
         dominantSource,
+        isCatchAll: false,
         x: rep.x, y: rep.y, vx: 0, vy: 0, fx: null, fy: null,
-        r: 9 + Math.sqrt(members.length) * 6,
+        r: clusterRadius(members.length, false),
         // openT: 0 = fully collapsed bubble, 1 = fully opened members. Eased
         // each frame toward the logical open state for smooth expand/collapse.
         openT: members.length <= 1 ? 1 : 0,
@@ -2935,6 +2965,7 @@ function initGraph(data) {
       clusters.push(cluster);
       for (const m of members) clusterOf.set(m.id, cluster);
     }
+    markCatchAll();
   }
 
   // LOD: build cluster bubbles straight from the server's overview summaries —
@@ -2965,11 +2996,13 @@ function initGraph(data) {
         size,
         dominantSource: cs.dominant_source === 'subagent' ? 'subagent'
           : cs.dominant_source === 'mixed' ? 'mixed' : 'main',
+        isCatchAll: false,
         x: cw / 2 + Math.cos(ang) * ring + (Math.random() - 0.5) * 30,
         y: ch / 2 + Math.sin(ang) * ring + (Math.random() - 0.5) * 30,
         vx: 0, vy: 0, fx: null, fy: null,
-        // Radius ∝ √size, matching the client-clustered look.
-        r: 9 + Math.sqrt(size) * 6,
+        // Radius ∝ √size but clamped (see clusterRadius) so a huge catch-all
+        // never balloons into a canvas-filling circle.
+        r: clusterRadius(size, false),
         openT: 0,
         seeded: false,
         loaded: false,   // members fetched yet?
@@ -2978,6 +3011,7 @@ function initGraph(data) {
       clusters.push(cluster);
       clusterByRoot.set(cluster.root, cluster);
     });
+    markCatchAll();
   }
 
   if (isOverview) buildOverviewClusters();
@@ -3109,8 +3143,8 @@ function initGraph(data) {
   const MAX_STEP = 18;             // max world-units a node may move per frame (no teleport)
   const OPEN_EASE = 0.16;          // per-frame lerp of cluster openT toward its target (≈300ms)
   const VIEW_EASE = 0.18;          // per-frame lerp of view toward the tween target
-  const ZOOM_LERP = 0.28;          // per-frame lerp of view.k toward the wheel target scale
-  const ZOOM_STEP = 1.18;          // discrete zoom factor applied to the target per wheel tick
+  const ZOOM_LERP = 0.34;          // per-frame lerp of view.k toward the wheel target scale
+  const ZOOM_STEP = 1.25;          // discrete zoom factor applied to the target per wheel tick
 
   // Smooth view tween (fit / focus): eases view.k/x/y toward a target.
   let viewTarget = null;           // { k, x, y } or null when idle
@@ -3231,7 +3265,7 @@ function initGraph(data) {
     // Keep size honest: trust the server count, but never claim fewer than the
     // members we actually received.
     c.size = Math.max(c.size, memberNodes.length);
-    c.r = 9 + Math.sqrt(Math.max(1, c.size)) * 6;
+    c.r = clusterRadius(c.size, c.isCatchAll);
     // Pick a representative from the real members (highest degree, longest label).
     if (memberNodes.length) {
       let rep = memberNodes[0];
@@ -3340,15 +3374,27 @@ function initGraph(data) {
     let any = false;
     if (clusterMode) {
       // Collapse the view first so the threshold-based open state matches a
-      // genuine overview, then frame the bubble bounding box.
+      // genuine overview, then frame the bubble bounding box. EXCLUDE the
+      // catch-all so the real clusters aren't shrunk to dots around it.
       openedClusters.clear();
       for (const c of clusters) {
-        if (!clusterActive(c)) continue;
+        if (!clusterActive(c) || c.isCatchAll) continue;
         any = true;
         minX = Math.min(minX, c.x - c.r);
         maxX = Math.max(maxX, c.x + c.r);
         minY = Math.min(minY, c.y - c.r);
         maxY = Math.max(maxY, c.y + c.r);
+      }
+      // Degenerate fallback: catch-all was the only active cluster — frame it.
+      if (!any) {
+        for (const c of clusters) {
+          if (!clusterActive(c)) continue;
+          any = true;
+          minX = Math.min(minX, c.x - c.r);
+          maxX = Math.max(maxX, c.x + c.r);
+          minY = Math.min(minY, c.y - c.r);
+          maxY = Math.max(maxY, c.y + c.r);
+        }
       }
     } else {
       for (const n of nodes) {
@@ -3484,6 +3530,10 @@ function initGraph(data) {
 
   function setClusterTip(c) {
     if (!c) { setTip(null); return; }
+    if (c.isCatchAll) {
+      tip.innerHTML = `<span class="badge">미분류</span> 군집되지 않은 메모리 ${c.size.toLocaleString()}개 <span class="badge">클릭하면 펼침</span>`;
+      return;
+    }
     tip.innerHTML = `<span class="badge">클러스터</span> ${escapeHtml(clusterSourceLabel(c))} · ${c.size}개 — ${escapeHtml(graphNodeLabel(c.rep).slice(0, 90))} <span class="badge">클릭하면 펼침</span>`;
   }
 
@@ -3593,6 +3643,35 @@ function initGraph(data) {
     const fade = clusterAlpha(c);            // fades out as the cluster opens
     if (fade <= 0.01) return;
     const r = c.r * (0.82 + 0.18 * fade);    // subtle shrink while opening
+
+    if (c.isCatchAll) {
+      // Junk drawer: small, muted, DASHED outline + very low fill so it never
+      // competes with the real clusters. Still clickable to drill in.
+      ctx.save();
+      ctx.globalAlpha = (hovered ? 0.16 : 0.10) * fade;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = muted;
+      ctx.fill();
+      ctx.globalAlpha = (hovered ? 0.7 : 0.45) * fade;
+      ctx.setLineDash([5 / view.k, 4 / view.k]);
+      ctx.strokeStyle = searchHit ? '#fbbf24' : muted;
+      ctx.lineWidth = (searchHit ? 2.5 : 1.5) / view.k;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+      if (view.k > 0.18) {
+        ctx.globalAlpha = 0.6 * fade;
+        ctx.fillStyle = muted;
+        ctx.font = `${Math.max(7, 9 / Math.sqrt(view.k))}px system-ui`;
+        ctx.textAlign = 'center';
+        ctx.fillText(`미분류 ${c.size.toLocaleString()}`, c.x, c.y + r + 11 / view.k);
+        ctx.globalAlpha = 1;
+      }
+      return;
+    }
+
     ctx.globalAlpha = 0.9 * fade;
     ctx.beginPath();
     ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
@@ -3771,7 +3850,10 @@ function initGraph(data) {
             const minD = c.r + b.r + 28;
             const d = Math.sqrt(d2);
             const collision = d < minD ? (minD - d) * 0.16 : 0;
-            const force = (repel / d2 + collision) * alpha;
+            // The catch-all is a junk drawer — let it barely repel so it never
+            // shoves the real clusters into a corner.
+            const damp = (c.isCatchAll || b.isCatchAll) ? 0.25 : 1;
+            const force = (repel / d2 + collision) * alpha * damp;
             const fx = (dx / d) * force;
             const fy = (dy / d) * force;
             c.vx -= fx; c.vy -= fy;
@@ -3800,8 +3882,13 @@ function initGraph(data) {
       if (c.fx !== null && c.fy !== null) {
         c.x = c.fx; c.y = c.fy; c.vx = 0; c.vy = 0;
       } else {
-        c.vx += (centerX - c.x) * 0.012 * alpha;
-        c.vy += (centerY - c.y) * 0.012 * alpha;
+        // Real clusters gather at center; the catch-all drifts to a corner so it
+        // stays out of the way and the real bubbles own the canvas.
+        const anchorX = c.isCatchAll ? cw * 0.12 : centerX;
+        const anchorY = c.isCatchAll ? ch * 0.12 : centerY;
+        const pull = c.isCatchAll ? 0.02 : 0.012;
+        c.vx += (anchorX - c.x) * pull * alpha;
+        c.vy += (anchorY - c.y) * pull * alpha;
         c.vx *= DAMPING; c.vy *= DAMPING;
         const speed = Math.hypot(c.vx, c.vy);
         if (speed > maxSpeed) { c.vx = (c.vx / speed) * maxSpeed; c.vy = (c.vy / speed) * maxSpeed; }

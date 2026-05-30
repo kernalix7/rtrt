@@ -161,6 +161,10 @@ pub struct SimilarityGraph {
     pub basis: String,
 }
 
+/// One row from [`MemoryStore::reattribution_candidates`]:
+/// `(id, transcript_file, current_project, source_kind)`.
+pub type ReattributionRow = (i64, String, String, Option<String>);
+
 /// Prefix applied to the `kind` column for Letta-style memory blocks.
 const BLOCK_KIND_PREFIX: &str = "block:";
 
@@ -433,23 +437,20 @@ impl MemoryStore {
     }
 
     /// Transcript-captured rows that may need (re)attribution — purely by
-    /// PROVENANCE, no project-name pattern matching. Returns
-    /// `(id, transcript_file, current_project)` for every `source = "transcript"`
-    /// row that is either not yet classified (`source_kind` unset) OR was
-    /// captured under a `subagents/` path (so the caller can re-resolve its real
-    /// parent project and move it if the current bucket is wrong). The caller
-    /// only writes when the resolved parent differs, so this is idempotent and
-    /// cheap once everything has settled.
-    pub fn reattribution_candidates(&self) -> Result<Vec<(i64, String, String)>> {
+    /// PROVENANCE, no project-name pattern matching. Returns every
+    /// `source = "transcript"` row as `(id, transcript_file, current_project,
+    /// source_kind)`; the caller re-resolves the project from the file's encoded
+    /// dir and only writes when the project differs or the row is unclassified,
+    /// so it's idempotent and cheap once everything has settled.
+    pub fn reattribution_candidates(&self) -> Result<Vec<ReattributionRow>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf, m.project \
+                "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf, m.project, \
+                        json_extract(m.metadata, '$.source_kind') AS sk \
                    FROM memories m \
                   WHERE json_extract(m.metadata, '$.source') = 'transcript' \
-                    AND tf IS NOT NULL \
-                    AND ( json_extract(m.metadata, '$.source_kind') IS NULL \
-                       OR tf LIKE '%/subagents/%' )",
+                    AND tf IS NOT NULL",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         let rows = stmt
@@ -458,6 +459,7 @@ impl MemoryStore {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|e| Error::Memory(e.to_string()))?;

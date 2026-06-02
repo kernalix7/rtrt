@@ -204,8 +204,27 @@ pub struct ClusterMembers {
 /// `(id, transcript_file, current_project, source_kind)`.
 pub type ReattributionRow = (i64, String, String, Option<String>);
 
+/// A clusterable row: a [`MemNode`] paired with its salient-[`token_set`].
+/// The unit consumed by [`MemoryStore::cluster_rows`] /
+/// [`MemoryStore::subcluster`] / [`MemoryStore::members_for_ids`].
+pub type ClusterRow = (MemNode, std::collections::HashSet<String>);
+
 /// Prefix applied to the `kind` column for Letta-style memory blocks.
 const BLOCK_KIND_PREFIX: &str = "block:";
+
+/// Default LOD-overview bubble target: the singleton-fold ceiling for a
+/// whole-project [`MemoryStore::graph_clusters`] pass. Deeper drill-down levels
+/// pass their own (smaller) target to [`MemoryStore::subcluster`].
+const CLUSTER_TARGET: usize = 320;
+
+/// Max member nodes a single drill-down returns to the client — keeps the
+/// canvas renderable even for a huge catch-all cluster. Shared by
+/// [`MemoryStore::cluster_members`] and [`MemoryStore::members_for_ids`].
+const MEMBER_RENDER_CAP: usize = 800;
+
+/// Max intra-cluster edges streamed per drill-down: the UI only draws the
+/// strongest links, so an unbounded list would waste memory and sort time.
+const INTRA_EDGE_CAP: usize = 4000;
 
 /// Builds the `kind` string for a Letta memory block.
 pub fn block_kind(name: &str) -> String {
@@ -220,6 +239,148 @@ fn token_set(text: &str) -> std::collections::HashSet<String> {
         .filter(|t| t.chars().count() >= 3)
         .map(|t| t.to_lowercase())
         .collect()
+}
+
+/// Reduce a set of per-member `source_kind`s to a single dominant label:
+/// `"main"` / `"subagent"` when one non-empty source covers every labelled
+/// member, `"mixed"` otherwise (and when no member carries a source). Mirrors
+/// the inline summary logic in [`MemoryStore::graph_clusters`]; reused by
+/// [`MemoryStore::group_meta`].
+fn dominant_source(sources: &[Option<String>]) -> String {
+    let mut seen: Option<&str> = None;
+    let mut mixed = false;
+    for src in sources.iter().filter_map(|s| s.as_deref()) {
+        match seen {
+            None => seen = Some(src),
+            Some(prev) if prev == src => {}
+            Some(_) => {
+                mixed = true;
+                break;
+            }
+        }
+    }
+    if mixed {
+        "mixed".to_string()
+    } else {
+        seen.map(str::to_string).unwrap_or_else(|| "mixed".to_string())
+    }
+}
+
+/// Bucket pre-labelled rows `(id, label, source_kind)` into a [`ClusterIndex`]:
+/// one cluster per distinct label, root = min member id, dominant source from
+/// members. When distinct labels exceed `target`, the largest `target-1` are
+/// kept and the rest fold into one "(기타)" catch-all. Shared by
+/// [`MemoryStore::group_meta`] (whole project) and
+/// [`MemoryStore::group_meta_ids`] (an explicit id set).
+fn bucket_meta_rows(rows: Vec<(i64, String, Option<String>)>, target: usize) -> ClusterIndex {
+    struct Group {
+        min_id: i64,
+        label: String,
+        member_ids: Vec<i64>,
+        sources: Vec<Option<String>>,
+    }
+    // Preserve first-seen order so the catch-all fold is deterministic.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Group> = std::collections::HashMap::new();
+    for (id, label, source_kind) in rows {
+        let g = groups.entry(label.clone()).or_insert_with(|| {
+            order.push(label.clone());
+            Group {
+                min_id: id,
+                label: label.chars().take(60).collect(),
+                member_ids: Vec::new(),
+                sources: Vec::new(),
+            }
+        });
+        g.min_id = g.min_id.min(id);
+        g.member_ids.push(id);
+        g.sources.push(source_kind);
+    }
+
+    let mut node_cluster: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut clusters: Vec<ClusterSummary> = Vec::new();
+    let distinct = order.len();
+    let mut owned: Vec<Group> = order
+        .into_iter()
+        .map(|lbl| groups.remove(&lbl).expect("label present"))
+        .collect();
+
+    if target >= 1 && distinct > target {
+        owned.sort_by(|a, b| {
+            b.member_ids
+                .len()
+                .cmp(&a.member_ids.len())
+                .then(a.min_id.cmp(&b.min_id))
+        });
+        let keep = target.saturating_sub(1);
+        let mut kept = owned;
+        let folded: Vec<Group> = kept.split_off(keep);
+        for g in &kept {
+            for &mid in &g.member_ids {
+                node_cluster.insert(mid, g.min_id);
+            }
+            clusters.push(ClusterSummary {
+                id: g.min_id,
+                size: g.member_ids.len(),
+                label: g.label.clone(),
+                dominant_source: dominant_source(&g.sources),
+            });
+        }
+        if !folded.is_empty() {
+            let catch_root = folded.iter().map(|g| g.min_id).min().expect("non-empty");
+            let mut size = 0usize;
+            let mut sources: Vec<Option<String>> = Vec::new();
+            for g in &folded {
+                for &mid in &g.member_ids {
+                    node_cluster.insert(mid, catch_root);
+                }
+                size += g.member_ids.len();
+                sources.extend(g.sources.iter().cloned());
+            }
+            clusters.push(ClusterSummary {
+                id: catch_root,
+                size,
+                label: "(기타)".to_string(),
+                dominant_source: dominant_source(&sources),
+            });
+        }
+    } else {
+        for g in &owned {
+            for &mid in &g.member_ids {
+                node_cluster.insert(mid, g.min_id);
+            }
+            clusters.push(ClusterSummary {
+                id: g.min_id,
+                size: g.member_ids.len(),
+                label: g.label.clone(),
+                dominant_source: dominant_source(&g.sources),
+            });
+        }
+    }
+
+    clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+    ClusterIndex {
+        clusters,
+        cluster_edges: Vec::new(),
+        node_cluster,
+    }
+}
+
+/// First file-path-like token in free text, for [`MemoryStore::group_meta`]'s
+/// `"file"` facet. Matches a run of `[\w./-]` of length ≥3 that either contains
+/// a `/` (a path) or ends in a short `.ext` extension. The regex is compiled
+/// once (process-wide) — never per row.
+fn first_file_token(text: &str) -> Option<String> {
+    use std::sync::LazyLock;
+    // Two branches, leftmost-match wins:
+    //  * a path: a `[\w.\-]` run, a `/`, then more `[\w./\-]` (contains a slash).
+    //  * a filename: 2+ word/dash chars ending in a short `.ext` (1–5 alnum).
+    // Both yield a token of length >= 3.
+    static FILE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"[\w.\-]*/[\w./\-]+|[\w\-]{2,}\.[A-Za-z0-9]{1,5}")
+            .expect("static file-token regex compiles")
+    });
+    FILE_RE.find(text).map(|m| m.as_str().to_string())
 }
 
 /// Fast, deterministic hasher for integer keys (FxHash-style: one multiply +
@@ -2270,6 +2431,24 @@ impl MemoryStore {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| Error::Memory(e.to_string()))?;
 
+        // Whole-project clustering folds the singleton explosion down to the
+        // default overview target.
+        Ok(self.cluster_rows(rows, top_k, min_weight, CLUSTER_TARGET))
+    }
+
+    /// Cluster an already-loaded set of `(node, token_set)` rows into a
+    /// [`ClusterIndex`]. This is the pure clustering core extracted from
+    /// [`graph_clusters`]: it makes no database calls, so it can re-cluster an
+    /// arbitrary subset (deeper LOD levels via [`subcluster`](Self::subcluster))
+    /// just as well as a whole project. `target` is the singleton-fold ceiling
+    /// (the overview uses [`CLUSTER_TARGET`]); deeper levels pass a smaller one.
+    fn cluster_rows(
+        &self,
+        rows: Vec<(MemNode, std::collections::HashSet<String>)>,
+        top_k: usize,
+        min_weight: f32,
+        target: usize,
+    ) -> ClusterIndex {
         let n = rows.len();
 
         // Index nodes 0..n for compact union-find / posting lists. `id_of[i]`
@@ -2406,8 +2585,9 @@ impl MemoryStore {
         // below the union threshold — over several passes, mirroring the
         // client-side `buildClusters` merge. `comp_min_id` is recomputed AFTER
         // all merges, so every cluster root stays the deterministic min member id
-        // regardless of union-find's rank-based representative choice.
-        const CLUSTER_TARGET: usize = 320;
+        // regardless of union-find's rank-based representative choice. `target`
+        // is the fold ceiling (the whole-project overview passes
+        // [`CLUSTER_TARGET`]; deeper LOD levels pass a smaller value).
         if n > 0 {
             // Candidate edges, strongest first (deterministic tiebreak on the
             // packed endpoints) so fragments pull toward their best neighbour.
@@ -2431,7 +2611,7 @@ impl MemoryStore {
             // genuinely disjoint clusters (no shared candidate edge) stay apart.
             let mut small_bar = 3usize;
             for _ in 0..6 {
-                if cluster_count <= CLUSTER_TARGET {
+                if cluster_count <= target {
                     break;
                 }
                 let mut merged_any = false;
@@ -2453,7 +2633,7 @@ impl MemoryStore {
                     comp_size[other] = 0;
                     cluster_count -= 1;
                     merged_any = true;
-                    if cluster_count <= CLUSTER_TARGET {
+                    if cluster_count <= target {
                         break;
                     }
                 }
@@ -2472,7 +2652,7 @@ impl MemoryStore {
             // `cluster_members` can still drill into it. We seed the catch-all on
             // the smallest leftover root (its min member id becomes the bubble's
             // deterministic id once `comp_min_id` is recomputed below).
-            if cluster_count > CLUSTER_TARGET {
+            if cluster_count > target {
                 // Order leftover roots by size desc; keep the largest, fold the
                 // rest. Deterministic: tiebreak roots by their min member id.
                 let mut min_id_of_root: Vec<i64> = vec![i64::MAX; n];
@@ -2488,9 +2668,9 @@ impl MemoryStore {
                         .cmp(&comp_size[a])
                         .then(min_id_of_root[a].cmp(&min_id_of_root[b]))
                 });
-                // Keep the largest (CLUSTER_TARGET - 1) clusters intact, leaving
+                // Keep the largest (target - 1) clusters intact, leaving
                 // one slot for the catch-all bubble.
-                let keep = CLUSTER_TARGET.saturating_sub(1);
+                let keep = target.saturating_sub(1);
                 let mut catch_all: Option<usize> = None;
                 for &r in roots.iter().skip(keep) {
                     match catch_all {
@@ -2630,11 +2810,11 @@ impl MemoryStore {
         });
         cluster_edges.truncate(CLUSTER_EDGE_CAP);
 
-        Ok(ClusterIndex {
+        ClusterIndex {
             clusters,
             cluster_edges,
             node_cluster,
-        })
+        }
     }
 
     /// Drill-down: the members of one cluster (by root id) plus their
@@ -2648,9 +2828,6 @@ impl MemoryStore {
         root_id: i64,
         index: &ClusterIndex,
     ) -> Result<ClusterMembers> {
-        // Max member nodes returned to the client per drill-down — keeps the
-        // canvas renderable even for a huge catch-all cluster.
-        const MEMBER_RENDER_CAP: usize = 800;
         // Member ids = nodes mapped to this root in the cached index.
         let member_ids: std::collections::HashSet<i64> = index
             .node_cluster
@@ -2703,13 +2880,22 @@ impl MemoryStore {
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         let nodes: Vec<MemNode> = rows.iter().map(|(node, _)| node.clone()).collect();
+        let edges = Self::intra_edges(&rows);
+        Ok(ClusterMembers { nodes, edges })
+    }
 
-        // Intra-cluster edges via the same inverted-index candidate generation as
-        // `graph_clusters` — NOT a naive O(m²) double loop. Most clusters are
-        // small, but the "misc/unclustered" catch-all can hold thousands of rows;
-        // a quadratic pass over it would take tens of seconds. The shared-posting
-        // approach scores only pairs that actually share a (non-stop) token, so
-        // drill-down stays fast for clusters of any size.
+    /// Intra-set lexical similarity edges over an already-loaded row slice.
+    /// Shared by [`cluster_members`](Self::cluster_members) and
+    /// [`members_for_ids`](Self::members_for_ids).
+    ///
+    /// Uses the same inverted-index candidate generation as
+    /// [`graph_clusters`](Self::graph_clusters) — NOT a naive O(m²) double loop.
+    /// Most clusters are small, but the "misc/unclustered" catch-all can hold
+    /// thousands of rows; a quadratic pass over it would take tens of seconds.
+    /// The shared-posting approach scores only pairs that actually share a
+    /// (non-stop) token, so drill-down stays fast for sets of any size. Edges
+    /// are undirected (`a < b`), strongest first, capped at [`INTRA_EDGE_CAP`].
+    fn intra_edges(rows: &[(MemNode, std::collections::HashSet<String>)]) -> Vec<(i64, i64, f32)> {
         let m = rows.len();
         let tok_len: Vec<usize> = rows.iter().map(|(_, t)| t.len()).collect();
 
@@ -2746,10 +2932,6 @@ impl MemoryStore {
             }
         }
 
-        // Edge cap mirrors the inter-cluster cap: the UI only ever draws the
-        // strongest intra-cluster links, so an unbounded edge list on the
-        // catch-all would waste memory and sort time for no visual gain.
-        const INTRA_EDGE_CAP: usize = 4000;
         let mut edges: Vec<(i64, i64, f32)> = Vec::with_capacity(shared.len());
         for (&key, inter) in &shared {
             let (x, y) = unpack(key);
@@ -2770,8 +2952,205 @@ impl MemoryStore {
                 .then(x.1.cmp(&y.1))
         });
         edges.truncate(INTRA_EDGE_CAP);
+        edges
+    }
 
+    /// Load exactly the given memory ids as clusterable rows
+    /// (`id, kind, preview, source_kind` + [`token_set`] of the body),
+    /// regardless of project. Used to re-cluster / render an arbitrary subset
+    /// for deeper LOD levels. The IN-list is chunked to stay under SQLite's
+    /// bound-variable limit (999); input order is not preserved.
+    pub fn rows_for_ids(&self, ids: &[i64]) -> Result<Vec<ClusterRow>> {
+        // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk well under it.
+        const CHUNK: usize = 900;
+        let mut out: Vec<ClusterRow> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            // Build a `?,?,...` placeholder list for this chunk.
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind') \
+                   FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let rows = stmt
+                .query_map(params, |r| {
+                    let body: String = r.get(2)?;
+                    let tokens = token_set(&body);
+                    let node = MemNode {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        preview: body.chars().take(60).collect(),
+                        source_kind: r.get(3)?,
+                    };
+                    Ok((node, tokens))
+                })
+                .map_err(|e| Error::Memory(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// Semantic re-clustering of an arbitrary memory-id subset: load those rows
+    /// ([`rows_for_ids`](Self::rows_for_ids)) then run the same lexical
+    /// clustering core as [`graph_clusters`](Self::graph_clusters)
+    /// ([`cluster_rows`](Self::cluster_rows)) with the caller's fold `target`.
+    /// This is the building block for deeper LOD drill-down levels.
+    pub fn subcluster(
+        &self,
+        ids: &[i64],
+        top_k: usize,
+        min_weight: f32,
+        target: usize,
+    ) -> Result<ClusterIndex> {
+        let rows = self.rows_for_ids(ids)?;
+        Ok(self.cluster_rows(rows, top_k, min_weight, target))
+    }
+
+    /// Leaf rendering for an arbitrary memory-id set: load those rows, build
+    /// their [`MemNode`]s and intra-set Jaccard similarity edges (same scoring
+    /// as [`cluster_members`](Self::cluster_members)), capped at
+    /// [`MEMBER_RENDER_CAP`] nodes / [`INTRA_EDGE_CAP`] edges.
+    pub fn members_for_ids(&self, ids: &[i64]) -> Result<ClusterMembers> {
+        let mut rows = self.rows_for_ids(ids)?;
+        // Cap the members streamed to the client: a huge set would freeze the
+        // canvas. `rows_for_ids` does not order, so cap on the newest ids
+        // (largest id first) to drill into the most recent members.
+        if rows.len() > MEMBER_RENDER_CAP {
+            rows.sort_by(|a, b| b.0.id.cmp(&a.0.id));
+            rows.truncate(MEMBER_RENDER_CAP);
+        }
+        let nodes: Vec<MemNode> = rows.iter().map(|(node, _)| node.clone()).collect();
+        let edges = Self::intra_edges(&rows);
         Ok(ClusterMembers { nodes, edges })
+    }
+
+    /// Top-level metadata grouping (a non-semantic alternative to
+    /// [`graph_clusters`](Self::graph_clusters)): bucket the newest `max_nodes`
+    /// rows of `project` by a single metadata facet rather than lexical
+    /// similarity. `key` selects the facet:
+    ///
+    /// * `"kind"`    — the `kind` column value.
+    /// * `"source"`  — `metadata.$.source_kind` (`main` / `subagent`), else `unknown`.
+    /// * `"session"` — `session_id`, else `(세션 없음)`.
+    /// * `"file"`    — the first file-path-like token in the body, else `(파일 없음)`.
+    ///
+    /// Each group's `id` is its **minimum member id** (deterministic root),
+    /// `size` its member count, `label` the (truncated) group label, and
+    /// `dominant_source` is derived from members. Groups beyond `target` fold
+    /// into one catch-all labelled `(기타)`. `cluster_edges` is always empty
+    /// (metadata groups need no inter-edges). An unknown `key` is an error.
+    pub fn group_meta(
+        &self,
+        project: &str,
+        max_nodes: usize,
+        key: &str,
+        target: usize,
+    ) -> Result<ClusterIndex> {
+        // Reject unknown facets up front (spec: Err, not silent "kind" fallback).
+        if !matches!(key, "kind" | "source" | "session" | "file" | "time") {
+            return Err(Error::Memory(format!(
+                "group_meta: unknown key `{key}` (expected kind|source|session|file|time)"
+            )));
+        }
+
+        // Load newest rows of the project with every column a facet may need.
+        // `time` buckets by hour (epoch -> local-agnostic UTC label).
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind'), session_id, \
+                        strftime('%Y-%m-%d %Hh', created_at, 'unixepoch') \
+                   FROM memories \
+                  WHERE project = ?1 \
+                  ORDER BY created_at DESC, id DESC \
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        // Per row: (id, label, source_kind).
+        let rows: Vec<(i64, String, Option<String>)> = stmt
+            .query_map(rusqlite::params![project, max_nodes as i64], |r| {
+                let id: i64 = r.get(0)?;
+                let kind: String = r.get(1)?;
+                let body: String = r.get(2)?;
+                let source_kind: Option<String> = r.get(3)?;
+                let session_id: Option<String> = r.get(4)?;
+                let time_bucket: Option<String> = r.get(5)?;
+                let label = match key {
+                    "kind" => kind,
+                    "source" => source_kind.clone().unwrap_or_else(|| "unknown".to_string()),
+                    "session" => session_id.unwrap_or_else(|| "(세션 없음)".to_string()),
+                    "time" => time_bucket.unwrap_or_else(|| "(시간 없음)".to_string()),
+                    // "file": first file-path-like token in the body.
+                    _ => first_file_token(&body).unwrap_or_else(|| "(파일 없음)".to_string()),
+                };
+                Ok((id, label, source_kind))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        Ok(bucket_meta_rows(rows, target))
+    }
+
+    /// Like [`group_meta`](Self::group_meta) but over an explicit id set rather
+    /// than a whole project. Used as the drill-down fallback when a semantic
+    /// re-cluster cannot meaningfully split a bucket (a lexically-disjoint
+    /// "unclustered" mass): instead of recursing on a near-identical set forever,
+    /// the caller re-partitions it by a metadata facet so it stays navigable.
+    pub fn group_meta_ids(&self, ids: &[i64], key: &str, target: usize) -> Result<ClusterIndex> {
+        if !matches!(key, "kind" | "source" | "session" | "file" | "time") {
+            return Err(Error::Memory(format!(
+                "group_meta_ids: unknown key `{key}` (expected kind|source|session|file|time)"
+            )));
+        }
+        let mut rows: Vec<(i64, String, Option<String>)> = Vec::with_capacity(ids.len());
+        // Chunk the IN-list to stay under SQLite's bound-variable limit.
+        for chunk in ids.chunks(900) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, body, json_extract(metadata, '$.source_kind'), session_id, \
+                        strftime('%Y-%m-%d %Hh', created_at, 'unixepoch') \
+                   FROM memories WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            let mapped = stmt
+                .query_map(params.as_slice(), |r| {
+                    let id: i64 = r.get(0)?;
+                    let kind: String = r.get(1)?;
+                    let body: String = r.get(2)?;
+                    let source_kind: Option<String> = r.get(3)?;
+                    let session_id: Option<String> = r.get(4)?;
+                    let time_bucket: Option<String> = r.get(5)?;
+                    let label = match key {
+                        "kind" => kind,
+                        "source" => source_kind.clone().unwrap_or_else(|| "unknown".to_string()),
+                        "session" => session_id.unwrap_or_else(|| "(세션 없음)".to_string()),
+                        "time" => time_bucket.unwrap_or_else(|| "(시간 없음)".to_string()),
+                        _ => first_file_token(&body).unwrap_or_else(|| "(파일 없음)".to_string()),
+                    };
+                    Ok((id, label, source_kind))
+                })
+                .map_err(|e| Error::Memory(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            rows.extend(mapped);
+        }
+        Ok(bucket_meta_rows(rows, target))
     }
 
     /// Letta / MemGPT-style alias for [`compress_project`]: archives the

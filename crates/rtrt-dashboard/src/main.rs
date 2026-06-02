@@ -68,15 +68,81 @@ struct AppState {
     /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
     /// paths working without an Ollama instance.
     embedder: Option<Arc<dyn Embedder>>,
-    /// Per-project LOD cluster index cache (`project -> (built_at, index)`),
-    /// TTL [`CLUSTER_INDEX_TTL`]. The `overview` mode builds + caches; `cluster`
-    /// drill-down reads the cache (rebuilding if missing/expired).
+    /// Per-`(project, group)` LOD cluster/group index cache
+    /// (`"project\x1fgroup" -> (built_at, index)`), TTL [`CLUSTER_INDEX_TTL`].
+    /// The `overview` mode builds + caches; the legacy `cluster` drill-down
+    /// reads the `context` entry (rebuilding if missing/expired).
     cluster_cache:
         Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
+    /// Opaque drill tokens minted per overview/group build
+    /// (`token -> (built_at, entry)`), TTL [`LEVEL_TOKEN_TTL`]. Each token maps
+    /// to the member-id set of one bubble so the client can drill many levels
+    /// deep without ever sending large id lists over the wire.
+    level_tokens: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, TokenEntry)>>>,
+}
+
+/// One drill token's payload: which project it belongs to, the member ids it
+/// stands for, and the bubble label (kept for debugging / future reuse).
+#[derive(Clone)]
+struct TokenEntry {
+    project: String,
+    member_ids: Vec<i64>,
+    /// Project total at mint time — drives the dynamic leaf cutoff so the
+    /// "show individual nodes" threshold is consistent across drill levels.
+    total_n: usize,
+    /// Bubble label captured at mint time. Not read on the drill path (the
+    /// child rebuild derives its own labels) but retained for debug logging
+    /// and future "breadcrumb" responses.
+    #[allow(dead_code)]
+    label: String,
+}
+
+/// Monotonic source for unique drill-token suffixes (paired with a coarse
+/// timestamp so tokens are short, opaque, and collision-free across rebuilds).
+static LEVEL_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mint a fresh opaque drill token (e.g. `t-<seq>-<nanos>`).
+fn mint_level_token() -> String {
+    let seq = LEVEL_TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("t-{seq}-{nanos:09}")
 }
 
 /// Time-to-live for a cached [`ClusterIndex`] before it is rebuilt.
 const CLUSTER_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Time-to-live for a minted drill [`TokenEntry`]. Long enough for a user to
+/// drill several levels; short enough that the token cache stays bounded.
+const LEVEL_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Leaf cutoff: a bubble at/under this many members renders its individual
+/// memory nodes instead of splitting further. Dynamic in the project total
+/// (~√total, clamped) so a small project bottoms out in one or two levels while
+/// a huge one does not dump thousands of points into a single leaf.
+fn dynamic_leaf(total: usize) -> usize {
+    ((total as f64).sqrt().round() as usize).clamp(40, 160)
+}
+
+/// Sub-bubble target when re-clustering a bubble of `size` members at a deeper
+/// level. Dynamic in the bucket size (~1.4·√size, clamped): bigger buckets fan
+/// out wider, so drill DEPTH grows with quantity instead of being a fixed step.
+fn dynamic_branch(size: usize) -> usize {
+    (((size as f64).sqrt() * 1.4).round() as usize).clamp(12, 64)
+}
+
+/// Top-bubble target when grouping the overview by a metadata facet. Dynamic in
+/// the project total (~√total, clamped).
+fn dynamic_meta_target(total: usize) -> usize {
+    ((total as f64).sqrt().round() as usize).clamp(24, 200)
+}
+
+/// A re-cluster "did not split" — its largest child still holds this fraction of
+/// the parent — so semantic clustering cannot break it up (a lexically-disjoint
+/// unclustered mass). The drill path then falls back to a metadata facet.
+const STALL_DOMINANCE: f64 = 0.6;
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
@@ -272,6 +338,7 @@ async fn main() -> Result<()> {
         events: events_tx,
         embedder,
         cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
@@ -1158,6 +1225,7 @@ async fn memory_timeline(
 
 #[derive(Debug, Deserialize)]
 struct MemoryGraphQuery {
+    #[serde(default)]
     project: String,
     #[serde(default = "default_graph_limit")]
     limit: usize,
@@ -1166,8 +1234,17 @@ struct MemoryGraphQuery {
     /// bubbles for large graphs).
     #[serde(default)]
     mode: Option<String>,
-    /// Drill-down: when set, return the members of the cluster with this root id
-    /// (reuses the cached `ClusterIndex`). Takes precedence over `mode`.
+    /// Top-level grouping basis for `mode=overview`: `context` (semantic,
+    /// default) | `file` | `kind` | `session` | `source`.
+    #[serde(default)]
+    group: Option<String>,
+    /// Multi-level drill token (opaque, server-minted). Takes precedence over
+    /// every other param: the server resolves it to a member-id set and either
+    /// re-subclusters (deeper `group` level) or returns a `leaf`.
+    #[serde(default)]
+    token: Option<String>,
+    /// Legacy drill-down by cluster root id (kept for the old frontend path);
+    /// superseded by `token`.
     #[serde(default)]
     cluster: Option<i64>,
 }
@@ -1186,11 +1263,21 @@ async fn memory_graph(
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+
+    // ── Token drill (highest precedence) ────────────────────────────────────
+    // A drill token resolves to a member-id set. Tiny sets render as a `leaf`
+    // (individual memory nodes); larger sets re-subcluster into sub-bubbles
+    // (each minted a fresh child token). All resolved before holding the
+    // `!Send` store guard across an `.await`.
+    if let Some(tok) = q.token.clone() {
+        return memory_graph_drill(&state, store, tok).await;
+    }
+
     // LOD drill-down (`cluster=<root>`): return the members of one cluster from
     // the cached index. Rebuilds the index if missing/expired. Checked before
     // `mode` so a drill-down request needs no extra `mode=` param. Resolved
     // before the long-lived store guard below so the `!Send` store reference is
-    // never held across an `.await`.
+    // never held across an `.await`. Superseded by `token`, kept for the old UI.
     if let Some(root_id) = q.cluster {
         let index = cluster_index_cached(&state, store, &q.project).await?;
         let members = {
@@ -1225,35 +1312,14 @@ async fn memory_graph(
         })));
     }
 
-    // LOD overview (`mode=overview`): server-side clustering of the whole
-    // project. Returns ONLY cluster summaries + aggregated inter-cluster edges,
-    // never the individual nodes — this scales to hundreds of thousands of rows.
+    // LOD overview (`mode=overview&group=<basis>`): server-side top-level
+    // grouping of the whole project. Returns ONLY bubble summaries (each with a
+    // drill token) + aggregated inter-cluster edges, never individual nodes —
+    // this scales to hundreds of thousands of rows. `group=context` (default)
+    // clusters semantically; any other basis buckets by a metadata facet.
     if q.mode.as_deref() == Some("overview") {
-        let index = cluster_index_cached(&state, store, &q.project).await?;
-        let total_nodes: usize = index.node_cluster.len();
-        let clusters: Vec<serde_json::Value> = index
-            .clusters
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "id": c.id,
-                    "size": c.size,
-                    "label": c.label,
-                    "dominant_source": c.dominant_source,
-                })
-            })
-            .collect();
-        let cluster_edges: Vec<serde_json::Value> = index
-            .cluster_edges
-            .iter()
-            .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
-            .collect();
-        return Ok(Json(serde_json::json!({
-            "mode": "overview",
-            "clusters": clusters,
-            "cluster_edges": cluster_edges,
-            "total_nodes": total_nodes,
-        })));
+        let group = q.group.as_deref().unwrap_or("context");
+        return memory_graph_overview(&state, store, &q.project, group).await;
     }
 
     let guard = store.lock().await;
@@ -1371,6 +1437,355 @@ async fn cluster_index_cached(
         (std::time::Instant::now(), index.clone()),
     );
     Ok(index)
+}
+
+/// Cache-key separator for the `(project, group)` overview cache.
+const CACHE_KEY_SEP: char = '\u{1f}';
+
+/// Build (or serve cached) a top-level overview keyed by `(project, group)`.
+///
+/// `group=context` clusters semantically via [`MemoryStore::graph_clusters`];
+/// any other valid basis (`file`/`kind`/`session`/`source`) buckets by that
+/// metadata facet via [`MemoryStore::group_meta`]. Each emitted bubble is
+/// minted a fresh drill token (mapping to its member ids) so the client can
+/// drill arbitrarily deep without ever shipping id lists. Expired tokens (and
+/// stale tokens of this same project) are pruned on every build to bound growth.
+async fn memory_graph_overview(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    group: &str,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // `context` is semantic; everything else is a metadata facet. Reject an
+    // unknown basis up front (group_meta also rejects, but a 400 is clearer).
+    let is_context = group == "context";
+    if !is_context && !matches!(group, "file" | "kind" | "session" | "source" | "time") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown group `{group}` (expected context|file|kind|session|source|time)"),
+        ));
+    }
+
+    let cache_key = format!("{project}{CACHE_KEY_SEP}{group}");
+
+    // Fast path: serve a still-fresh cached index (re-mint tokens against it).
+    let cached = {
+        let cache = state.cluster_cache.lock().await;
+        cache.get(&cache_key).and_then(|(built_at, index)| {
+            (built_at.elapsed() < CLUSTER_INDEX_TTL).then(|| index.clone())
+        })
+    };
+    let index = match cached {
+        Some(idx) => idx,
+        None => {
+            // Miss / expired: rebuild under the store lock (no await inside).
+            let idx = {
+                let guard = store.lock().await;
+                if is_context {
+                    guard
+                        .graph_clusters(project, CLUSTER_MAX_NODES, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                } else {
+                    // Top-bubble count scales with the project total (~√total).
+                    let total = guard.count_by_project(project).unwrap_or(0);
+                    guard
+                        .group_meta(project, CLUSTER_MAX_NODES, group, dynamic_meta_target(total))
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                }
+            };
+            let mut cache = state.cluster_cache.lock().await;
+            cache.insert(cache_key, (std::time::Instant::now(), idx.clone()));
+            idx
+        }
+    };
+
+    // Invert `node_cluster` (member -> root) into `root -> member_ids`.
+    let total_nodes = index.node_cluster.len();
+    let mut members_by_root: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (&mem_id, &root) in &index.node_cluster {
+        members_by_root.entry(root).or_default().push(mem_id);
+    }
+
+    // Prune expired tokens + stale tokens of this same project, then mint one
+    // token per bubble.
+    let clusters = {
+        let mut tokens = state.level_tokens.lock().await;
+        tokens.retain(|_, (built_at, entry)| {
+            built_at.elapsed() < LEVEL_TOKEN_TTL && entry.project != project
+        });
+        index
+            .clusters
+            .iter()
+            .map(|c| {
+                let member_ids = members_by_root.remove(&c.id).unwrap_or_default();
+                let token = mint_level_token();
+                tokens.insert(
+                    token.clone(),
+                    (
+                        std::time::Instant::now(),
+                        TokenEntry {
+                            project: project.to_string(),
+                            member_ids,
+                            total_n: total_nodes,
+                            label: c.label.clone(),
+                        },
+                    ),
+                );
+                serde_json::json!({
+                    "id": c.id,
+                    "token": token,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                    // Every bubble opens: > leaf_cut -> sub-bubbles, else a leaf
+                    // of its members. Only a size-1 bubble is a dead end.
+                    "drillable": c.size > 1,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let cluster_edges: Vec<serde_json::Value> = index
+        .cluster_edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "mode": "overview",
+        "group": group,
+        "total_nodes": total_nodes,
+        "clusters": clusters,
+        "cluster_edges": cluster_edges,
+    })))
+}
+
+/// Resolve a drill `token` to its member-id set and render the next level.
+///
+/// * missing / expired token  -> `410 stale` (client refetches the overview).
+/// * `ids.len() <= LEAF_THRESHOLD` -> `leaf` (individual memory nodes).
+/// * otherwise re-subcluster; if the subset does not split
+///   (`clusters.len() <= 1`, e.g. all highly similar) fall back to a `leaf`
+///   (anti-stall guard); else emit a `group` of sub-bubbles, each minted a
+///   fresh child token.
+async fn memory_graph_drill(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    token: String,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Resolve the token (honouring TTL) and clone out its payload.
+    let entry = {
+        let tokens = state.level_tokens.lock().await;
+        match tokens.get(&token) {
+            Some((built_at, entry)) if built_at.elapsed() < LEVEL_TOKEN_TTL => entry.clone(),
+            _ => return Err((StatusCode::GONE, "stale".into())),
+        }
+    };
+    let total_n = entry.total_n;
+    let project = entry.project.clone();
+    let ids = entry.member_ids;
+    let leaf_cut = dynamic_leaf(total_n);
+
+    // Leaf: small enough to render individual memory nodes.
+    if ids.len() <= leaf_cut {
+        return memory_graph_leaf(store, &token, &ids).await;
+    }
+
+    // Deeper level: semantic re-cluster of the subset. Branch width scales with
+    // the bucket size so drill depth grows with quantity.
+    let branch = dynamic_branch(ids.len());
+    let idx2 = {
+        let guard = store.lock().await;
+        guard
+            .subcluster(&ids, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT, branch)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // Anti-stall: if the semantic split did not actually break the set up — one
+    // dominant child still holds most of it (a lexically-disjoint "unclustered"
+    // mass) — recursing on it would peel only a few rows per level (the 90-deep
+    // pathology). Re-partition by a metadata facet (session) so the mass becomes
+    // navigable sub-bubbles instead of one blob.
+    let largest = idx2.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+    let stalled = idx2.clusters.len() <= 1 || largest as f64 >= ids.len() as f64 * STALL_DOMINANCE;
+    let level = if stalled {
+        // Try metadata facets in turn until one actually distributes the mass
+        // (more than one bucket, no single bucket still holding ~everything).
+        // session -> time(hour) -> kind. `time` almost always splits a
+        // same-session lexical mass chronologically, avoiding a truncated leaf.
+        let chosen = {
+            let guard = store.lock().await;
+            let mut found: Option<ClusterIndex> = None;
+            for facet in ["session", "time", "kind"] {
+                let meta = guard
+                    .group_meta_ids(&ids, facet, branch)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let ml = meta.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+                if meta.clusters.len() > 1 && (ml as f64) < ids.len() as f64 * 0.9 {
+                    found = Some(meta);
+                    break;
+                }
+            }
+            found
+        };
+        // No facet helped (a truly homogeneous mass). Rather than truncate it to
+        // a capped leaf (silent node loss), split it into ordinal time-ordered
+        // PAGE buckets of <= leaf_cut, each of which opens to a full leaf. This
+        // guarantees every memory stays reachable while the graph never has to
+        // render thousands of points at once.
+        match chosen {
+            Some(m) => m,
+            None => {
+                let pages = page_buckets(&ids, leaf_cut);
+                return Ok(
+                    emit_group_response(state, &pages, &project, total_n, &token, ids.len(), true)
+                        .await,
+                );
+            }
+        }
+    } else {
+        idx2
+    };
+
+    Ok(emit_group_response(state, &level, &project, total_n, &token, ids.len(), false).await)
+}
+
+/// Last-resort partition for a homogeneous mass no facet could split: sort by id
+/// (≈ chronological) and cut into ordinal pages of `page` members each. Each page
+/// is its own cluster (root = min id) so it opens to a complete leaf — no node is
+/// ever dropped.
+fn page_buckets(ids: &[i64], page: usize) -> ClusterIndex {
+    let page = page.max(1);
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    let mut clusters = Vec::new();
+    let mut node_cluster = std::collections::HashMap::new();
+    for (ci, chunk) in sorted.chunks(page).enumerate() {
+        let root = *chunk.iter().min().expect("non-empty chunk");
+        for &id in chunk {
+            node_cluster.insert(id, root);
+        }
+        let start = ci * page + 1;
+        clusters.push(rtrt_memory::ClusterSummary {
+            id: root,
+            size: chunk.len(),
+            label: format!("{}–{} (시간순)", start, start + chunk.len() - 1),
+            dominant_source: "mixed".to_string(),
+        });
+    }
+    ClusterIndex {
+        clusters,
+        cluster_edges: Vec::new(),
+        node_cluster,
+    }
+}
+
+/// Mint a child drill token per sub-bubble of `index` and render a `group`
+/// level. Shared by the semantic and metadata-fallback drill paths. Prunes
+/// expired tokens before minting so the cache stays bounded on deep drills
+/// (overviews are not always rebuilt between drills).
+async fn emit_group_response(
+    state: &AppState,
+    index: &ClusterIndex,
+    project: &str,
+    total_n: usize,
+    parent: &str,
+    parent_size: usize,
+    force_drillable: bool,
+) -> Json<serde_json::Value> {
+    let mut members_by_root: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (&mem_id, &root) in &index.node_cluster {
+        members_by_root.entry(root).or_default().push(mem_id);
+    }
+    let clusters = {
+        let mut tokens = state.level_tokens.lock().await;
+        tokens.retain(|_, (built_at, _)| built_at.elapsed() < LEVEL_TOKEN_TTL);
+        index
+            .clusters
+            .iter()
+            .map(|c| {
+                let member_ids = members_by_root.remove(&c.id).unwrap_or_default();
+                let child = mint_level_token();
+                tokens.insert(
+                    child.clone(),
+                    (
+                        std::time::Instant::now(),
+                        TokenEntry {
+                            project: project.to_string(),
+                            member_ids,
+                            total_n,
+                            label: c.label.clone(),
+                        },
+                    ),
+                );
+                serde_json::json!({
+                    "id": c.id,
+                    "token": child,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                    // Every bubble opens (sub-bubbles or a member leaf); only a
+                    // size-1 bubble is a dead end. (force_drillable kept for
+                    // symmetry with the overview path / page buckets.)
+                    "drillable": force_drillable || c.size > 1,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let cluster_edges: Vec<serde_json::Value> = index
+        .cluster_edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+        .collect();
+
+    Json(serde_json::json!({
+        "mode": "group",
+        "parent": parent,
+        "total_nodes": parent_size,
+        "clusters": clusters,
+        "cluster_edges": cluster_edges,
+    }))
+}
+
+/// Leaf render shared by the token-drill paths: load `ids` as individual
+/// memory nodes + their intra-set edges (capped by the store).
+async fn memory_graph_leaf(
+    store: &Arc<Mutex<MemoryStore>>,
+    parent: &str,
+    ids: &[i64],
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let members = {
+        let guard = store.lock().await;
+        guard
+            .members_for_ids(ids)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let nodes: Vec<serde_json::Value> = members
+        .nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": format!("m{}", n.id),
+                "node_type": "memory",
+                "label": n.preview,
+                "kind": n.kind,
+                "source_kind": n.source_kind,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = members
+        .edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "leaf",
+        "parent": parent,
+        "nodes": nodes,
+        "edges": edges,
+    })))
 }
 
 #[derive(Debug, Deserialize)]

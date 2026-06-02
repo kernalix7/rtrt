@@ -150,6 +150,13 @@
   .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0; }
   .memmap-controls .sort-row { margin: 0; }
   .memmap-search { min-width: min(260px, 100%); flex: 1 1 220px; }
+  .memmap-group { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.25rem 0.5rem; font-size: 0.85em; color: var(--fg); cursor: pointer; }
+  .memmap-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 0.15rem; font-size: 0.85em; margin: 0.35rem 0 0.2rem; }
+  .memmap-crumbs .crumb { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0.1rem 0.3rem; font-size: inherit; border-radius: 4px; }
+  .memmap-crumbs .crumb:hover { background: var(--accent-soft); }
+  .memmap-crumbs .crumb.current { color: var(--muted); cursor: default; }
+  .memmap-crumbs .crumb.current:hover { background: none; }
+  .memmap-crumbs .crumb-sep { color: var(--muted); }
   .memmap-cy { width: 100%; height: 70vh; min-height: 360px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; }
   .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
   .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
@@ -650,6 +657,14 @@
 
             <div class="memmap-controls">
               <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
+              <select id="memmap-group" class="memmap-group" aria-label="묶음 기준">
+                <option value="context" selected>문맥</option>
+                <option value="file">파일</option>
+                <option value="kind">종류</option>
+                <option value="session">세션</option>
+                <option value="source">출처</option>
+                <option value="time">시간</option>
+              </select>
               <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
                 <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
                 <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
@@ -658,6 +673,7 @@
               <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
               <button id="memmap-fit" class="ghost" type="button">맞춤</button>
             </div>
+            <div id="memmap-crumbs" class="memmap-crumbs" hidden></div>
             <div id="memmap-overview-head" class="memmap-head"></div>
 
             <!-- Cytoscape renders the node graph into this container. -->
@@ -2560,11 +2576,20 @@ let memmapOverview = null;           // last overview payload for the current pr
 let memmapProject = '';              // project the overview belongs to
 let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
 let memmapSearch = '';               // cluster label filter substring
-let memmapMode = 'overview';         // 'overview' | 'cluster'
+let memmapGroup = 'context';         // grouping basis: context|file|kind|session|source|time
+let memmapMode = 'overview';         // 'overview' | 'group' | 'leaf' (current level kind)
 let memmapCy = null;                 // the single Cytoscape instance, lazily created
 let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
-// Drill-down cache: cluster id -> { nodes, edges }. Fetched at most once.
-const memmapClusterCache = new Map();
+// Breadcrumb stack of drilled levels: [{ token, label }, …]. The overview itself
+// is the implicit root (rendered as the "전체" crumb); pushed levels follow.
+let memmapStack = [];
+// Per-level cache keyed by drill token -> the raw level payload (group or leaf).
+// Lets breadcrumb pops / re-opens render instantly without re-fetching.
+const memmapLevelCache = new Map();
+
+const MEMMAP_GROUP_KO = {
+  context: '문맥', file: '파일', kind: '종류', session: '세션', source: '출처', time: '시간',
+};
 
 function memmapSourceLabelKo(source) {
   return source === 'subagent' ? '🤖서브' : '🧠메인';
@@ -2686,11 +2711,16 @@ function memmapEnsureCy() {
     maxZoom: 3,
     wheelSensitivity: 0.2,
   });
-  // Tap on a node: cluster node drills down; member node opens the detail modal.
+  // Tap on a node: a bubble (cluster) drills via its token; a member opens the modal.
   memmapCy.on('tap', 'node', (ev) => {
     const data = ev.target.data();
     if (data.kindType === 'cluster') {
-      if (!data.misc) openMemmapCluster(data.clusterId);
+      // Not drillable (misc/leaf-of-leaf): just centre it, don't try to drill.
+      if (data.drillable === false || data.misc || !data.token) {
+        try { memmapCy.animate({ center: { eles: ev.target }, duration: 200 }); } catch (_) { /* ignore */ }
+        return;
+      }
+      memmapDrill(String(data.token), String(data.rawLabel || data.token));
     } else if (data.kindType === 'member') {
       const num = String(data.memId || '').replace(/^m/, '');
       if (/^\d+$/.test(num)) openDetailModal(Number(num));
@@ -2702,16 +2732,43 @@ function memmapEnsureCy() {
   return memmapCy;
 }
 
-// Toggle the controls that only make sense in overview vs drill-down.
+// Set the current level kind and toggle controls. 'overview'/'group' are bubble
+// levels (source filter + search apply); 'leaf' shows individual members (hidden).
 function memmapSetMode(mode) {
   memmapMode = mode;
+  const isBubble = mode === 'overview' || mode === 'group';
   const back = document.getElementById('memmap-back');
-  if (back) back.hidden = mode !== 'cluster';
-  // Source filter + search only apply to the overview cluster graph.
+  if (back) back.hidden = memmapStack.length === 0;   // hidden at the root
+  // Source filter + search only apply to bubble levels (overview / group).
   const filter = document.getElementById('memmap-source-filter');
-  if (filter) filter.style.display = mode === 'overview' ? '' : 'none';
+  if (filter) filter.style.display = isBubble ? '' : 'none';
   const search = document.getElementById('memmap-search');
-  if (search) search.style.display = mode === 'overview' ? '' : 'none';
+  if (search) search.style.display = isBubble ? '' : 'none';
+}
+
+// Render the breadcrumb bar: "전체 › 라벨 › 라벨". Each non-current crumb pops back
+// to that depth and re-renders from cache. Root crumb (전체) reloads the overview.
+function memmapRenderCrumbs() {
+  const bar = document.getElementById('memmap-crumbs');
+  if (!bar) return;
+  bar.innerHTML = '';
+  const crumbs = [{ token: null, label: '전체' }].concat(memmapStack);
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = '›';
+      bar.appendChild(sep);
+    }
+    const isLast = i === crumbs.length - 1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (isLast ? ' current' : '');
+    btn.textContent = c.label;
+    if (!isLast) btn.onclick = () => memmapGoToDepth(i);   // i === stack index to keep
+    bar.appendChild(btn);
+  });
+  bar.hidden = false;
 }
 
 // Clear the offline/no-cy fallback list + empty notice + the cy container.
@@ -2748,10 +2805,13 @@ function memmapBackboneEdges(rawEdges, validIds) {
   return out;
 }
 
-// Build the Cytoscape elements for the cluster overview from the cached payload.
-function memmapOverviewElements() {
-  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
-  const edges = Array.isArray(memmapOverview.cluster_edges) ? memmapOverview.cluster_edges : [];
+// Build the Cytoscape bubble elements from a clusters[] + cluster_edges[] pair.
+// Used by both the overview and every drilled "group" level (same bubble shape).
+// Each bubble carries `token` + `drillable` so the tap handler can drill deeper.
+function memmapOverviewElements(payload) {
+  payload = payload || memmapOverview || {};
+  const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
+  const edges = Array.isArray(payload.cluster_edges) ? payload.cluster_edges : [];
   const catchAllId = memmapCatchAllId(clusters);
   // Size scaling: clamp node diameter so the biggest cluster never dwarfs the rest.
   const sizes = clusters.map(c => Number(c.size || 0));
@@ -2775,6 +2835,8 @@ function memmapOverviewElements() {
         id, label, size: Math.round(diam), src: dom,
         misc: isMisc ? 1 : undefined,
         kindType: 'cluster', clusterId: id, dom,
+        token: c.token != null ? String(c.token) : '',
+        drillable: c.drillable !== false,
         rawLabel: String(c.label || ''),
       },
     };
@@ -2878,9 +2940,12 @@ function memmapRunLayout() {
 }
 
 // Render the overview cluster graph (or fallback list when cy is unavailable).
+// The overview is the breadcrumb root: it clears the drill stack.
 function renderMemmapOverview() {
   const head = document.getElementById('memmap-overview-head');
+  memmapStack = [];
   memmapSetMode('overview');
+  memmapRenderCrumbs();
   memmapResetViews();
   if (!memmapOverview) {
     if (head) head.textContent = '';
@@ -2889,7 +2954,9 @@ function renderMemmapOverview() {
   }
   const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
   const total = Number(memmapOverview.total_nodes || 0);
-  if (head) head.textContent = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 클러스터`;
+  const groupKo = MEMMAP_GROUP_KO[memmapGroup] || memmapGroup;
+  if (head) head.textContent =
+    `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹 · 기준: ${groupKo}`;
   if (!clusters.length) {
     const empty = document.getElementById('memmap-empty');
     if (empty) empty.hidden = false;
@@ -2899,14 +2966,57 @@ function renderMemmapOverview() {
   const cy = memmapEnsureCy();
   if (!cy) { renderMemmapFallback(clusters); return; }
   cy.elements().remove();
-  cy.add(memmapOverviewElements());
+  cy.add(memmapOverviewElements(memmapOverview));
   memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Render a drilled "group" level: bubbles again (same builder), with a caption and
+// the source filter/search re-enabled. Assumes the crumb is already on the stack.
+function memmapRenderGroupLevel(payload, label) {
+  const head = document.getElementById('memmap-overview-head');
+  memmapSetMode('group');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
+  const total = Number(payload.total_nodes || 0);
+  if (head) head.textContent =
+    `${label} · ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹`;
+  if (!clusters.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) empty.hidden = false;
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapFallback(clusters); return; }
+  cy.elements().remove();
+  cy.add(memmapOverviewElements(payload));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Render a "leaf" level: individual member nodes; tapping one opens the modal.
+function memmapRenderLeafLevel(payload, label) {
+  const head = document.getElementById('memmap-overview-head');
+  memmapSetMode('leaf');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  const memberCount = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  ).length;
+  if (head) head.textContent = `${label} · ${memberCount.toLocaleString()}개 메모리`;
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapMemberFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(memmapMemberElements(payload));
   memmapRunLayout();
 }
 
 // Apply the source filter + search highlight to the overview using cy selectors.
 function memmapApplyFilters() {
-  if (!memmapCy || memmapMode !== 'overview') return;
+  // Bubble levels only (overview / group); leaf shows members, no cluster filter.
+  if (!memmapCy || (memmapMode !== 'overview' && memmapMode !== 'group')) return;
   const needle = memmapSearch.trim().toLowerCase();
   memmapCy.nodes().removeClass('dim hit');
   // Source filter: dim nodes whose dominant_source doesn't match (mixed always shows).
@@ -2936,7 +3046,9 @@ function renderMemmapFallback(clusters) {
       const size = Number(c.size || 0);
       const dom = c.dominant_source || 'mixed';
       const badge = dom === 'subagent' ? 'badge source-subagent' : 'badge';
-      return `<div class="member-row" data-cluster="${escapeHtml(String(c.id))}">`
+      const tok = c.token != null ? String(c.token) : '';
+      const drillable = c.drillable !== false && tok;
+      return `<div class="member-row" data-token="${escapeHtml(tok)}" data-drillable="${drillable ? '1' : '0'}" data-label="${escapeHtml(String(c.label || ''))}">`
         + `<span class="mr-badge ${badge}">${memmapSourceLabelKo(dom === 'subagent' ? 'subagent' : 'main')}</span>`
         + `<div class="mr-body"><div class="mr-preview">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
         + `<div class="mr-kind">${size.toLocaleString()}건</div></div></div>`;
@@ -2944,7 +3056,10 @@ function renderMemmapFallback(clusters) {
   fb.innerHTML = note + rows;
   fb.hidden = false;
   fb.querySelectorAll('.member-row').forEach(el => {
-    el.onclick = () => openMemmapCluster(el.dataset.cluster);
+    el.onclick = () => {
+      if (el.dataset.drillable !== '1') return;
+      memmapDrill(el.dataset.token, el.dataset.label || el.dataset.token);
+    };
   });
 }
 
@@ -2977,58 +3092,66 @@ function renderMemmapMemberFallback(payload) {
   });
 }
 
-// Drill into one cluster: fetch (once, cached) its members, then expand them in
-// the same cy instance (replace-and-back). Clicking a member opens the modal.
-async function openMemmapCluster(clusterId) {
-  const project = memmapProject || currentProject();
-  if (!project) return;
-  const head = document.getElementById('memmap-overview-head');
-  // Resolve a friendly label from the overview for the caption.
-  let label = String(clusterId);
-  if (memmapOverview && Array.isArray(memmapOverview.clusters)) {
-    const c = memmapOverview.clusters.find(x => String(x.id) === String(clusterId));
-    if (c && c.label) label = c.label;
-  }
-  memmapSetMode('cluster');
-  memmapResetViews();
-  if (head) head.textContent = `${label} · 불러오는 중…`;
+// Render a cached level payload by its declared mode (group bubbles vs leaf members).
+function memmapRenderLevelPayload(payload, label) {
+  if (payload && payload.mode === 'leaf') memmapRenderLeafLevel(payload, label);
+  else memmapRenderGroupLevel(payload, label);
+}
 
-  let payload = memmapClusterCache.get(String(clusterId));
+// Drill into one bubble by token: fetch the level (cached by token), push a crumb,
+// and render it (group bubbles or leaf members). On a stale (HTTP 410) token the
+// whole map is reloaded from the overview.
+async function memmapDrill(token, label) {
+  token = String(token || '');
+  label = String(label || token);
+  if (!token) return;
+  const head = document.getElementById('memmap-overview-head');
+
+  let payload = memmapLevelCache.get(token);
   if (!payload) {
+    if (head) head.textContent = `${label} · 불러오는 중…`;
     try {
-      const params = new URLSearchParams({ project, cluster: String(clusterId) });
-      const r = await fetch(`/api/memory/graph?${params.toString()}`);
+      const r = await fetch('/api/memory/graph?token=' + encodeURIComponent(token));
+      if (r.status === 410) {
+        showToast('맵이 갱신되어 처음부터 다시 불러옵니다', 'err');
+        await loadGraph(currentProject());
+        return;
+      }
       if (!r.ok) {
-        showToast(`클러스터 로드 실패 ${r.status}`, 'err');
+        showToast(`그룹 로드 실패 ${r.status}`, 'err');
         if (head) head.textContent = `${label} · 오류 ${r.status}`;
         return;
       }
-      const d = await r.json();
-      payload = {
-        nodes: Array.isArray(d.nodes) ? d.nodes : [],
-        edges: Array.isArray(d.edges) ? d.edges : [],
-      };
-      memmapClusterCache.set(String(clusterId), payload);
+      payload = await r.json();
+      memmapLevelCache.set(token, payload);
     } catch (e) {
       showToast(`네트워크 오류: ${e.message || e}`, 'err');
       if (head) head.textContent = `${label} · 네트워크 오류`;
       return;
     }
   }
-  const memberCount = (payload.nodes || []).filter(
-    n => n.node_type === 'memory' || n.node_type === undefined,
-  ).length;
-  if (head) head.textContent = `${label} · ${memberCount.toLocaleString()}개 메모리`;
-  const cy = memmapEnsureCy();
-  if (!cy) { renderMemmapMemberFallback(payload); return; }
-  cy.elements().remove();
-  cy.add(memmapMemberElements(payload));
-  memmapRunLayout();
+  memmapStack.push({ token, label });
+  memmapRenderLevelPayload(payload, label);
 }
 
-// Load the overview graph for a project. Always lands on the overview.
+// Jump to a breadcrumb depth (number of pushed levels to keep). depth 0 = overview
+// root; depth N renders the Nth pushed level from cache. Pops the stack to match.
+function memmapGoToDepth(depth) {
+  if (depth <= 0) { renderMemmapOverview(); return; }
+  memmapStack = memmapStack.slice(0, depth);
+  const crumb = memmapStack[memmapStack.length - 1];
+  const payload = crumb ? memmapLevelCache.get(crumb.token) : null;
+  if (!payload) { renderMemmapOverview(); return; }
+  memmapRenderLevelPayload(payload, crumb.label);
+}
+
+// Load the overview graph for a project with the current grouping basis. Always
+// lands on the overview (resets the breadcrumb stack + per-level token cache).
 async function loadGraph(project) {
+  memmapStack = [];
+  memmapLevelCache.clear();
   memmapSetMode('overview');
+  memmapRenderCrumbs();
   memmapResetViews();
   const head = document.getElementById('memmap-overview-head');
   if (memmapCy) memmapCy.elements().remove();
@@ -3039,7 +3162,7 @@ async function loadGraph(project) {
   }
   if (head) head.textContent = '불러오는 중…';
   try {
-    const params = new URLSearchParams({ project, mode: 'overview' });
+    const params = new URLSearchParams({ project, mode: 'overview', group: memmapGroup });
     const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();
@@ -3052,9 +3175,9 @@ async function loadGraph(project) {
     d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
     d.cluster_edges = Array.isArray(d.cluster_edges) ? d.cluster_edges : [];
     d.total_nodes = Number(d.total_nodes || 0);
+    if (d.group) memmapGroup = String(d.group);   // echo the server's resolved basis
     memmapOverview = d;
     memmapProject = project;
-    memmapClusterCache.clear();
     renderMemmapOverview();
   } catch (e) {
     showToast(`네트워크 오류: ${e.message || e}`, 'err');
@@ -3063,10 +3186,17 @@ async function loadGraph(project) {
   }
 }
 
-// Wire up the controls: search box, source filter, back button, fit button.
+// Wire up the controls: search box, group basis, source filter, back, fit.
 (function wireMemmap() {
   const search = document.getElementById('memmap-search');
   if (search) search.oninput = () => { memmapSearch = search.value || ''; memmapApplyFilters(); };
+  // Grouping basis: changing it resets the breadcrumb + cache and reloads overview.
+  const group = document.getElementById('memmap-group');
+  if (group) group.onchange = () => {
+    memmapGroup = group.value || 'context';
+    const project = memmapProject || currentProject();
+    if (project) loadGraph(project);
+  };
   document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {
       memmapSource = btn.dataset.memmapSource || 'all';
@@ -3076,8 +3206,9 @@ async function loadGraph(project) {
       memmapApplyFilters();
     };
   });
+  // Back: pop exactly one breadcrumb level (root reloads the overview).
   const back = document.getElementById('memmap-back');
-  if (back) back.onclick = () => renderMemmapOverview();
+  if (back) back.onclick = () => memmapGoToDepth(memmapStack.length - 1);
   const fit = document.getElementById('memmap-fit');
   if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
 })();

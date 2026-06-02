@@ -403,6 +403,7 @@ async fn main() -> Result<()> {
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
         .route("/", get(index))
+        .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
         .route("/api/stats", get(stats))
         .route("/api/templates", get(list_templates))
@@ -675,6 +676,33 @@ fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: 
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// Serve the vendored graph libraries (Cytoscape + cola/fcose layout deps) from
+/// the binary itself, so the memory map renders WITHOUT any CDN / internet — a
+/// blocked CDN was making the map fall back to a plain list.
+async fn vendor_asset(
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> std::result::Result<([(axum::http::HeaderName, &'static str); 2], &'static str), StatusCode> {
+    let body = match file.as_str() {
+        "cytoscape.min.js" => VENDOR_CYTOSCAPE,
+        "layout-base.js" => VENDOR_LAYOUT_BASE,
+        "cose-base.js" => VENDOR_COSE_BASE,
+        "cytoscape-fcose.js" => VENDOR_FCOSE,
+        "cola.min.js" => VENDOR_COLA,
+        "cytoscape-cola.js" => VENDOR_CYTO_COLA,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    ))
 }
 
 async fn healthz() -> &'static str {
@@ -3701,3 +3729,11 @@ async fn ollama_delete(
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
+
+// Vendored graph libraries (served at /vendor/*) so the map needs no CDN.
+const VENDOR_CYTOSCAPE: &str = include_str!("../ui/vendor/cytoscape.min.js");
+const VENDOR_LAYOUT_BASE: &str = include_str!("../ui/vendor/layout-base.js");
+const VENDOR_COSE_BASE: &str = include_str!("../ui/vendor/cose-base.js");
+const VENDOR_FCOSE: &str = include_str!("../ui/vendor/cytoscape-fcose.js");
+const VENDOR_COLA: &str = include_str!("../ui/vendor/cola.min.js");
+const VENDOR_CYTO_COLA: &str = include_str!("../ui/vendor/cytoscape-cola.js");

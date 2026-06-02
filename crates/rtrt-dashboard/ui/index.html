@@ -336,19 +336,21 @@
   }
 </style>
 <!-- Knowledge-map graph rendering: Cytoscape.js owns layout/zoom/pan/drag.
-     If the CDN is unreachable (offline), window.cytoscape stays undefined and
-     the memmap subtab falls back to a plain list — see loadGraph(). -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.2/cytoscape.min.js"></script>
+     Served LOCALLY from the dashboard binary (/vendor/*) so the map renders with
+     NO CDN / internet — a blocked CDN was making it fall back to a plain list.
+     If a script still fails, window.cytoscape stays undefined and the memmap
+     subtab falls back to a list — see loadGraph(). -->
+<script src="/vendor/cytoscape.min.js"></script>
 <!-- fcose layout (better overlap avoidance + component packing than built-in cose).
      Order matters: layout-base -> cose-base -> cytoscape-fcose. If any fails to load
      the graph falls back to cose then concentric (see memmapRunLayout). -->
-<script src="https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
+<script src="/vendor/layout-base.js"></script>
+<script src="/vendor/cose-base.js"></script>
+<script src="/vendor/cytoscape-fcose.js"></script>
 <!-- cola: continuous force layout — live physics so dragging a node makes the
      others spring/avoid in real time. webcola must load before cytoscape-cola. -->
-<script src="https://cdn.jsdelivr.net/npm/webcola@3.4.0/WebCola/cola.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/cytoscape-cola@2.5.1/cytoscape-cola.js"></script>
+<script src="/vendor/cola.min.js"></script>
+<script src="/vendor/cytoscape-cola.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -664,6 +666,11 @@
                 <option value="session">세션</option>
                 <option value="source">출처</option>
                 <option value="time">시간</option>
+              </select>
+              <select id="memmap-embed" class="memmap-group" aria-label="임베딩(의미 분류)" title="이 프로젝트의 임베딩(의미 기반) 사용 여부">
+                <option value="">임베딩: 전역 기본</option>
+                <option value="on">임베딩: 켜기</option>
+                <option value="off">임베딩: 끄기</option>
               </select>
               <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
                 <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
@@ -3214,12 +3221,22 @@ function memmapGoToDepth(depth) {
 
 // Load the overview graph for a project with the current grouping basis. Always
 // lands on the overview (resets the breadcrumb stack + per-level token cache).
+// Reflect the project's embedding override (전역 기본/켜기/끄기) in the map control.
+function memmapSyncEmbedSelect(project) {
+  const sel = document.getElementById('memmap-embed');
+  if (!sel) return;
+  const p = (PROJECTS_CACHE || []).find(x => x.name === project);
+  const ee = p ? p.embeddings_enabled : null;
+  sel.value = ee === true ? 'on' : ee === false ? 'off' : '';
+}
+
 async function loadGraph(project) {
   memmapStack = [];
   memmapLevelCache.clear();
   memmapSetMode('overview');
   memmapRenderCrumbs();
   memmapResetViews();
+  memmapSyncEmbedSelect(project);
   const head = document.getElementById('memmap-overview-head');
   if (memmapCy) memmapCy.elements().remove();
   if (isGlobalScope() || isGlobalProjectValue(project)) {
@@ -3263,6 +3280,28 @@ async function loadGraph(project) {
     memmapGroup = group.value || 'context';
     const project = memmapProject || currentProject();
     if (project) loadGraph(project);
+  };
+  // Embedding override (의미 vs 어휘) right on the map: save per-project + reload.
+  const embed = document.getElementById('memmap-embed');
+  if (embed) embed.onchange = async () => {
+    const project = memmapProject || currentProject();
+    if (!project || isGlobalScope() || isGlobalProjectValue(project)) {
+      showToast('프로젝트를 먼저 선택하세요.', 'err');
+      return;
+    }
+    const mode = embed.value === 'on' ? 'on' : embed.value === 'off' ? 'off' : 'inherit';
+    try {
+      const r = await fetch('/api/projects', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: project, embeddings_mode: mode }),
+      });
+      if (!r.ok) { showToast('임베딩 설정 저장 실패', 'err'); return; }
+      const p = (PROJECTS_CACHE || []).find(x => x.name === project);
+      if (p) p.embeddings_enabled = embed.value === 'on' ? true : embed.value === 'off' ? false : null;
+      showToast(mode === 'off' ? '임베딩 끔 — 어휘 기반' : mode === 'on' ? '임베딩 켬 — 의미 기반' : '전역 기본 따름', 'ok');
+      loadGraph(project);
+    } catch (e) { showToast(`네트워크 오류: ${e.message || e}`, 'err'); }
   };
   document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {

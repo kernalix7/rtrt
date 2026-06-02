@@ -338,6 +338,10 @@
 <script src="https://cdn.jsdelivr.net/npm/layout-base@2.0.1/layout-base.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/cose-base@2.2.0/cose-base.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
+<!-- cola: continuous force layout — live physics so dragging a node makes the
+     others spring/avoid in real time. webcola must load before cytoscape-cola. -->
+<script src="https://cdn.jsdelivr.net/npm/webcola@3.4.0/WebCola/cola.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-cola@2.5.1/cytoscape-cola.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -1401,6 +1405,8 @@ wireSubtabs('memory-subtabs', (sub) => {
   if (sub === 'memgovern' && project) { loadGovStats(project); }
   // Auto-load graph when the map tab opens (saves an extra button click).
   if (sub === 'memmap' && project) { loadGraph(project); }
+  // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
+  else if (sub !== 'memmap') { memmapStopLayout(); }
 });
 wireSubtabs('security-subtabs', (sub) => {
   if (sub === 'securityprofiles') loadSecurityProfileSettings();
@@ -2556,6 +2562,7 @@ let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
 let memmapSearch = '';               // cluster label filter substring
 let memmapMode = 'overview';         // 'overview' | 'cluster'
 let memmapCy = null;                 // the single Cytoscape instance, lazily created
+let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
 // Drill-down cache: cluster id -> { nodes, edges }. Fetched at most once.
 const memmapClusterCache = new Map();
 
@@ -2629,11 +2636,20 @@ function memmapCyStyle() {
     {
       selector: 'edge',
       style: {
-        'width': 'data(w)',
-        'line-color': border,
-        'opacity': 0.6,
-        'curve-style': 'haystack',
+        'width': 'mapData(w, 1, 4, 1.4, 4.5)',
+        'line-color': muted,
+        'opacity': 0.55,
+        'curve-style': 'straight',   // repositions live with the continuous sim
       },
+    },
+    // Edges touching a hovered/selected node pop so connections read clearly.
+    {
+      selector: 'node:selected',
+      style: { 'border-width': 3, 'border-color': accent },
+    },
+    {
+      selector: 'edge.hl',
+      style: { 'line-color': accent, 'opacity': 0.95, 'width': 'mapData(w, 1, 4, 2.5, 6)', 'z-index': 9 },
     },
   ];
 }
@@ -2646,6 +2662,15 @@ function memmapRegisterFcose() {
   try { window.cytoscape.use(window.cytoscapeFcose); memmapFcoseReady = true; }
   catch (_) { memmapFcoseReady = false; }
   return memmapFcoseReady;
+}
+
+let memmapColaReady = false;
+function memmapRegisterCola() {
+  if (memmapColaReady) return true;
+  if (!memmapHasCy() || typeof window.cytoscapeCola !== 'function') return false;
+  try { window.cytoscape.use(window.cytoscapeCola); memmapColaReady = true; }
+  catch (_) { memmapColaReady = false; }
+  return memmapColaReady;
 }
 
 function memmapEnsureCy() {
@@ -2671,6 +2696,9 @@ function memmapEnsureCy() {
       if (/^\d+$/.test(num)) openDetailModal(Number(num));
     }
   });
+  // Hover a node: light up its connecting edges so links are easy to follow.
+  memmapCy.on('mouseover', 'node', (ev) => ev.target.connectedEdges().addClass('hl'));
+  memmapCy.on('mouseout', 'node', () => memmapCy.edges('.hl').removeClass('hl'));
   return memmapCy;
 }
 
@@ -2688,6 +2716,7 @@ function memmapSetMode(mode) {
 
 // Clear the offline/no-cy fallback list + empty notice + the cy container.
 function memmapResetViews() {
+  memmapStopLayout();   // halt the continuous sim before nodes get removed/replaced
   const fb = document.getElementById('memmap-fallback');
   if (fb) { fb.hidden = true; fb.innerHTML = ''; }
   const empty = document.getElementById('memmap-empty');
@@ -2790,43 +2819,58 @@ function memmapMemberElements(payload) {
   return nodes.concat(edges);
 }
 
-// Run the layout + fit. Prefers fcose (strong overlap avoidance + component
-// packing) and degrades to cose then concentric so a load/layout failure never
-// bubbles up.
+// Stop the running layout (cola runs continuously; must be stopped before a
+// re-layout or when the user leaves the map tab).
+function memmapStopLayout() {
+  if (memmapLayout) { try { memmapLayout.stop(); } catch (_) { /* ignore */ } memmapLayout = null; }
+}
+
+// Run the layout. Prefers cola — a CONTINUOUS force sim, so dragging a node makes
+// its neighbours spring and the rest avoid in real time (the live motion the
+// static one-shot layouts lacked). Degrades to fcose -> cose -> concentric if the
+// extension fails to load.
 function memmapRunLayout() {
   if (!memmapCy) return;
   const n = memmapCy.nodes().length;
+  memmapStopLayout();
+  if (memmapRegisterCola()) {
+    try {
+      const layout = memmapCy.layout({
+        name: 'cola',
+        animate: true,            // animate every tick (the live motion)
+        infinite: true,           // keep simulating so drags reflow neighbours
+        fit: false,               // we fit once on first settle, not every tick
+        refresh: 1,
+        maxSimulationTime: 4000,
+        nodeSpacing: 16,          // min gap around each node (overlap avoidance)
+        edgeLength: 130,
+        avoidOverlap: true,
+        handleDisconnected: true, // arrange disconnected islands instead of stacking
+        randomize: false,
+        unconstrIter: 10,
+        userConstIter: 10,
+      });
+      memmapLayout = layout;
+      layout.one('layoutready', () => { try { memmapCy.fit(undefined, 36); } catch (_) { /* ignore */ } });
+      layout.run();
+      return;
+    } catch (_) { memmapStopLayout(); /* fall through */ }
+  }
   if (memmapRegisterFcose()) {
     try {
       memmapCy.layout({
-        name: 'fcose',
-        quality: 'default',
-        randomize: true,
-        animate: false,
-        packComponents: true,        // pack disconnected islands instead of overlapping them
-        nodeRepulsion: 9000,
-        idealEdgeLength: 110,
-        nodeSeparation: 90,          // hard min gap between nodes
-        gravity: 0.2,
-        gravityRange: 3.0,
-        numIter: n > 600 ? 1500 : 2500,
-        fit: true,
-        padding: 36,
+        name: 'fcose', quality: 'default', randomize: true, animate: true,
+        animationDuration: 600, packComponents: true, nodeRepulsion: 9000,
+        idealEdgeLength: 120, nodeSeparation: 90, gravity: 0.2, gravityRange: 3.0,
+        numIter: n > 600 ? 1500 : 2500, fit: true, padding: 36,
       }).run();
       return;
     } catch (_) { /* fall through to cose */ }
   }
   try {
     memmapCy.layout({
-      name: 'cose',
-      animate: false,
-      nodeRepulsion: 12000,
-      nodeOverlap: 24,
-      componentSpacing: 140,
-      idealEdgeLength: 110,
-      gravity: 0.2,
-      fit: true,
-      padding: 36,
+      name: 'cose', animate: true, nodeRepulsion: 12000, nodeOverlap: 24,
+      componentSpacing: 140, idealEdgeLength: 120, gravity: 0.2, fit: true, padding: 36,
     }).run();
   } catch (_) {
     try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_e) { /* ignore */ }

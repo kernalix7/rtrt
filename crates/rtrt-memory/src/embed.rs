@@ -20,6 +20,33 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// Max characters fed to an embedding model. Embeddings only capture the gist,
+/// and the local models (nomic-embed-text, bge, MiniLM) have small context
+/// windows — sending a 31k-char body either truncates server-side or times out,
+/// which is why backfill historically covered only a fraction of a project.
+/// Capping by *char* (not byte) keeps multi-byte text intact.
+// Only the concrete embedders (and the test) consume this; allow dead_code when
+// neither embedder feature is enabled so the bare `hnsw` build stays warning-free.
+#[cfg_attr(
+    not(any(feature = "ollama-embed", feature = "embeddings", test)),
+    allow(dead_code)
+)]
+pub(crate) const EMBED_CHAR_CAP: usize = 2000;
+
+/// Returns `text` capped to the first [`EMBED_CHAR_CAP`] chars. Cheap no-op when
+/// the text is already short (borrows instead of allocating).
+#[cfg_attr(
+    not(any(feature = "ollama-embed", feature = "embeddings", test)),
+    allow(dead_code)
+)]
+pub(crate) fn truncate_for_embed(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().count() <= EMBED_CHAR_CAP {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.chars().take(EMBED_CHAR_CAP).collect())
+    }
+}
+
 /// Vec<f32> → little-endian byte BLOB (4 bytes per element). Round-trips with
 /// [`vector_from_blob`].
 pub fn vector_to_blob(v: &[f32]) -> Vec<u8> {
@@ -105,9 +132,12 @@ mod ollama_impl {
 
         fn embed_one_text(&self, text: &str) -> Result<Vec<f32>> {
             let url = format!("{}/api/embeddings", self.base_url);
+            // Cap the prompt: long bodies otherwise time out or fail at the
+            // model's context window, leaving rows unembedded.
+            let prompt = super::truncate_for_embed(text);
             let body = serde_json::json!({
                 "model": self.model,
-                "prompt": text,
+                "prompt": prompt.as_ref(),
             });
             let resp = ureq::post(&url)
                 .set("Content-Type", "application/json")
@@ -198,7 +228,12 @@ mod fastembed_impl {
         }
 
         fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
+            // Cap each text: MiniLM truncates anything past its 256-token window
+            // anyway, and the cap keeps long bodies from blowing the budget.
+            let owned: Vec<String> = texts
+                .iter()
+                .map(|s| super::truncate_for_embed(s).into_owned())
+                .collect();
             let mut guard = self
                 .model
                 .lock()
@@ -229,6 +264,16 @@ mod tests {
         let a = vec![0.5, 0.5, 0.5];
         let v = cosine(&a, &a);
         assert!((v - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truncate_caps_by_char() {
+        let short = "hello";
+        assert_eq!(truncate_for_embed(short).as_ref(), "hello");
+        // Multi-byte chars: cap counts chars, not bytes, and never splits one.
+        let long: String = "あ".repeat(EMBED_CHAR_CAP + 500);
+        let capped = truncate_for_embed(&long);
+        assert_eq!(capped.chars().count(), EMBED_CHAR_CAP);
     }
 
     #[test]

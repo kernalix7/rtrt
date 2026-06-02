@@ -144,6 +144,61 @@ fn dynamic_meta_target(total: usize) -> usize {
 /// unclustered mass). The drill path then falls back to a metadata facet.
 const STALL_DOMINANCE: f64 = 0.6;
 
+/// At the context overview, if one bubble holds at least this fraction of the
+/// whole project it is the lexical "unclustered" dump — decompose it in place.
+const OVERVIEW_DOMINANCE: f64 = 0.35;
+
+/// Break a dominant "unclustered" bubble in a context [`ClusterIndex`] into
+/// metadata buckets (time→session→kind) so the overview is not one mega-blob.
+/// In place: removes the dominant bubble, splices in the facet buckets, remaps
+/// `node_cluster`, drops edges that referenced the removed root, and re-sorts.
+fn decompose_dominant(store: &MemoryStore, idx: &mut ClusterIndex) {
+    let total = idx.node_cluster.len();
+    if total == 0 {
+        return;
+    }
+    let (dom_pos, dom_id, dom_size) = match idx
+        .clusters
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, c)| c.size)
+    {
+        Some((p, c)) => (p, c.id, c.size),
+        None => return,
+    };
+    if (dom_size as f64) < total as f64 * OVERVIEW_DOMINANCE {
+        return;
+    }
+    let dom_ids: Vec<i64> = idx
+        .node_cluster
+        .iter()
+        .filter(|&(_, &r)| r == dom_id)
+        .map(|(&m, _)| m)
+        .collect();
+    let target = dynamic_meta_target(dom_ids.len());
+    let mut chosen = None;
+    for facet in ["time", "session", "kind"] {
+        if let Ok(sub) = store.group_meta_ids(&dom_ids, facet, target) {
+            let ml = sub.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+            if sub.clusters.len() > 1 && (ml as f64) < dom_ids.len() as f64 * 0.9 {
+                chosen = Some(sub);
+                break;
+            }
+        }
+    }
+    let Some(sub) = chosen else {
+        return;
+    };
+    idx.clusters.remove(dom_pos);
+    for (&m, &r) in &sub.node_cluster {
+        idx.node_cluster.insert(m, r);
+    }
+    idx.clusters.extend(sub.clusters);
+    idx.cluster_edges.retain(|(a, b, _)| *a != dom_id && *b != dom_id);
+    idx.clusters
+        .sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+}
+
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
 }
@@ -1482,9 +1537,18 @@ async fn memory_graph_overview(
             let idx = {
                 let guard = store.lock().await;
                 if is_context {
-                    guard
+                    let mut idx = guard
                         .graph_clusters(project, CLUSTER_MAX_NODES, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT)
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    // Lexical clustering dumps everything it cannot link into one
+                    // dominant bubble (on a 20k project that single "unclustered"
+                    // bubble is ~⅔ of the rows — the overview reads as "all
+                    // uncategorised"). Break that bubble up by a metadata facet
+                    // (time→session→kind) right here so the overview shows real
+                    // semantic clusters PLUS navigable time/session buckets, never
+                    // one mega-blob.
+                    decompose_dominant(&guard, &mut idx);
+                    idx
                 } else {
                     // Top-bubble count scales with the project total (~√total).
                     let total = guard.count_by_project(project).unwrap_or(0);
@@ -1552,12 +1616,31 @@ async fn memory_graph_overview(
         .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
         .collect();
 
+    // Report which signal the map is actually using so the UI can badge it:
+    // a context overview is "vector" (semantic, embeddings) when the project is
+    // mostly embedded — matching graph_clusters' own auto-dispatch — else
+    // "lexical" (keyword fallback); metadata facets are neither.
+    let (embedded, total_rows) = {
+        let guard = store.lock().await;
+        guard.embedding_coverage(project).unwrap_or((0, 0))
+    };
+    let basis = if !is_context {
+        "metadata"
+    } else if embedded > 0 && embedded * 2 >= total_rows {
+        "vector"
+    } else {
+        "lexical"
+    };
+
     Ok(Json(serde_json::json!({
         "mode": "overview",
         "group": group,
         "total_nodes": total_nodes,
         "clusters": clusters,
         "cluster_edges": cluster_edges,
+        "basis": basis,
+        "embedded": embedded,
+        "total_rows": total_rows,
     })))
 }
 

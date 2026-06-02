@@ -983,16 +983,23 @@
             <div class="field-row" style="margin-top:0.5rem;">
               <div class="field-label">
                 <span>model</span>
-                <!-- populated from /api/models; also accepts free-text via datalist -->
-                <input id="cfg-emb-model" list="cfg-emb-model-list" placeholder="예: bge-m3">
-                <datalist id="cfg-emb-model-list"></datalist>
+                <!-- populated from /api/ollama/models; preselected from /api/config -->
+                <select id="cfg-emb-model"><option value="">모델 선택…</option></select>
               </div>
               <div class="field-label">
                 <span>base_url</span>
                 <input type="url" id="cfg-emb-base-url" placeholder="http://localhost:11434">
               </div>
             </div>
+            <div class="field-label" style="margin-top:0.5rem;">
+              <span>생성 (현재 프로젝트)</span>
+              <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
+                <button id="cfg-emb-generate-btn" class="primary" type="button">임베딩 생성</button>
+                <span id="cfg-emb-coverage" class="out-meta"></span>
+              </div>
+            </div>
             <div class="note">
+              <strong>모델 변경은 서버 재시작 후 적용됩니다.</strong>
               <strong>SessionStart 주입</strong>: <code>rtrt hook session-inject</code>가
               세션 시작 시 중요도 상위 N개 메모리를 시스템 프롬프트에 삽입합니다.
               임베딩이 활성화되면 벡터 검색, 비활성이면 BM25로 폴백합니다.
@@ -1928,6 +1935,7 @@ function navigate(page) {
     updateGlobalScopeIndicators();
     // Reload config each time the panel opens so it stays current.
     populateModelSelects();
+    loadOllamaModelsCache(); // refresh embedding model <select> from installed Ollama models
     loadConfig();
   }
   if (page === 'llm') {
@@ -2235,6 +2243,40 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
       const d = await r.json();
       showToast(`임베딩 완료 · ${d.embedded}건 백필됨`, 'ok');
       pushActivity(`embed backfill · ${project} · ${d.embedded}건`);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  };
+})();
+
+// Settings → 임베딩 생성 button — backfill embeddings for the current project.
+// POST /api/memory/embed {project} → { embedded: N }. Disabled while running.
+(function wireEmbedGenerate() {
+  const btn = document.getElementById('cfg-emb-generate-btn');
+  if (!btn) return;
+  const cap = document.getElementById('cfg-emb-coverage');
+  btn.onclick = async () => {
+    const project = currentProject();
+    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
+    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = '생성 중…';
+    try {
+      const r = await fetch('/api/memory/embed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project }),
+      });
+      if (r.status === 404) { btn.hidden = true; return; } // not compiled in
+      if (!r.ok) { showToast(`임베딩 오류 ${r.status}: ${await r.text()}`, 'err'); return; }
+      const d = await r.json();
+      showToast(`임베딩 생성 완료 · ${d.embedded}건`, 'ok');
+      if (cap) cap.textContent = `${project}: ${d.embedded}건 임베딩됨`;
+      pushActivity(`embed generate · ${project} · ${d.embedded}건`);
     } catch (e) {
       showToast(`네트워크 오류: ${e.message || e}`, 'err');
     } finally {
@@ -2955,8 +2997,18 @@ function renderMemmapOverview() {
   const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
   const total = Number(memmapOverview.total_nodes || 0);
   const groupKo = MEMMAP_GROUP_KO[memmapGroup] || memmapGroup;
-  if (head) head.textContent =
-    `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹 · 기준: ${groupKo}`;
+  let caption = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹 · 기준: ${groupKo}`;
+  // For the 문맥 (context) basis, show whether the map is using the semantic
+  // (embedding/vector) signal or the keyword (lexical) fallback, plus coverage.
+  if (memmapGroup === 'context') {
+    const emb = Number(memmapOverview.embedded || 0);
+    const totRows = Number(memmapOverview.total_rows || 0);
+    const cov = totRows ? ` (임베딩 ${emb.toLocaleString()}/${totRows.toLocaleString()})` : '';
+    caption += memmapOverview.basis === 'vector'
+      ? ` · 🧠 의미 기반${cov}`
+      : ` · 🔤 어휘 기반${cov}`;
+  }
+  if (head) head.textContent = caption;
   if (!clusters.length) {
     const empty = document.getElementById('memmap-empty');
     if (empty) empty.hidden = false;
@@ -3472,13 +3524,35 @@ function populateModelSelects() {
     // Restore previously selected value if it still exists.
     if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
   });
-  // Embeddings model datalist — allows free-text entry plus autocomplete from known models.
-  const dl = document.getElementById('cfg-emb-model-list');
-  if (dl) {
-    dl.innerHTML = MODELS_CACHE.map(m =>
-      `<option value="${escapeHtml(m.id)}">`
-    ).join('');
-  }
+  // Embeddings model <select> — populated from installed Ollama models.
+  populateEmbModelSelect(document.getElementById('cfg-emb-model')?.value || '');
+}
+
+// Installed Ollama models — fetched for the embedding model <select>.
+// GET /api/ollama/models → { models: [{name, ...}] }
+let OLLAMA_MODELS_CACHE = [];
+async function loadOllamaModelsCache() {
+  try {
+    const r = await fetch('/api/ollama/models');
+    if (!r.ok) return; // 404 not compiled / 502 unreachable — leave cache empty
+    const d = await r.json();
+    OLLAMA_MODELS_CACHE = Array.isArray(d.models) ? d.models : [];
+  } catch (_) { /* Ollama not reachable — leave cache empty */ }
+  populateEmbModelSelect(document.getElementById('cfg-emb-model')?.value || '');
+}
+
+// Build/refresh the embedding model <select> from the Ollama cache.
+// `selected` is preserved even if it is not in the installed list (e.g. the
+// configured model is not yet pulled) so the saved value never silently drops.
+function populateEmbModelSelect(selected) {
+  const sel = document.getElementById('cfg-emb-model');
+  if (!sel) return;
+  const names = OLLAMA_MODELS_CACHE.map(m => m.name).filter(Boolean);
+  if (selected && !names.includes(selected)) names.unshift(selected);
+  sel.innerHTML = `<option value="">모델 선택…</option>` + names.map(n =>
+    `<option value="${escapeHtml(n)}"${n === selected ? ' selected' : ''}>${escapeHtml(n)}</option>`
+  ).join('');
+  sel.value = selected || '';
 }
 
 // Settings page — config form.
@@ -3510,7 +3584,7 @@ async function loadConfig() {
   }
   // Embeddings section — fields are present only when the backend includes the key.
   document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
-  document.getElementById('cfg-emb-model').value = emb.model || '';
+  populateEmbModelSelect(emb.model || '');
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
   await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
 }

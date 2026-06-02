@@ -2404,6 +2404,21 @@ impl MemoryStore {
         top_k: usize,
         min_weight: f32,
     ) -> Result<ClusterIndex> {
+        // When the project is (mostly) embedded, cluster on the dense vectors —
+        // the real semantic signal — instead of lexical token overlap. Lexical
+        // Jaccard collapses ~2/3 of a large project into one "unclustered" blob
+        // because most rows share no salient tokens; cosine over embeddings does
+        // not. We only switch when the build can actually use the HNSW index AND
+        // at least half the project is embedded (so the vector map is
+        // representative); otherwise we fall back to the lexical path below.
+        #[cfg(feature = "hnsw")]
+        {
+            let (embedded, total) = self.embedding_coverage(project)?;
+            if embedded > 0 && embedded >= total / 2 {
+                return self.graph_clusters_vec(project, max_nodes, top_k, CLUSTER_TARGET);
+            }
+        }
+
         // 1. Load newest rows (capped). Keep token sets alongside node metadata.
         let mut mem_stmt = self
             .conn
@@ -2452,13 +2467,8 @@ impl MemoryStore {
         let n = rows.len();
 
         // Index nodes 0..n for compact union-find / posting lists. `id_of[i]`
-        // is the memory id of position `i`; `pos_of` maps id -> position.
+        // is the memory id of position `i`.
         let id_of: Vec<i64> = rows.iter().map(|(node, _)| node.id).collect();
-        let mut pos_of: std::collections::HashMap<i64, usize> =
-            std::collections::HashMap::with_capacity(n);
-        for (i, id) in id_of.iter().enumerate() {
-            pos_of.insert(*id, i);
-        }
 
         // 2. Inverted index token -> positions. Drop oversized postings.
         // The posting cap is the single most important scaling knob: a posting
@@ -2545,6 +2555,45 @@ impl MemoryStore {
             peers[xi].push((y, w));
             peers[yi].push((x, w));
         }
+        // Hand off to the shared core: union-find over top_k peers, the
+        // multi-pass singleton fold, the catch-all, and summary/edge building.
+        // The lexical previews + sources come straight from the loaded rows.
+        let previews: Vec<String> = rows.iter().map(|(node, _)| node.preview.clone()).collect();
+        let sources: Vec<Option<String>> =
+            rows.iter().map(|(node, _)| node.source_kind.clone()).collect();
+        Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target)
+    }
+
+    /// Pure clustering core shared by the lexical [`cluster_rows`](Self::cluster_rows)
+    /// and the vector [`graph_clusters_vec`](Self::graph_clusters_vec) paths.
+    ///
+    /// Given, per position `i`:
+    /// * `ids[i]`     — its memory id,
+    /// * `previews[i]`— its label text,
+    /// * `sources[i]` — its `source_kind`,
+    /// * `peers[i]`   — `(other_pos, weight)` neighbours above the caller's
+    ///   similarity threshold (the union-find rails), and
+    /// * `best_peer[i]` — its single strongest neighbour regardless of threshold
+    ///   (the singleton-fold rails),
+    ///
+    /// this runs the union-find over each node's `top_k` strongest peers, the
+    /// multi-pass singleton fold + catch-all down to `target` bubbles, then
+    /// builds the deterministic summaries (root = min member id, size desc / id
+    /// asc) and aggregated inter-cluster edges. No database calls and no
+    /// dependence on *how* the peers were scored (lexical Jaccard or vector
+    /// cosine), so both paths share it verbatim.
+    fn cluster_from_peers(
+        ids: Vec<i64>,
+        previews: Vec<String>,
+        sources: Vec<Option<String>>,
+        mut peers: Vec<Vec<(u32, f32)>>,
+        best_peer: Vec<Option<(u32, f32)>>,
+        top_k: usize,
+        target: usize,
+    ) -> ClusterIndex {
+        let n = ids.len();
+        let id_of = &ids;
+
         // Flatten best-peer edges into a compact, deduped merge-rail list (one
         // per node that has any candidate neighbour, direction a < b). O(n).
         let mut cand_edges: Vec<(u32, u32, f32)> = Vec::with_capacity(n);
@@ -2578,16 +2627,16 @@ impl MemoryStore {
         // 5b. Fold the singleton explosion down to a manageable bubble count.
         //
         // The strong union-find above merges only high-similarity pairs, so on
-        // real projects most rows survive as size-1 components (00G_winpodx:
-        // ~17k singletons of ~18k rows). The LOD overview must stay in the low
-        // hundreds, so we absorb singleton/tiny clusters into the neighbour they
-        // share their strongest *candidate* edge with — using ANY edge, even one
-        // below the union threshold — over several passes, mirroring the
-        // client-side `buildClusters` merge. `comp_min_id` is recomputed AFTER
-        // all merges, so every cluster root stays the deterministic min member id
-        // regardless of union-find's rank-based representative choice. `target`
-        // is the fold ceiling (the whole-project overview passes
-        // [`CLUSTER_TARGET`]; deeper LOD levels pass a smaller value).
+        // real projects most rows survive as size-1 components. The LOD overview
+        // must stay in the low hundreds, so we absorb singleton/tiny clusters
+        // into the neighbour they share their strongest *candidate* edge with —
+        // using ANY edge, even one below the union threshold — over several
+        // passes, mirroring the client-side `buildClusters` merge. `comp_min_id`
+        // is recomputed AFTER all merges, so every cluster root stays the
+        // deterministic min member id regardless of union-find's rank-based
+        // representative choice. `target` is the fold ceiling (the whole-project
+        // overview passes [`CLUSTER_TARGET`]; deeper LOD levels pass a smaller
+        // value).
         if n > 0 {
             // Candidate edges, strongest first (deterministic tiebreak on the
             // packed endpoints) so fragments pull toward their best neighbour.
@@ -2696,8 +2745,7 @@ impl MemoryStore {
         // Resolve every node to its cluster root expressed as a *memory id* (the
         // minimum member id of the union-find component — deterministic), once,
         // into a flat array. Downstream loops then index this array instead of
-        // calling `uf.find` + a HashMap lookup per touch (millions of touches in
-        // the inter-cluster aggregation).
+        // calling `uf.find` + a HashMap lookup per touch.
         let mut comp_of_pos: Vec<usize> = vec![0; n];
         let mut comp_min_id: FxHashMap<usize, i64> = FxHashMap::default();
         for (i, slot) in comp_of_pos.iter_mut().enumerate() {
@@ -2723,27 +2771,35 @@ impl MemoryStore {
         }
 
         // 6a. Cluster summaries: size, label (root member preview), dominant
-        // source. Group members by cluster root id.
-        let mut members_by_root: std::collections::HashMap<i64, Vec<usize>> =
+        // source. Group member positions by cluster root id.
+        let mut pos_by_root: std::collections::HashMap<i64, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, &root_id) in root_of_pos.iter().enumerate() {
-            members_by_root.entry(root_id).or_default().push(i);
+            pos_by_root.entry(root_id).or_default().push(i);
+        }
+        // root id -> its member position (min id), for the label preview.
+        let mut root_pos: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::with_capacity(pos_by_root.len());
+        for (i, &root_id) in root_of_pos.iter().enumerate() {
+            if id_of[i] == root_id {
+                root_pos.insert(root_id, i);
+            }
         }
 
-        let mut clusters: Vec<ClusterSummary> = members_by_root
+        let mut clusters: Vec<ClusterSummary> = pos_by_root
             .iter()
             .map(|(root_id, positions)| {
                 // Label = preview of the root member (min id).
-                let root_pos = *pos_of.get(root_id).unwrap_or(&positions[0]);
-                let label = rows[root_pos].0.preview.clone();
+                let rp = *root_pos.get(root_id).unwrap_or(&positions[0]);
+                let label = previews[rp].clone();
                 // Dominant source: "main"/"subagent" if a single non-empty kind
                 // covers every labelled member; "mixed" otherwise.
-                let mut seen_source: Option<String> = None;
+                let mut seen_source: Option<&str> = None;
                 let mut mixed = false;
                 for &p in positions {
-                    if let Some(src) = rows[p].0.source_kind.as_deref() {
-                        match &seen_source {
-                            None => seen_source = Some(src.to_string()),
+                    if let Some(src) = sources[p].as_deref() {
+                        match seen_source {
+                            None => seen_source = Some(src),
                             Some(prev) if prev == src => {}
                             Some(_) => {
                                 mixed = true;
@@ -2755,7 +2811,7 @@ impl MemoryStore {
                 let dominant_source = if mixed {
                     "mixed".to_string()
                 } else {
-                    seen_source.unwrap_or_else(|| "mixed".to_string())
+                    seen_source.map(str::to_string).unwrap_or_else(|| "mixed".to_string())
                 };
                 ClusterSummary {
                     id: *root_id,
@@ -2767,29 +2823,28 @@ impl MemoryStore {
             .collect();
         clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
 
-        // 6b. Inter-cluster aggregated edges. Reuse the candidate `shared` map:
-        // every cross-cluster shared-token pair contributes its Jaccard weight
-        // (summed). Cluster roots come from the flat `root_of_pos` array (no
-        // `uf.find`/HashMap per touch), and the aggregation map is keyed on a
-        // packed pair of *cluster indices* via the same FxHashMap as `shared`.
-        // Cap at the strongest CLUSTER_EDGE_CAP.
+        // 6b. Inter-cluster aggregated edges from the (post-truncation) peer
+        // lists: every cross-cluster peer edge contributes its weight (summed).
+        // Direction-agnostic (each undirected pair is seen twice — once from
+        // each endpoint — so we halve), keyed on a packed pair of *cluster
+        // indices*. Cap at the strongest CLUSTER_EDGE_CAP.
         const CLUSTER_EDGE_CAP: usize = 2000;
+        let pack = |x: u32, y: u32| -> u64 {
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            ((hi as u64) << 32) | lo as u64
+        };
+        let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
         let mut agg: FxHashMap<u64, f32> = FxHashMap::default();
-        for (&key, inter) in &shared {
-            let (x, y) = unpack(key);
-            let (xi, yi) = (x as usize, y as usize);
-            // Pack on union-find component index (compact, fits u32) rather than
-            // the i64 root id, so the key is a single u64.
-            let (ca, cb) = (comp_of_pos[xi], comp_of_pos[yi]);
-            if ca == cb {
-                continue;
+        for (xi, plist) in peers.iter().enumerate() {
+            let ca = comp_of_pos[xi];
+            for &(y, w) in plist {
+                let yi = y as usize;
+                let cb = comp_of_pos[yi];
+                if ca == cb {
+                    continue;
+                }
+                *agg.entry(pack(ca as u32, cb as u32)).or_insert(0.0) += w * 0.5;
             }
-            let union = tok_len[xi] + tok_len[yi] - *inter as usize;
-            if union == 0 {
-                continue;
-            }
-            let w = *inter as f32 / union as f32;
-            *agg.entry(pack(ca as u32, cb as u32)).or_insert(0.0) += w;
         }
         let mut cluster_edges: Vec<(i64, i64, f32)> = agg
             .into_iter()
@@ -2815,6 +2870,183 @@ impl MemoryStore {
             cluster_edges,
             node_cluster,
         }
+    }
+
+    /// `(embedded, total)` row counts for `project`: how many rows have an entry
+    /// in the `embeddings` table, and how many rows the project has overall.
+    /// Drives the lexical-vs-vector clustering choice in
+    /// [`graph_clusters`](Self::graph_clusters).
+    pub fn embedding_coverage(&self, project: &str) -> Result<(usize, usize)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings e \
+                   JOIN memories m ON m.id = e.memory_id \
+                  WHERE m.project = ?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok((embedded as usize, total as usize))
+    }
+
+    /// Whole-project clustering over **dense embedding vectors** instead of
+    /// lexical token overlap. This is the semantic clustering: it loads every
+    /// row that has a stored embedding, builds an HNSW index over those vectors,
+    /// and for each point takes its nearest neighbours as the union-find /
+    /// singleton-fold rails — then hands off to the same
+    /// [`cluster_from_peers`](Self::cluster_from_peers) core as the lexical path,
+    /// so determinism (root = min id, size desc / id asc) and the fold-to-`target`
+    /// behaviour are identical.
+    ///
+    /// The union threshold is the internal `VEC_MIN_SIM` cosine constant, NOT the
+    /// lexical `min_weight`: unrelated nomic-embed text routinely sits at cosine
+    /// 0.3–0.5, so a 0.15-style lexical threshold would merge everything into one
+    /// blob. `VEC_MIN_SIM` is tuned so meaningful clusters form, the biggest stays
+    /// well under ~30% of the project, and we get neither all-singletons nor one
+    /// bubble. `best_peer` keeps each point's single strongest neighbour
+    /// regardless of threshold so the fold always has rails to pull singletons in.
+    #[cfg(feature = "hnsw")]
+    pub fn graph_clusters_vec(
+        &self,
+        project: &str,
+        max_nodes: usize,
+        top_k: usize,
+        target: usize,
+    ) -> Result<ClusterIndex> {
+        // Cosine-similarity union threshold for vectors. Tuned empirically on a
+        // real embedded project (nomic-embed-text, 768-dim). See the tuning
+        // notes / `graph_clusters_vec_speechpad_tune`.
+        #[cfg(test)]
+        let vec_min_sim: f32 = std::env::var("RTRT_VEC_MIN_SIM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(VEC_MIN_SIM);
+        #[cfg(not(test))]
+        let vec_min_sim: f32 = VEC_MIN_SIM;
+        const VEC_MIN_SIM: f32 = 0.82;
+
+        // 1. Load every embedded row's (id, preview, source_kind) + its vector,
+        //    newest first and capped at `max_nodes`. JOIN drops rows without an
+        //    embedding so the HNSW map only ever sees points we can cluster.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.id, substr(m.body, 1, 60), \
+                        json_extract(m.metadata, '$.source_kind'), e.vector \
+                   FROM memories m \
+                   JOIN embeddings e ON e.memory_id = m.id \
+                  WHERE m.project = ?1 \
+                  ORDER BY m.created_at DESC, m.id DESC \
+                  LIMIT ?2",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        struct VecRow {
+            id: i64,
+            preview: String,
+            source: Option<String>,
+            vector: Vec<f32>,
+        }
+        let loaded: Vec<VecRow> = stmt
+            .query_map(rusqlite::params![project, max_nodes as i64], |r| {
+                let id: i64 = r.get(0)?;
+                let preview: String = r.get(1)?;
+                let source: Option<String> = r.get(2)?;
+                let blob: Vec<u8> = r.get(3)?;
+                Ok((id, preview, source, blob))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .map(|row| {
+                let (id, preview, source, blob) =
+                    row.map_err(|e| Error::Memory(e.to_string()))?;
+                let vector = vector_from_blob(&blob)?;
+                Ok(VecRow {
+                    id,
+                    preview,
+                    source,
+                    vector,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let n = loaded.len();
+        if n == 0 {
+            return Ok(ClusterIndex {
+                clusters: Vec::new(),
+                cluster_edges: Vec::new(),
+                node_cluster: std::collections::HashMap::new(),
+            });
+        }
+
+        // 2. Positional arrays for cluster_from_peers, and a pos lookup so we can
+        //    convert neighbour ids back to compact positions.
+        let ids: Vec<i64> = loaded.iter().map(|r| r.id).collect();
+        let previews: Vec<String> = loaded.iter().map(|r| r.preview.clone()).collect();
+        let sources: Vec<Option<String>> = loaded.iter().map(|r| r.source.clone()).collect();
+        let mut pos_of: std::collections::HashMap<i64, u32> =
+            std::collections::HashMap::with_capacity(n);
+        for (i, &id) in ids.iter().enumerate() {
+            pos_of.insert(id, i as u32);
+        }
+
+        // 3. Build the HNSW index over the loaded vectors.
+        let index = match crate::hnsw_index::HnswIndex::from_vectors(
+            loaded
+                .iter()
+                .map(|r| (r.vector.clone(), r.id))
+                .collect::<Vec<_>>(),
+        ) {
+            Some(idx) => idx,
+            None => {
+                return Ok(ClusterIndex {
+                    clusters: Vec::new(),
+                    cluster_edges: Vec::new(),
+                    node_cluster: std::collections::HashMap::new(),
+                });
+            }
+        };
+
+        // 4. For each point, query its top (top_k + 1) neighbours, drop self,
+        //    convert cosine distance -> similarity (sim = 1 - distance), and
+        //    build peers (sim >= VEC_MIN_SIM) + best_peer (strongest neighbour
+        //    regardless of threshold, for the fold rails).
+        let mut peers: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
+        let mut best_peer: Vec<Option<(u32, f32)>> = vec![None; n];
+        for (i, row) in loaded.iter().enumerate() {
+            let hits = index.neighbors(&row.vector, top_k + 1);
+            for (dist, nid) in hits {
+                if nid == row.id {
+                    continue; // self
+                }
+                let Some(&j) = pos_of.get(&nid) else {
+                    continue;
+                };
+                if j as usize == i {
+                    continue;
+                }
+                let sim = 1.0 - dist;
+                // Strongest-neighbour rail (deterministic tiebreak on smaller pos).
+                match best_peer[i] {
+                    Some((bo, bw)) if bw > sim || (bw == sim && bo <= j) => {}
+                    _ => best_peer[i] = Some((j, sim)),
+                }
+                if sim >= vec_min_sim {
+                    peers[i].push((j, sim));
+                }
+            }
+        }
+
+        Ok(Self::cluster_from_peers(
+            ids, previews, sources, peers, best_peer, top_k, target,
+        ))
     }
 
     /// Drill-down: the members of one cluster (by root id) plus their
@@ -4144,5 +4376,148 @@ mod tests {
             elapsed.as_secs_f64() < 1.0,
             "graph_clusters too slow: {elapsed:?}"
         );
+    }
+
+    /// Empirical tuning probe for `VEC_MIN_SIM` against the real on-disk store.
+    /// Ignored by default; run with `--ignored` after setting `RTRT_MEMORY_PATH`
+    /// (defaults to `~/.rtrt/memory.sqlite`). Reports cluster count, biggest
+    /// cluster size + %, and elapsed for `00G_SpeechPad`.
+    #[cfg(feature = "hnsw")]
+    #[test]
+    #[ignore = "needs the real on-disk memory store"]
+    fn graph_clusters_vec_speechpad_tune() {
+        let path = std::env::var("RTRT_MEMORY_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.rtrt/memory.sqlite")
+        });
+        let store = MemoryStore::open(&path).unwrap();
+        let (embedded, total) = store.embedding_coverage("00G_SpeechPad").unwrap();
+        // Warm-up (page cache); not measured.
+        let _ = store
+            .graph_clusters_vec("00G_SpeechPad", 200_000, 4, 320)
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let idx = store
+            .graph_clusters_vec("00G_SpeechPad", 200_000, 4, 320)
+            .unwrap();
+        let elapsed = t0.elapsed();
+        let nodes = idx.node_cluster.len();
+        let biggest = idx.clusters.first().map(|c| c.size).unwrap_or(0);
+        let singletons = idx.clusters.iter().filter(|c| c.size == 1).count();
+        let pct = if nodes > 0 {
+            biggest as f64 * 100.0 / nodes as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "SpeechPad: coverage {embedded}/{total}, {} nodes -> {} clusters ({} singletons), biggest {} ({:.1}%), {:?}",
+            nodes,
+            idx.clusters.len(),
+            singletons,
+            biggest,
+            pct,
+            elapsed
+        );
+        // The vector path must break the blob: biggest bubble well under 30%.
+        assert!(pct < 30.0, "biggest bubble {pct:.1}% too large");
+        assert!(elapsed.as_secs_f64() < 1.0, "vec clustering too slow: {elapsed:?}");
+    }
+
+    /// Hand-insert an embedding row for `id` so vector clustering has dense
+    /// signal without running a real embedder.
+    #[cfg(feature = "hnsw")]
+    fn put_embedding(store: &MemoryStore, id: i64, vec: &[f32]) {
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, "test-vec", vector_to_blob(vec)],
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "hnsw")]
+    #[test]
+    fn embedding_coverage_counts() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store.save("p", "note", "alpha").unwrap();
+        let b = store.save("p", "note", "beta").unwrap();
+        let _c = store.save("p", "note", "gamma").unwrap();
+        // 2 of 3 rows embedded.
+        put_embedding(&store, a, &[1.0, 0.0, 0.0]);
+        put_embedding(&store, b, &[0.0, 1.0, 0.0]);
+        let (embedded, total) = store.embedding_coverage("p").unwrap();
+        assert_eq!((embedded, total), (2, 3));
+        // Unknown project: zero of zero.
+        assert_eq!(store.embedding_coverage("none").unwrap(), (0, 0));
+    }
+
+    #[cfg(feature = "hnsw")]
+    #[test]
+    fn graph_clusters_vec_groups_two_clusters_and_outlier() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Two semantic groups + one outlier. Bodies are deliberately distinct
+        // lexically; the grouping comes purely from the hand-inserted vectors.
+        let a1 = store.save("p", "note", "first about deployments").unwrap();
+        let a2 = store.save("p", "note", "second about deployments").unwrap();
+        let a3 = store.save("p", "note", "third about deployments").unwrap();
+        let b1 = store.save("p", "note", "first about parsing").unwrap();
+        let b2 = store.save("p", "note", "second about parsing").unwrap();
+        let outlier = store.save("p", "note", "a lone unrelated thought").unwrap();
+
+        // Cluster A: tight around (1, 0, 0). Cluster B: tight around (0, 1, 0).
+        // Outlier: (0, 0, 1) — orthogonal to both (cosine 0 << VEC_MIN_SIM).
+        put_embedding(&store, a1, &[1.00, 0.02, 0.0]);
+        put_embedding(&store, a2, &[0.98, 0.05, 0.0]);
+        put_embedding(&store, a3, &[0.99, 0.00, 0.0]);
+        put_embedding(&store, b1, &[0.02, 1.00, 0.0]);
+        put_embedding(&store, b2, &[0.05, 0.98, 0.0]);
+        put_embedding(&store, outlier, &[0.0, 0.0, 1.0]);
+
+        let idx = store.graph_clusters_vec("p", 100_000, 4, 320).unwrap();
+
+        // Membership comes from node_cluster (cluster root per memory id).
+        let root = |id: i64| -> i64 { *idx.node_cluster.get(&id).unwrap() };
+        // A's three rows share one root; B's two share another; they differ.
+        assert_eq!(root(a1), root(a2));
+        assert_eq!(root(a1), root(a3));
+        assert_eq!(root(b1), root(b2));
+        assert_ne!(root(a1), root(b1), "two semantic groups must separate");
+        // The outlier is in neither group.
+        assert_ne!(root(outlier), root(a1));
+        assert_ne!(root(outlier), root(b1));
+
+        // Deterministic roots = min member id of each group.
+        assert_eq!(root(a1), a1.min(a2).min(a3));
+        assert_eq!(root(b1), b1.min(b2));
+        assert_eq!(root(outlier), outlier);
+
+        // Summaries: cluster A (size 3) is largest and sorts first.
+        assert_eq!(idx.clusters[0].size, 3, "{:?}", idx.clusters);
+        assert_eq!(idx.clusters[0].id, root(a1));
+        // Exactly three bubbles: A, B, outlier.
+        assert_eq!(idx.clusters.len(), 3, "{:?}", idx.clusters);
+    }
+
+    #[cfg(feature = "hnsw")]
+    #[test]
+    fn graph_clusters_auto_dispatches_to_vector_when_embedded() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Lexically near-identical bodies that vectors place in two groups.
+        let a1 = store.save("p", "note", "topic alpha alpha alpha").unwrap();
+        let a2 = store.save("p", "note", "topic alpha alpha alpha").unwrap();
+        let b1 = store.save("p", "note", "topic beta beta beta").unwrap();
+        let b2 = store.save("p", "note", "topic beta beta beta").unwrap();
+        put_embedding(&store, a1, &[1.0, 0.0]);
+        put_embedding(&store, a2, &[0.99, 0.02]);
+        put_embedding(&store, b1, &[0.0, 1.0]);
+        put_embedding(&store, b2, &[0.02, 0.99]);
+        // All four embedded -> coverage 100% -> graph_clusters delegates to the
+        // vector path, which separates the two vector groups.
+        let idx = store.graph_clusters("p", 100_000, 4, 0.15).unwrap();
+        let root = |id: i64| -> i64 { *idx.node_cluster.get(&id).unwrap() };
+        assert_eq!(root(a1), root(a2));
+        assert_eq!(root(b1), root(b2));
+        assert_ne!(root(a1), root(b1));
     }
 }

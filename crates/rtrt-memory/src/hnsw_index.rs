@@ -64,6 +64,52 @@ impl HnswIndex {
         Ok(Some(Self { inner }))
     }
 
+    /// Builds an index directly from `(vector, id)` pairs — no database read.
+    /// Returns `None` when `items` is empty. Used by vector clustering, which
+    /// already has the project's vectors in hand and needs to query each
+    /// point's neighbours against the same set.
+    ///
+    /// Two deliberate departures from [`Builder::default`]:
+    /// * **Fixed seed** — the default seeds the layer RNG from entropy, making
+    ///   the graph (and therefore clustering) non-deterministic across runs.
+    ///   Clustering must be reproducible, so we pin the seed.
+    /// * **Lower `ef_construction`** — the default (100) makes building a few
+    ///   hundred 768-dim points take seconds. Clustering only needs each point's
+    ///   immediate neighbourhood, not high-recall ANN, so a small beam keeps the
+    ///   build well under a second without changing which tight clusters form.
+    pub fn from_vectors(items: Vec<(Vec<f32>, i64)>) -> Option<Self> {
+        if items.is_empty() {
+            return None;
+        }
+        let mut points: Vec<EmbVec> = Vec::with_capacity(items.len());
+        let mut values: Vec<i64> = Vec::with_capacity(items.len());
+        for (v, id) in items {
+            points.push(EmbVec(v));
+            values.push(id);
+        }
+        let inner = Builder::default()
+            .seed(0x5251_5254_5645_4332) // "RQRTVEC2" — fixed for determinism.
+            .ef_construction(24)
+            .ef_search(24)
+            .build(points, values);
+        Some(Self { inner })
+    }
+
+    /// Approximate top-`limit` nearest neighbours of a raw vector, as
+    /// `(cosine_distance, memory_id)` where distance = `1 - cosine` in `[0, 2]`
+    /// (smaller is closer). The query point itself is included if present in the
+    /// index, so callers that query a stored point should request `limit + 1`
+    /// and drop the self-hit.
+    pub fn neighbors(&self, v: &[f32], limit: usize) -> Vec<(f32, i64)> {
+        let mut search = Search::default();
+        let qp = EmbVec(v.to_vec());
+        self.inner
+            .search(&qp, &mut search)
+            .take(limit)
+            .map(|item| (item.distance, *item.value))
+            .collect()
+    }
+
     /// Approximate top-`limit` nearest neighbours of the query string.
     pub fn search(
         &self,

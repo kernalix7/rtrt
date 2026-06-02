@@ -2404,6 +2404,21 @@ impl MemoryStore {
         top_k: usize,
         min_weight: f32,
     ) -> Result<ClusterIndex> {
+        self.graph_clusters_opt(project, max_nodes, top_k, min_weight, true)
+    }
+
+    /// Like [`graph_clusters`](Self::graph_clusters) but with explicit control
+    /// over whether the semantic (vector) path may be used. `allow_vector =
+    /// false` forces the lexical path even when the project is embedded — the
+    /// dashboard passes the per-project embedding toggle through here.
+    pub fn graph_clusters_opt(
+        &self,
+        project: &str,
+        max_nodes: usize,
+        top_k: usize,
+        min_weight: f32,
+        allow_vector: bool,
+    ) -> Result<ClusterIndex> {
         // When the project is (mostly) embedded, cluster on the dense vectors —
         // the real semantic signal — instead of lexical token overlap. Lexical
         // Jaccard collapses ~2/3 of a large project into one "unclustered" blob
@@ -2412,12 +2427,14 @@ impl MemoryStore {
         // at least half the project is embedded (so the vector map is
         // representative); otherwise we fall back to the lexical path below.
         #[cfg(feature = "hnsw")]
-        {
+        if allow_vector {
             let (embedded, total) = self.embedding_coverage(project)?;
             if embedded > 0 && embedded >= total / 2 {
                 return self.graph_clusters_vec(project, max_nodes, top_k, CLUSTER_TARGET);
             }
         }
+        #[cfg(not(feature = "hnsw"))]
+        let _ = allow_vector;
 
         // 1. Load newest rows (capped). Keep token sets alongside node metadata.
         let mut mem_stmt = self

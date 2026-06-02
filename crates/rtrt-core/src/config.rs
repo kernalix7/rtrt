@@ -61,6 +61,11 @@ pub struct ProjectEntry {
     /// Bound profile name; `None` = use ai-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_profile: Option<String>,
+    /// Per-project embedding override: `Some(true)`/`Some(false)` forces the
+    /// semantic (vector) memory map on/off for this project; `None` inherits the
+    /// global `[embeddings] enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings_enabled: Option<bool>,
 }
 
 /// Dense-embedding knobs. When `enabled = true`, the dashboard and CLI route

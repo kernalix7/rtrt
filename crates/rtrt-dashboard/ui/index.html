@@ -1160,6 +1160,12 @@
       <input id="project-name-input" placeholder="프로젝트 이름" required>
       <input id="project-path-input" placeholder="프로젝트 경로">
       <select id="project-security-profile-select"><option value="">프로파일 로드 중…</option></select>
+      <label class="memmap-head" style="margin:0.4rem 0 0;">메모리 맵 임베딩(의미 분류)</label>
+      <select id="project-embeddings-select">
+        <option value="">전역 기본 따름</option>
+        <option value="on">켜기 (의미 기반)</option>
+        <option value="off">끄기 (어휘 기반)</option>
+      </select>
       <button class="primary" type="submit">저장</button>
     </form>
   </div>
@@ -1356,6 +1362,12 @@ async function openProjectModal(forceNew) {
   document.getElementById('project-name-input').value = project ? project.name : '';
   document.getElementById('project-path-input').value = project && project.path ? project.path : '';
   await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : GLOBAL_DEFAULT_PROFILE);
+  // Per-project embedding override: null/undefined -> 전역 기본, true -> on, false -> off.
+  const embSel = document.getElementById('project-embeddings-select');
+  if (embSel) {
+    const ee = project ? project.embeddings_enabled : null;
+    embSel.value = ee === true ? 'on' : ee === false ? 'off' : '';
+  }
   document.getElementById('project-modal').hidden = false;
   setTimeout(() => document.getElementById('project-name-input').focus(), 0);
 }
@@ -1382,11 +1394,14 @@ document.getElementById('project-form').onsubmit = async (ev) => {
   const security_profile = document.getElementById('project-security-profile-select').value || GLOBAL_DEFAULT_PROFILE;
   if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
   if (isGlobalProjectValue(name)) { showToast('예약된 전역 항목 이름입니다.', 'err'); return; }
+  // '' -> 전역 기본(inherit), 'on'/'off' explicit. Sent as a tri-state string.
+  const embVal = document.getElementById('project-embeddings-select').value;
+  const embeddings_mode = embVal === 'on' ? 'on' : embVal === 'off' ? 'off' : 'inherit';
   try {
     const r = await fetch('/api/projects', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, path, security_profile }),
+      body: JSON.stringify({ name, path, security_profile, embeddings_mode }),
     });
     if (!r.ok) {
       showToast(await securityErrorMessage(r, '프로젝트 저장 실패'), 'err');

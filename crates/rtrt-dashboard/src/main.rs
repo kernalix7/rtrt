@@ -775,6 +775,8 @@ struct ProjectView {
     name: String,
     path: Option<String>,
     security_profile: Option<String>,
+    /// Per-project embedding override (`None` = inherit global default).
+    embeddings_enabled: Option<bool>,
     mem_count: usize,
 }
 
@@ -797,6 +799,7 @@ async fn list_projects(
                 name: entry.name.clone(),
                 path: entry.path.clone(),
                 security_profile: entry.security_profile.clone(),
+                embeddings_enabled: entry.embeddings_enabled,
                 mem_count: 0,
             },
         );
@@ -821,6 +824,7 @@ async fn list_projects(
                     name,
                     path: None,
                     security_profile: None,
+                    embeddings_enabled: None,
                     mem_count: count,
                 });
         }
@@ -837,6 +841,13 @@ struct ProjectUpsertReq {
     path: Option<String>,
     #[serde(default)]
     security_profile: Option<String>,
+    /// Per-project embedding override as a tri-state string so the handler can
+    /// tell "field absent" (preserve existing) from an explicit choice:
+    /// `"on"` -> Some(true), `"off"` -> Some(false), `"inherit"` -> None.
+    /// (A bare `Option<bool>`/`Option<Option<bool>>` can't distinguish absent
+    /// from JSON `null` — serde maps both to `None`.)
+    #[serde(default)]
+    embeddings_mode: Option<String>,
 }
 
 /// `PUT /api/projects` — upsert a project entry into the config registry.
@@ -846,10 +857,18 @@ async fn upsert_project(
     let mut cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let name = req.name.clone();
+    // Explicit choice wins; an absent field preserves the existing override.
+    let embeddings_enabled = match req.embeddings_mode.as_deref() {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some("inherit") => None,
+        _ => cfg.project(&name).and_then(|p| p.embeddings_enabled),
+    };
     cfg.upsert_project(rtrt_core::ProjectEntry {
         name: req.name,
         path: req.path,
         security_profile: req.security_profile,
+        embeddings_enabled,
     });
 
     let path = rtrt_core::Config::default_path().ok_or((
@@ -1521,7 +1540,19 @@ async fn memory_graph_overview(
         ));
     }
 
-    let cache_key = format!("{project}{CACHE_KEY_SEP}{group}");
+    // Per-project embedding toggle: Some(true/false) overrides the global
+    // `[embeddings] enabled`. When false, the context map uses the lexical path
+    // even if the project has vectors.
+    let allow_vector = {
+        let cfg = rtrt_core::Config::load().unwrap_or_default();
+        cfg.project(project)
+            .and_then(|p| p.embeddings_enabled)
+            .unwrap_or_else(|| cfg.embeddings.is_enabled())
+    };
+
+    // Key the cache on the vector toggle too so flipping it doesn't serve a
+    // stale opposite-basis index.
+    let cache_key = format!("{project}{CACHE_KEY_SEP}{group}{CACHE_KEY_SEP}{}", allow_vector as u8);
 
     // Fast path: serve a still-fresh cached index (re-mint tokens against it).
     let cached = {
@@ -1538,7 +1569,13 @@ async fn memory_graph_overview(
                 let guard = store.lock().await;
                 if is_context {
                     let mut idx = guard
-                        .graph_clusters(project, CLUSTER_MAX_NODES, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT)
+                        .graph_clusters_opt(
+                            project,
+                            CLUSTER_MAX_NODES,
+                            CLUSTER_TOP_K,
+                            CLUSTER_MIN_WEIGHT,
+                            allow_vector,
+                        )
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                     // Lexical clustering dumps everything it cannot link into one
                     // dominant bubble (on a 20k project that single "unclustered"
@@ -1626,7 +1663,7 @@ async fn memory_graph_overview(
     };
     let basis = if !is_context {
         "metadata"
-    } else if embedded > 0 && embedded * 2 >= total_rows {
+    } else if allow_vector && embedded > 0 && embedded * 2 >= total_rows {
         "vector"
     } else {
         "lexical"

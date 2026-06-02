@@ -2578,7 +2578,49 @@ impl MemoryStore {
         let previews: Vec<String> = rows.iter().map(|(node, _)| node.preview.clone()).collect();
         let sources: Vec<Option<String>> =
             rows.iter().map(|(node, _)| node.source_kind.clone()).collect();
-        Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target)
+        // pos -> id, kept for the edge remap below (id_of is moved into the core).
+        let id_pos = id_of.clone();
+        let mut idx = Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target);
+
+        // Rebuild inter-cluster edges from the FULL candidate map (`shared`) —
+        // EVERY token-sharing pair, including sub-`min_weight` ones the union-find
+        // ignored. The fold leaves a node's above-threshold peers almost all
+        // intra-cluster, so aggregating only those left the overview edgeless (a
+        // disconnected grid); the weak cross pairs are exactly what tied the small
+        // clusters to the rest in the original, richly-connected lexical map.
+        const CLUSTER_EDGE_CAP: usize = 2000;
+        let mut agg: std::collections::HashMap<(i64, i64), f32> = std::collections::HashMap::new();
+        for (&key, &inter) in &shared {
+            let (x, y) = unpack(key);
+            let (xi, yi) = (x as usize, y as usize);
+            let union = tok_len[xi] + tok_len[yi] - inter as usize;
+            if union == 0 {
+                continue;
+            }
+            let w = inter as f32 / union as f32;
+            let (Some(&ra), Some(&rb)) = (
+                idx.node_cluster.get(&id_pos[xi]),
+                idx.node_cluster.get(&id_pos[yi]),
+            ) else {
+                continue;
+            };
+            if ra == rb {
+                continue;
+            }
+            let pair = if ra < rb { (ra, rb) } else { (rb, ra) };
+            *agg.entry(pair).or_insert(0.0) += w;
+        }
+        let mut edges: Vec<(i64, i64, f32)> =
+            agg.into_iter().map(|((a, b), w)| (a, b, w)).collect();
+        edges.sort_by(|x, y| {
+            y.2.partial_cmp(&x.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(x.0.cmp(&y.0))
+                .then(x.1.cmp(&y.1))
+        });
+        edges.truncate(CLUSTER_EDGE_CAP);
+        idx.cluster_edges = edges;
+        idx
     }
 
     /// Pure clustering core shared by the lexical [`cluster_rows`](Self::cluster_rows)
@@ -2626,6 +2668,13 @@ impl MemoryStore {
         }
         cand_edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         cand_edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        // Keep the FULL candidate peer set (all pairs the caller passed, before
+        // the top_k truncation below) for inter-cluster edge aggregation. The
+        // union-find only needs each node's top_k, but aggregating edges from the
+        // truncated set leaves the overview almost edgeless (a grid) — the lexical
+        // map used to be richly connected and the truncation regressed it.
+        let full_peers = peers.clone();
 
         // 5. Union-find over each node's top_k strongest peer edges.
         let mut uf = UnionFind::new(n);
@@ -2852,7 +2901,7 @@ impl MemoryStore {
         };
         let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
         let mut agg: FxHashMap<u64, f32> = FxHashMap::default();
-        for (xi, plist) in peers.iter().enumerate() {
+        for (xi, plist) in full_peers.iter().enumerate() {
             let ca = comp_of_pos[xi];
             for &(y, w) in plist {
                 let yi = y as usize;

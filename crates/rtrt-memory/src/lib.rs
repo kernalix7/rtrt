@@ -2404,13 +2404,13 @@ impl MemoryStore {
         top_k: usize,
         min_weight: f32,
     ) -> Result<ClusterIndex> {
-        self.graph_clusters_opt(project, max_nodes, top_k, min_weight, true)
+        self.graph_clusters_opt(project, max_nodes, top_k, min_weight, true, CLUSTER_TARGET)
     }
 
     /// Like [`graph_clusters`](Self::graph_clusters) but with explicit control
-    /// over whether the semantic (vector) path may be used. `allow_vector =
-    /// false` forces the lexical path even when the project is embedded — the
-    /// dashboard passes the per-project embedding toggle through here.
+    /// over whether the semantic (vector) path may be used (`allow_vector =
+    /// false` forces lexical) and the bubble `target` (the "세밀도" / granularity
+    /// knob — a larger target means more, finer bubbles and a smaller catch-all).
     pub fn graph_clusters_opt(
         &self,
         project: &str,
@@ -2418,6 +2418,7 @@ impl MemoryStore {
         top_k: usize,
         min_weight: f32,
         allow_vector: bool,
+        target: usize,
     ) -> Result<ClusterIndex> {
         // When the project is (mostly) embedded, cluster on the dense vectors —
         // the real semantic signal — instead of lexical token overlap. Lexical
@@ -2430,7 +2431,7 @@ impl MemoryStore {
         if allow_vector {
             let (embedded, total) = self.embedding_coverage(project)?;
             if embedded > 0 && embedded >= total / 2 {
-                return self.graph_clusters_vec(project, max_nodes, top_k, CLUSTER_TARGET);
+                return self.graph_clusters_vec(project, max_nodes, top_k, target);
             }
         }
         #[cfg(not(feature = "hnsw"))]
@@ -2464,8 +2465,8 @@ impl MemoryStore {
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         // Whole-project clustering folds the singleton explosion down to the
-        // default overview target.
-        Ok(self.cluster_rows(rows, top_k, min_weight, CLUSTER_TARGET))
+        // requested bubble target.
+        Ok(self.cluster_rows(rows, top_k, min_weight, target))
     }
 
     /// Cluster an already-loaded set of `(node, token_set)` rows into a

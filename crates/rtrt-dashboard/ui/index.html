@@ -667,10 +667,22 @@
                 <option value="source">출처</option>
                 <option value="time">시간</option>
               </select>
-              <select id="memmap-embed" class="memmap-group" aria-label="임베딩(의미 분류)" title="이 프로젝트의 임베딩(의미 기반) 사용 여부">
-                <option value="">임베딩: 전역 기본</option>
-                <option value="on">임베딩: 켜기</option>
-                <option value="off">임베딩: 끄기</option>
+              <select id="memmap-basis" class="memmap-group" aria-label="분류 기준" title="문맥 묶음을 의미(임베딩) 기반 / 어휘(키워드) 기반 중 무엇으로 할지">
+                <option value="auto" selected>기준: 자동</option>
+                <option value="vector">기준: 의미</option>
+                <option value="lexical">기준: 어휘</option>
+              </select>
+              <select id="memmap-target" class="memmap-group" aria-label="세밀도" title="버블 개수 — 클수록 미분류가 잘게 쪼개짐">
+                <option value="120">세밀도: 거침</option>
+                <option value="320" selected>세밀도: 보통</option>
+                <option value="600">세밀도: 세밀</option>
+                <option value="900">세밀도: 매우 세밀</option>
+              </select>
+              <select id="memmap-depth" class="memmap-group" aria-label="깊이" title="드릴 깊이 — 깊을수록 더 잘게 파고듦">
+                <option value="0" selected>깊이: 자동</option>
+                <option value="200">깊이: 얕게</option>
+                <option value="80">깊이: 보통</option>
+                <option value="30">깊이: 깊게</option>
               </select>
               <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
                 <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
@@ -2641,6 +2653,9 @@ let memmapProject = '';              // project the overview belongs to
 let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
 let memmapSearch = '';               // cluster label filter substring
 let memmapGroup = 'context';         // grouping basis: context|file|kind|session|source|time
+let memmapBasis = 'auto';            // 문맥 분류 기준: auto|vector(의미)|lexical(어휘)
+let memmapTarget = 320;              // 세밀도: overview bubble target
+let memmapDepth = 0;                 // 깊이: drill leaf cutoff (0 = 자동)
 let memmapMode = 'overview';         // 'overview' | 'group' | 'leaf' (current level kind)
 let memmapCy = null;                 // the single Cytoscape instance, lazily created
 let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
@@ -3185,7 +3200,10 @@ async function memmapDrill(token, label) {
   if (!payload) {
     if (head) head.textContent = `${label} · 불러오는 중…`;
     try {
-      const r = await fetch('/api/memory/graph?token=' + encodeURIComponent(token));
+      // 깊이(leaf) is re-sent on every drill so the server applies the same
+      // depth at each level (the token only carries the member set).
+      const dp = memmapDepth ? `&leaf=${memmapDepth}` : '';
+      const r = await fetch('/api/memory/graph?token=' + encodeURIComponent(token) + dp);
       if (r.status === 410) {
         showToast('맵이 갱신되어 처음부터 다시 불러옵니다', 'err');
         await loadGraph(currentProject());
@@ -3221,22 +3239,12 @@ function memmapGoToDepth(depth) {
 
 // Load the overview graph for a project with the current grouping basis. Always
 // lands on the overview (resets the breadcrumb stack + per-level token cache).
-// Reflect the project's embedding override (전역 기본/켜기/끄기) in the map control.
-function memmapSyncEmbedSelect(project) {
-  const sel = document.getElementById('memmap-embed');
-  if (!sel) return;
-  const p = (PROJECTS_CACHE || []).find(x => x.name === project);
-  const ee = p ? p.embeddings_enabled : null;
-  sel.value = ee === true ? 'on' : ee === false ? 'off' : '';
-}
-
 async function loadGraph(project) {
   memmapStack = [];
   memmapLevelCache.clear();
   memmapSetMode('overview');
   memmapRenderCrumbs();
   memmapResetViews();
-  memmapSyncEmbedSelect(project);
   const head = document.getElementById('memmap-overview-head');
   if (memmapCy) memmapCy.elements().remove();
   if (isGlobalScope() || isGlobalProjectValue(project)) {
@@ -3247,6 +3255,9 @@ async function loadGraph(project) {
   if (head) head.textContent = '불러오는 중…';
   try {
     const params = new URLSearchParams({ project, mode: 'overview', group: memmapGroup });
+    // 문맥 기준일 때만 의미/어휘 + 세밀도 노브를 보냄 (메타 facet엔 무의미).
+    if (memmapGroup === 'context') params.set('basis', memmapBasis);
+    params.set('target', String(memmapTarget));
     const r = await fetch(`/api/memory/graph?${params.toString()}`);
     if (!r.ok) {
       const text = await r.text();
@@ -3281,28 +3292,18 @@ async function loadGraph(project) {
     const project = memmapProject || currentProject();
     if (project) loadGraph(project);
   };
-  // Embedding override (의미 vs 어휘) right on the map: save per-project + reload.
-  const embed = document.getElementById('memmap-embed');
-  if (embed) embed.onchange = async () => {
+  // 분류 기준(자동/의미/어휘) · 세밀도(버블 수) · 깊이(드릴) — view-level knobs,
+  // each reloads the overview with the new value.
+  const reloadMap = () => {
     const project = memmapProject || currentProject();
-    if (!project || isGlobalScope() || isGlobalProjectValue(project)) {
-      showToast('프로젝트를 먼저 선택하세요.', 'err');
-      return;
-    }
-    const mode = embed.value === 'on' ? 'on' : embed.value === 'off' ? 'off' : 'inherit';
-    try {
-      const r = await fetch('/api/projects', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: project, embeddings_mode: mode }),
-      });
-      if (!r.ok) { showToast('임베딩 설정 저장 실패', 'err'); return; }
-      const p = (PROJECTS_CACHE || []).find(x => x.name === project);
-      if (p) p.embeddings_enabled = embed.value === 'on' ? true : embed.value === 'off' ? false : null;
-      showToast(mode === 'off' ? '임베딩 끔 — 어휘 기반' : mode === 'on' ? '임베딩 켬 — 의미 기반' : '전역 기본 따름', 'ok');
-      loadGraph(project);
-    } catch (e) { showToast(`네트워크 오류: ${e.message || e}`, 'err'); }
+    if (project && !isGlobalScope() && !isGlobalProjectValue(project)) loadGraph(project);
   };
+  const basisSel = document.getElementById('memmap-basis');
+  if (basisSel) basisSel.onchange = () => { memmapBasis = basisSel.value || 'auto'; reloadMap(); };
+  const targetSel = document.getElementById('memmap-target');
+  if (targetSel) targetSel.onchange = () => { memmapTarget = Number(targetSel.value) || 320; reloadMap(); };
+  const depthSel = document.getElementById('memmap-depth');
+  if (depthSel) depthSel.onchange = () => { memmapDepth = Number(depthSel.value) || 0; reloadMap(); };
   document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
     btn.onclick = () => {
       memmapSource = btn.dataset.memmapSource || 'all';

@@ -133,12 +133,6 @@ fn dynamic_branch(size: usize) -> usize {
     (((size as f64).sqrt() * 1.4).round() as usize).clamp(12, 64)
 }
 
-/// Top-bubble target when grouping the overview by a metadata facet. Dynamic in
-/// the project total (~√total, clamped).
-fn dynamic_meta_target(total: usize) -> usize {
-    ((total as f64).sqrt().round() as usize).clamp(24, 200)
-}
-
 /// A re-cluster "did not split" — its largest child still holds this fraction of
 /// the parent — so semantic clustering cannot break it up (a lexically-disjoint
 /// unclustered mass). The drill path then falls back to a metadata facet.
@@ -1294,6 +1288,19 @@ struct MemoryGraphQuery {
     /// superseded by `token`.
     #[serde(default)]
     cluster: Option<i64>,
+    /// Clustering basis the user picked on the map for `group=context`:
+    /// `auto` (default — coverage decides) | `vector` (force semantic/embeddings)
+    /// | `lexical` (force keyword). Overrides the per-project default.
+    #[serde(default)]
+    basis: Option<String>,
+    /// Granularity ("세밀도"): overview bubble target. More bubbles = a smaller
+    /// unclustered/"미분류" catch-all. Clamped server-side. `None` = default.
+    #[serde(default)]
+    target: Option<usize>,
+    /// Drill depth ("깊이"): leaf cutoff — a bubble at/under this many members
+    /// renders individual nodes. `None`/`0` = dynamic (~√total).
+    #[serde(default)]
+    leaf: Option<usize>,
 }
 
 fn default_graph_limit() -> usize {
@@ -1317,7 +1324,7 @@ async fn memory_graph(
     // (each minted a fresh child token). All resolved before holding the
     // `!Send` store guard across an `.await`.
     if let Some(tok) = q.token.clone() {
-        return memory_graph_drill(&state, store, tok).await;
+        return memory_graph_drill(&state, store, tok, q.leaf).await;
     }
 
     // LOD drill-down (`cluster=<root>`): return the members of one cluster from
@@ -1366,7 +1373,8 @@ async fn memory_graph(
     // clusters semantically; any other basis buckets by a metadata facet.
     if q.mode.as_deref() == Some("overview") {
         let group = q.group.as_deref().unwrap_or("context");
-        return memory_graph_overview(&state, store, &q.project, group).await;
+        let basis = q.basis.as_deref().unwrap_or("auto");
+        return memory_graph_overview(&state, store, &q.project, group, basis, q.target).await;
     }
 
     let guard = store.lock().await;
@@ -1444,6 +1452,9 @@ async fn memory_graph(
 const CLUSTER_MAX_NODES: usize = 200_000;
 const CLUSTER_TOP_K: usize = 4;
 const CLUSTER_MIN_WEIGHT: f32 = 0.15;
+/// Default overview bubble target (the "세밀도" knob midpoint) when the client
+/// sends no `target`. Matches the memory crate's internal `CLUSTER_TARGET`.
+const GRAPH_TARGET_DEFAULT: usize = 320;
 
 /// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
 /// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
@@ -1502,6 +1513,8 @@ async fn memory_graph_overview(
     store: &Arc<Mutex<MemoryStore>>,
     project: &str,
     group: &str,
+    basis_pref: &str,
+    target_pref: Option<usize>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     // `context` is semantic; everything else is a metadata facet. Reject an
     // unknown basis up front (group_meta also rejects, but a 400 is clearer).
@@ -1513,19 +1526,27 @@ async fn memory_graph_overview(
         ));
     }
 
-    // Per-project embedding toggle: Some(true/false) overrides the global
-    // `[embeddings] enabled`. When false, the context map uses the lexical path
-    // even if the project has vectors.
-    let allow_vector = {
+    // 자동 default = per-project embedding toggle else global `[embeddings] enabled`.
+    let allow_vector_default = {
         let cfg = rtrt_core::Config::load().unwrap_or_default();
         cfg.project(project)
             .and_then(|p| p.embeddings_enabled)
             .unwrap_or_else(|| cfg.embeddings.is_enabled())
     };
+    // The map's 기준 selector: auto | vector(의미) | lexical(어휘).
+    let basis_pref = match basis_pref {
+        "vector" | "lexical" => basis_pref,
+        _ => "auto",
+    };
+    // 세밀도(granularity): bubble target, clamped. (Depth/leaf is a drill-time knob.)
+    let target = target_pref.map(|t| t.clamp(24, 1000)).unwrap_or(GRAPH_TARGET_DEFAULT);
 
-    // Key the cache on the vector toggle too so flipping it doesn't serve a
-    // stale opposite-basis index.
-    let cache_key = format!("{project}{CACHE_KEY_SEP}{group}{CACHE_KEY_SEP}{}", allow_vector as u8);
+    // Key the cache on every knob so a different selection never serves a stale
+    // opposite-basis / opposite-granularity index.
+    let cache_key = format!(
+        "{project}{CACHE_KEY_SEP}{group}{CACHE_KEY_SEP}{basis_pref}{CACHE_KEY_SEP}{target}{CACHE_KEY_SEP}{}",
+        allow_vector_default as u8
+    );
 
     // Fast path: serve a still-fresh cached index (re-mint tokens against it).
     let cached = {
@@ -1541,20 +1562,38 @@ async fn memory_graph_overview(
             let idx = {
                 let guard = store.lock().await;
                 if is_context {
-                    guard
-                        .graph_clusters_opt(
-                            project,
-                            CLUSTER_MAX_NODES,
-                            CLUSTER_TOP_K,
-                            CLUSTER_MIN_WEIGHT,
-                            allow_vector,
-                        )
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                    match basis_pref {
+                        // Force semantic: cluster on vectors even at low coverage
+                        // (the map then covers only the embedded rows).
+                        "vector" => guard
+                            .graph_clusters_vec(project, CLUSTER_MAX_NODES, CLUSTER_TOP_K, target)
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                        // Force keyword.
+                        "lexical" => guard
+                            .graph_clusters_opt(
+                                project,
+                                CLUSTER_MAX_NODES,
+                                CLUSTER_TOP_K,
+                                CLUSTER_MIN_WEIGHT,
+                                false,
+                                target,
+                            )
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                        // Auto: coverage decides (honours the per-project toggle).
+                        _ => guard
+                            .graph_clusters_opt(
+                                project,
+                                CLUSTER_MAX_NODES,
+                                CLUSTER_TOP_K,
+                                CLUSTER_MIN_WEIGHT,
+                                allow_vector_default,
+                                target,
+                            )
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                    }
                 } else {
-                    // Top-bubble count scales with the project total (~√total).
-                    let total = guard.count_by_project(project).unwrap_or(0);
                     guard
-                        .group_meta(project, CLUSTER_MAX_NODES, group, dynamic_meta_target(total))
+                        .group_meta(project, CLUSTER_MAX_NODES, group, target)
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 }
             };
@@ -1627,10 +1666,14 @@ async fn memory_graph_overview(
     };
     let basis = if !is_context {
         "metadata"
-    } else if allow_vector && embedded > 0 && embedded * 2 >= total_rows {
-        "vector"
     } else {
-        "lexical"
+        match basis_pref {
+            "vector" => "vector",
+            "lexical" => "lexical",
+            // auto: coverage decides (honours the per-project toggle).
+            _ if allow_vector_default && embedded > 0 && embedded * 2 >= total_rows => "vector",
+            _ => "lexical",
+        }
     };
 
     Ok(Json(serde_json::json!({
@@ -1657,6 +1700,7 @@ async fn memory_graph_drill(
     state: &AppState,
     store: &Arc<Mutex<MemoryStore>>,
     token: String,
+    leaf_pref: Option<usize>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Resolve the token (honouring TTL) and clone out its payload.
     let entry = {
@@ -1669,7 +1713,12 @@ async fn memory_graph_drill(
     let total_n = entry.total_n;
     let project = entry.project.clone();
     let ids = entry.member_ids;
-    let leaf_cut = dynamic_leaf(total_n);
+    // 깊이(depth): an explicit leaf cutoff from the map control, else dynamic.
+    // A larger cutoff bottoms out sooner (shallower); smaller drills deeper.
+    let leaf_cut = leaf_pref
+        .filter(|&l| l > 0)
+        .map(|l| l.clamp(8, 2000))
+        .unwrap_or_else(|| dynamic_leaf(total_n));
 
     // Leaf: small enough to render individual memory nodes.
     if ids.len() <= leaf_cut {

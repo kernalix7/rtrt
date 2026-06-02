@@ -2863,6 +2863,20 @@ impl MemoryStore {
                 *agg.entry(pack(ca as u32, cb as u32)).or_insert(0.0) += w * 0.5;
             }
         }
+        // Also fold in each node's single strongest candidate edge (`best_peer`,
+        // ANY weight). After the aggressive singleton-fold the top-k `peers` are
+        // almost all INTRA-cluster, leaving the overview with no connecting lines;
+        // the best-peer rails are the cross-cluster links that keep the map
+        // connected (every node contributes the one edge that pulled it toward
+        // its nearest neighbour, even across cluster boundaries).
+        for &(x, y, w) in &cand_edges {
+            let ca = comp_of_pos[x as usize];
+            let cb = comp_of_pos[y as usize];
+            if ca == cb {
+                continue;
+            }
+            *agg.entry(pack(ca as u32, cb as u32)).or_insert(0.0) += w;
+        }
         let mut cluster_edges: Vec<(i64, i64, f32)> = agg
             .into_iter()
             .map(|(key, w)| {
@@ -3061,9 +3075,73 @@ impl MemoryStore {
             }
         }
 
-        Ok(Self::cluster_from_peers(
+        let mut idx = Self::cluster_from_peers(
             ids, previews, sources, peers, best_peer, top_k, target,
-        ))
+        );
+
+        // Cluster-level backbone: connect each cluster to its 2 nearest OTHER
+        // clusters by CENTROID cosine. The per-node peer aggregation alone leaves
+        // the overview almost edgeless (after the fold, a node's strongest links
+        // are intra-cluster), so the map renders as a disconnected grid. Centroids
+        // give a reliable, data-independent backbone — there are <= `target`
+        // clusters, so the O(k²) pass is trivial. Replaces the sparse peer edges.
+        let dim = loaded.first().map(|r| r.vector.len()).unwrap_or(0);
+        if dim > 0 && idx.clusters.len() > 1 {
+            let mut sum: std::collections::HashMap<i64, (Vec<f32>, usize)> =
+                std::collections::HashMap::new();
+            for row in &loaded {
+                if let Some(&root) = idx.node_cluster.get(&row.id) {
+                    let e = sum.entry(root).or_insert_with(|| (vec![0.0f32; dim], 0));
+                    for (a, b) in e.0.iter_mut().zip(&row.vector) {
+                        *a += *b;
+                    }
+                    e.1 += 1;
+                }
+            }
+            let roots: Vec<i64> = {
+                let mut r: Vec<i64> = sum.keys().copied().collect();
+                r.sort_unstable();
+                r
+            };
+            let centroids: Vec<Vec<f32>> = roots
+                .iter()
+                .map(|r| {
+                    let (s, c) = &sum[r];
+                    let inv = 1.0 / (*c as f32);
+                    s.iter().map(|x| x * inv).collect()
+                })
+                .collect();
+            let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+            let mut edges: Vec<(i64, i64, f32)> = Vec::new();
+            for i in 0..roots.len() {
+                let mut best: Vec<(f32, usize)> = Vec::with_capacity(roots.len());
+                for j in 0..roots.len() {
+                    if i != j {
+                        best.push((crate::embed::cosine(&centroids[i], &centroids[j]), j));
+                    }
+                }
+                best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                for &(s, j) in best.iter().take(2) {
+                    let (a, b) = if roots[i] < roots[j] {
+                        (roots[i], roots[j])
+                    } else {
+                        (roots[j], roots[i])
+                    };
+                    if seen.insert((a, b)) {
+                        edges.push((a, b, s));
+                    }
+                }
+            }
+            edges.sort_by(|x, y| {
+                y.2.partial_cmp(&x.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(x.0.cmp(&y.0))
+                    .then(x.1.cmp(&y.1))
+            });
+            idx.cluster_edges = edges;
+        }
+
+        Ok(idx)
     }
 
     /// Drill-down: the members of one cluster (by root id) plus their

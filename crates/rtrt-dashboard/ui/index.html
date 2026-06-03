@@ -679,8 +679,14 @@
               <button class="primary" type="submit">새로고침</button>
             </form>
 
+            <div id="memmap-mode-toggle" class="sort-row" aria-label="맵 모드" style="margin:0.4rem 0;">
+              <button class="sort-btn active" type="button" data-memmap-mode="brain" title="개념(토큰) 간 연결을 옵시디언처럼 그래프로 — 노드는 개념, 선은 함께 등장한 관계">브레인(개념)</button>
+              <button class="sort-btn" type="button" data-memmap-mode="cluster" title="비슷한 메모리를 클러스터 노드로 묶어 보기">묶음(클러스터)</button>
+            </div>
+
             <div class="memmap-controls">
               <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
+              <span id="memmap-cluster-controls" style="display:contents;">
               <select id="memmap-group" class="memmap-group" aria-label="묶음 기준">
                 <option value="context" selected>문맥</option>
                 <option value="file">파일</option>
@@ -706,6 +712,7 @@
                 <option value="80">깊이: 보통</option>
                 <option value="30">깊이: 깊게</option>
               </select>
+              </span>
               <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
                 <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
                 <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
@@ -1482,15 +1489,16 @@ function wireSubtabs(navId, onActivate) {
 }
 wireSubtabs('memory-subtabs', (sub) => {
   const project = currentProject();
+  // The map (맵) works in global scope when in 브레인 mode (GLOBAL merged brain),
+  // so handle it BEFORE the global-scope early-return that other subtabs use.
+  if (sub === 'memmap') { loadMemmap(project); return; }
+  // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
+  memmapStopLayout();
   if (isGlobalScope()) { refreshMemoryScope(); return; }
   // Auto-load stats + compression queue when the stats tab is activated.
   if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
   // Auto-load governance stats when governance tab opens.
   if (sub === 'memgovern' && project) { loadGovStats(project); }
-  // Auto-load graph when the map tab opens (saves an extra button click).
-  if (sub === 'memmap' && project) { loadGraph(project); }
-  // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
-  else if (sub !== 'memmap') { memmapStopLayout(); }
 });
 wireSubtabs('security-subtabs', (sub) => {
   if (sub === 'securityprofiles') loadSecurityProfileSettings();
@@ -2305,7 +2313,7 @@ async function startEmbedAndPoll(project, statusFn) {
     if (c.running) { setTimeout(poll, 3000); return; }
     EMBED_POLLING.delete(project);
     showToast(`임베딩 완료 · ${project} · ${c.embedded.toLocaleString()}/${c.total.toLocaleString()}`, 'ok');
-    if ((memmapProject || currentProject()) === project) loadGraph(project);
+    if ((memmapProject || currentProject()) === project) loadMemmap(project);
   };
   poll();
   return true;
@@ -2665,6 +2673,13 @@ let memmapDepth = 0;                 // 깊이: drill leaf cutoff (0 = 자동)
 let memmapMode = 'overview';         // 'overview' | 'group' | 'leaf' (current level kind)
 let memmapCy = null;                 // the single Cytoscape instance, lazily created
 let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
+// 맵 모드: 'brain' (개념 그래프, default) vs 'cluster' (기존 묶음 뷰). The toggle swaps
+// which loader runs; the cy instance, styling, layout + tooltip are shared.
+let memmapViewMode = 'brain';
+let brainGraph = null;               // last brain overview payload for the current scope
+let brainProject = '';               // project the brain belongs to ('' = global)
+let brainScopeGlobal = false;        // whether the loaded brain is the GLOBAL (merged) brain
+let brainConcept = null;             // when set, we're viewing one concept's memories (drill)
 // Breadcrumb stack of drilled levels: [{ token, label }, …]. The overview itself
 // is the implicit root (rendered as the "전체" crumb); pushed levels follow.
 let memmapStack = [];
@@ -2746,6 +2761,16 @@ function memmapCyStyle() {
     // hubs; leaf member nodes are round-rectangles ("things" hanging off a hub).
     { selector: 'node[kindType = "cluster"]', style: { 'shape': 'ellipse' } },
     { selector: 'node[kindType = "member"]', style: { 'shape': 'round-rectangle' } },
+    // Brain concept nodes are circular "ideas"; labels are hidden by default
+    // (only hubs + hover show them) so the map reads as a clean constellation.
+    {
+      selector: 'node[kindType = "concept"]',
+      style: { 'shape': 'ellipse', 'text-opacity': 0 },
+    },
+    // Hubs (high degree) keep their label so the brain has anchor points.
+    { selector: 'node[kindType = "concept"][?hub]', style: { 'text-opacity': 1 } },
+    // Hovered concept (+ its neighbours) always shows its label.
+    { selector: 'node.label-on', style: { 'text-opacity': 1 } },
     // Catch-all / misc bubble: neutral, dashed, visually set apart from real groups.
     {
       selector: 'node[?misc]',
@@ -2817,9 +2842,14 @@ function memmapEnsureCy() {
     maxZoom: 3,
     wheelSensitivity: 0.2,
   });
-  // Tap on a node: a bubble (cluster) drills via its token; a member opens the modal.
+  // Tap on a node: a bubble (cluster) drills via its token; a member opens the
+  // modal; a concept shows its memories.
   memmapCy.on('tap', 'node', (ev) => {
     const data = ev.target.data();
+    if (data.kindType === 'concept') {
+      brainDrillConcept(String(data.token || data.label || ''));
+      return;
+    }
     if (data.kindType === 'cluster') {
       // Not drillable (misc/leaf-of-leaf): just centre it, don't try to drill.
       if (data.drillable === false || data.misc || !data.token) {
@@ -2833,12 +2863,22 @@ function memmapEnsureCy() {
     }
   });
   // Hover a node: light up its connecting edges + show the agentmemory-style card.
+  // In brain mode, fade the non-neighbours and reveal the hovered node + its
+  // neighbours' labels (agentmemory focus behaviour).
   memmapCy.on('mouseover', 'node', (ev) => {
     ev.target.connectedEdges().addClass('hl');
+    if (memmapViewMode === 'brain' && !brainConcept) {
+      const focus = ev.target.closedNeighborhood();
+      memmapCy.nodes().not(focus).addClass('dim');
+      focus.nodes().addClass('label-on');
+    }
     memmapShowTooltip(ev.target);
   });
   memmapCy.on('mouseout', 'node', () => {
     memmapCy.edges('.hl').removeClass('hl');
+    if (memmapViewMode === 'brain' && !brainConcept) {
+      memmapCy.nodes().removeClass('dim label-on');
+    }
     memmapHideTooltip();
   });
   // Track the cursor so the card follows it (offset +12px, like agentmemory).
@@ -2855,6 +2895,7 @@ function memmapEnsureCy() {
 function memmapTooltipMeta(node) {
   const data = node.data();
   if (data.misc) return { type: '미분류', col: MEMMAP_PALETTE.misc };
+  if (data.kindType === 'concept') return { type: '개념', col: data.col || MEMMAP_PALETTE.mixed };
   if (data.kindType === 'member') return { type: '메모리', col: memmapColor(data.src || 'mixed') };
   return { type: '클러스터', col: memmapColor(data.src || 'mixed') };
 }
@@ -3192,6 +3233,17 @@ function memmapRenderLeafLevel(payload, label) {
 
 // Apply the source filter + search highlight to the overview using cy selectors.
 function memmapApplyFilters() {
+  // Brain mode: only a concept-name search highlight (no source/cluster filter).
+  if (memmapViewMode === 'brain') {
+    if (!memmapCy || brainConcept) return;
+    const needle = memmapSearch.trim().toLowerCase();
+    memmapCy.nodes().removeClass('dim hit');
+    if (needle) {
+      memmapCy.nodes().filter(n => !String(n.data('rawLabel') || '').toLowerCase().includes(needle)).addClass('dim');
+      memmapCy.nodes().filter(n => String(n.data('rawLabel') || '').toLowerCase().includes(needle)).removeClass('dim').addClass('hit');
+    }
+    return;
+  }
   // Bubble levels only (overview / group); leaf shows members, no cluster filter.
   if (!memmapCy || (memmapMode !== 'overview' && memmapMode !== 'group')) return;
   const needle = memmapSearch.trim().toLowerCase();
@@ -3325,6 +3377,264 @@ function memmapGoToDepth(depth) {
   memmapRenderLevelPayload(payload, crumb.label);
 }
 
+// ── DIGITAL BRAIN (개념 그래프) ───────────────────────────────────────────────
+// Obsidian-style concept map: nodes are CONCEPTS (salient tokens), edges are
+// co-occurrence between them. Works per-project and GLOBAL (전체 = all projects
+// merged into one brain). Reuses the shared cy instance, styling, layout +
+// hover card. No LLM — the server derives concepts from the token index.
+
+// Concept node radius is driven by DEGREE: r = clamp(8 + degree*2.5, 8, 22)
+// (same spec already used by the cluster view). cy 'width'/'height' want the
+// DIAMETER, so we return 2r.
+function brainNodeDiameter(degree) {
+  const r = Math.max(8, Math.min(22, 8 + Number(degree || 0) * 2.5));
+  return Math.round(r * 2);
+}
+
+// Deterministic palette colour per concept (clean agentmemory gold/blue/green,
+// never an 18-colour rainbow). Hash the token so the same concept keeps its hue.
+const BRAIN_CONCEPT_PALETTE = [
+  MEMMAP_PALETTE.main, MEMMAP_PALETTE.subagent, MEMMAP_PALETTE.mixed,
+];
+function brainConceptColor(token) {
+  const s = String(token || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return BRAIN_CONCEPT_PALETTE[h % BRAIN_CONCEPT_PALETTE.length];
+}
+
+// Build the Cytoscape elements for the brain overview from { nodes, edges }.
+// Nodes carry kindType:'concept', size-by-degree, token for the drill, and a
+// `hub` flag (top-degree nodes keep their label visible).
+function brainOverviewElements(payload) {
+  const rawNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const rawEdges = Array.isArray(payload.edges) ? payload.edges : [];
+  const ids = new Set(rawNodes.map(n => String(n.id)));
+  // Hubs: the top ~12 by degree get a persistent label so the map has anchors.
+  const byDegree = rawNodes.slice().sort((a, b) => Number(b.degree || 0) - Number(a.degree || 0));
+  const hubIds = new Set(byDegree.slice(0, 12).map(n => String(n.id)));
+  const nodes = rawNodes.map(n => {
+    const id = String(n.id);
+    const token = String(n.label != null ? n.label : id.replace(/^c:/, ''));
+    const degree = Number(n.degree || 0);
+    const freq = Number(n.freq || 0);
+    const projects = Array.isArray(n.projects) ? n.projects : [];
+    return {
+      data: {
+        id, label: token, rawLabel: token, token,
+        size: brainNodeDiameter(degree),
+        col: brainConceptColor(token),
+        kindType: 'concept',
+        degree, freq, projects,
+        hub: hubIds.has(id) ? 1 : undefined,
+      },
+    };
+  });
+  const edgeEls = rawEdges
+    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)) && e.src !== e.dst)
+    .map((e, i) => ({
+      data: {
+        id: `be${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(4, Number(e.weight || 1))),
+      },
+    }));
+  return nodes.concat(edgeEls);
+}
+
+// Render the brain overview (or fallback list if cy is unavailable). Clears the
+// concept-drill state so we're back at the constellation.
+function renderBrainOverview() {
+  brainConcept = null;
+  const head = document.getElementById('memmap-overview-head');
+  memmapResetViews();
+  memmapStack = [];
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = true;
+  const crumbs = document.getElementById('memmap-crumbs');
+  if (crumbs) { crumbs.hidden = true; crumbs.innerHTML = ''; }
+  if (!brainGraph) {
+    if (head) head.textContent = '';
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const concepts = Number(brainGraph.total_concepts || (brainGraph.nodes || []).length || 0);
+  const mems = Number(brainGraph.total_memories || 0);
+  const scopeLabel = brainScopeGlobal ? '전체' : (brainProject || '');
+  if (head) {
+    head.textContent = `개념 ${concepts.toLocaleString()}개 · 메모리 ${mems.toLocaleString()}개 · ${scopeLabel}`;
+  }
+  if (!(brainGraph.nodes || []).length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) { empty.textContent = '개념이 충분하지 않습니다 (메모리가 더 쌓이면 나타납니다).'; empty.hidden = false; }
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderBrainFallback(brainGraph); return; }
+  cy.elements().remove();
+  cy.add(brainOverviewElements(brainGraph));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Offline / no-cy fallback: list the strongest concepts as clickable rows.
+function renderBrainFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (Array.isArray(payload.nodes) ? payload.nodes : [])
+    .slice().sort((a, b) => Number(b.degree || 0) - Number(a.degree || 0));
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  fb.innerHTML = note + nodes.map(n => {
+    const token = String(n.label != null ? n.label : String(n.id).replace(/^c:/, ''));
+    const degree = Number(n.degree || 0);
+    const freq = Number(n.freq || 0);
+    return `<div class="member-row" data-concept="${escapeAttr(token)}">`
+      + `<span class="mr-badge badge">개념</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(token)}</div>`
+      + `<div class="mr-kind">${degree} 연결 · ${freq.toLocaleString()}건</div></div></div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => brainDrillConcept(el.dataset.concept);
+  });
+}
+
+// Drill a concept → its memories. Fetches mode=brain&concept=TOKEN for the
+// current scope and shows the memories as a side list (reuses .member-row);
+// clicking a row opens the memory modal. 뒤로 returns to the concept brain.
+async function brainDrillConcept(concept) {
+  concept = String(concept || '');
+  if (!concept) return;
+  brainConcept = concept;
+  const head = document.getElementById('memmap-overview-head');
+  if (head) head.textContent = `개념 "${concept}" · 불러오는 중…`;
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = false;
+  // Clear the graph canvas while the memories load (we show a list, not a graph).
+  if (memmapCy) memmapCy.elements().remove();
+  memmapStopLayout();
+  try {
+    const params = new URLSearchParams({ mode: 'brain', concept });
+    if (!brainScopeGlobal && brainProject) params.set('project', brainProject);
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
+    if (!r.ok) {
+      showToast(`개념 로드 실패 ${r.status}`, 'err');
+      if (head) head.textContent = `개념 "${concept}" · 오류 ${r.status}`;
+      return;
+    }
+    const d = await r.json();
+    renderBrainConceptMemories(concept, d);
+  } catch (e) {
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = `개념 "${concept}" · 네트워크 오류`;
+  }
+}
+
+// Render a concept's memories as a clickable list: preview + project badge +
+// source. Clicking a row opens the memory modal.
+function renderBrainConceptMemories(concept, payload) {
+  const head = document.getElementById('memmap-overview-head');
+  const fb = document.getElementById('memmap-fallback');
+  const empty = document.getElementById('memmap-empty');
+  const nodes = (payload && Array.isArray(payload.nodes) ? payload.nodes : [])
+    .filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (head) head.textContent = `개념 "${concept}" · 메모리 ${nodes.length.toLocaleString()}개`;
+  if (!fb) return;
+  if (!nodes.length) {
+    if (empty) { empty.textContent = '이 개념의 메모리가 없습니다.'; empty.hidden = false; }
+    fb.hidden = true; fb.innerHTML = '';
+    return;
+  }
+  if (empty) empty.hidden = true;
+  fb.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const proj = n.project ? `<span class="mr-badge badge">${escapeHtml(String(n.project))}</span>` : '';
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    return `<div class="member-row" data-id="${escapeAttr(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>${proj}`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      const num = String(el.dataset.id || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Load the brain for a project, OR the GLOBAL brain when global is set. Unlike
+// the cluster loader, this NEVER shows the "프로젝트를 선택하세요" message: global
+// scope loads the merged brain (전체).
+async function loadBrain(project) {
+  brainConcept = null;
+  memmapStopLayout();
+  memmapResetViews();
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = true;
+  const crumbs = document.getElementById('memmap-crumbs');
+  if (crumbs) { crumbs.hidden = true; crumbs.innerHTML = ''; }
+  const head = document.getElementById('memmap-overview-head');
+  if (memmapCy) memmapCy.elements().remove();
+  const global = isGlobalScope() || isGlobalProjectValue(project) || !project;
+  brainScopeGlobal = global;
+  brainProject = global ? '' : project;
+  if (head) head.textContent = '불러오는 중…';
+  try {
+    const params = new URLSearchParams({ mode: 'brain' });
+    // Omit project for the GLOBAL brain (server treats empty/sentinel as global).
+    if (!global) params.set('project', project);
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`브레인 로드 실패 ${r.status}: ${text}`, 'err');
+      if (head) head.textContent = `오류 ${r.status}`;
+      brainGraph = null;
+      return;
+    }
+    const d = await r.json();
+    d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+    d.edges = Array.isArray(d.edges) ? d.edges : [];
+    brainGraph = d;
+    renderBrainOverview();
+  } catch (e) {
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = '네트워크 오류';
+    brainGraph = null;
+  }
+}
+
+// Dispatch the right loader for the active map mode. Brain works in global
+// scope; cluster keeps its existing per-project behaviour.
+function loadMemmap(project) {
+  if (memmapViewMode === 'brain') { loadBrain(project); return; }
+  loadGraph(project);
+}
+
+// Switch the map between 브레인(개념) and 묶음(클러스터). Hides the cluster-only
+// controls (기준/세밀도/깊이/출처/임베딩) in brain mode and runs the matching loader.
+function memmapSetViewMode(mode, project) {
+  memmapViewMode = mode === 'cluster' ? 'cluster' : 'brain';
+  document.querySelectorAll('#memmap-mode-toggle .sort-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.memmapMode === memmapViewMode);
+  });
+  const isBrain = memmapViewMode === 'brain';
+  const clusterCtl = document.getElementById('memmap-cluster-controls');
+  if (clusterCtl) clusterCtl.style.display = isBrain ? 'none' : 'contents';
+  const srcFilter = document.getElementById('memmap-source-filter');
+  if (srcFilter) srcFilter.style.display = isBrain ? 'none' : '';
+  const embedBtn = document.getElementById('memmap-embed-btn');
+  if (embedBtn) embedBtn.style.display = isBrain ? 'none' : '';
+  const search = document.getElementById('memmap-search');
+  if (search) search.placeholder = isBrain ? '개념 검색' : '클러스터 검색';
+  loadMemmap(project || memmapProject || brainProject || currentProject());
+}
+
 // Load the overview graph for a project with the current grouping basis. Always
 // lands on the overview (resets the breadcrumb stack + per-level token cache).
 async function loadGraph(project) {
@@ -3371,6 +3681,10 @@ async function loadGraph(project) {
 
 // Wire up the controls: search box, group basis, source filter, back, fit.
 (function wireMemmap() {
+  // Map mode toggle: 브레인(개념) ↔ 묶음(클러스터). Default 브레인 (active in markup).
+  document.querySelectorAll('#memmap-mode-toggle .sort-btn').forEach(btn => {
+    btn.onclick = () => memmapSetViewMode(btn.dataset.memmapMode || 'brain');
+  });
   const search = document.getElementById('memmap-search');
   if (search) search.oninput = () => { memmapSearch = search.value || ''; memmapApplyFilters(); };
   // Grouping basis: changing it resets the breadcrumb + cache and reloads overview.
@@ -3401,9 +3715,13 @@ async function loadGraph(project) {
       memmapApplyFilters();
     };
   });
-  // Back: pop exactly one breadcrumb level (root reloads the overview).
+  // Back: in brain mode, return from a concept's memories to the concept brain;
+  // in cluster mode, pop exactly one breadcrumb level (root reloads the overview).
   const back = document.getElementById('memmap-back');
-  if (back) back.onclick = () => memmapGoToDepth(memmapStack.length - 1);
+  if (back) back.onclick = () => {
+    if (memmapViewMode === 'brain') { renderBrainOverview(); return; }
+    memmapGoToDepth(memmapStack.length - 1);
+  };
   const fit = document.getElementById('memmap-fit');
   if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
   // Embed this project (background) right from the map; caption shows progress.
@@ -3422,6 +3740,8 @@ async function loadGraph(project) {
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  // 브레인 mode loads even in global scope (GLOBAL merged brain).
+  if (memmapViewMode === 'brain') { await loadMemmap(project); return; }
   if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); await loadGraph(project); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   await loadGraph(project);

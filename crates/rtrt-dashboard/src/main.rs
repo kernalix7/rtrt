@@ -43,7 +43,9 @@ use axum::{
     response::Html,
     routing::{delete, get, post},
 };
-use rtrt_memory::{ClusterIndex, DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
+use rtrt_memory::{
+    ClusterIndex, ConceptGraph, DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser,
+};
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
 };
@@ -74,6 +76,12 @@ struct AppState {
     /// reads the `context` entry (rebuilding if missing/expired).
     cluster_cache:
         Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
+    /// Per-scope "digital brain" concept-graph cache, same style + TTL as
+    /// [`AppState::cluster_cache`] (`CLUSTER_INDEX_TTL`). Keyed
+    /// `"brain\x1f<scope>"` where `<scope>` is the project name or `__global__`
+    /// for the merged GLOBAL brain. Separate map because the value type differs
+    /// ([`ConceptGraph`] vs [`ClusterIndex`]); the eviction policy is identical.
+    brain_cache: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ConceptGraph)>>>,
     /// Opaque drill tokens minted per overview/group build
     /// (`token -> (built_at, entry)`), TTL [`LEVEL_TOKEN_TTL`]. Each token maps
     /// to the member-id set of one bubble so the client can drill many levels
@@ -338,6 +346,7 @@ async fn main() -> Result<()> {
         events: events_tx,
         embedder,
         cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        brain_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         memory_path: memory_store_path(),
         embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1314,6 +1323,10 @@ struct MemoryGraphQuery {
     /// renders individual nodes. `None`/`0` = dynamic (~√total).
     #[serde(default)]
     leaf: Option<usize>,
+    /// `mode=brain` concept drill: when set, return the memories containing this
+    /// concept token (the `brain-concept` response) instead of the brain graph.
+    #[serde(default)]
+    concept: Option<String>,
 }
 
 fn default_graph_limit() -> usize {
@@ -1388,6 +1401,19 @@ async fn memory_graph(
         let group = q.group.as_deref().unwrap_or("context");
         let basis = q.basis.as_deref().unwrap_or("auto");
         return memory_graph_overview(&state, store, &q.project, group, basis, q.target).await;
+    }
+
+    // Brain mode (`mode=brain`): the Obsidian-style concept map. Scope resolves
+    // the same way the project selector does — a present, non-sentinel project
+    // is one project's brain; an empty string or the `__global__` sentinel is
+    // the GLOBAL brain (all projects merged by concept token). With `concept=`
+    // it drills to the memories of one concept instead of returning the graph.
+    if q.mode.as_deref() == Some("brain") {
+        let scope: Option<&str> = brain_scope(&q.project);
+        if let Some(concept) = q.concept.as_deref().filter(|c| !c.is_empty()) {
+            return memory_graph_brain_concept(store, scope, concept).await;
+        }
+        return memory_graph_brain(&state, store, &q.project, scope).await;
     }
 
     let guard = store.lock().await;
@@ -1465,6 +1491,139 @@ async fn memory_graph(
 const CLUSTER_MAX_NODES: usize = 200_000;
 const CLUSTER_TOP_K: usize = 4;
 const CLUSTER_MIN_WEIGHT: f32 = 0.15;
+
+/// Server defaults for the "digital brain" concept graph (`mode=brain`).
+const BRAIN_MAX_CONCEPTS: usize = 250;
+const BRAIN_MAX_EDGES: usize = 750;
+const BRAIN_MIN_COOCCUR: usize = 2;
+
+/// The global-scope sentinel value the project selector sends for "all projects
+/// merged into one brain" (mirrors `GLOBAL_PROJECT_VALUE` in the frontend). An
+/// empty project string is treated as global too.
+const GLOBAL_PROJECT_SENTINEL: &str = "__global__";
+
+/// Map a raw `project` query param to a [`MemoryStore::concept_graph`] scope:
+/// `None` (GLOBAL, all projects merged) for an empty string or the global
+/// sentinel, else `Some(project)` for one project's brain.
+fn brain_scope(project: &str) -> Option<&str> {
+    if project.is_empty() || project == GLOBAL_PROJECT_SENTINEL {
+        None
+    } else {
+        Some(project)
+    }
+}
+
+/// Build (or serve from the 60s cache) the per-scope concept graph and return
+/// the documented `mode=brain` JSON. Cached in [`AppState::brain_cache`] under
+/// `"brain\x1f<scope>"`, the same TTL + style as the LOD cluster cache.
+///
+/// The store is `!Send`, so the build runs inside a synchronous block with no
+/// `.await` while the guard is held — keeping the future `Send` for axum.
+async fn memory_graph_brain(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    scope: Option<&str>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let scope_key = if scope.is_none() {
+        GLOBAL_PROJECT_SENTINEL
+    } else {
+        project
+    };
+    let cache_key = format!("brain\x1f{scope_key}");
+
+    // Fast path: serve a still-fresh cached graph.
+    let graph = {
+        let cache = state.brain_cache.lock().await;
+        match cache.get(&cache_key) {
+            Some((built_at, g)) if built_at.elapsed() < CLUSTER_INDEX_TTL => Some(g.clone()),
+            _ => None,
+        }
+    };
+    let graph = match graph {
+        Some(g) => g,
+        None => {
+            // Miss / expired: rebuild under the store lock (no await inside).
+            let g = {
+                let guard = store.lock().await;
+                guard
+                    .concept_graph(
+                        scope,
+                        BRAIN_MAX_CONCEPTS,
+                        BRAIN_MAX_EDGES,
+                        BRAIN_MIN_COOCCUR,
+                    )
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            };
+            let mut cache = state.brain_cache.lock().await;
+            cache.insert(cache_key, (std::time::Instant::now(), g.clone()));
+            g
+        }
+    };
+
+    let nodes: Vec<serde_json::Value> = graph
+        .nodes
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": format!("c:{}", c.name),
+                "label": c.name,
+                "degree": c.degree,
+                "freq": c.freq,
+                "projects": c.projects,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|(a, b, w)| {
+            serde_json::json!({"src": format!("c:{a}"), "dst": format!("c:{b}"), "weight": w})
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain",
+        "scope": if scope.is_none() { "global" } else { "project" },
+        "total_memories": graph.total_memories,
+        "total_concepts": graph.nodes.len(),
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// Drill one concept: return the memories containing `concept` (newest first,
+/// capped) as the documented `mode=brain-concept` JSON.
+async fn memory_graph_brain_concept(
+    store: &Arc<Mutex<MemoryStore>>,
+    scope: Option<&str>,
+    concept: &str,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rows = {
+        let guard = store.lock().await;
+        guard
+            .concept_memories(scope, concept, default_graph_limit())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let nodes: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(m, project)| {
+            serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+                "project": project,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain-concept",
+        "concept": concept,
+        "nodes": nodes,
+        "edges": [],
+    })))
+}
 
 /// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
 /// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
@@ -1793,10 +1952,16 @@ async fn memory_graph_drill(
             Some(m) => m,
             None => {
                 let pages = page_buckets(&ids, leaf_cut);
-                return Ok(
-                    emit_group_response(state, &pages, &project, total_n, &token, ids.len(), true)
-                        .await,
-                );
+                return Ok(emit_group_response(
+                    state,
+                    &pages,
+                    &project,
+                    total_n,
+                    &token,
+                    ids.len(),
+                    true,
+                )
+                .await);
             }
         }
     } else {
@@ -3450,7 +3615,9 @@ async fn memory_embed(
     {
         let mut jobs = state.embedding_jobs.lock().unwrap();
         if jobs.contains(&req.project) {
-            return Ok(Json(serde_json::json!({ "started": false, "running": true })));
+            return Ok(Json(
+                serde_json::json!({ "started": false, "running": true }),
+            ));
         }
         jobs.insert(req.project.clone());
     }
@@ -3482,7 +3649,9 @@ async fn memory_embed(
         jobs.lock().unwrap().remove(&project);
     });
 
-    Ok(Json(serde_json::json!({ "started": true, "running": true })))
+    Ok(Json(
+        serde_json::json!({ "started": true, "running": true }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

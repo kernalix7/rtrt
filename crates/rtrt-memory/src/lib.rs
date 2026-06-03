@@ -200,6 +200,39 @@ pub struct ClusterMembers {
     pub edges: Vec<(i64, i64, f32)>,
 }
 
+/// A concept node in the Obsidian-style "digital brain" map. A concept is a
+/// salient, word-like token (see [`token_set`]) whose document frequency sits
+/// in the keep band — frequent enough to matter, not so frequent it is a
+/// stop-word. Built **without any LLM**: concepts and their relationships come
+/// entirely from token co-occurrence over the existing memory bodies.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConceptNode {
+    /// The concept token, lowercase (the `name` the UI labels the node with).
+    pub name: String,
+    /// Number of memories containing this concept (document frequency).
+    pub freq: usize,
+    /// Number of distinct co-occurring concepts in the kept edge set.
+    pub degree: usize,
+    /// Distinct projects whose memories contain this concept. For a per-project
+    /// brain this is a single project; for the GLOBAL brain a concept shared by
+    /// several projects lists them all (the bridge that links the projects).
+    pub projects: Vec<String>,
+}
+
+/// The full "digital brain" graph: concept nodes plus weighted concept↔concept
+/// edges, derived purely from token co-occurrence ([`MemoryStore::concept_graph`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConceptGraph {
+    /// Concept nodes, sorted by degree desc, then freq desc, then name asc.
+    pub nodes: Vec<ConceptNode>,
+    /// Undirected co-occurrence edges `(concept_a, concept_b, weight)` with
+    /// `concept_a < concept_b` lexicographically, strongest first. `weight` is
+    /// the number of memories in which the two concepts co-occur.
+    pub edges: Vec<(String, String, f32)>,
+    /// Total memories scanned to build this brain.
+    pub total_memories: usize,
+}
+
 /// One row from [`MemoryStore::reattribution_candidates`]:
 /// `(id, transcript_file, current_project, source_kind)`.
 pub type ReattributionRow = (i64, String, String, Option<String>);
@@ -262,7 +295,8 @@ fn dominant_source(sources: &[Option<String>]) -> String {
     if mixed {
         "mixed".to_string()
     } else {
-        seen.map(str::to_string).unwrap_or_else(|| "mixed".to_string())
+        seen.map(str::to_string)
+            .unwrap_or_else(|| "mixed".to_string())
     }
 }
 
@@ -2577,11 +2611,14 @@ impl MemoryStore {
         // multi-pass singleton fold, the catch-all, and summary/edge building.
         // The lexical previews + sources come straight from the loaded rows.
         let previews: Vec<String> = rows.iter().map(|(node, _)| node.preview.clone()).collect();
-        let sources: Vec<Option<String>> =
-            rows.iter().map(|(node, _)| node.source_kind.clone()).collect();
+        let sources: Vec<Option<String>> = rows
+            .iter()
+            .map(|(node, _)| node.source_kind.clone())
+            .collect();
         // pos -> id, kept for the edge remap below (id_of is moved into the core).
         let id_pos = id_of.clone();
-        let mut idx = Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target);
+        let mut idx =
+            Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target);
 
         // ── Split the dominant lexical "미분류" catch-all into topic bubbles ──
         // cluster_from_peers dumps every row it could not link into ONE bubble;
@@ -2592,7 +2629,11 @@ impl MemoryStore {
         // groups instead. Only fires when a bubble really dominates (>= 25%).
         {
             let n_total = idx.node_cluster.len();
-            let dom = idx.clusters.iter().max_by_key(|c| c.size).map(|c| (c.id, c.size));
+            let dom = idx
+                .clusters
+                .iter()
+                .max_by_key(|c| c.size)
+                .map(|c| (c.id, c.size));
             if let Some((dom_root, dom_size)) = dom
                 && n_total > 0
                 && dom_size >= 8
@@ -2643,13 +2684,19 @@ impl MemoryStore {
                         }
                     }
                     let src_of = |positions: &[usize]| -> String {
-                        let s: Vec<Option<String>> =
-                            positions.iter().map(|&i| rows[i].0.source_kind.clone()).collect();
+                        let s: Vec<Option<String>> = positions
+                            .iter()
+                            .map(|&i| rows[i].0.source_kind.clone())
+                            .collect();
                         dominant_source(&s)
                     };
                     idx.clusters.retain(|c| c.id != dom_root);
                     for (label, positions) in &groups {
-                        let root = positions.iter().map(|&i| id_pos[i]).min().unwrap_or(dom_root);
+                        let root = positions
+                            .iter()
+                            .map(|&i| id_pos[i])
+                            .min()
+                            .unwrap_or(dom_root);
                         for &i in positions {
                             idx.node_cluster.insert(id_pos[i], root);
                         }
@@ -2672,7 +2719,8 @@ impl MemoryStore {
                             dominant_source: src_of(&misc),
                         });
                     }
-                    idx.clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+                    idx.clusters
+                        .sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
                 }
             }
         }
@@ -2972,7 +3020,9 @@ impl MemoryStore {
                 let dominant_source = if mixed {
                     "mixed".to_string()
                 } else {
-                    seen_source.map(str::to_string).unwrap_or_else(|| "mixed".to_string())
+                    seen_source
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "mixed".to_string())
                 };
                 ClusterSummary {
                     id: *root_id,
@@ -3140,8 +3190,7 @@ impl MemoryStore {
             })
             .map_err(|e| Error::Memory(e.to_string()))?
             .map(|row| {
-                let (id, preview, source, blob) =
-                    row.map_err(|e| Error::Memory(e.to_string()))?;
+                let (id, preview, source, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
                 let vector = vector_from_blob(&blob)?;
                 Ok(VecRow {
                     id,
@@ -3219,9 +3268,8 @@ impl MemoryStore {
             }
         }
 
-        let mut idx = Self::cluster_from_peers(
-            ids, previews, sources, peers, best_peer, top_k, target,
-        );
+        let mut idx =
+            Self::cluster_from_peers(ids, previews, sources, peers, best_peer, top_k, target);
 
         // Cluster-level backbone: connect each cluster to its 2 nearest OTHER
         // clusters by CENTROID cosine. The per-node peer aggregation alone leaves
@@ -3765,6 +3813,328 @@ impl MemoryStore {
         out.truncate(limit);
         Ok(out)
     }
+
+    /// Build an Obsidian-style "digital brain" [`ConceptGraph`] — nodes are
+    /// CONCEPTS (salient tokens), edges are their CO-OCCURRENCE — **with no LLM
+    /// and no background job**. The signal is read straight from the memory
+    /// bodies via [`token_set`], so the whole graph is computed on demand and
+    /// stays well under a second at 20k+ memories.
+    ///
+    /// `scope`:
+    /// - `Some(project)` → one project's brain.
+    /// - `None` → the GLOBAL brain: every project merged into one map, where a
+    ///   concept appearing in several projects bridges them (its `projects`
+    ///   lists each one).
+    ///
+    /// Pipeline:
+    /// 1. Load the bodies (project filter applied in SQL when scoped), tokenise
+    ///    each with [`token_set`]; keep only **word-like** tokens (≥1 non-digit
+    ///    char) so PR / issue numbers never become concepts.
+    /// 2. Document frequency (df) per token + the set of projects it appears in.
+    /// 3. Keep tokens whose df is in `[MIN_DF, df_cap]` — drops hapax/noise below
+    ///    and stop-words above (`df_cap = max(MIN_DF+1, min(total/3, DF_ABS_CAP))`).
+    ///    Rank survivors by df desc and keep the top `max_concepts`.
+    /// 4. EDGES: for each memory take its concept tokens, cap to the rarest
+    ///    `PER_MEM_CAP` (rarest = lowest df, the most informative; bounds cost),
+    ///    and increment co-occurrence for every unordered pair. Keep pairs with
+    ///    weight ≥ `min_cooccur`, then keep the strongest `max_edges`.
+    /// 5. `degree` = distinct neighbours in the kept edge set.
+    ///
+    /// Determinism: nodes sorted by degree desc, then freq desc, then name asc;
+    /// edges (`a < b`) sorted by weight desc, then `a` asc, then `b` asc.
+    pub fn concept_graph(
+        &self,
+        scope: Option<&str>,
+        max_concepts: usize,
+        max_edges: usize,
+        min_cooccur: usize,
+    ) -> Result<ConceptGraph> {
+        /// df floor: drop hapax / near-unique noise tokens.
+        const MIN_DF: usize = 3;
+        /// Absolute df ceiling for stop-words even on a huge store.
+        const DF_ABS_CAP: usize = 2_000;
+        /// Max concept tokens contributed per memory to the pair count, picked
+        /// by rarity (lowest df) — keeps edge generation O(memories · cap²).
+        const PER_MEM_CAP: usize = 12;
+
+        // 1. Load bodies (+ project, for the GLOBAL merge) and INTERN tokens in
+        // the same streaming pass. One SQL shape with an optional project filter,
+        // no per-token query, no LLM. Interning to u32 ids here means the df and
+        // co-occurrence loops never re-hash a token string — the single biggest
+        // win at 60k+ bodies, where building a `HashSet<String>` per row dominated.
+        let mut tok_ids: Vec<String> = Vec::new(); // interner: id -> token text
+        let mut tok_intern: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut proj_ids: Vec<String> = Vec::new(); // interner: id -> project name
+        let mut proj_intern: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        // Per doc: (project id, deduped token ids). The token ids are already the
+        // distinct salient tokens of the body (token_set dedups), word-like only.
+        let mut docs: Vec<(u32, Vec<u32>)> = Vec::new();
+        {
+            let tok_ids = &mut tok_ids;
+            let tok_intern = &mut tok_intern;
+            let proj_ids = &mut proj_ids;
+            let proj_intern = &mut proj_intern;
+            let docs = &mut docs;
+            let mut load = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let mut stmt = self
+                    .conn
+                    .prepare(sql)
+                    .map_err(|e| Error::Memory(e.to_string()))?;
+                let mapped = stmt
+                    .query_map(params, |r| {
+                        let project: String = r.get(0)?;
+                        let body: String = r.get(1)?;
+                        Ok((project, body))
+                    })
+                    .map_err(|e| Error::Memory(e.to_string()))?;
+                for row in mapped {
+                    let (project, body) = row.map_err(|e| Error::Memory(e.to_string()))?;
+                    let pid = match proj_intern.get(project.as_str()) {
+                        Some(&id) => id,
+                        None => {
+                            let id = proj_ids.len() as u32;
+                            proj_ids.push(project.clone());
+                            proj_intern.insert(project, id);
+                            id
+                        }
+                    };
+                    // Word-like tokens only: a concept must carry a non-digit
+                    // char, so "1234" / "#42" never becomes a node.
+                    let mut ids: Vec<u32> = token_set(&body)
+                        .into_iter()
+                        .filter(|t| t.chars().any(|c| !c.is_ascii_digit()))
+                        .map(|t| match tok_intern.get(t.as_str()) {
+                            Some(&id) => id,
+                            None => {
+                                let id = tok_ids.len() as u32;
+                                tok_ids.push(t.clone());
+                                tok_intern.insert(t, id);
+                                id
+                            }
+                        })
+                        .collect();
+                    ids.sort_unstable();
+                    docs.push((pid, ids));
+                }
+                Ok(())
+            };
+            match scope {
+                Some(project) => load(
+                    "SELECT project, body FROM memories WHERE project = ?1",
+                    &[&project],
+                )?,
+                None => load("SELECT project, body FROM memories", &[])?,
+            }
+        }
+        let total_memories = docs.len();
+        let n_tokens = tok_ids.len();
+
+        // 2. Document frequency + the projects each token appears in, over u32
+        // ids (vector-indexed, no string hashing).
+        let mut df: Vec<usize> = vec![0; n_tokens];
+        let mut tok_projects: Vec<std::collections::BTreeSet<u32>> =
+            vec![std::collections::BTreeSet::new(); n_tokens];
+        for (pid, ids) in &docs {
+            for &id in ids {
+                df[id as usize] += 1;
+                tok_projects[id as usize].insert(*pid);
+            }
+        }
+
+        // 3. Keep band: drop hapax (< MIN_DF) and stop-words (> df_cap). The
+        // cap scales with the corpus (total / 3) but is clamped to
+        // `[MIN_DF + 1, DF_ABS_CAP]` so a tiny corpus still admits real concepts
+        // and a giant store still sheds genuine stop-words.
+        let df_cap = (total_memories / 3).clamp(MIN_DF + 1, DF_ABS_CAP);
+        // Rank by df desc (then name asc for determinism); keep top max_concepts.
+        let mut kept: Vec<u32> = (0..n_tokens as u32)
+            .filter(|&id| df[id as usize] >= MIN_DF && df[id as usize] <= df_cap)
+            .collect();
+        kept.sort_by(|&a, &b| {
+            df[b as usize]
+                .cmp(&df[a as usize])
+                .then_with(|| tok_ids[a as usize].cmp(&tok_ids[b as usize]))
+        });
+        kept.truncate(max_concepts);
+
+        // Concept old-id -> compact new index (0..kept.len()), plus per-concept
+        // name / df / freq arrays. `concept_of[old_id]` is the compact index or
+        // u32::MAX when the token is not a kept concept.
+        let mut concept_of: Vec<u32> = vec![u32::MAX; n_tokens];
+        let mut names: Vec<&str> = Vec::with_capacity(kept.len());
+        let mut freqs: Vec<usize> = Vec::with_capacity(kept.len());
+        // Per concept: its distinct projects (resolved from interned ids), sorted
+        // for determinism. For the GLOBAL brain this is the project bridge list.
+        let mut concept_projects: Vec<Vec<String>> = Vec::with_capacity(kept.len());
+        for &old in &kept {
+            concept_of[old as usize] = names.len() as u32;
+            names.push(tok_ids[old as usize].as_str());
+            freqs.push(df[old as usize]);
+            let mut projects: Vec<String> = tok_projects[old as usize]
+                .iter()
+                .map(|&pid| proj_ids[pid as usize].clone())
+                .collect();
+            projects.sort();
+            concept_projects.push(projects);
+        }
+
+        // 4. Co-occurrence over concept tokens only. Per memory: select its
+        // concept tokens, keep the rarest PER_MEM_CAP (lowest df = most
+        // informative), and bump every unordered pair. Packed-u32 key + FxHashMap
+        // keeps the multi-million-pair loop off SipHash, same as the clusterer.
+        let pack = |x: u32, y: u32| -> u64 {
+            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+            ((hi as u64) << 32) | lo as u64
+        };
+        let mut pair_w: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut sel: Vec<(u32, usize)> = Vec::with_capacity(PER_MEM_CAP * 2);
+        for (_, ids) in &docs {
+            sel.clear();
+            for &old in ids {
+                let i = concept_of[old as usize];
+                if i != u32::MAX {
+                    sel.push((i, freqs[i as usize]));
+                }
+            }
+            if sel.len() < 2 {
+                continue;
+            }
+            if sel.len() > PER_MEM_CAP {
+                // Keep the rarest tokens; tie-break on index so the cut is stable.
+                sel.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                sel.truncate(PER_MEM_CAP);
+            }
+            for a in 0..sel.len() {
+                for b in (a + 1)..sel.len() {
+                    *pair_w.entry(pack(sel[a].0, sel[b].0)).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Keep pairs at/above min_cooccur; sort strongest first (deterministic
+        // tie-break on the two endpoint names) and cap to max_edges.
+        let min_w = min_cooccur.max(1) as u32;
+        let unpack = |key: u64| -> (u32, u32) { (key as u32, (key >> 32) as u32) };
+        let mut edge_idx: Vec<(u32, u32, u32)> = pair_w
+            .iter()
+            .filter(|&(_, &w)| w >= min_w)
+            .map(|(&key, &w)| {
+                let (lo, hi) = unpack(key);
+                (lo, hi, w)
+            })
+            .collect();
+        edge_idx.sort_by(|x, y| {
+            y.2.cmp(&x.2)
+                .then_with(|| names[x.0 as usize].cmp(names[y.0 as usize]))
+                .then_with(|| names[x.1 as usize].cmp(names[y.1 as usize]))
+        });
+        edge_idx.truncate(max_edges);
+
+        // 5. degree = distinct neighbours in the kept edge set.
+        let mut degree: Vec<usize> = vec![0; names.len()];
+        {
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for &(lo, hi, _) in &edge_idx {
+                if seen.insert(pack(lo, hi)) {
+                    degree[lo as usize] += 1;
+                    degree[hi as usize] += 1;
+                }
+            }
+        }
+
+        // Materialise edges with `a < b` lexicographically (names are already the
+        // canonical lowercase token; the packed key gives lo<hi by *index*, so
+        // re-order by name here).
+        let mut edges: Vec<(String, String, f32)> = edge_idx
+            .iter()
+            .map(|&(lo, hi, w)| {
+                let (na, nb) = (names[lo as usize], names[hi as usize]);
+                let (a, b) = if na <= nb { (na, nb) } else { (nb, na) };
+                (a.to_string(), b.to_string(), w as f32)
+            })
+            .collect();
+        // Re-sort: the index sort approximated the name order; the swap above can
+        // perturb the name tie-breaks, so finalise on the real (weight, a, b).
+        edges.sort_by(|x, y| {
+            y.2.partial_cmp(&x.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.0.cmp(&y.0))
+                .then_with(|| x.1.cmp(&y.1))
+        });
+
+        // Build concept nodes; sort by degree desc, freq desc, name asc.
+        let mut nodes: Vec<ConceptNode> = names
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| ConceptNode {
+                name: name.to_string(),
+                freq: freqs[i],
+                degree: degree[i],
+                projects: concept_projects[i].clone(),
+            })
+            .collect();
+        nodes.sort_by(|a, b| {
+            b.degree
+                .cmp(&a.degree)
+                .then_with(|| b.freq.cmp(&a.freq))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        Ok(ConceptGraph {
+            nodes,
+            edges,
+            total_memories,
+        })
+    }
+
+    /// The memories containing a given concept token, newest first, capped at
+    /// `limit`. Returned as `(MemNode, project)` so the GLOBAL brain can show
+    /// which project each memory belongs to. LLM-free: a plain body scan via the
+    /// same [`token_set`] used to build the brain (the token must survive the
+    /// word-like filter to match a concept node).
+    pub fn concept_memories(
+        &self,
+        scope: Option<&str>,
+        concept: &str,
+        limit: usize,
+    ) -> Result<Vec<(MemNode, String)>> {
+        let needle = concept.to_lowercase();
+        let sql = "SELECT id, kind, body, json_extract(metadata, '$.source_kind'), project \
+                     FROM memories \
+                    WHERE (?1 IS NULL OR project = ?1) \
+                    ORDER BY created_at DESC, id DESC";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope], |r| {
+                let body: String = r.get(2)?;
+                let node = MemNode {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    preview: body.chars().take(60).collect(),
+                    source_kind: r.get(3)?,
+                };
+                let project: String = r.get(4)?;
+                Ok((node, project, body))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        let mut out: Vec<(MemNode, String)> = Vec::new();
+        for row in rows {
+            let (node, project, body) = row.map_err(|e| Error::Memory(e.to_string()))?;
+            if token_set(&body).contains(&needle) {
+                out.push((node, project));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -3783,6 +4153,118 @@ mod tests {
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
+    }
+
+    #[test]
+    fn concept_graph_links_cooccurring_tokens() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "alpha" + "bravo" co-occur in 4 memories → must form an edge.
+        for _ in 0..4 {
+            store.save("p1", "note", "alpha bravo charlie").unwrap();
+        }
+        let g = store.concept_graph(Some("p1"), 250, 750, 2).unwrap();
+        assert_eq!(g.total_memories, 4);
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"bravo"));
+        // The alpha—bravo edge exists, a < b, weight = co-occurrence count.
+        let edge = g
+            .edges
+            .iter()
+            .find(|(a, b, _)| a == "alpha" && b == "bravo")
+            .expect("alpha—bravo edge");
+        assert_eq!(edge.2, 4.0);
+        // freq = document frequency; degree counts distinct neighbours.
+        let alpha = g.nodes.iter().find(|n| n.name == "alpha").unwrap();
+        assert_eq!(alpha.freq, 4);
+        assert!(alpha.degree >= 1);
+    }
+
+    #[test]
+    fn concept_graph_excludes_hapax_and_stopwords() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Build a 30-memory corpus so df_cap = total/3 = 10 is meaningful.
+        // "common" → df 20 (> 10) → stop-word, dropped.
+        // "core"   → df 6  (within [3, 10]) → real concept, kept.
+        // "lonely" → df 1  (< MIN_DF = 3) → hapax, dropped.
+        for _ in 0..6 {
+            store.save("p1", "note", "common core widget").unwrap();
+        }
+        for _ in 0..14 {
+            store.save("p1", "note", "common gadget thing").unwrap();
+        }
+        for _ in 0..9 {
+            store.save("p1", "note", "filler topic alpha").unwrap();
+        }
+        store.save("p1", "note", "lonely outlier note").unwrap();
+        let g = store.concept_graph(Some("p1"), 250, 750, 2).unwrap();
+        assert_eq!(g.total_memories, 30);
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(!names.contains(&"lonely"), "hapax must be dropped");
+        assert!(
+            !names.contains(&"common"),
+            "stop-word above df cap must be dropped"
+        );
+        assert!(names.contains(&"core"), "real concept must survive");
+    }
+
+    #[test]
+    fn concept_graph_global_merges_token_across_projects() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "shared" appears in both projects; global scope must merge it and list
+        // both projects on the one node (the bridge between projects). Filler
+        // memories keep df_cap = total/3 = 6 above "shared"'s df of 6.
+        for _ in 0..3 {
+            store.save("proj_a", "note", "shared widget alpha").unwrap();
+        }
+        for _ in 0..3 {
+            store.save("proj_b", "note", "shared gadget bravo").unwrap();
+        }
+        for i in 0..6 {
+            store
+                .save("proj_a", "note", &format!("filler topic numa{i}"))
+                .unwrap();
+        }
+        for i in 0..6 {
+            store
+                .save("proj_b", "note", &format!("filler topic numb{i}"))
+                .unwrap();
+        }
+        let g = store.concept_graph(None, 250, 750, 2).unwrap();
+        assert_eq!(g.total_memories, 18);
+        let shared = g
+            .nodes
+            .iter()
+            .find(|n| n.name == "shared")
+            .expect("shared concept");
+        assert_eq!(shared.freq, 6);
+        assert!(shared.projects.contains(&"proj_a".to_string()));
+        assert!(shared.projects.contains(&"proj_b".to_string()));
+        // A per-project brain sees only its own project on the node.
+        let ga = store.concept_graph(Some("proj_a"), 250, 750, 2).unwrap();
+        let shared_a = ga.nodes.iter().find(|n| n.name == "shared").unwrap();
+        assert_eq!(shared_a.projects, vec!["proj_a".to_string()]);
+    }
+
+    #[test]
+    fn concept_memories_returns_matching_rows() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store.save("p1", "note", "alpha bravo charlie").unwrap();
+        store.save("p1", "note", "alpha delta echo").unwrap();
+        store.save("p1", "note", "foxtrot golf hotel").unwrap();
+        let hits = store.concept_memories(Some("p1"), "alpha", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|(n, _)| n.preview.contains("alpha")));
+        assert!(hits.iter().all(|(_, project)| project == "p1"));
+        // Newest first.
+        assert!(hits[0].0.id > hits[1].0.id);
+        // Cap is honoured.
+        let one = store.concept_memories(Some("p1"), "alpha", 1).unwrap();
+        assert_eq!(one.len(), 1);
+        // Global scope finds it too.
+        let global = store.concept_memories(None, "foxtrot", 10).unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].1, "p1");
     }
 
     #[test]
@@ -4659,7 +5141,10 @@ mod tests {
         );
         // The vector path must break the blob: biggest bubble well under 30%.
         assert!(pct < 30.0, "biggest bubble {pct:.1}% too large");
-        assert!(elapsed.as_secs_f64() < 1.0, "vec clustering too slow: {elapsed:?}");
+        assert!(
+            elapsed.as_secs_f64() < 1.0,
+            "vec clustering too slow: {elapsed:?}"
+        );
     }
 
     /// Hand-insert an embedding row for `id` so vector clustering has dense

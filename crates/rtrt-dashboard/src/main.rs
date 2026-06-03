@@ -79,6 +79,12 @@ struct AppState {
     /// to the member-id set of one bubble so the client can drill many levels
     /// deep without ever sending large id lists over the wire.
     level_tokens: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, TokenEntry)>>>,
+    /// On-disk SQLite path, so a background embedding backfill can open its OWN
+    /// connection (WAL = concurrent with the main one) instead of holding the
+    /// shared store mutex for the whole multi-minute job.
+    memory_path: std::path::PathBuf,
+    /// Projects with an embedding backfill currently running (dedup + progress).
+    embedding_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// One drill token's payload: which project it belongs to, the member ids it
@@ -333,6 +339,8 @@ async fn main() -> Result<()> {
         embedder,
         cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        memory_path: memory_store_path(),
+        embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
@@ -377,6 +385,7 @@ async fn main() -> Result<()> {
         .route("/api/memory/queue", get(memory_queue))
         .route("/api/memory/delete", post(memory_delete_batch))
         .route("/api/memory/embed", post(memory_embed))
+        .route("/api/memory/coverage", get(memory_coverage))
         .route("/api/memory/entities", post(memory_entities))
         .route("/api/ollama/models", get(ollama_models))
         .route("/api/ollama/{name}", delete(ollama_delete))
@@ -1035,11 +1044,15 @@ struct MetricsResponse {
     recent: Vec<RequestMetric>,
 }
 
-fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
-    let path = std::env::var("RTRT_MEMORY_PATH")
+fn memory_store_path() -> PathBuf {
+    std::env::var("RTRT_MEMORY_PATH")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"))
+}
+
+fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
+    let path = memory_store_path();
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -3409,23 +3422,85 @@ struct MemoryEmbedRequest {
     project: String,
 }
 
+// Kicks off a NON-BLOCKING background backfill. A big project (20k rows) takes
+// many minutes of Ollama calls; doing that under the shared store mutex would
+// freeze the whole dashboard. Instead a dedicated thread opens its OWN SQLite
+// connection (WAL mode = concurrent with the main one) and backfills there, so
+// the UI stays live and `embedding_coverage` reflects progress as rows commit.
 async fn memory_embed(
     State(state): State<AppState>,
     Json(req): Json<MemoryEmbedRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let embedder = state.embedder.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "embeddings not enabled".into(),
-    ))?;
+    if state.embedder.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embeddings not enabled".into(),
+        ));
+    }
+    // Dedup: refuse a second concurrent job for the same project.
+    {
+        let mut jobs = state.embedding_jobs.lock().unwrap();
+        if jobs.contains(&req.project) {
+            return Ok(Json(serde_json::json!({ "started": false, "running": true })));
+        }
+        jobs.insert(req.project.clone());
+    }
+
+    let path = state.memory_path.clone();
+    let project = req.project.clone();
+    let jobs = state.embedding_jobs.clone();
+    // Resolve embed config for the worker's own embedder.
+    let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+    let base_url = ecfg.resolved_base_url(
+        rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.auto_compress.base_url)
+            .as_deref(),
+    );
+    let model = ecfg.effective_model();
+
+    std::thread::spawn(move || {
+        match MemoryStore::open(&path) {
+            Ok(store) => {
+                let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
+                match store.backfill_embeddings(&project, &embedder) {
+                    Ok(n) => tracing::info!("embedding backfill done: {project} (+{n})"),
+                    Err(e) => tracing::warn!("embedding backfill failed for {project}: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("embedding backfill: open store failed: {e}"),
+        }
+        jobs.lock().unwrap().remove(&project);
+    });
+
+    Ok(Json(serde_json::json!({ "started": true, "running": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryCoverageQuery {
+    project: String,
+}
+
+// GET /api/memory/coverage?project=X -> { embedded, total, running }
+// Lets the UI poll embedding progress while a background backfill runs.
+async fn memory_coverage(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryCoverageQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
-    let guard = store.lock().await;
-    let embedded = guard
-        .backfill_embeddings(&req.project, embedder.as_ref())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "embedded": embedded })))
+    let (embedded, total) = {
+        let guard = store.lock().await;
+        guard
+            .embedding_coverage(&q.project)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let running = state.embedding_jobs.lock().unwrap().contains(&q.project);
+    Ok(Json(
+        serde_json::json!({ "embedded": embedded, "total": total, "running": running }),
+    ))
 }
 
 // ---------------------------------------------------------------------------

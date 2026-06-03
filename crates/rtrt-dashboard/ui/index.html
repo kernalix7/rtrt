@@ -691,6 +691,7 @@
               </div>
               <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
               <button id="memmap-fit" class="ghost" type="button">맞춤</button>
+              <button id="memmap-embed-btn" class="ghost" type="button" title="이 프로젝트를 임베딩해 의미 기반 맵으로 (백그라운드)">임베딩 생성</button>
             </div>
             <div id="memmap-crumbs" class="memmap-crumbs" hidden></div>
             <div id="memmap-overview-head" class="memmap-head"></div>
@@ -2246,78 +2247,57 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   pushActivity(`recall ${body.project} · ${d.hits.length}건 (${usedMode})`);
 };
 
-// Embedding backfill button — POST /api/memory/embed {project}.
-// Hidden when the endpoint returns 404 (embeddings not compiled in).
-(function wireEmbedBackfill() {
-  const btn = document.getElementById('embed-backfill-btn');
-  if (!btn) return;
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '백필 중…';
-    try {
-      const r = await fetch('/api/memory/embed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
-      });
-      if (r.status === 404) {
-        // Embeddings not built into this binary; hide the button silently.
-        btn.hidden = true;
-        return;
-      }
-      if (!r.ok) {
-        const text = await r.text();
-        showToast(`임베딩 오류 ${r.status}: ${text}`, 'err');
-        return;
-      }
-      const d = await r.json();
-      showToast(`임베딩 완료 · ${d.embedded}건 백필됨`, 'ok');
-      pushActivity(`embed backfill · ${project} · ${d.embedded}건`);
-    } catch (e) {
-      showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
+// Kick off a NON-BLOCKING embedding backfill and poll progress. The server
+// returns immediately ({started}); a background thread embeds (minutes for 20k).
+// We poll /api/memory/coverage and report N/M until it finishes, then reload the
+// map if it's showing this project. `statusFn(text)` receives progress strings.
+const EMBED_POLLING = new Set();
+async function startEmbedAndPoll(project, statusFn) {
+  if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return false; }
+  let r;
+  try {
+    r = await fetch('/api/memory/embed', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project }),
+    });
+  } catch (e) { showToast(`네트워크 오류: ${e.message || e}`, 'err'); return false; }
+  if (r.status === 404) return false;                 // not compiled in
+  if (!r.ok) { showToast(`임베딩 오류 ${r.status}: ${await r.text()}`, 'err'); return false; }
+  showToast('임베딩 생성 시작 (백그라운드) — 진행 중에도 사용 가능', 'ok');
+  pushActivity(`embed start · ${project}`);
+  if (EMBED_POLLING.has(project)) return true;
+  EMBED_POLLING.add(project);
+  const poll = async () => {
+    let c;
+    try { c = await (await fetch(`/api/memory/coverage?project=${encodeURIComponent(project)}`)).json(); }
+    catch (e) { EMBED_POLLING.delete(project); return; }
+    const pct = c.total ? Math.round(100 * c.embedded / c.total) : 0;
+    if (statusFn) statusFn(`임베딩 ${c.embedded.toLocaleString()}/${c.total.toLocaleString()} (${pct}%)${c.running ? ' · 생성 중…' : ' · 완료'}`);
+    // keep the project cache fresh so the map basis badge updates
+    const p = (PROJECTS_CACHE || []).find(x => x.name === project);
+    if (p && !c.running && c.embedded > 0) p.embeddings_enabled = p.embeddings_enabled; // no-op, coverage drives basis
+    if (c.running) { setTimeout(poll, 3000); return; }
+    EMBED_POLLING.delete(project);
+    showToast(`임베딩 완료 · ${project} · ${c.embedded.toLocaleString()}/${c.total.toLocaleString()}`, 'ok');
+    if ((memmapProject || currentProject()) === project) loadGraph(project);
   };
-})();
+  poll();
+  return true;
+}
 
-// Settings → 임베딩 생성 button — backfill embeddings for the current project.
-// POST /api/memory/embed {project} → { embedded: N }. Disabled while running.
-(function wireEmbedGenerate() {
-  const btn = document.getElementById('cfg-emb-generate-btn');
-  if (!btn) return;
+// Settings 백필 + 생성 buttons + the map button all share startEmbedAndPoll.
+(function wireEmbedButtons() {
+  const settingsBtns = ['embed-backfill-btn', 'cfg-emb-generate-btn'];
   const cap = document.getElementById('cfg-emb-coverage');
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '생성 중…';
-    try {
-      const r = await fetch('/api/memory/embed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
-      });
-      if (r.status === 404) { btn.hidden = true; return; } // not compiled in
-      if (!r.ok) { showToast(`임베딩 오류 ${r.status}: ${await r.text()}`, 'err'); return; }
-      const d = await r.json();
-      showToast(`임베딩 생성 완료 · ${d.embedded}건`, 'ok');
-      if (cap) cap.textContent = `${project}: ${d.embedded}건 임베딩됨`;
-      pushActivity(`embed generate · ${project} · ${d.embedded}건`);
-    } catch (e) {
-      showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
-  };
+  settingsBtns.forEach(id => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.onclick = async () => {
+      const project = currentProject();
+      if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
+      await startEmbedAndPoll(project, (t) => { if (cap) cap.textContent = t; });
+    };
+  });
 })();
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -3318,6 +3298,17 @@ async function loadGraph(project) {
   if (back) back.onclick = () => memmapGoToDepth(memmapStack.length - 1);
   const fit = document.getElementById('memmap-fit');
   if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
+  // Embed this project (background) right from the map; caption shows progress.
+  const embedBtn = document.getElementById('memmap-embed-btn');
+  if (embedBtn) embedBtn.onclick = async () => {
+    const project = memmapProject || currentProject();
+    if (!project || isGlobalScope() || isGlobalProjectValue(project)) {
+      showToast('프로젝트를 먼저 선택하세요.', 'err');
+      return;
+    }
+    const head = document.getElementById('memmap-overview-head');
+    await startEmbedAndPoll(project, (t) => { if (head) head.textContent = t; });
+  };
 })();
 
 document.getElementById('graph-form').onsubmit = async (ev) => {

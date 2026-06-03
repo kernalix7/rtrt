@@ -3931,6 +3931,21 @@ impl MemoryStore {
         let total_memories = docs.len();
         let n_tokens = tok_ids.len();
 
+        // Auto budget (0 = derive from the corpus): the concept/edge count scales
+        // with the number of memories so a small project shows fewer nodes and a
+        // large one more — never a flat hard-coded cap. ~2·√memories, clamped to a
+        // renderable range; edges follow at 3× the concept count.
+        let max_concepts = if max_concepts == 0 {
+            ((total_memories as f64).sqrt() * 2.0).round().clamp(80.0, 600.0) as usize
+        } else {
+            max_concepts
+        };
+        let max_edges = if max_edges == 0 {
+            max_concepts.saturating_mul(3)
+        } else {
+            max_edges
+        };
+
         // 2. Document frequency + the projects each token appears in, over u32
         // ids (vector-indexed, no string hashing).
         let mut df: Vec<usize> = vec![0; n_tokens];

@@ -1492,9 +1492,10 @@ const CLUSTER_MAX_NODES: usize = 200_000;
 const CLUSTER_TOP_K: usize = 4;
 const CLUSTER_MIN_WEIGHT: f32 = 0.15;
 
-/// Server defaults for the "digital brain" concept graph (`mode=brain`).
-const BRAIN_MAX_CONCEPTS: usize = 250;
-const BRAIN_MAX_EDGES: usize = 750;
+/// "Digital brain" concept graph (`mode=brain`): 0 = let rtrt-memory size the
+/// concept/edge budget dynamically from the corpus (no flat cap). min_cooccur 2
+/// just means "co-occurred in at least two memories" — a property, not a cap.
+const BRAIN_AUTO: usize = 0;
 const BRAIN_MIN_COOCCUR: usize = 2;
 
 /// The global-scope sentinel value the project selector sends for "all projects
@@ -1547,12 +1548,7 @@ async fn memory_graph_brain(
             let g = {
                 let guard = store.lock().await;
                 guard
-                    .concept_graph(
-                        scope,
-                        BRAIN_MAX_CONCEPTS,
-                        BRAIN_MAX_EDGES,
-                        BRAIN_MIN_COOCCUR,
-                    )
+                    .concept_graph(scope, BRAIN_AUTO, BRAIN_AUTO, BRAIN_MIN_COOCCUR)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             };
             let mut cache = state.brain_cache.lock().await;
@@ -1598,10 +1594,12 @@ async fn memory_graph_brain_concept(
     scope: Option<&str>,
     concept: &str,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Show ALL of a concept's memories — the count is naturally its frequency,
+    // not an arbitrary cap. usize::MAX = "no limit".
     let rows = {
         let guard = store.lock().await;
         guard
-            .concept_memories(scope, concept, default_graph_limit())
+            .concept_memories(scope, concept, usize::MAX)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     let nodes: Vec<serde_json::Value> = rows

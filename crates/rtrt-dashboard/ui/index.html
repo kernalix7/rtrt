@@ -160,12 +160,15 @@
   .memmap-cy {
     width: 100%; height: 70vh; min-height: 360px; border-radius: 12px;
     position: relative;
-    /* Clean airy canvas: warm off-white with a faint dot grid (agentmemory look). */
-    background-color: #F9F9F7;
+    /* Deep "neural" canvas: dark space + faint dot grid so the concept nodes glow. */
+    background-color: #0b0e14;
     background-image:
-      radial-gradient(circle, #D4D4CF 0.5px, transparent 0.5px);
-    background-size: 16px 16px;
-    border: 1px solid #E2E2DC;
+      radial-gradient(circle at 28% 22%, rgba(124,58,237,0.10), transparent 42%),
+      radial-gradient(circle at 76% 78%, rgba(6,182,212,0.10), transparent 42%),
+      radial-gradient(circle, rgba(150,165,200,0.15) 0.6px, transparent 0.6px);
+    background-size: 100% 100%, 100% 100%, 18px 18px;
+    border: 1px solid #1e2533;
+    box-shadow: inset 0 0 80px rgba(0,0,0,0.5);
   }
   /* Floating hover card over the map (Cytoscape has no built-in tooltip). */
   .memmap-tooltip {
@@ -2742,18 +2745,23 @@ function memmapCyStyle() {
         'height': 'data(size)',
         'font-size': '10px',
         'font-family': 'var(--font-ui, sans-serif)',
-        'color': '#4b5563',          // dark label text on the light canvas
+        'color': '#e6edf3',          // light label text on the dark canvas
         'text-valign': 'bottom',
         'text-halign': 'center',
         'text-margin-y': 4,
         'text-wrap': 'ellipsis',
         'text-max-width': '130px',
-        // Subtle white halo keeps labels readable over the dot grid (no heavy glow).
+        // Dark halo keeps labels readable over the glowing nodes/grid.
         'text-outline-width': 2,
-        'text-outline-color': '#F9F9F7',
+        'text-outline-color': '#0b0e14',
         'text-outline-opacity': 0.9,
+        // Soft same-colour glow behind each node = the neural-constellation look.
+        'underlay-color': 'data(col)',
+        'underlay-opacity': 0.28,
+        'underlay-padding': 5,
+        'underlay-shape': 'ellipse',
         'border-width': 1.5,
-        'border-color': 'rgba(17,17,17,0.12)',
+        'border-color': 'rgba(255,255,255,0.22)',
         'min-zoomed-font-size': 8,
       },
     },
@@ -3525,7 +3533,17 @@ async function brainDrillConcept(concept) {
       return;
     }
     const d = await r.json();
-    renderBrainConceptMemories(concept, d);
+    const mems = (Array.isArray(d.nodes) ? d.nodes : [])
+      .filter(n => n.node_type === 'memory' || n.node_type === undefined);
+    if (head) head.textContent = `개념 "${concept}" · 메모리 ${mems.length.toLocaleString()}개`;
+    // Render the concept's memories AS NODES inside the same graph (not a hidden
+    // list below the canvas — that left the canvas blank). Member tap -> modal.
+    const cy = memmapEnsureCy();
+    if (!cy) { renderBrainConceptMemories(concept, d); return; }
+    memmapResetViews();
+    cy.elements().remove();
+    cy.add(memmapMemberElements(d));
+    memmapRunLayout();
   } catch (e) {
     showToast(`네트워크 오류: ${e.message || e}`, 'err');
     if (head) head.textContent = `개념 "${concept}" · 네트워크 오류`;

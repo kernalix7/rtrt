@@ -1558,7 +1558,7 @@ async fn memory_graph_overview(
                 let guard = store.lock().await;
                 guard.count_by_project(project).unwrap_or(0)
             };
-            ((n as f64).sqrt() * 2.5).round().clamp(250.0, 500.0) as usize
+            ((n as f64).sqrt() * 3.0).round().clamp(300.0, 600.0) as usize
         }
     };
 

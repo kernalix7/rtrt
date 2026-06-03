@@ -233,6 +233,46 @@ pub struct ConceptGraph {
     pub total_memories: usize,
 }
 
+/// A TOPIC COMMUNITY — the top level of the "digital brain" map. A community is
+/// a cluster of co-occurring [`ConceptNode`]s, found **with no LLM** by running
+/// the shared union-find ([`MemoryStore::cluster_from_peers`]) over the concept
+/// co-occurrence graph itself. The first view shows a few dozen of these
+/// super-nodes; drilling into one yields its concepts ([`ConceptGraph`]), and
+/// drilling into a concept yields its memories.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConceptCommunity {
+    /// Deterministic, stable id = the minimum member concept index (the same
+    /// root `cluster_from_peers` assigns). Used as the drill key.
+    pub id: i64,
+    /// The highest-degree member concept's name (the community's headline).
+    pub label: String,
+    /// Memories touched = sum of member concept `freq` (document frequencies).
+    pub size: usize,
+    /// Number of member concepts in this community.
+    pub concept_count: usize,
+    /// A few highest-degree member concept names, for the hover tooltip.
+    pub top_concepts: Vec<String>,
+}
+
+/// The top-level "digital brain" hierarchy: topic communities plus the
+/// aggregated inter-community co-occurrence edges
+/// ([`MemoryStore::concept_communities`]). Derived purely from token
+/// co-occurrence — no LLM, no background job.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConceptHierarchy {
+    /// Communities, sorted by `size` (memories touched) descending, ties by
+    /// `id` ascending — deterministic.
+    pub communities: Vec<ConceptCommunity>,
+    /// Aggregated inter-community edges `(community_a_id, community_b_id, weight)`
+    /// with `community_a_id < community_b_id`, strongest first. `weight` is the
+    /// summed weight of the concept edges that cross the two communities.
+    pub edges: Vec<(i64, i64, f32)>,
+    /// Total concepts placed into communities.
+    pub total_concepts: usize,
+    /// Total memories scanned to build the underlying brain.
+    pub total_memories: usize,
+}
+
 /// One row from [`MemoryStore::reattribution_candidates`]:
 /// `(id, transcript_file, current_project, source_kind)`.
 pub type ReattributionRow = (i64, String, String, Option<String>);
@@ -4150,6 +4190,291 @@ impl MemoryStore {
         }
         Ok(out)
     }
+
+    /// Build the TOP LEVEL of the "digital brain" — a few dozen TOPIC
+    /// COMMUNITIES — **with no LLM**. The brain overview otherwise shows hundreds
+    /// of concepts at once (global ~500); this folds them into super-nodes the
+    /// first view can actually read.
+    ///
+    /// `scope`: `Some(project)` for one project, `None` for the GLOBAL brain
+    /// (concepts merged by name across projects).
+    ///
+    /// Pipeline (entirely co-occurrence driven):
+    /// 1. Build [`concept_graph`](Self::concept_graph)`(scope, 0, 0, min_cooccur)`
+    ///    — AUTO sizing, the same brain the overview renders.
+    /// 2. Treat each concept as a node and its co-occurrence edges as peers
+    ///    (`peers[i]` = concept `i`'s neighbours with the edge weight; `best_peer`
+    ///    = the strongest neighbour), then cluster with the SHARED
+    ///    [`cluster_from_peers`](Self::cluster_from_peers) — the exact union-find +
+    ///    singleton-fold core the memory map uses. The concept *index* is passed
+    ///    as the `id`, so every community's deterministic root is the minimum
+    ///    member concept index (its stable id).
+    /// 3. The fold target is DYNAMIC: `√concepts` clamped to `[8, 60]` — never a
+    ///    flat hard-coded count.
+    /// 4. For each community: `label` = highest-degree member concept, `size` =
+    ///    Σ member `freq` (memories touched), `top_concepts` = top ~5 members by
+    ///    degree. Inter-community edges aggregate the concept edges that cross
+    ///    two communities.
+    ///
+    /// Determinism: communities sorted by `size` desc then `id` asc; ids stable
+    /// (min member concept index); edges `a < b`, strongest first.
+    pub fn concept_communities(
+        &self,
+        scope: Option<&str>,
+        min_cooccur: usize,
+    ) -> Result<ConceptHierarchy> {
+        let graph = self.concept_graph(scope, 0, 0, min_cooccur)?;
+        Ok(communities_from_graph(&graph))
+    }
+
+    /// The concept sub-graph for ONE topic community: its member concepts plus
+    /// the co-occurrence edges *among them* (intra-community edges only). LLM-free.
+    ///
+    /// The concept graph is small, so this just recomputes
+    /// [`concept_communities`](Self::concept_communities) and slices out the
+    /// requested community, identified by its stable `community_id` (the min
+    /// member concept index that [`concept_communities`](Self::concept_communities)
+    /// reports as the community `id`). An unknown id yields an empty
+    /// [`ConceptGraph`] (no error) so the caller can render "nothing here".
+    pub fn community_concepts(
+        &self,
+        scope: Option<&str>,
+        community_id: i64,
+        min_cooccur: usize,
+    ) -> Result<ConceptGraph> {
+        let graph = self.concept_graph(scope, 0, 0, min_cooccur)?;
+        Ok(community_subgraph(&graph, community_id))
+    }
+}
+
+/// Compute the community assignment of every concept in `graph`, returning, for
+/// each concept index, the deterministic community root id (min member concept
+/// index) it belongs to — plus the `ConceptHierarchy` summary. Shared by
+/// [`MemoryStore::concept_communities`] and [`community_subgraph`] so the two
+/// public methods agree on ids without re-clustering twice. Pure / LLM-free.
+fn cluster_concepts(graph: &ConceptGraph) -> (Vec<i64>, ConceptHierarchy) {
+    let n = graph.nodes.len();
+
+    // Concept name -> its index in `graph.nodes`. Names are unique per graph.
+    let mut index_of: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(n);
+    for (i, node) in graph.nodes.iter().enumerate() {
+        index_of.insert(node.name.as_str(), i);
+    }
+
+    // Build per-concept peer lists from the co-occurrence edges. `peers[i]` =
+    // concept i's neighbours, weighted by ASSOCIATION STRENGTH rather than raw
+    // co-occurrence. These are exactly what `cluster_from_peers` consumes —
+    // concept indices stand in for memory ids.
+    //
+    // Why not the raw weight: `cluster_from_peers` single-link-unions each
+    // node's top_k strongest peers, so a hub concept (one that co-occurs with
+    // everything at a high RAW count) would chain the whole brain into one giant
+    // community. Normalising the edge by the geometric mean of the two concepts'
+    // frequencies (a cosine-style association, `w / √(freq_a·freq_b)`) damps the
+    // hub: a pair that almost always appears together scores ~1, while a hub that
+    // co-occurs with a rare token only because the hub is everywhere scores low.
+    // This keeps topic communities balanced while still being a pure, LLM-free
+    // function of co-occurrence. The PUBLIC `ConceptGraph` edges and the
+    // inter-community aggregation below keep the RAW weight.
+    let assoc = |ia: usize, ib: usize, w: f32| -> f32 {
+        let denom = ((graph.nodes[ia].freq as f64) * (graph.nodes[ib].freq as f64)).sqrt();
+        if denom > 0.0 {
+            (w as f64 / denom) as f32
+        } else {
+            0.0
+        }
+    };
+    let mut peers: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
+    for (a, b, w) in &graph.edges {
+        let (Some(&ia), Some(&ib)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) else {
+            continue;
+        };
+        let s = assoc(ia, ib, *w);
+        peers[ia].push((ib as u32, s));
+        peers[ib].push((ia as u32, s));
+    }
+    let best_peer: Vec<Option<(u32, f32)>> = peers
+        .iter()
+        .map(|plist| {
+            plist
+                .iter()
+                .copied()
+                .max_by(|x, y| {
+                    x.1.partial_cmp(&y.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // Prefer the lower neighbour index on a tie — deterministic.
+                        .then(y.0.cmp(&x.0))
+                })
+        })
+        .collect();
+
+    // Positional arrays for cluster_from_peers: the concept INDEX is the id, so
+    // each community's root (min member id) is the min member concept index — a
+    // stable, deterministic community id. Previews carry the concept name only
+    // for completeness; we derive the community label from degree below.
+    let ids: Vec<i64> = (0..n as i64).collect();
+    let previews: Vec<String> = graph.nodes.iter().map(|node| node.name.clone()).collect();
+    let sources: Vec<Option<String>> = vec![None; n];
+
+    // DYNAMIC community target: ~√concepts, clamped to a readable band. Never a
+    // flat hard-coded count — a small brain shows a handful of communities, a
+    // large one a few dozen.
+    let target = (n as f64).sqrt().round().clamp(8.0, 60.0) as usize;
+    // top_k peers per concept feeding the union-find. `cluster_from_peers`
+    // single-link-unions each concept's top_k strongest peers; on a CONNECTED
+    // co-occurrence graph a large top_k chains the whole brain into one bubble
+    // (transitive closure of single linkage). Keeping top_k SMALL means each
+    // concept only fuses with its single strongest topical neighbour, so the
+    // graph fragments into many natural topic communities before the fold ever
+    // runs. 1 = "join only your strongest link" — the maximum-spanning-forest of
+    // mutual best edges, which is exactly the topic-community signal we want.
+    const CONCEPT_TOP_K: usize = 1;
+
+    let index = MemoryStore::cluster_from_peers(
+        ids,
+        previews,
+        sources,
+        peers,
+        best_peer,
+        CONCEPT_TOP_K,
+        target,
+    );
+
+    // `node_cluster[concept_index] -> community root id (min member index)`.
+    let mut community_of: Vec<i64> = vec![-1; n];
+    for (concept_index, root) in &index.node_cluster {
+        community_of[*concept_index as usize] = *root;
+    }
+
+    // Build the community summaries. Group member concept indices by root.
+    let mut members_by_root: std::collections::HashMap<i64, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, &root) in community_of.iter().enumerate() {
+        members_by_root.entry(root).or_default().push(i);
+    }
+
+    let mut communities: Vec<ConceptCommunity> = members_by_root
+        .into_iter()
+        .map(|(root, mut members)| {
+            // Order members by degree desc, then freq desc, then name asc — the
+            // label and top_concepts both read off the front of this order.
+            members.sort_by(|&a, &b| {
+                graph.nodes[b]
+                    .degree
+                    .cmp(&graph.nodes[a].degree)
+                    .then_with(|| graph.nodes[b].freq.cmp(&graph.nodes[a].freq))
+                    .then_with(|| graph.nodes[a].name.cmp(&graph.nodes[b].name))
+            });
+            let label = graph.nodes[members[0]].name.clone();
+            let size: usize = members.iter().map(|&m| graph.nodes[m].freq).sum();
+            let top_concepts: Vec<String> = members
+                .iter()
+                .take(5)
+                .map(|&m| graph.nodes[m].name.clone())
+                .collect();
+            ConceptCommunity {
+                id: root,
+                label,
+                size,
+                concept_count: members.len(),
+                top_concepts,
+            }
+        })
+        .collect();
+    communities.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+
+    // Aggregate inter-community edges: every concept edge whose endpoints fall
+    // in different communities contributes its weight to that community pair.
+    let pack = |x: i64, y: i64| -> (i64, i64) {
+        if x < y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    };
+    let mut agg: std::collections::HashMap<(i64, i64), f32> = std::collections::HashMap::new();
+    for (a, b, w) in &graph.edges {
+        let (Some(&ia), Some(&ib)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) else {
+            continue;
+        };
+        let (ca, cb) = (community_of[ia], community_of[ib]);
+        if ca == cb {
+            continue;
+        }
+        *agg.entry(pack(ca, cb)).or_insert(0.0) += *w;
+    }
+    let mut edges: Vec<(i64, i64, f32)> = agg.into_iter().map(|((a, b), w)| (a, b, w)).collect();
+    edges.sort_by(|x, y| {
+        y.2.partial_cmp(&x.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(x.0.cmp(&y.0))
+            .then(x.1.cmp(&y.1))
+    });
+
+    let hierarchy = ConceptHierarchy {
+        communities,
+        edges,
+        total_concepts: n,
+        total_memories: graph.total_memories,
+    };
+    (community_of, hierarchy)
+}
+
+/// Topic communities of a prebuilt brain — the pure core behind
+/// [`MemoryStore::concept_communities`].
+fn communities_from_graph(graph: &ConceptGraph) -> ConceptHierarchy {
+    cluster_concepts(graph).1
+}
+
+/// The concept sub-graph for ONE community of a prebuilt brain — the pure core
+/// behind [`MemoryStore::community_concepts`]. Returns the member concepts and
+/// the co-occurrence edges among them (intra-community only). An unknown
+/// `community_id` yields an empty graph (preserving `total_memories`).
+fn community_subgraph(graph: &ConceptGraph, community_id: i64) -> ConceptGraph {
+    let (community_of, _) = cluster_concepts(graph);
+
+    // The member concept indices of the requested community.
+    let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, &root) in community_of.iter().enumerate() {
+        if root == community_id {
+            keep.insert(i);
+        }
+    }
+
+    // Names of the kept concepts, for the edge filter (intra-community only).
+    let kept_names: std::collections::HashSet<&str> =
+        keep.iter().map(|&i| graph.nodes[i].name.as_str()).collect();
+
+    let mut nodes: Vec<ConceptNode> = keep
+        .iter()
+        .map(|&i| graph.nodes[i].clone())
+        .collect();
+    nodes.sort_by(|a, b| {
+        b.degree
+            .cmp(&a.degree)
+            .then_with(|| b.freq.cmp(&a.freq))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut edges: Vec<(String, String, f32)> = graph
+        .edges
+        .iter()
+        .filter(|(a, b, _)| kept_names.contains(a.as_str()) && kept_names.contains(b.as_str()))
+        .cloned()
+        .collect();
+    edges.sort_by(|x, y| {
+        y.2.partial_cmp(&x.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| x.0.cmp(&y.0))
+            .then_with(|| x.1.cmp(&y.1))
+    });
+
+    ConceptGraph {
+        nodes,
+        edges,
+        total_memories: graph.total_memories,
+    }
 }
 
 #[cfg(test)]
@@ -4280,6 +4605,180 @@ mod tests {
         let global = store.concept_memories(None, "foxtrot", 10).unwrap();
         assert_eq!(global.len(), 1);
         assert_eq!(global[0].1, "p1");
+    }
+
+    /// Build a corpus with two TIGHT token cliques that never co-occur with each
+    /// other (so they must land in different communities), plus an isolated
+    /// clique that shares no token with either. df is engineered so every concept
+    /// clears MIN_DF=3 and stays under df_cap = total/3.
+    fn seed_community_corpus(store: &MemoryStore, project: &str) {
+        // Clique A: alpha+bravo+charlie co-occur 6×.
+        for _ in 0..6 {
+            store.save(project, "note", "alpha bravo charlie").unwrap();
+        }
+        // Clique B: delta+echo+foxtrot co-occur 6× (no overlap with A).
+        for _ in 0..6 {
+            store.save(project, "note", "delta echo foxtrot").unwrap();
+        }
+        // Isolated clique C: hotel+india co-occur 4× (shares nothing with A/B).
+        for _ in 0..4 {
+            store.save(project, "note", "hotel india").unwrap();
+        }
+        // Filler so df_cap = total/3 = (16+filler)/3 stays above every concept's
+        // df (max 6) — keeps them all out of the stop-word band.
+        for i in 0..8 {
+            store
+                .save(project, "note", &format!("filler topic numz{i}"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn cooccurring_concepts_share_a_community() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        seed_community_corpus(&store, "p1");
+        let h = store.concept_communities(Some("p1"), 2).unwrap();
+        // total_concepts matches the brain's node count.
+        let g = store.concept_graph(Some("p1"), 0, 0, 2).unwrap();
+        assert_eq!(h.total_concepts, g.nodes.len());
+        assert_eq!(h.total_memories, g.total_memories);
+        assert!(!h.communities.is_empty());
+
+        // Locate the community each concept belongs to via its sub-graph.
+        let find = |concept: &str| -> i64 {
+            for c in &h.communities {
+                let sub = store.community_concepts(Some("p1"), c.id, 2).unwrap();
+                if sub.nodes.iter().any(|n| n.name == concept) {
+                    return c.id;
+                }
+            }
+            panic!("concept {concept} not placed in any community");
+        };
+
+        // Clique A members co-occur heavily -> same community.
+        assert_eq!(find("alpha"), find("bravo"), "alpha+bravo co-occur");
+        assert_eq!(find("alpha"), find("charlie"), "alpha+charlie co-occur");
+        // Clique B is a DIFFERENT community from clique A (they never co-occur).
+        assert_ne!(find("alpha"), find("delta"), "A and B must split");
+        assert_eq!(find("delta"), find("echo"), "delta+echo co-occur");
+
+        // Communities are sorted by size (memories touched) desc, ties by id asc.
+        for w in h.communities.windows(2) {
+            assert!(
+                w[0].size > w[1].size || (w[0].size == w[1].size && w[0].id < w[1].id),
+                "communities must be size-desc / id-asc: {:?}",
+                h.communities
+            );
+        }
+        // Every community has a non-empty label and at least one concept.
+        for c in &h.communities {
+            assert!(!c.label.is_empty());
+            assert!(c.concept_count >= 1);
+            assert!(c.top_concepts.len() <= 5);
+            assert!(c.top_concepts.contains(&c.label), "label is a member");
+        }
+    }
+
+    #[test]
+    fn isolated_concept_is_its_own_or_misc_community() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        seed_community_corpus(&store, "p1");
+        let h = store.concept_communities(Some("p1"), 2).unwrap();
+
+        // The isolated clique C (hotel/india) shares no token with A or B, so it
+        // cannot be unioned into either — it forms its own community (or, if the
+        // singleton-fold ran, a misc bubble), distinct from A and B.
+        let find = |concept: &str| -> i64 {
+            for c in &h.communities {
+                let sub = store.community_concepts(Some("p1"), c.id, 2).unwrap();
+                if sub.nodes.iter().any(|n| n.name == concept) {
+                    return c.id;
+                }
+            }
+            panic!("concept {concept} not placed");
+        };
+        assert_ne!(find("hotel"), find("alpha"), "C must not join A");
+        assert_ne!(find("hotel"), find("delta"), "C must not join B");
+        // hotel and india co-occur -> they stay together.
+        assert_eq!(find("hotel"), find("india"));
+    }
+
+    #[test]
+    fn community_concepts_returns_only_its_members_and_intra_edges() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        seed_community_corpus(&store, "p1");
+        let h = store.concept_communities(Some("p1"), 2).unwrap();
+
+        // The community holding "alpha".
+        let mut alpha_comm: Option<i64> = None;
+        for c in &h.communities {
+            let sub = store.community_concepts(Some("p1"), c.id, 2).unwrap();
+            if sub.nodes.iter().any(|n| n.name == "alpha") {
+                alpha_comm = Some(c.id);
+                break;
+            }
+        }
+        let cid = alpha_comm.expect("alpha community");
+        let sub = store.community_concepts(Some("p1"), cid, 2).unwrap();
+
+        let names: std::collections::HashSet<&str> =
+            sub.nodes.iter().map(|n| n.name.as_str()).collect();
+        // Clique A members are present; clique B / C members are NOT.
+        assert!(names.contains("alpha"));
+        assert!(names.contains("bravo"));
+        assert!(!names.contains("delta"), "cross-community concept leaked");
+        assert!(!names.contains("hotel"), "cross-community concept leaked");
+        // Every returned edge is INTRA-community (both endpoints are members).
+        for (a, b, _) in &sub.edges {
+            assert!(names.contains(a.as_str()), "edge endpoint outside community");
+            assert!(names.contains(b.as_str()), "edge endpoint outside community");
+        }
+        // total_memories is carried through unchanged.
+        assert_eq!(sub.total_memories, h.total_memories);
+
+        // Unknown community id -> empty graph (no error), memories preserved.
+        let empty = store.community_concepts(Some("p1"), i64::MAX, 2).unwrap();
+        assert!(empty.nodes.is_empty());
+        assert!(empty.edges.is_empty());
+        assert_eq!(empty.total_memories, h.total_memories);
+    }
+
+    #[test]
+    fn concept_communities_global_scope() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Same two cliques but split across two projects; global scope (None)
+        // must merge by token and still separate A from B.
+        for _ in 0..6 {
+            store.save("proj_a", "note", "alpha bravo charlie").unwrap();
+        }
+        for _ in 0..6 {
+            store.save("proj_b", "note", "delta echo foxtrot").unwrap();
+        }
+        for i in 0..8 {
+            store
+                .save("proj_a", "note", &format!("filler topic numa{i}"))
+                .unwrap();
+        }
+        for i in 0..8 {
+            store
+                .save("proj_b", "note", &format!("filler topic numb{i}"))
+                .unwrap();
+        }
+        let h = store.concept_communities(None, 2).unwrap();
+        assert!(h.total_memories >= 28);
+        assert!(!h.communities.is_empty());
+
+        let find = |concept: &str| -> i64 {
+            for c in &h.communities {
+                let sub = store.community_concepts(None, c.id, 2).unwrap();
+                if sub.nodes.iter().any(|n| n.name == concept) {
+                    return c.id;
+                }
+            }
+            panic!("concept {concept} not placed");
+        };
+        assert_eq!(find("alpha"), find("bravo"));
+        assert_ne!(find("alpha"), find("delta"), "A and B split globally too");
     }
 
     #[test]
@@ -5112,6 +5611,65 @@ mod tests {
             elapsed.as_secs_f64() < 1.0,
             "graph_clusters too slow: {elapsed:?}"
         );
+    }
+
+    /// Performance probe for the topic-community top level against the real
+    /// on-disk store. Ignored by default; run with `--ignored` after setting
+    /// `RTRT_MEMORY_PATH`. The concept graph is small, so `concept_communities`
+    /// must clear well under a second for both a project and the global scope.
+    #[test]
+    #[ignore = "needs the real on-disk memory store"]
+    fn concept_communities_perf() {
+        let path = std::env::var("RTRT_MEMORY_PATH").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap();
+            format!("{home}/.rtrt/memory.sqlite")
+        });
+        let store = MemoryStore::open(&path).unwrap();
+
+        for scope in [Some("00G_winpodx"), None] {
+            // Warm-up (page cache + concept_graph build); not measured.
+            let _ = store.concept_communities(scope, 2).unwrap();
+            let t0 = std::time::Instant::now();
+            let h = store.concept_communities(scope, 2).unwrap();
+            let elapsed = t0.elapsed();
+            let label = scope.unwrap_or("<global>");
+            eprintln!(
+                "concept_communities({label}): {} concepts -> {} communities, {} inter-edges, {} memories in {:?}",
+                h.total_concepts,
+                h.communities.len(),
+                h.edges.len(),
+                h.total_memories,
+                elapsed
+            );
+            for c in h.communities.iter().take(8) {
+                eprintln!(
+                    "  community id={} label={:?} size={} concepts={} top={:?}",
+                    c.id, c.label, c.size, c.concept_count, c.top_concepts
+                );
+            }
+            // Drill into the biggest community.
+            if let Some(top) = h.communities.first() {
+                let dt0 = std::time::Instant::now();
+                let sub = store.community_concepts(scope, top.id, 2).unwrap();
+                eprintln!(
+                    "  community_concepts(id={}): {} concepts, {} intra-edges in {:?}",
+                    top.id,
+                    sub.nodes.len(),
+                    sub.edges.len(),
+                    dt0.elapsed()
+                );
+            }
+            assert!(
+                elapsed.as_secs_f64() < 1.0,
+                "concept_communities({label}) too slow: {elapsed:?}"
+            );
+            // Dynamic target band: ~√concepts clamped [8, 60].
+            assert!(
+                h.communities.len() <= 60,
+                "community count must stay within the dynamic band, got {}",
+                h.communities.len()
+            );
+        }
     }
 
     /// Empirical tuning probe for `VEC_MIN_SIM` against the real on-disk store.

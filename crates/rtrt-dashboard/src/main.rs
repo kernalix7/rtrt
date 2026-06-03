@@ -44,7 +44,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use rtrt_memory::{
-    ClusterIndex, ConceptGraph, DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser,
+    ClusterIndex, ConceptHierarchy, DetailedRecord, Embedder, MemoryStore, PayloadFilter,
+    Summariser,
 };
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
@@ -76,12 +77,14 @@ struct AppState {
     /// reads the `context` entry (rebuilding if missing/expired).
     cluster_cache:
         Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
-    /// Per-scope "digital brain" concept-graph cache, same style + TTL as
-    /// [`AppState::cluster_cache`] (`CLUSTER_INDEX_TTL`). Keyed
-    /// `"brain\x1f<scope>"` where `<scope>` is the project name or `__global__`
-    /// for the merged GLOBAL brain. Separate map because the value type differs
-    /// ([`ConceptGraph`] vs [`ClusterIndex`]); the eviction policy is identical.
-    brain_cache: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ConceptGraph)>>>,
+    /// Per-scope TOP-LEVEL "digital brain" community hierarchy cache (the
+    /// `mode=brain` community level). Same style + TTL ([`CLUSTER_INDEX_TTL`]) as
+    /// [`AppState::cluster_cache`], keyed `"brainh\x1f<scope>"` and holding a
+    /// [`ConceptHierarchy`] (communities + inter-community edges). The per-
+    /// community concept sub-graph (`community=ID`) and the per-concept memories
+    /// drill (`concept=TOKEN`) are served fresh — only this top level is cached.
+    brainh_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ConceptHierarchy)>>>,
     /// Opaque drill tokens minted per overview/group build
     /// (`token -> (built_at, entry)`), TTL [`LEVEL_TOKEN_TTL`]. Each token maps
     /// to the member-id set of one bubble so the client can drill many levels
@@ -346,7 +349,7 @@ async fn main() -> Result<()> {
         events: events_tx,
         embedder,
         cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        brain_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        brainh_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         memory_path: memory_store_path(),
         embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1327,6 +1330,12 @@ struct MemoryGraphQuery {
     /// concept token (the `brain-concept` response) instead of the brain graph.
     #[serde(default)]
     concept: Option<String>,
+    /// `mode=brain` community drill: the stable community id (the `mode=brain`
+    /// community-level node's numeric id). When set — and `concept` is not — the
+    /// response is that community's CONCEPT sub-graph (`level:"concept"`) instead
+    /// of the top-level community overview.
+    #[serde(default)]
+    community: Option<i64>,
 }
 
 fn default_graph_limit() -> usize {
@@ -1403,15 +1412,21 @@ async fn memory_graph(
         return memory_graph_overview(&state, store, &q.project, group, basis, q.target).await;
     }
 
-    // Brain mode (`mode=brain`): the Obsidian-style concept map. Scope resolves
-    // the same way the project selector does — a present, non-sentinel project
-    // is one project's brain; an empty string or the `__global__` sentinel is
-    // the GLOBAL brain (all projects merged by concept token). With `concept=`
-    // it drills to the memories of one concept instead of returning the graph.
+    // Brain mode (`mode=brain`): the three-level "digital brain" map. Scope
+    // resolves the same way the project selector does — a present, non-sentinel
+    // project is one project's brain; an empty string or the `__global__`
+    // sentinel is the GLOBAL brain (all projects merged by concept token). Drill
+    // precedence (per contract):
+    //   1. `concept=TOKEN` → that concept's MEMORIES   (`mode:"brain-concept"`)
+    //   2. `community=ID`   → that community's CONCEPTS (`level:"concept"`)
+    //   3. neither          → TOP-LEVEL communities     (`level:"community"`)
     if q.mode.as_deref() == Some("brain") {
         let scope: Option<&str> = brain_scope(&q.project);
         if let Some(concept) = q.concept.as_deref().filter(|c| !c.is_empty()) {
             return memory_graph_brain_concept(store, scope, concept).await;
+        }
+        if let Some(community_id) = q.community {
+            return memory_graph_brain_community(store, scope, community_id).await;
         }
         return memory_graph_brain(&state, store, &q.project, scope).await;
     }
@@ -1492,10 +1507,9 @@ const CLUSTER_MAX_NODES: usize = 200_000;
 const CLUSTER_TOP_K: usize = 4;
 const CLUSTER_MIN_WEIGHT: f32 = 0.15;
 
-/// "Digital brain" concept graph (`mode=brain`): 0 = let rtrt-memory size the
-/// concept/edge budget dynamically from the corpus (no flat cap). min_cooccur 2
-/// just means "co-occurred in at least two memories" — a property, not a cap.
-const BRAIN_AUTO: usize = 0;
+/// "Digital brain" min co-occurrence (`mode=brain`): 2 just means "co-occurred
+/// in at least two memories" — a property, not a cap. The concept/edge budget
+/// and the community-fold target are sized dynamically by rtrt-memory (AUTO).
 const BRAIN_MIN_COOCCUR: usize = 2;
 
 /// The global-scope sentinel value the project selector sends for "all projects
@@ -1514,9 +1528,13 @@ fn brain_scope(project: &str) -> Option<&str> {
     }
 }
 
-/// Build (or serve from the 60s cache) the per-scope concept graph and return
-/// the documented `mode=brain` JSON. Cached in [`AppState::brain_cache`] under
-/// `"brain\x1f<scope>"`, the same TTL + style as the LOD cluster cache.
+/// TOP LEVEL of the brain (`mode=brain`, no `community`/`concept` param): build
+/// (or serve from the 60s cache) the per-scope TOPIC-COMMUNITY hierarchy and
+/// return the documented `level:"community"` JSON. A few dozen super-nodes
+/// (`kind:"community"`) replace the hundreds-of-concepts hairball; drilling a
+/// node (`community=ID`) yields its concepts. Cached in
+/// [`AppState::brainh_cache`] under `"brainh\x1f<scope>"`, the same TTL + style
+/// as the LOD cluster cache.
 ///
 /// The store is `!Send`, so the build runs inside a synchronous block with no
 /// `.await` while the guard is held — keeping the future `Send` for axum.
@@ -1526,35 +1544,98 @@ async fn memory_graph_brain(
     project: &str,
     scope: Option<&str>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let hierarchy = brain_hierarchy_cached(state, store, project, scope).await?;
+
+    let nodes: Vec<serde_json::Value> = hierarchy
+        .communities
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": format!("k:{}", c.id),
+                "label": c.label,
+                "size": c.size,
+                "concept_count": c.concept_count,
+                "top_concepts": c.top_concepts,
+                "kind": "community",
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = hierarchy
+        .edges
+        .iter()
+        .map(|(a, b, w)| {
+            serde_json::json!({"src": format!("k:{a}"), "dst": format!("k:{b}"), "weight": w})
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain",
+        "level": "community",
+        "scope": if scope.is_none() { "global" } else { "project" },
+        "total_memories": hierarchy.total_memories,
+        "total_concepts": hierarchy.total_concepts,
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// Build (or serve from the 60s cache) the per-scope [`ConceptHierarchy`].
+/// Cached in [`AppState::brainh_cache`] under `"brainh\x1f<scope>"`, the same
+/// TTL + style as the LOD cluster + flat-brain caches.
+///
+/// The store is `!Send`, so the build runs inside a synchronous block with no
+/// `.await` while the guard is held — keeping the future `Send` for axum.
+async fn brain_hierarchy_cached(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    scope: Option<&str>,
+) -> std::result::Result<ConceptHierarchy, (StatusCode, String)> {
     let scope_key = if scope.is_none() {
         GLOBAL_PROJECT_SENTINEL
     } else {
         project
     };
-    let cache_key = format!("brain\x1f{scope_key}");
+    let cache_key = format!("brainh\x1f{scope_key}");
 
-    // Fast path: serve a still-fresh cached graph.
-    let graph = {
-        let cache = state.brain_cache.lock().await;
+    // Fast path: serve a still-fresh cached hierarchy.
+    let cached = {
+        let cache = state.brainh_cache.lock().await;
         match cache.get(&cache_key) {
-            Some((built_at, g)) if built_at.elapsed() < CLUSTER_INDEX_TTL => Some(g.clone()),
+            Some((built_at, h)) if built_at.elapsed() < CLUSTER_INDEX_TTL => Some(h.clone()),
             _ => None,
         }
     };
-    let graph = match graph {
-        Some(g) => g,
-        None => {
-            // Miss / expired: rebuild under the store lock (no await inside).
-            let g = {
-                let guard = store.lock().await;
-                guard
-                    .concept_graph(scope, BRAIN_AUTO, BRAIN_AUTO, BRAIN_MIN_COOCCUR)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            };
-            let mut cache = state.brain_cache.lock().await;
-            cache.insert(cache_key, (std::time::Instant::now(), g.clone()));
-            g
-        }
+    if let Some(h) = cached {
+        return Ok(h);
+    }
+
+    // Miss / expired: rebuild under the store lock (no await inside).
+    let hierarchy = {
+        let guard = store.lock().await;
+        guard
+            .concept_communities(scope, BRAIN_MIN_COOCCUR)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let mut cache = state.brainh_cache.lock().await;
+    cache.insert(cache_key, (std::time::Instant::now(), hierarchy.clone()));
+    Ok(hierarchy)
+}
+
+/// MIDDLE LEVEL of the brain (`mode=brain&community=ID`): the concept sub-graph
+/// for ONE topic community — its member concepts + the intra-community edges,
+/// via [`MemoryStore::community_concepts`]. Returns the documented
+/// `level:"concept"` JSON (concept nodes keyed `c:<token>`). An unknown id
+/// yields an empty graph (the memory layer's contract), rendered as zero nodes.
+async fn memory_graph_brain_community(
+    store: &Arc<Mutex<MemoryStore>>,
+    scope: Option<&str>,
+    community_id: i64,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let graph = {
+        let guard = store.lock().await;
+        guard
+            .community_concepts(scope, community_id, BRAIN_MIN_COOCCUR)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
     let nodes: Vec<serde_json::Value> = graph
@@ -1579,9 +1660,8 @@ async fn memory_graph_brain(
         .collect();
     Ok(Json(serde_json::json!({
         "mode": "brain",
-        "scope": if scope.is_none() { "global" } else { "project" },
-        "total_memories": graph.total_memories,
-        "total_concepts": graph.nodes.len(),
+        "level": "concept",
+        "community": community_id,
         "nodes": nodes,
         "edges": edges,
     })))

@@ -2641,10 +2641,20 @@ let memmapLayout = null;             // the running layout (cola is continuous; 
 // 맵 모드: 'brain' (개념 그래프, default) vs 'cluster' (기존 묶음 뷰). The toggle swaps
 // which loader runs; the cy instance, styling, layout + tooltip are shared.
 let memmapViewMode = 'brain';
-let brainGraph = null;               // last brain overview payload for the current scope
+let brainGraph = null;               // last brain TOP-LEVEL (communities) payload for the scope
 let brainProject = '';               // project the brain belongs to ('' = global)
 let brainScopeGlobal = false;        // whether the loaded brain is the GLOBAL (merged) brain
 let brainConcept = null;             // when set, we're viewing one concept's memories (drill)
+// Brain is now 3-level: communities → concepts → memories. brainLevel tracks the
+// current depth; brainStack is the breadcrumb of pushed levels (community, then
+// concept) — the communities overview is the implicit "전체(주제)" root.
+//   { kind:'community', id, label }  — a topic community we drilled into
+//   { kind:'concept',   token, label } — a concept we drilled into
+let brainLevel = 'community';        // 'community' | 'concept' | 'memory'
+let brainStack = [];
+let brainCommunity = null;           // the community we're inside, when at concept/memory level
+// Cache concept sub-graphs per community id so breadcrumb pops re-render instantly.
+const brainCommunityCache = new Map();
 // Breadcrumb stack of drilled levels: [{ token, label }, …]. The overview itself
 // is the implicit root (rendered as the "전체" crumb); pushed levels follow.
 let memmapStack = [];
@@ -2739,6 +2749,20 @@ function memmapCyStyle() {
     },
     // Hubs (high degree) keep their label so the brain has anchor points.
     { selector: 'node[kindType = "concept"][?hub]', style: { 'text-opacity': 1 } },
+    // TOPIC COMMUNITIES (top brain level): hexagon super-nodes so topics read
+    // differently from the round concept "ideas". Labels always on (only a few
+    // dozen of them) with a brighter border to mark them as a level above.
+    {
+      selector: 'node[kindType = "community"]',
+      style: {
+        'shape': 'hexagon',
+        'text-opacity': 1,
+        'font-size': '12px',
+        'border-width': 2,
+        'border-color': 'rgba(255,255,255,0.40)',
+        'underlay-opacity': 0.32,
+      },
+    },
     // Hovered concept (+ its neighbours) always shows its label.
     { selector: 'node.label-on', style: { 'text-opacity': 1 } },
     // Catch-all / misc bubble: neutral, dashed, visually set apart from real groups.
@@ -2816,6 +2840,10 @@ function memmapEnsureCy() {
   // modal; a concept shows its memories.
   memmapCy.on('tap', 'node', (ev) => {
     const data = ev.target.data();
+    if (data.kindType === 'community') {
+      brainDrillCommunity(data.communityId, String(data.rawLabel || data.label || ''));
+      return;
+    }
     if (data.kindType === 'concept') {
       brainDrillConcept(String(data.token || data.label || ''));
       return;
@@ -2865,6 +2893,7 @@ function memmapEnsureCy() {
 function memmapTooltipMeta(node) {
   const data = node.data();
   if (data.misc) return { type: '미분류', col: MEMMAP_PALETTE.misc };
+  if (data.kindType === 'community') return { type: '주제', col: data.col || MEMMAP_PALETTE.mixed };
   if (data.kindType === 'concept') return { type: '개념', col: data.col || MEMMAP_PALETTE.mixed };
   if (data.kindType === 'member') return { type: '메모리', col: memmapColor(data.src || 'mixed') };
   return { type: '클러스터', col: memmapColor(data.src || 'mixed') };
@@ -2886,7 +2915,14 @@ function memmapShowTooltip(node) {
   ty.style.backgroundColor = meta.col;
   const cn = document.createElement('div');
   cn.className = 'tt-conns';
-  cn.textContent = `${conns} connections`;
+  if (data.kindType === 'community') {
+    // Topic super-node: how many concepts it groups + a few representative ones.
+    const tops = Array.isArray(data.topConcepts) ? data.topConcepts : [];
+    const cnt = Number(data.conceptCount || 0);
+    cn.textContent = `${cnt.toLocaleString()}개 개념` + (tops.length ? ` · ${tops.join(', ')}` : '');
+  } else {
+    cn.textContent = `${conns} connections`;
+  }
   tip.appendChild(nm);
   tip.appendChild(ty);
   tip.appendChild(cn);
@@ -3413,43 +3449,236 @@ function brainOverviewElements(payload) {
   return nodes.concat(edgeEls);
 }
 
-// Render the brain overview (or fallback list if cy is unavailable). Clears the
-// concept-drill state so we're back at the constellation.
+// Build the Cytoscape elements for the brain TOP LEVEL: TOPIC COMMUNITIES.
+// Nodes carry kindType:'community' (hexagon super-node), sized by the community's
+// SIZE (memories touched) with concept_count as a tie-break, clamped so a few big
+// topics read clearly while small ones stay legible. Inter-community edges are
+// thinned to a backbone (same as concepts) to keep the top view airy.
+function brainCommunityElements(payload) {
+  const rawNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const rawEdges = Array.isArray(payload.edges) ? payload.edges : [];
+  const ids = new Set(rawNodes.map(n => String(n.id)));
+  // Sqrt scale on size keeps small communities visible; clamp to a hexagon range
+  // bigger than concept ideas so topics dominate the canvas.
+  const sizes = rawNodes.map(n => Number(n.size || 0));
+  const maxSize = Math.max(1, ...sizes);
+  const SCALE_MIN = 28, SCALE_MAX = 72;
+  const nodes = rawNodes.map(n => {
+    const id = String(n.id);
+    const label = String(n.label != null ? n.label : id.replace(/^k:/, ''));
+    const size = Number(n.size || 0);
+    const conceptCount = Number(n.concept_count || 0);
+    const tops = Array.isArray(n.top_concepts) ? n.top_concepts.map(String) : [];
+    const diam = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.sqrt(size / maxSize);
+    return {
+      data: {
+        id, label, rawLabel: label,
+        size: Math.round(Math.max(SCALE_MIN, Math.min(SCALE_MAX, diam))),
+        col: brainConceptColor(label),
+        kindType: 'community',
+        // The community id the API drills by (strip the "k:" id prefix).
+        communityId: id.replace(/^k:/, ''),
+        conceptCount, topConcepts: tops,
+      },
+    };
+  });
+  const edgeEls = memmapBackboneEdges(
+    rawEdges.map(e => ({ src: e.src, dst: e.dst, weight: e.weight })), ids,
+  ).map((e, i) => ({
+    data: {
+      id: `ke${i}`,
+      source: String(e.src),
+      target: String(e.dst),
+      w: Math.max(1, Math.min(4, Number(e.w || 1))),
+    },
+  }));
+  return nodes.concat(edgeEls);
+}
+
+// Render the breadcrumb for the brain: 전체(주제) › <주제 label> › <개념 label>.
+// The communities overview is the implicit root; pushed levels follow. Clicking a
+// non-current crumb pops back to that level; the current crumb is inert.
+function brainRenderCrumbs() {
+  const bar = document.getElementById('memmap-crumbs');
+  if (!bar) return;
+  bar.innerHTML = '';
+  // Hidden at the top level — the communities overview shows no breadcrumb.
+  if (!brainStack.length) { bar.hidden = true; return; }
+  const crumbs = [{ kind: 'root', label: '전체(주제)' }].concat(brainStack);
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = '›';
+      bar.appendChild(sep);
+    }
+    const isLast = i === crumbs.length - 1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (isLast ? ' current' : '');
+    btn.textContent = c.label;
+    if (!isLast) btn.onclick = () => brainGoToDepth(i);   // i = pushed levels to keep
+    bar.appendChild(btn);
+  });
+  bar.hidden = false;
+}
+
+// Pop the brain breadcrumb to a given depth (number of pushed levels to keep).
+// depth 0 = communities root; depth 1 = the community's concepts (from cache).
+function brainGoToDepth(depth) {
+  if (depth <= 0) { renderBrainOverview(); return; }
+  // Only depth 1 is a re-rendered level (community → concepts). The concept level
+  // (depth 2) is a memory list and is never a "go back" target (it's the leaf).
+  const crumb = brainStack[depth - 1];
+  if (!crumb || crumb.kind !== 'community') { renderBrainOverview(); return; }
+  brainStack = brainStack.slice(0, depth);
+  const payload = brainCommunityCache.get(String(crumb.id));
+  if (!payload) { renderBrainOverview(); return; }
+  renderBrainCommunityLevel(crumb.id, crumb.label, payload);
+}
+
+// #memmap-back pops exactly one brain level:
+//   memory (concept drill) → back to the community's concepts
+//   concept (community drill) → back to the communities overview
+function brainBack() {
+  if (brainLevel === 'memory' && brainCommunity) {
+    const cached = brainCommunityCache.get(String(brainCommunity.id));
+    if (cached) {
+      brainStack = [{ kind: 'community', id: brainCommunity.id, label: brainCommunity.label }];
+      renderBrainCommunityLevel(brainCommunity.id, brainCommunity.label, cached);
+      return;
+    }
+  }
+  renderBrainOverview();
+}
+
+// Render the brain TOP LEVEL = TOPIC COMMUNITIES (or fallback list if cy is
+// unavailable). Resets the drill state so we're back at the topic constellation.
 function renderBrainOverview() {
   brainConcept = null;
+  brainCommunity = null;
+  brainLevel = 'community';
+  brainStack = [];
   const head = document.getElementById('memmap-overview-head');
   memmapResetViews();
   memmapStack = [];
   const back = document.getElementById('memmap-back');
-  if (back) back.hidden = true;
-  const crumbs = document.getElementById('memmap-crumbs');
-  if (crumbs) { crumbs.hidden = true; crumbs.innerHTML = ''; }
+  if (back) back.hidden = true;   // top level: no 뒤로
+  brainRenderCrumbs();            // hidden at the top
   if (!brainGraph) {
     if (head) head.textContent = '';
     if (memmapCy) memmapCy.elements().remove();
     return;
   }
-  const concepts = Number(brainGraph.total_concepts || (brainGraph.nodes || []).length || 0);
+  const communities = (Array.isArray(brainGraph.nodes) ? brainGraph.nodes : []);
+  const concepts = Number(brainGraph.total_concepts || 0);
   const mems = Number(brainGraph.total_memories || 0);
   const scopeLabel = brainScopeGlobal ? '전체' : (brainProject || '');
   if (head) {
-    head.textContent = `개념 ${concepts.toLocaleString()}개 · 메모리 ${mems.toLocaleString()}개 · ${scopeLabel}`;
+    head.textContent = `주제 ${communities.length.toLocaleString()}개 · `
+      + `개념 ${concepts.toLocaleString()}개 · 메모리 ${mems.toLocaleString()}개 · ${scopeLabel}`;
   }
-  if (!(brainGraph.nodes || []).length) {
+  if (!communities.length) {
     const empty = document.getElementById('memmap-empty');
-    if (empty) { empty.textContent = '개념이 충분하지 않습니다 (메모리가 더 쌓이면 나타납니다).'; empty.hidden = false; }
+    if (empty) { empty.textContent = '주제가 충분하지 않습니다 (메모리가 더 쌓이면 나타납니다).'; empty.hidden = false; }
     if (memmapCy) memmapCy.elements().remove();
     return;
   }
   const cy = memmapEnsureCy();
-  if (!cy) { renderBrainFallback(brainGraph); return; }
+  if (!cy) { renderBrainCommunityFallback(brainGraph); return; }
   cy.elements().remove();
-  cy.add(brainOverviewElements(brainGraph));
+  cy.add(brainCommunityElements(brainGraph));
   memmapApplyFilters();
   memmapRunLayout();
 }
 
-// Offline / no-cy fallback: list the strongest concepts as clickable rows.
+// Drill a TOPIC COMMUNITY → its CONCEPTS. Fetches mode=brain&community=ID for the
+// current scope, pushes a breadcrumb, and renders the member concepts (existing
+// concept node style). Tapping a concept then drills to its memories.
+async function brainDrillCommunity(communityId, label) {
+  communityId = String(communityId || '');
+  label = String(label || communityId);
+  if (communityId === '') return;
+  const head = document.getElementById('memmap-overview-head');
+  let payload = brainCommunityCache.get(communityId);
+  if (!payload) {
+    if (head) head.textContent = `주제 "${label}" · 불러오는 중…`;
+    try {
+      const params = new URLSearchParams({ mode: 'brain', community: communityId });
+      if (!brainScopeGlobal && brainProject) params.set('project', brainProject);
+      const r = await fetch(`/api/memory/graph?${params.toString()}`);
+      if (!r.ok) {
+        showToast(`주제 로드 실패 ${r.status}`, 'err');
+        if (head) head.textContent = `주제 "${label}" · 오류 ${r.status}`;
+        return;
+      }
+      payload = await r.json();
+      payload.nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      payload.edges = Array.isArray(payload.edges) ? payload.edges : [];
+      brainCommunityCache.set(communityId, payload);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+      if (head) head.textContent = `주제 "${label}" · 네트워크 오류`;
+      return;
+    }
+  }
+  brainStack = [{ kind: 'community', id: communityId, label }];
+  renderBrainCommunityLevel(communityId, label, payload);
+}
+
+// Render one community's CONCEPTS (the second brain level). Reuses the concept
+// node style + layout. Assumes the crumb is already on brainStack.
+function renderBrainCommunityLevel(communityId, label, payload) {
+  brainConcept = null;
+  brainCommunity = { id: String(communityId), label: String(label) };
+  brainLevel = 'concept';
+  const head = document.getElementById('memmap-overview-head');
+  memmapResetViews();
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = false;
+  brainRenderCrumbs();
+  const concepts = (Array.isArray(payload.nodes) ? payload.nodes : []);
+  if (head) head.textContent = `주제 "${label}" · 개념 ${concepts.length.toLocaleString()}개`;
+  if (!concepts.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) { empty.textContent = '이 주제에 개념이 없습니다.'; empty.hidden = false; }
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderBrainFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(brainOverviewElements(payload));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Offline / no-cy fallback for the TOP LEVEL: list communities as clickable rows.
+function renderBrainCommunityFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (Array.isArray(payload.nodes) ? payload.nodes : [])
+    .slice().sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  fb.innerHTML = note + nodes.map(n => {
+    const id = String(n.id != null ? n.id : '').replace(/^k:/, '');
+    const label = String(n.label != null ? n.label : id);
+    const size = Number(n.size || 0);
+    const cnt = Number(n.concept_count || 0);
+    const tops = Array.isArray(n.top_concepts) ? n.top_concepts.map(String) : [];
+    const sub = tops.length ? ` · ${escapeHtml(tops.join(', '))}` : '';
+    return `<div class="member-row" data-community="${escapeAttr(id)}" data-label="${escapeAttr(label)}">`
+      + `<span class="mr-badge badge">주제</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(label)}</div>`
+      + `<div class="mr-kind">${cnt.toLocaleString()}개 개념 · 메모리 ${size.toLocaleString()}${sub}</div></div></div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => brainDrillCommunity(el.dataset.community, el.dataset.label || el.dataset.community);
+  });
+}
+
+// Offline / no-cy fallback for a community's CONCEPTS: clickable concept rows.
 function renderBrainFallback(payload) {
   const fb = document.getElementById('memmap-fallback');
   if (!fb) return;
@@ -3471,13 +3700,22 @@ function renderBrainFallback(payload) {
   });
 }
 
-// Drill a concept → its memories. Fetches mode=brain&concept=TOKEN for the
-// current scope and shows the memories as a side list (reuses .member-row);
-// clicking a row opens the memory modal. 뒤로 returns to the concept brain.
+// Drill a concept → its MEMORIES (the third/leaf brain level). Fetches
+// mode=brain&concept=TOKEN for the current scope, pushes a breadcrumb, and renders
+// the memories AS member nodes; tapping one opens the memory modal. 뒤로 / the
+// crumb returns to the community's concepts.
 async function brainDrillConcept(concept) {
   concept = String(concept || '');
   if (!concept) return;
   brainConcept = concept;
+  brainLevel = 'memory';
+  // Push the concept crumb (drop any stale concept crumb from a previous drill so
+  // we never stack 전체(주제) › 주제 › 개념A › 개념B).
+  if (brainStack.length && brainStack[brainStack.length - 1].kind === 'concept') {
+    brainStack = brainStack.slice(0, -1);
+  }
+  brainStack.push({ kind: 'concept', token: concept, label: concept });
+  brainRenderCrumbs();
   const head = document.getElementById('memmap-overview-head');
   if (head) head.textContent = `개념 "${concept}" · 불러오는 중…`;
   const back = document.getElementById('memmap-back');
@@ -3553,6 +3791,10 @@ function renderBrainConceptMemories(concept, payload) {
 // scope loads the merged brain (전체).
 async function loadBrain(project) {
   brainConcept = null;
+  brainCommunity = null;
+  brainLevel = 'community';
+  brainStack = [];
+  brainCommunityCache.clear();   // scope/project changed — drop the old sub-graphs
   memmapStopLayout();
   memmapResetViews();
   const back = document.getElementById('memmap-back');
@@ -3698,7 +3940,7 @@ async function loadGraph(project) {
   // in cluster mode, pop exactly one breadcrumb level (root reloads the overview).
   const back = document.getElementById('memmap-back');
   if (back) back.onclick = () => {
-    if (memmapViewMode === 'brain') { renderBrainOverview(); return; }
+    if (memmapViewMode === 'brain') { brainBack(); return; }
     memmapGoToDepth(memmapStack.length - 1);
   };
   const fit = document.getElementById('memmap-fit');

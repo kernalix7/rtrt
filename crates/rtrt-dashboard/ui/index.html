@@ -682,48 +682,10 @@
               <button class="primary" type="submit">새로고침</button>
             </form>
 
-            <div id="memmap-mode-toggle" class="sort-row" aria-label="맵 모드" style="margin:0.4rem 0;">
-              <button class="sort-btn active" type="button" data-memmap-mode="brain" title="개념(토큰) 간 연결을 옵시디언처럼 그래프로 — 노드는 개념, 선은 함께 등장한 관계">브레인(개념)</button>
-              <button class="sort-btn" type="button" data-memmap-mode="cluster" title="비슷한 메모리를 클러스터 노드로 묶어 보기">묶음(클러스터)</button>
-            </div>
-
             <div class="memmap-controls">
-              <input id="memmap-search" class="memmap-search" type="search" placeholder="클러스터 검색">
-              <span id="memmap-cluster-controls" style="display:contents;">
-              <select id="memmap-group" class="memmap-group" aria-label="묶음 기준">
-                <option value="context" selected>문맥</option>
-                <option value="file">파일</option>
-                <option value="kind">종류</option>
-                <option value="session">세션</option>
-                <option value="source">출처</option>
-                <option value="time">시간</option>
-              </select>
-              <select id="memmap-basis" class="memmap-group" aria-label="분류 기준" title="문맥 묶음을 의미(임베딩) 기반 / 어휘(키워드) 기반 중 무엇으로 할지">
-                <option value="auto" selected>기준: 자동</option>
-                <option value="vector">기준: 의미</option>
-                <option value="lexical">기준: 어휘</option>
-              </select>
-              <select id="memmap-target" class="memmap-group" aria-label="세밀도" title="버블 개수 — 클수록 미분류가 잘게 쪼개짐">
-                <option value="120">세밀도: 거침</option>
-                <option value="320" selected>세밀도: 보통</option>
-                <option value="600">세밀도: 세밀</option>
-                <option value="900">세밀도: 매우 세밀</option>
-              </select>
-              <select id="memmap-depth" class="memmap-group" aria-label="깊이" title="드릴 깊이 — 깊을수록 더 잘게 파고듦">
-                <option value="0" selected>깊이: 자동</option>
-                <option value="200">깊이: 얕게</option>
-                <option value="80">깊이: 보통</option>
-                <option value="30">깊이: 깊게</option>
-              </select>
-              </span>
-              <div id="memmap-source-filter" class="sort-row" aria-label="출처 필터">
-                <button class="sort-btn active" type="button" data-memmap-source="all">전체</button>
-                <button class="sort-btn" type="button" data-memmap-source="main">메인</button>
-                <button class="sort-btn" type="button" data-memmap-source="subagent">서브</button>
-              </div>
+              <input id="memmap-search" class="memmap-search" type="search" placeholder="개념 검색">
               <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
               <button id="memmap-fit" class="ghost" type="button">맞춤</button>
-              <button id="memmap-embed-btn" class="ghost" type="button" title="이 프로젝트를 임베딩해 의미 기반 맵으로 (백그라운드)">임베딩 생성</button>
             </div>
             <div id="memmap-crumbs" class="memmap-crumbs" hidden></div>
             <div id="memmap-overview-head" class="memmap-head"></div>
@@ -3627,11 +3589,10 @@ async function loadBrain(project) {
   }
 }
 
-// Dispatch the right loader for the active map mode. Brain works in global
-// scope; cluster keeps its existing per-project behaviour.
+// The map is the digital brain (concept graph). Always loads the brain — works
+// per-project AND global (never the "select a project" message).
 function loadMemmap(project) {
-  if (memmapViewMode === 'brain') { loadBrain(project); return; }
-  loadGraph(project);
+  loadBrain(project);
 }
 
 // Switch the map between 브레인(개념) and 묶음(클러스터). Hides the cluster-only
@@ -3757,12 +3718,8 @@ async function loadGraph(project) {
 
 document.getElementById('graph-form').onsubmit = async (ev) => {
   ev.preventDefault();
-  const project = currentProject();
-  // 브레인 mode loads even in global scope (GLOBAL merged brain).
-  if (memmapViewMode === 'brain') { await loadMemmap(project); return; }
-  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); await loadGraph(project); return; }
-  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
-  await loadGraph(project);
+  // The map is the brain — loads per-project AND global, no scope guard.
+  await loadMemmap(currentProject());
 };
 
 // Show/hide LLM model dropdown when engine switches.

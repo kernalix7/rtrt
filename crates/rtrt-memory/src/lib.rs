@@ -2583,6 +2583,95 @@ impl MemoryStore {
         let id_pos = id_of.clone();
         let mut idx = Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target);
 
+        // ── Split the dominant lexical "미분류" catch-all into topic bubbles ──
+        // cluster_from_peers dumps every row it could not link into ONE bubble;
+        // on a large project that is ~half the rows and reads as a single
+        // undifferentiated blob ("정량으로 잘린 느낌"). Re-group those rows by each
+        // one's SIGNATURE token — its rarest SHARED token, usually a topic word
+        // the posting cap had dropped — so the blob becomes many small topic
+        // groups instead. Only fires when a bubble really dominates (>= 25%).
+        {
+            let n_total = idx.node_cluster.len();
+            let dom = idx.clusters.iter().max_by_key(|c| c.size).map(|c| (c.id, c.size));
+            if let Some((dom_root, dom_size)) = dom
+                && n_total > 0
+                && dom_size >= 8
+                && dom_size * 4 >= n_total
+            {
+                // Each dominant member's rarest token that at least two rows share.
+                let mut by_sig: std::collections::HashMap<&str, Vec<usize>> =
+                    std::collections::HashMap::new();
+                let mut misc: Vec<usize> = Vec::new();
+                for i in 0..n {
+                    if idx.node_cluster.get(&id_pos[i]) != Some(&dom_root) {
+                        continue;
+                    }
+                    let sig = rows[i]
+                        .1
+                        .iter()
+                        .filter(|t| inverted.get(t.as_str()).map(|v| v.len()).unwrap_or(0) >= 2)
+                        .min_by_key(|t| inverted[t.as_str()].len())
+                        .map(|t| t.as_str());
+                    match sig {
+                        Some(s) => by_sig.entry(s).or_default().push(i),
+                        None => misc.push(i),
+                    }
+                }
+                // Groups of >=2 become topic bubbles; lone signatures fall to misc.
+                let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+                for (s, v) in by_sig {
+                    if v.len() >= 2 {
+                        groups.push((s.to_string(), v));
+                    } else {
+                        misc.extend(v);
+                    }
+                }
+                // Only worth doing if it actually breaks the blob into several.
+                if groups.len() >= 2 {
+                    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+                    // Topic-bubble budget = the 세밀도 target: more bubbles means a
+                    // smaller leftover "(기타)". The tail folds into 기타 (drillable).
+                    let keep = target.max(8);
+                    if groups.len() > keep {
+                        for (_, v) in groups.split_off(keep) {
+                            misc.extend(v);
+                        }
+                    }
+                    let src_of = |positions: &[usize]| -> String {
+                        let s: Vec<Option<String>> =
+                            positions.iter().map(|&i| rows[i].0.source_kind.clone()).collect();
+                        dominant_source(&s)
+                    };
+                    idx.clusters.retain(|c| c.id != dom_root);
+                    for (label, positions) in &groups {
+                        let root = positions.iter().map(|&i| id_pos[i]).min().unwrap_or(dom_root);
+                        for &i in positions {
+                            idx.node_cluster.insert(id_pos[i], root);
+                        }
+                        idx.clusters.push(ClusterSummary {
+                            id: root,
+                            size: positions.len(),
+                            label: label.clone(),
+                            dominant_source: src_of(positions),
+                        });
+                    }
+                    if !misc.is_empty() {
+                        let root = misc.iter().map(|&i| id_pos[i]).min().unwrap_or(dom_root);
+                        for &i in &misc {
+                            idx.node_cluster.insert(id_pos[i], root);
+                        }
+                        idx.clusters.push(ClusterSummary {
+                            id: root,
+                            size: misc.len(),
+                            label: "(기타)".to_string(),
+                            dominant_source: src_of(&misc),
+                        });
+                    }
+                    idx.clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+                }
+            }
+        }
+
         // Rebuild inter-cluster edges from the FULL candidate map (`shared`) —
         // EVERY token-sharing pair, including sub-`min_weight` ones the union-find
         // ignored. The fold leaves a node's above-threshold peers almost all

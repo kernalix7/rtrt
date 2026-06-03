@@ -1465,9 +1465,6 @@ async fn memory_graph(
 const CLUSTER_MAX_NODES: usize = 200_000;
 const CLUSTER_TOP_K: usize = 4;
 const CLUSTER_MIN_WEIGHT: f32 = 0.15;
-/// Default overview bubble target (the "세밀도" knob midpoint) when the client
-/// sends no `target`. Matches the memory crate's internal `CLUSTER_TARGET`.
-const GRAPH_TARGET_DEFAULT: usize = 320;
 
 /// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
 /// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
@@ -1551,8 +1548,19 @@ async fn memory_graph_overview(
         "vector" | "lexical" => basis_pref,
         _ => "auto",
     };
-    // 세밀도(granularity): bubble target, clamped. (Depth/leaf is a drill-time knob.)
-    let target = target_pref.map(|t| t.clamp(24, 1000)).unwrap_or(GRAPH_TARGET_DEFAULT);
+    // 세밀도(granularity): bubble target. Explicit value (clamped) wins; otherwise
+    // scale with project size — a bigger project gets MORE bubbles so the
+    // lexical "미분류" catch-all is split finer instead of dominating as one blob.
+    let target = match target_pref {
+        Some(t) => t.clamp(24, 1000),
+        None => {
+            let n = {
+                let guard = store.lock().await;
+                guard.count_by_project(project).unwrap_or(0)
+            };
+            ((n as f64).sqrt() * 2.5).round().clamp(250.0, 500.0) as usize
+        }
+    };
 
     // Key the cache on every knob so a different selection never serves a stale
     // opposite-basis / opposite-granularity index.

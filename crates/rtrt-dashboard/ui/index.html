@@ -1736,7 +1736,7 @@ async function loadHistory(name, offset) {
 
 // Detail modal: fetch GET /api/memory/{id} and render.
 async function openDetailModal(id) {
-  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
+  // A memory opens by id (scope-independent) — works in global brain too.
   const modal = document.getElementById('mem-detail-modal');
   const body = document.getElementById('detail-modal-body');
   document.getElementById('detail-modal-title').textContent = `메모리 #${id}`;

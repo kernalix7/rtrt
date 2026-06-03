@@ -2606,10 +2606,15 @@ impl MemoryStore {
                     if idx.node_cluster.get(&id_pos[i]) != Some(&dom_root) {
                         continue;
                     }
+                    // Signature = rarest SHARED, word-like token. Skip pure-numeric
+                    // tokens (PR/issue numbers, counts) — they make noise topics.
                     let sig = rows[i]
                         .1
                         .iter()
-                        .filter(|t| inverted.get(t.as_str()).map(|v| v.len()).unwrap_or(0) >= 2)
+                        .filter(|t| {
+                            inverted.get(t.as_str()).map(|v| v.len()).unwrap_or(0) >= 2
+                                && t.chars().any(|c| !c.is_numeric())
+                        })
                         .min_by_key(|t| inverted[t.as_str()].len())
                         .map(|t| t.as_str());
                     match sig {

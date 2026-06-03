@@ -157,7 +157,18 @@
   .memmap-crumbs .crumb.current { color: var(--muted); cursor: default; }
   .memmap-crumbs .crumb.current:hover { background: none; }
   .memmap-crumbs .crumb-sep { color: var(--muted); }
-  .memmap-cy { width: 100%; height: 70vh; min-height: 360px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; }
+  .memmap-cy {
+    width: 100%; height: 70vh; min-height: 360px; border-radius: 12px;
+    /* Deep "space" canvas with a faint dot grid — the constellation backdrop. */
+    background-color: #0b0e14;
+    background-image:
+      radial-gradient(circle at 30% 20%, rgba(124,58,237,0.10), transparent 45%),
+      radial-gradient(circle at 75% 75%, rgba(6,182,212,0.10), transparent 45%),
+      radial-gradient(circle, rgba(150,165,200,0.16) 0.6px, transparent 0.6px);
+    background-size: 100% 100%, 100% 100%, 18px 18px;
+    border: 1px solid #1e2533;
+    box-shadow: inset 0 0 80px rgba(0,0,0,0.5);
+  }
   .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
   .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
   .member-row:hover { border-color: var(--accent); }
@@ -2676,64 +2687,83 @@ function memmapCatchAllId(clusters) {
 // Cytoscape style sheet: node size scaled (clamped) by cluster size, colour by
 // dominant_source, the catch-all/misc cluster muted + dashed + small. Reuses the
 // dashboard CSS vars by reading them off :root at init time.
+// Vibrant categorical palette (bright on the dark canvas) — each bubble gets a
+// colour from its id so the map reads as a varied constellation, not a grey mass.
+const MEMMAP_PALETTE = [
+  '#7c3aed', '#10b981', '#3b82f6', '#f97316', '#06b6d4', '#eab308',
+  '#ec4899', '#ef4444', '#8b5cf6', '#14b8a6', '#f59e0b', '#22d3ee',
+  '#a855f7', '#34d399', '#60a5fa', '#fb923c', '#2dd4bf', '#f472b6',
+];
+function memmapColor(key) {
+  const s = String(key);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return MEMMAP_PALETTE[h % MEMMAP_PALETTE.length];
+}
+
 function memmapCyStyle() {
-  const css = getComputedStyle(document.documentElement);
-  const accent = (css.getPropertyValue('--accent') || '#2962FF').trim();
-  const muted = (css.getPropertyValue('--muted') || '#64748b').trim();
-  const border = (css.getPropertyValue('--border') || '#e5e7eb').trim();
-  const fg = (css.getPropertyValue('--fg') || '#0f172a').trim();
   return [
     {
       selector: 'node',
       style: {
-        'background-color': muted,
+        'background-color': 'data(col)',
+        'background-opacity': 0.95,
+        // Soft colour halo behind each node = the "glow" constellation look.
+        'underlay-color': 'data(col)',
+        'underlay-opacity': 0.30,
+        'underlay-padding': 6,
+        'underlay-shape': 'ellipse',
         'label': 'data(label)',
         'width': 'data(size)',
         'height': 'data(size)',
         'font-size': '10px',
-        'color': fg,
+        'color': '#e6edf3',
         'text-valign': 'bottom',
         'text-halign': 'center',
         'text-margin-y': 4,
         'text-wrap': 'ellipsis',
-        'text-max-width': '120px',
-        'border-width': 1,
-        'border-color': border,
-        'min-zoomed-font-size': 6,
+        'text-max-width': '130px',
+        'text-outline-width': 2,
+        'text-outline-color': '#0b0e14',
+        'text-outline-opacity': 0.9,
+        'border-width': 1.5,
+        'border-color': 'rgba(255,255,255,0.28)',
+        'min-zoomed-font-size': 7,
       },
     },
-    { selector: 'node[src = "main"]', style: { 'background-color': accent } },
-    { selector: 'node[src = "subagent"]', style: { 'background-color': '#7c3aed' } },
-    { selector: 'node[src = "mixed"]', style: { 'background-color': muted } },
+    // Source shows as a coloured ring so the categorical fill stays varied.
+    { selector: 'node[src = "main"]', style: { 'border-color': 'rgba(96,165,250,0.85)' } },
+    { selector: 'node[src = "subagent"]', style: { 'border-color': 'rgba(167,139,250,0.9)' } },
+    { selector: 'node[src = "mixed"]', style: { 'border-color': 'rgba(255,255,255,0.28)' } },
     {
       selector: 'node[?misc]',
-      style: { 'background-color': muted, 'border-style': 'dashed', 'opacity': 0.55 },
+      style: { 'border-style': 'dashed', 'background-opacity': 0.5, 'underlay-opacity': 0.15 },
     },
     {
       selector: 'node.dim',          // hidden by source filter / search miss
-      style: { 'opacity': 0.12, 'text-opacity': 0.12 },
+      style: { 'opacity': 0.1, 'text-opacity': 0.05, 'underlay-opacity': 0 },
     },
     {
       selector: 'node.hit',          // search match highlight
-      style: { 'border-width': 3, 'border-color': accent },
+      style: { 'border-width': 3.5, 'border-color': '#fde047', 'underlay-opacity': 0.55 },
     },
     {
       selector: 'edge',
       style: {
-        'width': 'mapData(w, 1, 4, 1.4, 4.5)',
-        'line-color': muted,
-        'opacity': 0.55,
+        'width': 'mapData(w, 1, 4, 0.8, 3)',
+        'line-color': 'rgba(120,160,220,0.9)',
+        'opacity': 0.22,
         'curve-style': 'straight',   // repositions live with the continuous sim
       },
     },
-    // Edges touching a hovered/selected node pop so connections read clearly.
     {
       selector: 'node:selected',
-      style: { 'border-width': 3, 'border-color': accent },
+      style: { 'border-width': 3.5, 'border-color': '#fde047', 'underlay-opacity': 0.6 },
     },
+    // Edges touching a hovered/selected node pop so connections read clearly.
     {
       selector: 'edge.hl',
-      style: { 'line-color': accent, 'opacity': 0.95, 'width': 'mapData(w, 1, 4, 2.5, 6)', 'z-index': 9 },
+      style: { 'line-color': '#fde047', 'opacity': 0.95, 'width': 'mapData(w, 1, 4, 2, 5)', 'z-index': 9 },
     },
   ];
 }
@@ -2892,6 +2922,7 @@ function memmapOverviewElements(payload) {
     return {
       data: {
         id, label, size: Math.round(diam), src: dom,
+        col: isMisc ? '#5b6472' : memmapColor(c.label || id),
         misc: isMisc ? 1 : undefined,
         kindType: 'cluster', clusterId: id, dom,
         token: c.token != null ? String(c.token) : '',
@@ -2924,6 +2955,7 @@ function memmapMemberElements(payload) {
     return {
       data: {
         id: String(n.id), label: preview, size: 30, src: source,
+        col: memmapColor(n.kind || n.id),
         kindType: 'member', memId: String(n.id || ''),
       },
     };

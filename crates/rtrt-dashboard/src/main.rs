@@ -1549,8 +1549,9 @@ async fn memory_graph_overview(
         _ => "auto",
     };
     // 세밀도(granularity): bubble target. Explicit value (clamped) wins; otherwise
-    // scale with project size — a bigger project gets MORE bubbles so the
-    // lexical "미분류" catch-all is split finer instead of dominating as one blob.
+    // default to a clean, airy count — agentmemory stays uncluttered by distilling
+    // to few-but-meaningful nodes, so scale gently with project size (~sqrt(n))
+    // and clamp low: a 20k project lands ~140 bubbles, a small project ~60.
     let target = match target_pref {
         Some(t) => t.clamp(24, 1000),
         None => {
@@ -1558,7 +1559,7 @@ async fn memory_graph_overview(
                 let guard = store.lock().await;
                 guard.count_by_project(project).unwrap_or(0)
             };
-            ((n as f64).sqrt() * 3.0).round().clamp(300.0, 600.0) as usize
+            (n as f64).sqrt().round().clamp(60.0, 200.0) as usize
         }
     };
 

@@ -159,16 +159,27 @@
   .memmap-crumbs .crumb-sep { color: var(--muted); }
   .memmap-cy {
     width: 100%; height: 70vh; min-height: 360px; border-radius: 12px;
-    /* Deep "space" canvas with a faint dot grid — the constellation backdrop. */
-    background-color: #0b0e14;
+    position: relative;
+    /* Clean airy canvas: warm off-white with a faint dot grid (agentmemory look). */
+    background-color: #F9F9F7;
     background-image:
-      radial-gradient(circle at 30% 20%, rgba(124,58,237,0.10), transparent 45%),
-      radial-gradient(circle at 75% 75%, rgba(6,182,212,0.10), transparent 45%),
-      radial-gradient(circle, rgba(150,165,200,0.16) 0.6px, transparent 0.6px);
-    background-size: 100% 100%, 100% 100%, 18px 18px;
-    border: 1px solid #1e2533;
-    box-shadow: inset 0 0 80px rgba(0,0,0,0.5);
+      radial-gradient(circle, #D4D4CF 0.5px, transparent 0.5px);
+    background-size: 16px 16px;
+    border: 1px solid #E2E2DC;
   }
+  /* Floating hover card over the map (Cytoscape has no built-in tooltip). */
+  .memmap-tooltip {
+    position: absolute; z-index: 10; display: none; pointer-events: none;
+    background: rgba(255,255,255,0.92); backdrop-filter: blur(12px);
+    border: 1px solid rgba(17,17,17,0.08); border-radius: 8px;
+    padding: 10px 14px; max-width: 260px; font-family: var(--font-ui, inherit);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06);
+    transition: opacity 0.15s ease;
+  }
+  .memmap-tooltip.visible { display: block; }
+  .memmap-tooltip .tt-name { font-weight: 700; color: #111; margin-bottom: 5px; font-size: 13px; word-break: break-word; }
+  .memmap-tooltip .tt-type { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; padding: 2px 6px; border-radius: 3px; display: inline-block; color: #fff; }
+  .memmap-tooltip .tt-conns { font-size: 10px; color: #999; margin-top: 7px; border-top: 1px solid rgba(17,17,17,0.08); padding-top: 6px; font-family: ui-monospace, monospace; }
   .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
   .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
   .member-row:hover { border-color: var(--accent); }
@@ -707,8 +718,12 @@
             <div id="memmap-crumbs" class="memmap-crumbs" hidden></div>
             <div id="memmap-overview-head" class="memmap-head"></div>
 
-            <!-- Cytoscape renders the node graph into this container. -->
-            <div id="cy" class="memmap-cy"></div>
+            <!-- Cytoscape renders the node graph into this container. The tooltip
+                 is an absolutely-positioned sibling inside this relative wrapper. -->
+            <div class="memmap-cy-wrap" style="position:relative;">
+              <div id="cy" class="memmap-cy"></div>
+              <div id="memmap-tooltip" class="memmap-tooltip" aria-hidden="true"></div>
+            </div>
             <!-- Fallback when the graph library fails to load (offline) or no data. -->
             <div id="memmap-fallback" class="memmap-member-list" hidden></div>
             <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
@@ -2684,21 +2699,19 @@ function memmapCatchAllId(clusters) {
   return null;
 }
 
-// Cytoscape style sheet: node size scaled (clamped) by cluster size, colour by
-// dominant_source, the catch-all/misc cluster muted + dashed + small. Reuses the
-// dashboard CSS vars by reading them off :root at init time.
-// Vibrant categorical palette (bright on the dark canvas) — each bubble gets a
-// colour from its id so the map reads as a varied constellation, not a grey mass.
-const MEMMAP_PALETTE = [
-  '#7c3aed', '#10b981', '#3b82f6', '#f97316', '#06b6d4', '#eab308',
-  '#ec4899', '#ef4444', '#8b5cf6', '#14b8a6', '#f59e0b', '#22d3ee',
-  '#a855f7', '#34d399', '#60a5fa', '#fb923c', '#2dd4bf', '#f472b6',
-];
-function memmapColor(key) {
-  const s = String(key);
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return MEMMAP_PALETTE[h % MEMMAP_PALETTE.length];
+// Small, purposeful palette keyed to MEANING (source), not a per-id hash —
+// agentmemory-style gold/blue/green. Main = blue, subagent = gold, mixed = green,
+// catch-all/misc = neutral grey. This is what makes the map read as clean +
+// structured instead of an 18-colour rainbow.
+const MEMMAP_PALETTE = {
+  main: '#1D4E89',      // deep blue
+  subagent: '#B8860B',  // gold
+  mixed: '#2D6A4F',     // green
+  misc: '#9CA3AF',      // neutral grey (catch-all)
+};
+// Colour a node by its source bucket ('main' | 'subagent' | 'mixed').
+function memmapColor(source) {
+  return MEMMAP_PALETTE[String(source)] || MEMMAP_PALETTE.mixed;
 }
 
 function memmapCyStyle() {
@@ -2707,63 +2720,67 @@ function memmapCyStyle() {
       selector: 'node',
       style: {
         'background-color': 'data(col)',
-        'background-opacity': 0.95,
-        // Soft colour halo behind each node = the "glow" constellation look.
-        'underlay-color': 'data(col)',
-        'underlay-opacity': 0.30,
-        'underlay-padding': 6,
-        'underlay-shape': 'ellipse',
+        'background-opacity': 0.92,
+        'shape': 'ellipse',
         'label': 'data(label)',
         'width': 'data(size)',
         'height': 'data(size)',
         'font-size': '10px',
-        'color': '#e6edf3',
+        'font-family': 'var(--font-ui, sans-serif)',
+        'color': '#4b5563',          // dark label text on the light canvas
         'text-valign': 'bottom',
         'text-halign': 'center',
         'text-margin-y': 4,
         'text-wrap': 'ellipsis',
         'text-max-width': '130px',
+        // Subtle white halo keeps labels readable over the dot grid (no heavy glow).
         'text-outline-width': 2,
-        'text-outline-color': '#0b0e14',
+        'text-outline-color': '#F9F9F7',
         'text-outline-opacity': 0.9,
         'border-width': 1.5,
-        'border-color': 'rgba(255,255,255,0.28)',
-        'min-zoomed-font-size': 7,
+        'border-color': 'rgba(17,17,17,0.12)',
+        'min-zoomed-font-size': 8,
       },
     },
-    // Source shows as a coloured ring so the categorical fill stays varied.
-    { selector: 'node[src = "main"]', style: { 'border-color': 'rgba(96,165,250,0.85)' } },
-    { selector: 'node[src = "subagent"]', style: { 'border-color': 'rgba(167,139,250,0.9)' } },
-    { selector: 'node[src = "mixed"]', style: { 'border-color': 'rgba(255,255,255,0.28)' } },
+    // SHAPES carry meaning (agentmemory-style): cluster/group bubbles are ellipse
+    // hubs; leaf member nodes are round-rectangles ("things" hanging off a hub).
+    { selector: 'node[kindType = "cluster"]', style: { 'shape': 'ellipse' } },
+    { selector: 'node[kindType = "member"]', style: { 'shape': 'round-rectangle' } },
+    // Catch-all / misc bubble: neutral, dashed, visually set apart from real groups.
     {
       selector: 'node[?misc]',
-      style: { 'border-style': 'dashed', 'background-opacity': 0.5, 'underlay-opacity': 0.15 },
+      style: { 'border-style': 'dashed', 'border-color': 'rgba(17,17,17,0.20)', 'background-opacity': 0.45 },
     },
     {
       selector: 'node.dim',          // hidden by source filter / search miss
-      style: { 'opacity': 0.1, 'text-opacity': 0.05, 'underlay-opacity': 0 },
+      style: { 'opacity': 0.12, 'text-opacity': 0.06 },
     },
     {
-      selector: 'node.hit',          // search match highlight
-      style: { 'border-width': 3.5, 'border-color': '#fde047', 'underlay-opacity': 0.55 },
+      selector: 'node.hit',          // search match highlight (red ring, agentmemory)
+      style: { 'border-width': 3, 'border-color': '#CC0000' },
     },
     {
       selector: 'edge',
       style: {
-        'width': 'mapData(w, 1, 4, 0.8, 3)',
-        'line-color': 'rgba(120,160,220,0.9)',
-        'opacity': 0.22,
+        'width': 'mapData(w, 1, 4, 1, 2.5)',
+        'line-color': '#C8C8C2',     // thin light grey
+        'opacity': 0.45,
         'curve-style': 'straight',   // repositions live with the continuous sim
       },
     },
+    // Hover / selection: soft accent glow only here (not a permanent halo).
     {
       selector: 'node:selected',
-      style: { 'border-width': 3.5, 'border-color': '#fde047', 'underlay-opacity': 0.6 },
+      style: {
+        'border-width': 3, 'border-color': '#1D4E89',
+        'underlay-color': '#1D4E89', 'underlay-opacity': 0.18,
+        'underlay-padding': 6, 'underlay-shape': 'ellipse',
+      },
     },
     // Edges touching a hovered/selected node pop so connections read clearly.
     {
       selector: 'edge.hl',
-      style: { 'line-color': '#fde047', 'opacity': 0.95, 'width': 'mapData(w, 1, 4, 2, 5)', 'z-index': 9 },
+      style: { 'line-color': '#1D4E89', 'opacity': 0.85, 'width': 'mapData(w, 1, 4, 2, 4)', 'z-index': 9 },
     },
   ];
 }
@@ -2815,10 +2832,65 @@ function memmapEnsureCy() {
       if (/^\d+$/.test(num)) openDetailModal(Number(num));
     }
   });
-  // Hover a node: light up its connecting edges so links are easy to follow.
-  memmapCy.on('mouseover', 'node', (ev) => ev.target.connectedEdges().addClass('hl'));
-  memmapCy.on('mouseout', 'node', () => memmapCy.edges('.hl').removeClass('hl'));
+  // Hover a node: light up its connecting edges + show the agentmemory-style card.
+  memmapCy.on('mouseover', 'node', (ev) => {
+    ev.target.connectedEdges().addClass('hl');
+    memmapShowTooltip(ev.target);
+  });
+  memmapCy.on('mouseout', 'node', () => {
+    memmapCy.edges('.hl').removeClass('hl');
+    memmapHideTooltip();
+  });
+  // Track the cursor so the card follows it (offset +12px, like agentmemory).
+  memmapCy.on('mousemove', 'node', (ev) => memmapMoveTooltip(ev));
+  // Any pan/zoom/tap-on-background dismisses the card so it never sticks.
+  memmapCy.on('pan zoom', () => memmapHideTooltip());
+  memmapCy.on('tap', (ev) => { if (ev.target === memmapCy) memmapHideTooltip(); });
   return memmapCy;
+}
+
+// Hover card (agentmemory style): "<name> · <TYPE> · N connections". TYPE is
+// derived from kindType + misc (클러스터 / 메모리 / 미분류); connection count is the
+// live cy node degree. The card is a DOM div positioned over the .memmap-cy-wrap.
+function memmapTooltipMeta(node) {
+  const data = node.data();
+  if (data.misc) return { type: '미분류', col: MEMMAP_PALETTE.misc };
+  if (data.kindType === 'member') return { type: '메모리', col: memmapColor(data.src || 'mixed') };
+  return { type: '클러스터', col: memmapColor(data.src || 'mixed') };
+}
+function memmapShowTooltip(node) {
+  const tip = document.getElementById('memmap-tooltip');
+  if (!tip) return;
+  const data = node.data();
+  const meta = memmapTooltipMeta(node);
+  const name = String(data.rawLabel || data.label || data.id || '');
+  const conns = node.degree(false);   // edges touching this node (live)
+  tip.innerHTML = '';
+  const nm = document.createElement('div');
+  nm.className = 'tt-name';
+  nm.textContent = name || '(이름 없음)';
+  const ty = document.createElement('div');
+  ty.className = 'tt-type';
+  ty.textContent = meta.type;
+  ty.style.backgroundColor = meta.col;
+  const cn = document.createElement('div');
+  cn.className = 'tt-conns';
+  cn.textContent = `${conns} connections`;
+  tip.appendChild(nm);
+  tip.appendChild(ty);
+  tip.appendChild(cn);
+  tip.classList.add('visible');
+}
+function memmapMoveTooltip(ev) {
+  const tip = document.getElementById('memmap-tooltip');
+  if (!tip || !ev.renderedPosition) return;
+  // renderedPosition is relative to the cy canvas, which fills .memmap-cy-wrap.
+  tip.style.left = `${Math.round(ev.renderedPosition.x) + 12}px`;
+  tip.style.top = `${Math.round(ev.renderedPosition.y) + 12}px`;
+}
+function memmapHideTooltip() {
+  const tip = document.getElementById('memmap-tooltip');
+  if (tip) tip.classList.remove('visible');
 }
 
 // Set the current level kind and toggle controls. 'overview'/'group' are bubble
@@ -2902,10 +2974,11 @@ function memmapOverviewElements(payload) {
   const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
   const edges = Array.isArray(payload.cluster_edges) ? payload.cluster_edges : [];
   const catchAllId = memmapCatchAllId(clusters);
-  // Size scaling: clamp node diameter so the biggest cluster never dwarfs the rest.
+  // Size scaling: clamp node diameter so a few hubs read clearly while satellites
+  // stay small (hub-and-spoke). Tighter range than before keeps the map airy.
   const sizes = clusters.map(c => Number(c.size || 0));
   const maxSize = Math.max(1, ...sizes);
-  const SCALE_MIN = 22, SCALE_MAX = 80;
+  const SCALE_MIN = 18, SCALE_MAX = 58;
   const ids = new Set();
   const nodes = clusters.map(c => {
     const id = String(c.id);
@@ -2922,7 +2995,8 @@ function memmapOverviewElements(payload) {
     return {
       data: {
         id, label, size: Math.round(diam), src: dom,
-        col: isMisc ? '#5b6472' : memmapColor(c.label || id),
+        // Colour by MEANING (source), neutral grey for the catch-all.
+        col: isMisc ? memmapColor('misc') : memmapColor(dom),
         misc: isMisc ? 1 : undefined,
         kindType: 'cluster', clusterId: id, dom,
         token: c.token != null ? String(c.token) : '',
@@ -2954,9 +3028,11 @@ function memmapMemberElements(payload) {
     const preview = String(n.label || n.preview || n.body || n.id || '');
     return {
       data: {
-        id: String(n.id), label: preview, size: 30, src: source,
-        col: memmapColor(n.kind || n.id),
+        id: String(n.id), label: preview, size: 24, src: source,
+        // Member colour also keyed to source (main/subagent/mixed), not a hash.
+        col: memmapColor(source),
         kindType: 'member', memId: String(n.id || ''),
+        rawLabel: preview,
       },
     };
   });

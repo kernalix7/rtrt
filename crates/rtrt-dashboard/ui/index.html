@@ -3107,6 +3107,10 @@ function memmapStopLayout() {
 // extension fails to load.
 function memmapRunLayout() {
   if (!memmapCy) return;
+  // Re-sync Cytoscape to the live container size first. Drilling shows/hides the
+  // breadcrumb, which changes #cy's height; without resize() the internal
+  // viewport stays stale and click hit-testing lands on the wrong coordinates.
+  try { memmapCy.resize(); } catch (_) { /* ignore */ }
   const n = memmapCy.nodes().length;
   memmapStopLayout();
   if (memmapRegisterCola()) {

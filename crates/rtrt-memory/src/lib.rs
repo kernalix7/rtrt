@@ -314,6 +314,130 @@ fn token_set(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Curated linguistic STOP-WORD set for the "digital brain" concept salience —
+/// LINGUISTIC REFERENCE DATA, not a tunable magic number. These tokens are
+/// excluded from concept candidates (and from co-occurrence) because they carry
+/// no topical signal no matter how frequent they are: a brain whose top concepts
+/// are "have"/"could"/"the" tells the user nothing, so distinctive
+/// project/topic terms (tessellate / jacobian / podman / x86 / auth …) can only
+/// surface once these are removed.
+///
+/// Two families, both function-word-like:
+/// 1. English function words — auxiliaries / modals / pronouns / determiners /
+///    prepositions / conjunctions / common adverbs. A concept is *about*
+///    something; these are pure glue.
+/// 2. Generic dev-log VERBS — "completed"/"added"/"fixed"/"working"… A memory
+///    store of agent work logs is saturated with these; they describe the *act*
+///    of working, never the *topic* worked on.
+///
+/// Kept lowercase (matches [`token_set`] output) and SORTED so membership is an
+/// `O(log n)` `binary_search` with zero per-call allocation. Only tokens of ≥3
+/// chars can ever be candidates (see [`token_set`]), so 1–2-char words are
+/// already excluded and are intentionally absent here.
+///
+/// Family 1 (function words) and family 2 (dev-log verbs) are merged into one
+/// sorted slice below; the section comments above describe intent, but the data
+/// is kept flat-and-sorted for the `binary_search`.
+static STOP_WORDS: &[&str] = &[
+    "about", "add", "added", "adding", "adds", "after", "again", "against",
+    "all", "also", "although", "always", "among", "and", "another", "any",
+    "are", "around", "because", "been", "before", "being", "between",
+    "both", "but", "can", "cannot", "change", "changed", "changes",
+    "changing", "check", "checked", "checking", "checks", "complete",
+    "completed", "completes", "completing", "continue", "continued",
+    "continuing", "could", "create", "created", "creates", "creating",
+    "cross", "did", "does", "doing", "done", "down", "during", "each",
+    "either", "else", "ensure", "ensured", "ensures", "etc", "even", "ever",
+    "every", "facing", "few", "find", "finding", "finds", "fix", "fixed",
+    "fixes", "fixing", "for", "found", "from", "further", "get", "gets",
+    "getting", "got", "had", "has", "have", "having", "here", "hers",
+    "herself", "him", "himself", "his", "how", "however", "into", "its",
+    "itself", "just", "less", "like", "look", "looked", "looking", "looks",
+    "made", "make", "makes", "making", "many", "may", "might", "more",
+    "most", "much", "must", "need", "needed", "needs", "neither", "never",
+    "new", "nor", "not", "now", "off", "once", "one", "only", "onto",
+    "other", "our", "ours", "ourselves", "out", "over", "own", "per", "ran",
+    "rather", "run", "running", "runs", "same", "see", "seen", "shall",
+    "should", "since", "some", "start", "started", "starting", "starts",
+    "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "these", "they", "this", "those", "through", "thus",
+    "too", "try", "trying", "two", "under", "understand", "understood",
+    "until", "update", "updated", "updates", "updating", "upon", "use",
+    "used", "uses", "using", "verified", "verifies", "verify", "verifying",
+    "very", "via", "want", "wanted", "wants", "was", "were", "what", "when",
+    "where", "whether", "which", "while", "who", "whom", "whose", "why",
+    "will", "with", "within", "without", "work", "worked", "working",
+    "works", "would", "you", "your", "yours", "yourself",
+];
+
+/// `true` when `tok` is in the curated [`STOP_WORDS`] set. Binary search over the
+/// sorted slice — deterministic, allocation-free. NOTE: relies on [`STOP_WORDS`]
+/// being sorted; a `cfg(test)` test asserts that invariant.
+fn is_stop_word(tok: &str) -> bool {
+    STOP_WORDS.binary_search(&tok).is_ok()
+}
+
+/// Conservative single-step morphological base for merging surface variants
+/// (`identifiers` → `identifier`, `occurrences` → `occurrence`, `facing` →
+/// `face`). Returns `Some(base)` only for a SAFE strip; `None` when no rule
+/// applies. This is *candidate* generation only — the caller keeps the stripped
+/// form **just** when `base` is itself an attested corpus token (data-driven),
+/// so it never mangles words like `class` → `clas` or `address` → `addres`.
+///
+/// Rules (first match wins), each requiring the base to stay ≥3 chars so we
+/// never collapse a word into noise:
+/// - `-ies` → `-y`   (`bodies` → `body`)
+/// - `-es`  → `-e` or bare (`occurrences`→`occurrence` checked by caller as
+///   `occurrenc(e)`; here we strip the trailing `s`, the `-e` is recovered by
+///   the caller's attestation check against both `occurrenc` and `occurrence`)
+/// - `-s`   → bare  (`identifiers` → `identifier`)
+/// - `-ing` → bare or `+e` (`facing` → `fac`/`face`)
+/// - `-ed`  → bare or `+e` (`faced` → `fac`/`face`)
+///
+/// Returns up to a few candidate bases (e.g. `fac` and `face` for `facing`); the
+/// caller picks whichever is attested. Kept dependency-free and allocation-lean.
+fn inflection_bases(tok: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(2);
+    let n = tok.chars().count();
+    let push = |s: String, out: &mut Vec<String>| {
+        if s.chars().count() >= 3 && !out.iter().any(|e| e == &s) {
+            out.push(s);
+        }
+    };
+    // -ies → -y (bodies → body). Needs the strip to leave ≥3 chars after +y.
+    if n >= 5 && tok.ends_with("ies") {
+        let stem = &tok[..tok.len() - 3];
+        push(format!("{stem}y"), &mut out);
+    }
+    // -ing → stem and stem+e (facing → fac, face). 'ing' only.
+    if n >= 6 && tok.ends_with("ing") {
+        let stem = &tok[..tok.len() - 3];
+        push(stem.to_string(), &mut out);
+        push(format!("{stem}e"), &mut out);
+    }
+    // -ed → stem and stem+e (faced → fac, face).
+    if n >= 5 && tok.ends_with("ed") {
+        let stem = &tok[..tok.len() - 2];
+        push(stem.to_string(), &mut out);
+        push(format!("{stem}e"), &mut out);
+    }
+    // -es → stem (occurrences → occurrence via stem 'occurrenc' + 'e', boxes →
+    // box). Push both the bare stem and stem+e so the caller's attestation check
+    // recovers either spelling.
+    if n >= 5 && tok.ends_with("es") {
+        let stem = &tok[..tok.len() - 2];
+        push(stem.to_string(), &mut out);
+        push(format!("{stem}e"), &mut out);
+    }
+    // -s plural (identifiers → identifier). Guard against -ss (class, address)
+    // and the already-handled -ies/-es so we don't double-strip.
+    if n >= 4 && tok.ends_with('s') && !tok.ends_with("ss") && !tok.ends_with("es") {
+        let stem = &tok[..tok.len() - 1];
+        push(stem.to_string(), &mut out);
+    }
+    out
+}
+
 /// Reduce a set of per-member `source_kind`s to a single dominant label:
 /// `"main"` / `"subagent"` when one non-empty source covers every labelled
 /// member, `"mixed"` otherwise (and when no member carries a source). Mirrors
@@ -3866,14 +3990,24 @@ impl MemoryStore {
     ///   concept appearing in several projects bridges them (its `projects`
     ///   lists each one).
     ///
-    /// Pipeline:
+    /// Pipeline (entirely LLM-free; salience is data-driven, no flat magic-number
+    /// cutoffs — every threshold is a formula over the corpus, plus a curated
+    /// linguistic [`STOP_WORDS`] reference set):
     /// 1. Load the bodies (project filter applied in SQL when scoped), tokenise
-    ///    each with [`token_set`]; keep only **word-like** tokens (≥1 non-digit
-    ///    char) so PR / issue numbers never become concepts.
+    ///    each with [`token_set`]; keep only **word-like, non-stop-word** tokens
+    ///    (≥1 non-digit + ≥1 alphabetic char, not in [`STOP_WORDS`]) so PR / issue
+    ///    numbers and function words / dev-log verbs never become concepts.
     /// 2. Document frequency (df) per token + the set of projects it appears in.
-    /// 3. Keep tokens whose df is in `[MIN_DF, df_cap]` — drops hapax/noise below
-    ///    and stop-words above (`df_cap = max(MIN_DF+1, min(total/3, DF_ABS_CAP))`).
-    ///    Rank survivors by df desc and keep the top `max_concepts`.
+    /// 3. NORMALISE then SUPPRESS, both data-driven. First merge morphological
+    ///    variants (identifiers→identifier, occurrences→occurrence, facing→face)
+    ///    into one concept, but ONLY when the stripped base is an attested corpus
+    ///    token (so class↛clas); the concept NAME is the group's most-common
+    ///    surface form, df/freq aggregate over the group (distinct docs, no
+    ///    double-count). Then apply a DYNAMIC corpus-generic ceiling: drop groups
+    ///    above the ~93rd percentile of candidate group df (derived from the df
+    ///    distribution, not a constant) so the handful of corpus-ubiquitous tokens
+    ///    are cut while mid-frequency distinctive terms survive. Keep the MIN_DF
+    ///    floor, rank survivors by df desc, keep the top `max_concepts`.
     /// 4. EDGES: for each memory take its concept tokens, cap to the rarest
     ///    `PER_MEM_CAP` (rarest = lowest df, the most informative; bounds cost),
     ///    and increment co-occurrence for every unordered pair. Keep pairs with
@@ -3940,11 +4074,21 @@ impl MemoryStore {
                             id
                         }
                     };
-                    // Word-like tokens only: a concept must carry a non-digit
-                    // char, so "1234" / "#42" never becomes a node.
+                    // Candidate tokens only. Three filters, cheapest first:
+                    //   - word-like: at least one non-digit char, so "1234" /
+                    //     "#42" never becomes a node (all-digit tokens dropped);
+                    //   - not a curated STOP_WORD (function word / dev-log verb)
+                    //     — excluded from BOTH concepts and co-occurrence, so a
+                    //     stop-word can never even contribute an edge;
+                    //   - ≥1 alphabetic char so pure-symbol noise can't slip in.
+                    // token_set already enforces ≥3 chars + alphanumeric/Hangul.
                     let mut ids: Vec<u32> = token_set(&body)
                         .into_iter()
-                        .filter(|t| t.chars().any(|c| !c.is_ascii_digit()))
+                        .filter(|t| {
+                            t.chars().any(|c| !c.is_ascii_digit())
+                                && t.chars().any(char::is_alphabetic)
+                                && !is_stop_word(t)
+                        })
                         .map(|t| match tok_intern.get(t.as_str()) {
                             Some(&id) => id,
                             None => {
@@ -3998,41 +4142,173 @@ impl MemoryStore {
             }
         }
 
-        // 3. Keep band: drop hapax (< MIN_DF) and stop-words (> df_cap). The
-        // cap scales with the corpus (total / 3) but is clamped to
-        // `[MIN_DF + 1, DF_ABS_CAP]` so a tiny corpus still admits real concepts
-        // and a giant store still sheds genuine stop-words.
-        let df_cap = (total_memories / 3).clamp(MIN_DF + 1, DF_ABS_CAP);
-        // Rank by df desc (then name asc for determinism); keep top max_concepts.
-        let mut kept: Vec<u32> = (0..n_tokens as u32)
-            .filter(|&id| df[id as usize] >= MIN_DF && df[id as usize] <= df_cap)
+        // 3a. NORMALISE — merge simple morphological variants into one concept.
+        // For every token, ask `inflection_bases` for conservative stripped forms
+        // (identifiers→identifier, occurrences→occurrence, facing→fac/face) and
+        // redirect the token onto a base ONLY when that base is itself an attested
+        // corpus token (`tok_intern` hit). Data-driven: an unattested strip
+        // (class→clas, address→addres) finds no target and the surface form is
+        // kept verbatim, so we never mangle a word. `merge_root[old]` follows the
+        // redirect chain (with path compression) to the group representative.
+        let mut merge_root: Vec<u32> = (0..n_tokens as u32).collect();
+        for old in 0..n_tokens as u32 {
+            // Skip near-unique noise early: a hapax variant can't pull a real
+            // concept around, and resolving it wastes work.
+            if df[old as usize] == 0 {
+                continue;
+            }
+            let surface = tok_ids[old as usize].as_str();
+            // Prefer the attested base with the HIGHEST df (the dominant spelling
+            // of the lemma) so merges flow toward the most-used form.
+            let mut best: Option<(u32, usize)> = None;
+            for base in inflection_bases(surface) {
+                if base == surface {
+                    continue;
+                }
+                if let Some(&bid) = tok_intern.get(base.as_str()) {
+                    let bdf = df[bid as usize];
+                    if bdf > 0 && best.is_none_or(|(_, d)| bdf > d) {
+                        best = Some((bid, bdf));
+                    }
+                }
+            }
+            if let Some((bid, _)) = best {
+                merge_root[old as usize] = bid;
+            }
+        }
+        // Resolve every token to its group root (path-compressed). A two-hop
+        // chain (e.g. plural→singular→base) collapses to the final attested root.
+        fn find_root(merge_root: &mut [u32], mut x: u32) -> u32 {
+            while merge_root[x as usize] != x {
+                let parent = merge_root[x as usize];
+                merge_root[x as usize] = merge_root[parent as usize]; // halve path
+                x = merge_root[x as usize];
+            }
+            x
+        }
+        let mut group_root: Vec<u32> = vec![0; n_tokens];
+        for old in 0..n_tokens as u32 {
+            group_root[old as usize] = find_root(&mut merge_root, old);
+        }
+
+        // 3b. Per-GROUP document frequency, projects, and the dominant surface
+        // form. Group df is counted as DISTINCT docs containing ANY member (one
+        // pass over docs with a per-group "seen this doc" stamp) so two variants
+        // in the same body never double-count. The group's NAME is its
+        // highest-df member surface form (ties broken lexicographically), which
+        // — being a real token — still appears verbatim in bodies, so
+        // `concept_memories` keeps matching it.
+        let mut gdf: Vec<usize> = vec![0; n_tokens]; // indexed by group-root id
+        let mut gprojects: Vec<std::collections::BTreeSet<u32>> =
+            vec![std::collections::BTreeSet::new(); n_tokens];
+        let mut seen_stamp: Vec<u32> = vec![u32::MAX; n_tokens];
+        for (doc_no, (pid, ids)) in docs.iter().enumerate() {
+            let stamp = doc_no as u32;
+            for &id in ids {
+                let g = group_root[id as usize] as usize;
+                gprojects[g].insert(*pid);
+                if seen_stamp[g] != stamp {
+                    seen_stamp[g] = stamp;
+                    gdf[g] += 1;
+                }
+            }
+        }
+        // Dominant surface form per group: highest member df, then lexicographic.
+        // Members contribute their *own* token df to the choice of spelling.
+        let mut group_name: Vec<u32> = (0..n_tokens as u32).collect(); // root -> name token id
+        let mut name_df: Vec<usize> = vec![0; n_tokens]; // df of the current name choice
+        for old in 0..n_tokens as u32 {
+            let g = group_root[old as usize] as usize;
+            let d = df[old as usize];
+            if d == 0 {
+                continue;
+            }
+            let better = d > name_df[g]
+                || (d == name_df[g]
+                    && tok_ids[old as usize].as_str() < tok_ids[group_name[g] as usize].as_str());
+            if name_df[g] == 0 || better {
+                name_df[g] = d;
+                group_name[g] = old;
+            }
+        }
+
+        // 3c. DYNAMIC corpus-generic ceiling — derived from the df DISTRIBUTION of
+        // the candidate GROUPS, never a flat constant. A token in a very high
+        // fraction of the scope (e.g. "identifiers" in a docstring-heavy store) is
+        // generic FOR THIS CORPUS even though it is no stop-word. We compute the
+        // ~93rd percentile of candidate group df and use it as the ceiling: the
+        // handful of corpus-ubiquitous groups above it are cut, while mid-
+        // frequency distinctive terms below it survive. The MIN_DF floor still
+        // drops hapax/noise. On a tiny corpus the percentile can collapse onto the
+        // max df, so we never let the ceiling fall below MIN_DF + 1.
+        const GENERIC_PCTL: f64 = 0.93;
+        let candidate_roots: Vec<u32> = (0..n_tokens as u32)
+            .filter(|&r| group_root[r as usize] == r && gdf[r as usize] >= MIN_DF)
+            .collect();
+        // Percentile over the candidate group df values (ascending). Empty/tiny
+        // sets fall back to the legacy total/3 cap so behaviour stays sane.
+        let df_ceiling = if candidate_roots.is_empty() {
+            (total_memories / 3).clamp(MIN_DF + 1, DF_ABS_CAP)
+        } else {
+            let mut dfs: Vec<usize> = candidate_roots.iter().map(|&r| gdf[r as usize]).collect();
+            dfs.sort_unstable();
+            let idx = ((dfs.len() as f64 - 1.0) * GENERIC_PCTL).round() as usize;
+            let pctl = dfs[idx.min(dfs.len() - 1)];
+            // Keep groups AT the percentile value; clamp into a sane band so a
+            // tiny corpus still admits concepts and a giant one still sheds the
+            // ubiquitous tail.
+            pctl.max(MIN_DF + 1).min(DF_ABS_CAP.max(MIN_DF + 1))
+        };
+
+        // Rank surviving groups by df desc (then name asc, deterministic); keep
+        // the top `max_concepts`. A group passes when its df is in
+        // `[MIN_DF, df_ceiling]`.
+        let mut kept: Vec<u32> = candidate_roots
+            .iter()
+            .copied()
+            .filter(|&r| gdf[r as usize] <= df_ceiling)
             .collect();
         kept.sort_by(|&a, &b| {
-            df[b as usize]
-                .cmp(&df[a as usize])
-                .then_with(|| tok_ids[a as usize].cmp(&tok_ids[b as usize]))
+            gdf[b as usize]
+                .cmp(&gdf[a as usize])
+                .then_with(|| {
+                    tok_ids[group_name[a as usize] as usize]
+                        .as_str()
+                        .cmp(tok_ids[group_name[b as usize] as usize].as_str())
+                })
         });
         kept.truncate(max_concepts);
 
-        // Concept old-id -> compact new index (0..kept.len()), plus per-concept
-        // name / df / freq arrays. `concept_of[old_id]` is the compact index or
-        // u32::MAX when the token is not a kept concept.
+        // Token old-id -> compact concept index, plus per-concept name / df /
+        // freq / projects. EVERY token whose group root is a kept concept maps to
+        // the SAME compact index, so a variant ("identifiers") and its canonical
+        // ("identifier") drive one shared node in the co-occurrence loop below.
+        // `concept_of[old_id]` is the compact index or u32::MAX otherwise.
+        let mut root_to_concept: Vec<u32> = vec![u32::MAX; n_tokens];
         let mut concept_of: Vec<u32> = vec![u32::MAX; n_tokens];
         let mut names: Vec<&str> = Vec::with_capacity(kept.len());
         let mut freqs: Vec<usize> = Vec::with_capacity(kept.len());
         // Per concept: its distinct projects (resolved from interned ids), sorted
         // for determinism. For the GLOBAL brain this is the project bridge list.
         let mut concept_projects: Vec<Vec<String>> = Vec::with_capacity(kept.len());
-        for &old in &kept {
-            concept_of[old as usize] = names.len() as u32;
-            names.push(tok_ids[old as usize].as_str());
-            freqs.push(df[old as usize]);
-            let mut projects: Vec<String> = tok_projects[old as usize]
+        for &root in &kept {
+            let ci = names.len() as u32;
+            root_to_concept[root as usize] = ci;
+            names.push(tok_ids[group_name[root as usize] as usize].as_str());
+            freqs.push(gdf[root as usize]);
+            let mut projects: Vec<String> = gprojects[root as usize]
                 .iter()
                 .map(|&pid| proj_ids[pid as usize].clone())
                 .collect();
             projects.sort();
             concept_projects.push(projects);
+        }
+        // Fan the compact index out to every member token of each kept group.
+        for old in 0..n_tokens as u32 {
+            let ci = root_to_concept[group_root[old as usize] as usize];
+            if ci != u32::MAX {
+                concept_of[old as usize] = ci;
+            }
         }
 
         // 4. Co-occurrence over concept tokens only. Per memory: select its
@@ -4053,6 +4329,16 @@ impl MemoryStore {
                     sel.push((i, freqs[i as usize]));
                 }
             }
+            if sel.len() < 2 {
+                continue;
+            }
+            // Dedup by concept index: after NORMALISE two variants in one body
+            // (e.g. "identifier" + "identifiers") map to the SAME concept, so
+            // without this they'd produce a spurious self-pair and over-weight the
+            // node. Sort-by-index then dedup is deterministic and cheap (≤ a few
+            // dozen tokens per body).
+            sel.sort_by(|a, b| a.0.cmp(&b.0));
+            sel.dedup_by_key(|p| p.0);
             if sel.len() < 2 {
                 continue;
             }
@@ -4521,31 +4807,165 @@ mod tests {
     }
 
     #[test]
-    fn concept_graph_excludes_hapax_and_stopwords() {
+    fn concept_graph_excludes_hapax_and_function_words() {
         let store = MemoryStore::open_in_memory().unwrap();
-        // Build a 30-memory corpus so df_cap = total/3 = 10 is meaningful.
-        // "common" → df 20 (> 10) → stop-word, dropped.
-        // "core"   → df 6  (within [3, 10]) → real concept, kept.
-        // "lonely" → df 1  (< MIN_DF = 3) → hapax, dropped.
+        // "core"   → df 6  → real concept, kept.
+        // "lonely" → df 1  → hapax (< MIN_DF = 3), dropped.
+        // "have" / "with" → curated function words, dropped no matter how often.
         for _ in 0..6 {
-            store.save("p1", "note", "common core widget").unwrap();
+            store.save("p1", "note", "have core with widget").unwrap();
         }
         for _ in 0..14 {
-            store.save("p1", "note", "common gadget thing").unwrap();
+            store.save("p1", "note", "have gadget with thing").unwrap();
         }
         for _ in 0..9 {
-            store.save("p1", "note", "filler topic alpha").unwrap();
+            store.save("p1", "note", "filler topic distinct").unwrap();
         }
-        store.save("p1", "note", "lonely outlier note").unwrap();
+        store.save("p1", "note", "lonely outlier zzznote").unwrap();
         let g = store.concept_graph(Some("p1"), 250, 750, 2).unwrap();
         assert_eq!(g.total_memories, 30);
         let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(!names.contains(&"lonely"), "hapax must be dropped");
         assert!(
-            !names.contains(&"common"),
-            "stop-word above df cap must be dropped"
+            !names.contains(&"have"),
+            "curated function word must be dropped"
+        );
+        assert!(
+            !names.contains(&"with"),
+            "curated function word must be dropped"
         );
         assert!(names.contains(&"core"), "real concept must survive");
+    }
+
+    /// STOP_WORDS must stay sorted (the `binary_search` membership test relies on
+    /// it) and carry no duplicates (a duplicate is a sign two families collided).
+    #[test]
+    fn stop_words_are_sorted_and_unique() {
+        for w in STOP_WORDS.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "STOP_WORDS must be strictly sorted/unique: {:?} !< {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        // Spot-check membership both ways.
+        assert!(is_stop_word("have"));
+        assert!(is_stop_word("completed"));
+        assert!(!is_stop_word("tessellate"));
+        assert!(!is_stop_word("jacobian"));
+    }
+
+    /// A curated stop word never becomes a concept even when it is the single
+    /// most frequent token in the scope.
+    #[test]
+    fn stop_word_is_excluded_even_when_ubiquitous() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "could" is in every body (df = 20) but is a function word; the
+        // distinctive "podman"/"jacobian"/"tessellate" terms are the real
+        // concepts. Vary the distinctive token so each clears MIN_DF.
+        for _ in 0..7 {
+            store.save("p1", "note", "could podman registry").unwrap();
+        }
+        for _ in 0..7 {
+            store.save("p1", "note", "could jacobian matrix").unwrap();
+        }
+        for _ in 0..6 {
+            store.save("p1", "note", "could tessellate mesh").unwrap();
+        }
+        let g = store.concept_graph(Some("p1"), 250, 750, 1).unwrap();
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(!names.contains(&"could"), "stop word must never be a concept");
+        assert!(names.contains(&"podman"), "distinctive term must survive");
+        assert!(names.contains(&"jacobian"), "distinctive term must survive");
+        assert!(
+            names.contains(&"tessellate"),
+            "distinctive term must survive"
+        );
+    }
+
+    /// Singular/plural (and -ing/-ed) variants whose base is attested in the
+    /// corpus merge into ONE concept: a single node, df aggregated over the
+    /// group, named by the dominant surface form.
+    #[test]
+    fn morphological_variants_merge_into_one_concept() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "identifier" (singular) is the dominant spelling: 8 bodies.
+        for _ in 0..8 {
+            store.save("p1", "note", "identifier parser lexer").unwrap();
+        }
+        // "identifiers" (plural) in 4 more bodies; base "identifier" is attested
+        // so the plural must redirect onto it -> ONE merged concept.
+        for _ in 0..4 {
+            store.save("p1", "note", "identifiers parser tokens").unwrap();
+        }
+        // Filler so MIN_DF and the percentile ceiling stay sane.
+        for i in 0..6 {
+            store
+                .save("p1", "note", &format!("filler topic numq{i}"))
+                .unwrap();
+        }
+        let g = store.concept_graph(Some("p1"), 250, 750, 2).unwrap();
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        // Exactly one of the two surface forms appears, and it's the dominant
+        // (singular) spelling.
+        assert!(
+            names.contains(&"identifier"),
+            "merged concept named by dominant surface form"
+        );
+        assert!(
+            !names.contains(&"identifiers"),
+            "plural variant must have merged away, not appear as its own node"
+        );
+        // df aggregates the whole group: 8 + 4 = 12 distinct bodies.
+        let node = g.nodes.iter().find(|n| n.name == "identifier").unwrap();
+        assert_eq!(node.freq, 12, "df aggregates over the merged group");
+        // The merge does not strip a word whose base is unattested: "parser" has
+        // no attested "pars" base, so it survives whole.
+        assert!(names.contains(&"parser"), "unattested strip must NOT happen");
+    }
+
+    /// A token in a very high FRACTION of the corpus is generic FOR THIS CORPUS
+    /// and is cut by the dynamic percentile ceiling, while a genuinely
+    /// distinctive mid-frequency token survives — no flat constant involved.
+    #[test]
+    fn dynamic_ceiling_drops_corpus_ubiquitous_token_keeps_distinctive() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "context" is sprinkled into nearly EVERY body (corpus-ubiquitous, like a
+        // docstring boilerplate word that is not a stop word). A broad spread of
+        // distinctive mid-frequency terms fills the bulk of the df distribution so
+        // the 93rd percentile sits at the mid-frequency df and the ubiquitous tail
+        // is the part that gets cut. The third token "thingy{i}" is unique per
+        // body (hapax, dropped) so only "context" + the distinctive term matter.
+        let distinctive = [
+            "tessellate", "jacobian", "podman", "auth", "kernel", "vector",
+            "lexer", "registry", "matrix", "scheduler", "allocator", "raster",
+            "shader", "mutex", "rgba", "quaternion", "bezier", "frustum",
+            "viewport", "sampler", "atlas", "glyph", "kerning", "codepoint",
+            "opcode", "syscall", "epoll", "futex", "cgroup", "namespace",
+        ];
+        let mut tag = 0u32;
+        for term in distinctive {
+            // Each distinctive term: df 4 (mid-frequency), always with "context".
+            for _ in 0..4 {
+                tag += 1;
+                store
+                    .save("p1", "note", &format!("context {term} thingy{tag}"))
+                    .unwrap();
+            }
+        }
+        let g = store.concept_graph(Some("p1"), 250, 750, 1).unwrap();
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        // "context" sits in ~48 bodies — far above the percentile of the df
+        // distribution (most candidate groups have df 4) — so it is suppressed.
+        assert!(
+            !names.contains(&"context"),
+            "corpus-ubiquitous token must be cut by the dynamic ceiling"
+        );
+        // The distinctive mid-frequency terms survive.
+        assert!(names.contains(&"tessellate"), "distinctive term must survive");
+        assert!(names.contains(&"jacobian"), "distinctive term must survive");
+        assert!(names.contains(&"podman"), "distinctive term must survive");
     }
 
     #[test]

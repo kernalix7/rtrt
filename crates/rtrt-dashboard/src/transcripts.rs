@@ -10,8 +10,10 @@
 //!
 //! Both shapes carry standard Claude transcript lines with `cwd`, `sessionId`,
 //! optional `agentId` / `slug`, and `message.content[]` parts. The watcher
-//! picks `cwd`'s basename as the rtrt project bucket so captures land next to
-//! everything else for that repo, and dedups via `MemoryStore::body_seen_at`
+//! resolves `cwd` to its GIT REPOSITORY ROOT (via `rtrt_core::project_for_cwd`)
+//! and uses that basename as the rtrt project bucket — so a capture in a
+//! sub-dir (`src`, `web`, …) or a git worktree lands under the real repo
+//! instead of its own bogus bucket. It dedups via `MemoryStore::body_seen_at`
 //! so existing rows from the SessionStart / Stop / SubagentStop hooks don't
 //! get duplicated.
 
@@ -210,11 +212,12 @@ struct AssistantTurn {
 /// The project a transcript file belongs to. Claude Code stores every session
 /// of one project under a single `~/.claude/projects/<encoded>/` directory
 /// (keyed by the session's starting cwd). We derive the project from that
-/// `<encoded>` dir's representative cwd basename — NOT the per-line cwd, which
-/// can switch to a git-worktree path (a branch name like `feat-discovery-core`)
-/// mid-session and scatter rows into bogus buckets. Subagent / workflow
-/// transcripts live under the same `<encoded>` dir, so they resolve to the same
-/// real project automatically. Result is cached per `<encoded>` dir.
+/// `<encoded>` dir's representative cwd resolved to its GIT REPOSITORY ROOT —
+/// NOT the per-line cwd (which can switch to a git-worktree path mid-session)
+/// and NOT the raw cwd basename (which scatters sub-dir cwds like `src` into
+/// bogus buckets). Subagent / workflow transcripts live under the same
+/// `<encoded>` dir, so they resolve to the same real project automatically.
+/// Result is cached per `<encoded>` dir.
 fn project_for_transcript(
     file: &Path,
     base: &Path,
@@ -229,10 +232,13 @@ fn project_for_transcript(
         .clone()
 }
 
-/// Representative project name for an `<encoded>` dir: the basename of the cwd
-/// found in its first top-level session transcript (deterministic by sorted
-/// filename). Top-level only — we skip the `subagents/` subtree, whose cwds may
-/// be worktrees.
+/// Representative project name for an `<encoded>` dir: the GIT-ROOT project of
+/// the cwd found in its first top-level session transcript (deterministic by
+/// sorted filename). The cwd is run through [`rtrt_core::project_for_cwd`], so a
+/// session whose cwd was `.../00G_ONCRIX/crates/drivers/src` (a sub-dir) or a
+/// git worktree folds to its real repo (`00G_ONCRIX`) instead of the cwd
+/// basename (`src`). Top-level only — we skip the `subagents/` subtree, whose
+/// cwds may be worktrees.
 fn representative_project(encoded_dir: &Path) -> Option<String> {
     let rd = std::fs::read_dir(encoded_dir).ok()?;
     let mut sessions: Vec<PathBuf> = rd
@@ -243,10 +249,10 @@ fn representative_project(encoded_dir: &Path) -> Option<String> {
     sessions.sort();
     for s in &sessions {
         if let Some(cwd) = first_cwd_in(s) {
-            return Path::new(&cwd)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(String::from);
+            // Git-root attribution: walk the cwd up to its repo root (or the main
+            // repo for a worktree) and use that basename. Falls back to the cwd
+            // basename internally when no `.git` is found.
+            return Some(rtrt_core::project_for_cwd_str(&cwd));
         }
     }
     None
@@ -313,13 +319,13 @@ fn parse_assistant_turn(
 
     // Project: the file's `<encoded>` dir project is authoritative (one project
     // per dir, worktree-stable) for both main and subagent rows. Fall back to
-    // the line's own cwd basename only if the dir couldn't be resolved.
+    // the line's own cwd, resolved to its git root, only if the dir couldn't be
+    // resolved — never the raw cwd basename, which scatters sub-dir / worktree
+    // sessions into bogus buckets.
     let line_project = v
         .get("cwd")
         .and_then(|c| c.as_str())
-        .and_then(|p| Path::new(p).file_name())
-        .and_then(|n| n.to_str())
-        .map(String::from);
+        .map(rtrt_core::project_for_cwd_str);
     let project = resolved_project.map(String::from).or(line_project)?;
 
     let session_id = v

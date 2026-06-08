@@ -330,8 +330,8 @@ enum HookCmd {
         /// Memory `kind` to tag the row with — e.g. `pre-tool-use`,
         /// `post-tool-use`, `session-start`. Free-form.
         kind: String,
-        /// Project bucket. Defaults to `$RTRT_PROJECT` or the basename of
-        /// the current working directory.
+        /// Project bucket. Defaults to `$RTRT_PROJECT` or the git
+        /// repository root of the current working directory.
         #[arg(long)]
         project: Option<String>,
         /// Memory store path. Defaults to `~/.rtrt/memory.sqlite` so every
@@ -1406,6 +1406,23 @@ fn default_memory_path() -> PathBuf {
         .join("memory.sqlite")
 }
 
+/// Resolve the project bucket for a hook command. Explicit `--project`
+/// wins first, then `$RTRT_PROJECT`; otherwise the bucket is derived from
+/// the **git repository root** of the current working directory (so
+/// subagents / subdirectories / git worktrees fold into the real project)
+/// via [`rtrt_core::project_for_cwd`], falling back to the cwd basename and
+/// finally `"default"` when there is no cwd.
+fn resolve_hook_project(explicit: Option<String>) -> String {
+    explicit
+        .or_else(|| std::env::var("RTRT_PROJECT").ok())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| rtrt_core::project_for_cwd(&p))
+        })
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// Parse an env var into `T`, falling back to `default` when unset or
 /// unparseable. Used by the hook commands to layer env over config.
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -1432,14 +1449,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     if !enabled {
         return Ok(());
     }
-    let project = project
-        .or_else(|| std::env::var("RTRT_PROJECT").ok())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "default".to_string())
-        });
+    let project = resolve_hook_project(project);
     let store_path = store.unwrap_or_else(default_memory_path);
     if !store_path.exists() {
         return Ok(());
@@ -1541,14 +1551,7 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 return Ok(());
             }
             let redacted = rtrt_compress::redact_secrets(&cleaned);
-            let project = project
-                .or_else(|| std::env::var("RTRT_PROJECT").ok())
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                        .unwrap_or_else(|| "default".to_string())
-                });
+            let project = resolve_hook_project(project);
             let store_path = store.unwrap_or_else(default_memory_path);
             if let Some(parent) = store_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -1667,14 +1670,7 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    let project = project
-        .or_else(|| std::env::var("RTRT_PROJECT").ok())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "default".to_string())
-        });
+    let project = resolve_hook_project(project);
     let store_path = store.unwrap_or_else(default_memory_path);
     if !store_path.exists() {
         return Ok(());
@@ -1744,14 +1740,7 @@ fn run_hook_session_inject(
     store: Option<PathBuf>,
     limit: usize,
 ) -> Result<()> {
-    let project = project
-        .or_else(|| std::env::var("RTRT_PROJECT").ok())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "default".to_string())
-        });
+    let project = resolve_hook_project(project);
     let store_path = store.unwrap_or_else(default_memory_path);
     if !store_path.exists() {
         return Ok(());

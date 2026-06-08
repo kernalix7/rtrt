@@ -145,8 +145,51 @@
   details[open] > summary.muted-summary::before { content: '⇱ '; }
   details > .adv { padding-top: 0.5rem; display: grid; gap: 0.5rem; }
 
-  /* Graph canvas */
-  #graph-canvas { cursor: grab; }
+  /* Knowledge map — Cytoscape.js node graph (#cy) + plain-list fallback */
+  .memmap-head { font-size: 0.9em; color: var(--muted); margin: 0.65rem 0 0.5rem; }
+  .memmap-controls { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin: 0.65rem 0; }
+  .memmap-controls .sort-row { margin: 0; }
+  .memmap-search { min-width: min(260px, 100%); flex: 1 1 220px; }
+  .memmap-group { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.25rem 0.5rem; font-size: 0.85em; color: var(--fg); cursor: pointer; }
+  .memmap-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 0.15rem; font-size: 0.85em; margin: 0.35rem 0 0.2rem; }
+  .memmap-crumbs .crumb { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0.1rem 0.3rem; font-size: inherit; border-radius: 4px; }
+  .memmap-crumbs .crumb:hover { background: var(--accent-soft); }
+  .memmap-crumbs .crumb.current { color: var(--muted); cursor: default; }
+  .memmap-crumbs .crumb.current:hover { background: none; }
+  .memmap-crumbs .crumb-sep { color: var(--muted); }
+  .memmap-cy {
+    width: 100%; height: 70vh; min-height: 360px; border-radius: 12px;
+    position: relative;
+    /* Deep "neural" canvas: dark space + faint dot grid so the concept nodes glow. */
+    background-color: #0b0e14;
+    background-image:
+      radial-gradient(circle at 28% 22%, rgba(124,58,237,0.10), transparent 42%),
+      radial-gradient(circle at 76% 78%, rgba(6,182,212,0.10), transparent 42%),
+      radial-gradient(circle, rgba(150,165,200,0.15) 0.6px, transparent 0.6px);
+    background-size: 100% 100%, 100% 100%, 18px 18px;
+    border: 1px solid #1e2533;
+    box-shadow: inset 0 0 80px rgba(0,0,0,0.5);
+  }
+  /* Floating hover card over the map (Cytoscape has no built-in tooltip). */
+  .memmap-tooltip {
+    position: absolute; z-index: 10; display: none; pointer-events: none;
+    background: rgba(255,255,255,0.92); backdrop-filter: blur(12px);
+    border: 1px solid rgba(17,17,17,0.08); border-radius: 8px;
+    padding: 10px 14px; max-width: 260px; font-family: var(--font-ui, inherit);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06);
+    transition: opacity 0.15s ease;
+  }
+  .memmap-tooltip.visible { display: block; }
+  .memmap-tooltip .tt-name { font-weight: 700; color: #111; margin-bottom: 5px; font-size: 13px; word-break: break-word; }
+  .memmap-tooltip .tt-type { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; padding: 2px 6px; border-radius: 3px; display: inline-block; color: #fff; }
+  .memmap-tooltip .tt-conns { font-size: 10px; color: #999; margin-top: 7px; border-top: 1px solid rgba(17,17,17,0.08); padding-top: 6px; font-family: ui-monospace, monospace; }
+  .memmap-member-list { display: flex; flex-direction: column; gap: 0.45rem; max-height: 70vh; overflow: auto; }
+  .member-row { display: flex; gap: 0.6rem; padding: 0.6rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; align-items: flex-start; cursor: pointer; transition: border-color .12s ease; }
+  .member-row:hover { border-color: var(--accent); }
+  .member-row .mr-badge { flex-shrink: 0; font-size: 0.8em; white-space: nowrap; }
+  .member-row .mr-body { flex: 1; min-width: 0; }
+  .member-row .mr-preview { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9em; }
+  .member-row .mr-kind { color: var(--muted); font-size: 0.78em; margin-top: 0.2rem; }
 
   /* Memory project picker */
   .proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }
@@ -272,11 +315,6 @@
   .toast.err { border-left: 3px solid var(--err); }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
-  /* Graph entity-type color legend */
-  .graph-legend { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.4rem; }
-  .graph-legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.79em; color: var(--muted); }
-  .graph-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-
   /* Savings % badge — used in compress, proxy, queue rows */
   .badge.save { color: var(--ok); border-color: var(--ok); font-variant-numeric: tabular-nums; }
 
@@ -322,6 +360,22 @@
     .security-profile-tools { grid-template-columns: 1fr; }
   }
 </style>
+<!-- Knowledge-map graph rendering: Cytoscape.js owns layout/zoom/pan/drag.
+     Served LOCALLY from the dashboard binary (/vendor/*) so the map renders with
+     NO CDN / internet — a blocked CDN was making it fall back to a plain list.
+     If a script still fails, window.cytoscape stays undefined and the memmap
+     subtab falls back to a list — see loadGraph(). -->
+<script src="/vendor/cytoscape.min.js"></script>
+<!-- fcose layout (better overlap avoidance + component packing than built-in cose).
+     Order matters: layout-base -> cose-base -> cytoscape-fcose. If any fails to load
+     the graph falls back to cose then concentric (see memmapRunLayout). -->
+<script src="/vendor/layout-base.js"></script>
+<script src="/vendor/cose-base.js"></script>
+<script src="/vendor/cytoscape-fcose.js"></script>
+<!-- cola: continuous force layout — live physics so dragging a node makes the
+     others spring/avoid in real time. webcola must load before cytoscape-cola. -->
+<script src="/vendor/cola.min.js"></script>
+<script src="/vendor/cytoscape-cola.js"></script>
 </head>
 <body>
 <div class="topbar">
@@ -621,23 +675,30 @@
           <div class="card">
             <div class="head">
               <h2>지식 맵</h2>
-              <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
-                <button id="entity-extract-btn" class="ghost" type="button" style="font-size:0.85em;" title="메모리에서 엔티티 및 관계를 추출하여 그래프를 풍부하게 합니다">엔티티 추출</button>
-                <span class="hint">노드 = 메모리/엔티티, 선 = 연결</span>
-              </div>
+              <span class="hint">의미가 비슷한 메모리를 클러스터 노드로 묶어 그래프로 보여줍니다. 휠로 확대, 배경 드래그로 이동, 노드 클릭으로 펼치기.</span>
             </div>
             <form id="graph-form" style="grid-template-columns:1fr auto;">
               <input id="graph-project" type="hidden">
-              <button class="primary" type="submit">맵 새로고침</button>
+              <button class="primary" type="submit">새로고침</button>
             </form>
-            <div id="graph-meta" class="out-meta"></div>
-            <canvas id="graph-canvas" width="800" height="420" style="display:block;width:100%;height:420px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-top:0.5rem;"></canvas>
-            <div id="graph-legend" class="graph-legend">
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#2962FF;"></div>메모리 노드</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#7c3aed;"></div>블록</div>
-              <div class="graph-legend-item"><div class="graph-legend-dot" style="background:#16a34a;"></div>엔티티</div>
+
+            <div class="memmap-controls">
+              <input id="memmap-search" class="memmap-search" type="search" placeholder="개념 검색">
+              <button id="memmap-back" class="ghost" type="button" hidden>← 뒤로</button>
+              <button id="memmap-fit" class="ghost" type="button">맞춤</button>
             </div>
-            <div id="graph-tip" class="out-meta">노드 위에 마우스를 올리면 내용 미리보기.</div>
+            <div id="memmap-crumbs" class="memmap-crumbs" hidden></div>
+            <div id="memmap-overview-head" class="memmap-head"></div>
+
+            <!-- Cytoscape renders the node graph into this container. The tooltip
+                 is an absolutely-positioned sibling inside this relative wrapper. -->
+            <div class="memmap-cy-wrap" style="position:relative;">
+              <div id="cy" class="memmap-cy"></div>
+              <div id="memmap-tooltip" class="memmap-tooltip" aria-hidden="true"></div>
+            </div>
+            <!-- Fallback when the graph library fails to load (offline) or no data. -->
+            <div id="memmap-fallback" class="memmap-member-list" hidden></div>
+            <div id="memmap-empty" class="empty" hidden>클러스터 없음</div>
           </div>
         </div>
 
@@ -868,8 +929,8 @@
     <!-- 설정 -->
     <section id="page-settings" class="page" hidden>
       <div class="section-head">
-        <h1>설정</h1>
-        <div class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
+        <h1 id="settings-title">설정 <span id="settings-global-badge" class="badge ok" hidden>전역 기본</span></h1>
+        <div id="settings-lede" class="lede">캡처 · 자동 압축 설정을 보고 저장합니다.</div>
       </div>
       <div class="card">
         <div class="head"><h2>구성</h2><span class="hint">GET /api/config 로드</span></div>
@@ -940,19 +1001,36 @@
             <div class="field-row" style="margin-top:0.5rem;">
               <div class="field-label">
                 <span>model</span>
-                <!-- populated from /api/models; also accepts free-text via datalist -->
-                <input id="cfg-emb-model" list="cfg-emb-model-list" placeholder="예: bge-m3">
-                <datalist id="cfg-emb-model-list"></datalist>
+                <!-- populated from /api/ollama/models; preselected from /api/config -->
+                <select id="cfg-emb-model"><option value="">모델 선택…</option></select>
               </div>
               <div class="field-label">
                 <span>base_url</span>
                 <input type="url" id="cfg-emb-base-url" placeholder="http://localhost:11434">
               </div>
             </div>
+            <div class="field-label" style="margin-top:0.5rem;">
+              <span>생성 (현재 프로젝트)</span>
+              <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
+                <button id="cfg-emb-generate-btn" class="primary" type="button">임베딩 생성</button>
+                <span id="cfg-emb-coverage" class="out-meta"></span>
+              </div>
+            </div>
             <div class="note">
+              <strong>모델 변경은 서버 재시작 후 적용됩니다.</strong>
               <strong>SessionStart 주입</strong>: <code>rtrt hook session-inject</code>가
               세션 시작 시 중요도 상위 N개 메모리를 시스템 프롬프트에 삽입합니다.
               임베딩이 활성화되면 벡터 검색, 비활성이면 BM25로 폴백합니다.
+            </div>
+          </div>
+          <!-- Security -->
+          <div class="settings-section">
+            <h3>보안</h3>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label" for="setting-default-security-profile">
+                <span>기본 보안 프로파일</span>
+                <select id="setting-default-security-profile"><option value="">로딩 중…</option></select>
+              </label>
             </div>
           </div>
           <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
@@ -1037,6 +1115,17 @@
         </div>
       </div>
       <div id="sub-securityprofiles" class="subpage" hidden>
+        <div id="security-global-default-card" class="card" hidden>
+          <div class="head"><h2>전역 기본 보안</h2><span class="hint">새 프로젝트와 미지정 프로젝트의 기본값</span></div>
+          <div class="field-row" style="margin-top:0.5rem;">
+            <label class="field-label" for="security-global-default-profile-select">
+              <span>전역 기본 보안 프로파일</span>
+              <select id="security-global-default-profile-select"><option value="">로딩 중…</option></select>
+            </label>
+            <button id="security-global-default-save-btn" class="primary" type="button">전역 기본 저장</button>
+          </div>
+          <div id="security-global-default-result" class="out-meta"></div>
+        </div>
         <div class="card">
           <div class="head"><h2>프로파일 설정</h2><span class="hint">프로파일 조회 · 복제 · 저장</span></div>
           <div class="security-profile-tools">
@@ -1089,6 +1178,12 @@
       <input id="project-name-input" placeholder="프로젝트 이름" required>
       <input id="project-path-input" placeholder="프로젝트 경로">
       <select id="project-security-profile-select"><option value="">프로파일 로드 중…</option></select>
+      <label class="memmap-head" style="margin:0.4rem 0 0;">메모리 맵 임베딩(의미 분류)</label>
+      <select id="project-embeddings-select">
+        <option value="">전역 기본 따름</option>
+        <option value="on">켜기 (의미 기반)</option>
+        <option value="off">끄기 (어휘 기반)</option>
+      </select>
       <button class="primary" type="submit">저장</button>
     </form>
   </div>
@@ -1119,9 +1214,20 @@ document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate
 // Global project selector
 let PROJECTS_CACHE = [];
 let SECURITY_PROFILES_CACHE = [];
+let GLOBAL_DEFAULT_PROFILE = 'ai-default';
+const GLOBAL_PROJECT_VALUE = '__global__';
+const GLOBAL_SCOPE_MESSAGE = '전역 모드입니다 — 개별 프로젝트를 선택하세요';
 
 function currentProject() {
   return document.getElementById('project-selector').value;
+}
+
+function isGlobalScope() {
+  return document.getElementById('project-selector').value === GLOBAL_PROJECT_VALUE;
+}
+
+function isGlobalProjectValue(value) {
+  return value === GLOBAL_PROJECT_VALUE;
 }
 
 function escapeAttr(s) {
@@ -1152,6 +1258,7 @@ function syncProjectInputs(value) {
 }
 
 function projectScopeMessage(needsPath) {
+  if (isGlobalScope()) return GLOBAL_SCOPE_MESSAGE;
   if (!currentProject()) return '프로젝트를 선택하거나 추가하세요';
   if (needsPath && !projectPath()) return '경로 미설정 — 프로젝트 편집에서 추가하세요';
   return '';
@@ -1167,6 +1274,29 @@ function setScopeState(emptyId, cardSelector, needsPath) {
   }
   if (card) card.hidden = !!msg;
   return !msg;
+}
+
+function updateGlobalScopeIndicators() {
+  const global = isGlobalScope();
+  const settingsTitle = document.getElementById('settings-title');
+  const settingsLede = document.getElementById('settings-lede');
+  const settingsBadge = document.getElementById('settings-global-badge');
+  if (settingsTitle) {
+    settingsTitle.childNodes[0].nodeValue = global ? '전역 기본 설정 ' : '설정 ';
+  }
+  if (settingsLede) {
+    settingsLede.textContent = global
+      ? '보안 기본 프로파일 · 압축 · 임베딩 · 캡처 전역 기본값을 관리합니다.'
+      : '캡처 · 자동 압축 설정을 보고 저장합니다.';
+  }
+  if (settingsBadge) settingsBadge.hidden = !global;
+  const securityGlobalCard = document.getElementById('security-global-default-card');
+  if (securityGlobalCard) securityGlobalCard.hidden = !global;
+}
+
+function showGlobalScopeEmpty(targetId) {
+  const el = document.getElementById(targetId);
+  if (el) el.innerHTML = `<div class="empty">${GLOBAL_SCOPE_MESSAGE}</div>`;
 }
 
 async function fetchSecurityProfiles() {
@@ -1193,7 +1323,7 @@ async function populateSecurityProfileSelect(selectId, selected) {
     select.innerHTML = '<option value="">프로파일 없음</option>';
     return [];
   }
-  const desired = profiles.includes(selected) ? selected : (profiles.includes('ai-default') ? 'ai-default' : profiles[0]);
+  const desired = profiles.includes(selected) ? selected : (profiles.includes(GLOBAL_DEFAULT_PROFILE) ? GLOBAL_DEFAULT_PROFILE : profiles[0]);
   select.innerHTML = profiles.map(name =>
     `<option value="${escapeAttr(name)}"${name === desired ? ' selected' : ''}>${escapeHtml(name)}</option>`
   ).join('');
@@ -1204,38 +1334,40 @@ async function populateSecurityProfileSelect(selectId, selected) {
 async function loadProjects() {
   const select = document.getElementById('project-selector');
   const saved = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project') || '';
-  const previous = currentProject() || saved;
+  const previous = currentProject() || saved || GLOBAL_PROJECT_VALUE;
+  const globalOption = `<option value="${GLOBAL_PROJECT_VALUE}">🌐 글로벌 · 전역 기본</option>`;
   try {
     const r = await fetch('/api/projects');
     if (!r.ok) {
       showToast(await securityErrorMessage(r, '프로젝트 로드 실패'), 'err');
-      select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+      select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+      select.value = GLOBAL_PROJECT_VALUE;
       PROJECTS_CACHE = [];
       syncProjectInputs('');
       refreshProjectScopePage();
+      navigate('settings');
       return;
     }
     const projects = await r.json();
     PROJECTS_CACHE = Array.isArray(projects) ? projects : [];
-    if (!PROJECTS_CACHE.length) {
-      select.innerHTML = '<option value="">프로젝트 없음</option>';
-      syncProjectInputs('');
-      refreshProjectScopePage();
-      return;
-    }
-    select.innerHTML = '<option value="">프로젝트 선택</option>' + PROJECTS_CACHE.map(p =>
+    const projectOptions = PROJECTS_CACHE.length ? PROJECTS_CACHE.map(p =>
       `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
-    ).join('');
-    select.value = PROJECTS_CACHE.some(p => p.name === previous) ? previous : '';
-    syncProjectInputs(select.value);
-    if (select.value) localStorage.setItem('rtrt.project', select.value);
+    ).join('') : '<option value="">프로젝트 없음</option>';
+    select.innerHTML = globalOption + projectOptions;
+    select.value = previous === GLOBAL_PROJECT_VALUE || PROJECTS_CACHE.some(p => p.name === previous) ? previous : GLOBAL_PROJECT_VALUE;
+    syncProjectInputs(isGlobalScope() ? '' : select.value);
+    localStorage.setItem('rtrt.project', select.value);
+    localStorage.setItem('rtrt-project', select.value);
     refreshProjectScopePage();
+    if (isGlobalScope()) navigate('settings');
   } catch (e) {
     showToast(`프로젝트 로드 오류: ${e.message || e}`, 'err');
-    select.innerHTML = '<option value="">프로젝트 로드 실패</option>';
+    select.innerHTML = globalOption + '<option value="">프로젝트 로드 실패</option>';
+    select.value = GLOBAL_PROJECT_VALUE;
     PROJECTS_CACHE = [];
     syncProjectInputs('');
     refreshProjectScopePage();
+    navigate('settings');
   }
 }
 
@@ -1247,7 +1379,13 @@ async function openProjectModal(forceNew) {
   const project = forceNew ? null : selectedProject();
   document.getElementById('project-name-input').value = project ? project.name : '';
   document.getElementById('project-path-input').value = project && project.path ? project.path : '';
-  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : 'ai-default');
+  await populateSecurityProfileSelect('project-security-profile-select', project && project.security_profile ? project.security_profile : GLOBAL_DEFAULT_PROFILE);
+  // Per-project embedding override: null/undefined -> 전역 기본, true -> on, false -> off.
+  const embSel = document.getElementById('project-embeddings-select');
+  if (embSel) {
+    const ee = project ? project.embeddings_enabled : null;
+    embSel.value = ee === true ? 'on' : ee === false ? 'off' : '';
+  }
   document.getElementById('project-modal').hidden = false;
   setTimeout(() => document.getElementById('project-name-input').focus(), 0);
 }
@@ -1259,20 +1397,29 @@ document.getElementById('project-selector').onchange = () => {
   const name = currentProject();
   localStorage.setItem('rtrt.project', name);
   localStorage.setItem('rtrt-project', name);
-  syncProjectInputs(name);
+  syncProjectInputs(isGlobalScope() ? '' : name);
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) {
+    navigate('settings');
+    return;
+  }
   refreshProjectScopePage();
 };
 document.getElementById('project-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const name = document.getElementById('project-name-input').value.trim();
   const path = document.getElementById('project-path-input').value.trim();
-  const security_profile = document.getElementById('project-security-profile-select').value || 'ai-default';
+  const security_profile = document.getElementById('project-security-profile-select').value || GLOBAL_DEFAULT_PROFILE;
   if (!name) { showToast('프로젝트 이름을 입력하세요.', 'err'); return; }
+  if (isGlobalProjectValue(name)) { showToast('예약된 전역 항목 이름입니다.', 'err'); return; }
+  // '' -> 전역 기본(inherit), 'on'/'off' explicit. Sent as a tri-state string.
+  const embVal = document.getElementById('project-embeddings-select').value;
+  const embeddings_mode = embVal === 'on' ? 'on' : embVal === 'off' ? 'off' : 'inherit';
   try {
     const r = await fetch('/api/projects', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, path, security_profile }),
+      body: JSON.stringify({ name, path, security_profile, embeddings_mode }),
     });
     if (!r.ok) {
       showToast(await securityErrorMessage(r, '프로젝트 저장 실패'), 'err');
@@ -1281,6 +1428,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
     await r.json().catch(() => ({}));
     closeProjectModal();
     localStorage.setItem('rtrt.project', name);
+    document.getElementById('project-selector').value = name;
     await loadProjects();
     document.getElementById('project-selector').value = name;
     syncProjectInputs(name);
@@ -1306,12 +1454,16 @@ function wireSubtabs(navId, onActivate) {
 }
 wireSubtabs('memory-subtabs', (sub) => {
   const project = currentProject();
+  // The map (맵) works in global scope when in 브레인 mode (GLOBAL merged brain),
+  // so handle it BEFORE the global-scope early-return that other subtabs use.
+  if (sub === 'memmap') { loadMemmap(project); return; }
+  // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
+  memmapStopLayout();
+  if (isGlobalScope()) { refreshMemoryScope(); return; }
   // Auto-load stats + compression queue when the stats tab is activated.
   if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
   // Auto-load governance stats when governance tab opens.
   if (sub === 'memgovern' && project) { loadGovStats(project); }
-  // Auto-load graph when the map tab opens (saves an extra button click).
-  if (sub === 'memmap' && project) { loadGraph(project); }
 });
 wireSubtabs('security-subtabs', (sub) => {
   if (sub === 'securityprofiles') loadSecurityProfileSettings();
@@ -1333,8 +1485,17 @@ let CURRENT_PROJECT = null;
 const PROJECT_INPUTS = ['recall-project','save-project','blocks-project','block-set-project','export-project','graph-project'];
 
 function openProject(name) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) {
+    CURRENT_PROJECT = null;
+    syncProjectInputs('');
+    document.getElementById('mem-empty').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('mem-empty').hidden = false;
+    document.getElementById('mem-detail').hidden = true;
+    return;
+  }
   if (!name) {
     CURRENT_PROJECT = null;
+    document.getElementById('mem-empty').textContent = '프로젝트를 선택하거나 추가하세요';
     document.getElementById('mem-empty').hidden = false;
     document.getElementById('mem-detail').hidden = true;
     return;
@@ -1448,6 +1609,7 @@ function syncBulkBar() {
 }
 
 async function loadHistory(name, offset) {
+  if (isGlobalScope() || isGlobalProjectValue(name)) { showGlobalScopeEmpty('history-list'); return; }
   if (offset === undefined) offset = 0;
   HISTORY_OFFSET = offset;
   // Reset selection on each page load.
@@ -1536,6 +1698,7 @@ async function loadHistory(name, offset) {
       ev.stopPropagation();
       const row = btn.closest('.recompress-row');
       const project = row.dataset.proj;
+      if (isGlobalScope() || isGlobalProjectValue(project)) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
       const model = row.querySelector('.row-model-sel').value || undefined;
       const result = row.querySelector('.row-recompress-result');
       btn.disabled = true;
@@ -1573,6 +1736,7 @@ async function loadHistory(name, offset) {
 
 // Detail modal: fetch GET /api/memory/{id} and render.
 async function openDetailModal(id) {
+  // A memory opens by id (scope-independent) — works in global brain too.
   const modal = document.getElementById('mem-detail-modal');
   const body = document.getElementById('detail-modal-body');
   document.getElementById('detail-modal-title').textContent = `메모리 #${id}`;
@@ -1639,12 +1803,12 @@ document.addEventListener('keydown', (ev) => {
 });
 document.getElementById('history-prev').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, Math.max(0, HISTORY_OFFSET - HISTORY_PAGE_SIZE));
 };
 document.getElementById('history-next').onclick = () => {
   const project = currentProject();
-  if (!project) return;
+  if (!project || isGlobalScope()) return;
   loadHistory(project, HISTORY_OFFSET + HISTORY_PAGE_SIZE);
 };
 
@@ -1654,14 +1818,14 @@ document.getElementById('sort-recent').onclick = () => {
   document.getElementById('sort-recent').classList.add('active');
   document.getElementById('sort-importance').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.getElementById('sort-importance').onclick = () => {
   HISTORY_SORT = 'importance';
   document.getElementById('sort-importance').classList.add('active');
   document.getElementById('sort-recent').classList.remove('active');
   const project = currentProject();
-  if (project) loadHistory(project, 0);
+  if (project && !isGlobalScope()) loadHistory(project, 0);
 };
 document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
   btn.onclick = () => {
@@ -1674,12 +1838,13 @@ document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
     // Reload from page 0 with the server-side source filter so it spans the
     // whole project rather than only the rows already on screen.
     const project = currentProject();
-    if (project) loadHistory(project, 0);
+    if (project && !isGlobalScope()) loadHistory(project, 0);
   };
 });
 
 // Bulk delete — confirm dialog before sending.
 document.getElementById('bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!SELECTED_IDS.size) return;
   const ids = Array.from(SELECTED_IDS);
   const ok = confirm(`선택한 ${ids.length}건을 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
@@ -1701,7 +1866,7 @@ document.getElementById('bulk-delete-btn').onclick = async () => {
     SELECTED_IDS.clear();
     syncBulkBar();
     const project = currentProject();
-    if (project) loadHistory(project, HISTORY_OFFSET);
+    if (project && !isGlobalScope()) loadHistory(project, HISTORY_OFFSET);
   } catch (e) { pushActivity(`삭제 오류: ${e.message || e}`); }
 };
 document.getElementById('bulk-clear-btn').onclick = () => {
@@ -1715,7 +1880,7 @@ document.getElementById('bulk-clear-btn').onclick = () => {
 const originalSaveHandler = () => {};
 
 const savedProject = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project');
-if (savedProject) syncProjectInputs(savedProject);
+if (savedProject && !isGlobalProjectValue(savedProject)) syncProjectInputs(savedProject);
 
 // Sample data — one-click form fillers so the user can try a tool without
 // digging up an example. Each entry is a function so it can vary per call.
@@ -1769,7 +1934,7 @@ function refreshRepomapScope() {
   const ok = setScopeState('repomap-scope-empty', '#page-repomap .card', true);
   const path = projectPath();
   document.getElementById('repomap-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
-  document.getElementById('repomap-root').value = path;
+  document.getElementById('repomap-root').value = ok ? path : '';
 }
 function refreshDiagnoseScope() {
   const ok = setScopeState('diagnose-scope-empty', '#page-diagnose .card', true);
@@ -1784,6 +1949,7 @@ function refreshProjectScopePage() {
   if (page === 'diagnose') refreshDiagnoseScope();
 }
 function navigate(page) {
+  updateGlobalScopeIndicators();
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
   const link = document.querySelector(`aside a.nav[data-page="${page}"]`);
@@ -1800,8 +1966,10 @@ function navigate(page) {
     refreshDiagnoseScope();
   }
   if (page === 'settings') {
+    updateGlobalScopeIndicators();
     // Reload config each time the panel opens so it stays current.
     populateModelSelects();
+    loadOllamaModelsCache(); // refresh embedding model <select> from installed Ollama models
     loadConfig();
   }
   if (page === 'llm') {
@@ -2002,6 +2170,7 @@ document.getElementById('overview-refresh').onclick = () => { loadOverview(); pu
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('recall-results'); showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
@@ -2077,47 +2246,62 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   pushActivity(`recall ${body.project} · ${d.hits.length}건 (${usedMode})`);
 };
 
-// Embedding backfill button — POST /api/memory/embed {project}.
-// Hidden when the endpoint returns 404 (embeddings not compiled in).
-(function wireEmbedBackfill() {
-  const btn = document.getElementById('embed-backfill-btn');
-  if (!btn) return;
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '백필 중…';
-    try {
-      const r = await fetch('/api/memory/embed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
-      });
-      if (r.status === 404) {
-        // Embeddings not built into this binary; hide the button silently.
-        btn.hidden = true;
-        return;
-      }
-      if (!r.ok) {
-        const text = await r.text();
-        showToast(`임베딩 오류 ${r.status}: ${text}`, 'err');
-        return;
-      }
-      const d = await r.json();
-      showToast(`임베딩 완료 · ${d.embedded}건 백필됨`, 'ok');
-      pushActivity(`embed backfill · ${project} · ${d.embedded}건`);
-    } catch (e) {
-      showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
-    }
+// Kick off a NON-BLOCKING embedding backfill and poll progress. The server
+// returns immediately ({started}); a background thread embeds (minutes for 20k).
+// We poll /api/memory/coverage and report N/M until it finishes, then reload the
+// map if it's showing this project. `statusFn(text)` receives progress strings.
+const EMBED_POLLING = new Set();
+async function startEmbedAndPoll(project, statusFn) {
+  if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return false; }
+  let r;
+  try {
+    r = await fetch('/api/memory/embed', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project }),
+    });
+  } catch (e) { showToast(`네트워크 오류: ${e.message || e}`, 'err'); return false; }
+  if (r.status === 404) return false;                 // not compiled in
+  if (!r.ok) { showToast(`임베딩 오류 ${r.status}: ${await r.text()}`, 'err'); return false; }
+  showToast('임베딩 생성 시작 (백그라운드) — 진행 중에도 사용 가능', 'ok');
+  pushActivity(`embed start · ${project}`);
+  if (EMBED_POLLING.has(project)) return true;
+  EMBED_POLLING.add(project);
+  const poll = async () => {
+    let c;
+    try { c = await (await fetch(`/api/memory/coverage?project=${encodeURIComponent(project)}`)).json(); }
+    catch (e) { EMBED_POLLING.delete(project); return; }
+    const pct = c.total ? Math.round(100 * c.embedded / c.total) : 0;
+    if (statusFn) statusFn(`임베딩 ${c.embedded.toLocaleString()}/${c.total.toLocaleString()} (${pct}%)${c.running ? ' · 생성 중…' : ' · 완료'}`);
+    // keep the project cache fresh so the map basis badge updates
+    const p = (PROJECTS_CACHE || []).find(x => x.name === project);
+    if (p && !c.running && c.embedded > 0) p.embeddings_enabled = p.embeddings_enabled; // no-op, coverage drives basis
+    if (c.running) { setTimeout(poll, 3000); return; }
+    EMBED_POLLING.delete(project);
+    showToast(`임베딩 완료 · ${project} · ${c.embedded.toLocaleString()}/${c.total.toLocaleString()}`, 'ok');
+    if ((memmapProject || currentProject()) === project) loadMemmap(project);
   };
+  poll();
+  return true;
+}
+
+// Settings 백필 + 생성 buttons + the map button all share startEmbedAndPoll.
+(function wireEmbedButtons() {
+  const settingsBtns = ['embed-backfill-btn', 'cfg-emb-generate-btn'];
+  const cap = document.getElementById('cfg-emb-coverage');
+  settingsBtns.forEach(id => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.onclick = async () => {
+      const project = currentProject();
+      if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
+      await startEmbedAndPoll(project, (t) => { if (cap) cap.textContent = t; });
+    };
+  });
 })();
 document.getElementById('save-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('save-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   let metadata = {};
   const raw = document.getElementById('save-metadata').value.trim();
@@ -2143,6 +2327,7 @@ document.getElementById('save-form').onsubmit = async (ev) => {
 document.getElementById('blocks-list-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.querySelector('#blocks-tbl tbody').innerHTML = `<tr><td colspan="2" class="empty">${GLOBAL_SCOPE_MESSAGE}</td></tr>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const tbody = document.querySelector('#blocks-tbl tbody');
   tbody.innerHTML = `<tr><td colspan="2" class="empty">불러오는 중…</td></tr>`;
@@ -2161,6 +2346,7 @@ document.getElementById('blocks-list-form').onsubmit = async (ev) => {
 document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { document.getElementById('block-set-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`; return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const body = {
     project,
@@ -2181,6 +2367,7 @@ document.getElementById('blocks-set-form').onsubmit = async (ev) => {
 document.getElementById('export-form').onsubmit = (ev) => {
   ev.preventDefault();
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
@@ -2188,6 +2375,12 @@ document.getElementById('export-form').onsubmit = (ev) => {
 
 // Memory stats subtab — calls GET /api/memory/stats?project=
 async function loadMemStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('memstats-loading').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('memstats-loading').hidden = false;
+    document.getElementById('memstats-body').hidden = true;
+    return;
+  }
   if (!project) return;
   const loading = document.getElementById('memstats-loading');
   const body = document.getElementById('memstats-body');
@@ -2245,11 +2438,16 @@ async function loadMemStats(project) {
 
 document.getElementById('memstats-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadMemStats(project); loadQueue(project); }
+  if (project && !isGlobalScope()) { loadMemStats(project); loadQueue(project); }
 };
 
 // Compression queue — GET /api/memory/queue?project=
 async function loadQueue(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    document.getElementById('queue-summary').textContent = GLOBAL_SCOPE_MESSAGE;
+    document.getElementById('queue-list').innerHTML = '';
+    return;
+  }
   if (!project) return;
   const summary = document.getElementById('queue-summary');
   const list = document.getElementById('queue-list');
@@ -2284,6 +2482,7 @@ async function loadQueue(project) {
 let GOV_PREVIEW_IDS = [];
 
 async function loadGovStats(project) {
+  if (isGlobalScope() || isGlobalProjectValue(project)) return;
   if (!project) return;
   // Reuse the existing stats endpoint to populate the summary boxes.
   try {
@@ -2304,6 +2503,7 @@ async function loadGovStats(project) {
 
 async function runGovPreview() {
   const project = currentProject();
+  if (isGlobalScope()) { showGlobalScopeEmpty('gov-preview-result'); return; }
   if (!project) return;
   const kind = document.getElementById('gov-kind').value;
   const compFilter = document.getElementById('gov-compress-filter').value;
@@ -2367,10 +2567,11 @@ async function runGovPreview() {
 document.getElementById('gov-preview-btn').onclick = runGovPreview;
 document.getElementById('gov-refresh').onclick = () => {
   const project = currentProject();
-  if (project) { loadGovStats(project); runGovPreview(); }
+  if (project && !isGlobalScope()) { loadGovStats(project); runGovPreview(); }
 };
 
 document.getElementById('gov-bulk-delete-btn').onclick = async () => {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!GOV_PREVIEW_IDS.length) return;
   const ok = confirm(`필터 조건에 해당하는 ${GOV_PREVIEW_IDS.length}건을 모두 삭제합니다. 이 작업은 되돌릴 수 없습니다.`);
   if (!ok) return;
@@ -2394,7 +2595,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
     document.getElementById('gov-preview-result').innerHTML = '<div class="empty">삭제 완료. 미리보기를 다시 실행하세요.</div>';
     document.getElementById('gov-danger-zone').hidden = true;
     const project = currentProject();
-    if (project) loadGovStats(project);
+    if (project && !isGlobalScope()) loadGovStats(project);
   } catch (e) {
     resultEl.innerHTML = `<span style="color:var(--err);">오류: ${e.message || e}</span>`;
   }
@@ -2402,6 +2603,7 @@ document.getElementById('gov-bulk-delete-btn').onclick = async () => {
 
 document.getElementById('queue-compress-all').onclick = async (ev) => {
   const project = currentProject();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) return;
   const btn = ev.currentTarget;
   btn.disabled = true; btn.textContent = '압축 중…';
@@ -2417,212 +2619,1354 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
   loadQueue(project); loadMemStats(project);
 };
 
-// Memory graph — force-directed canvas layout
-let graphState = null;
-function initGraph(data) {
-  const canvas = document.getElementById('graph-canvas');
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth; const h = canvas.clientHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+// Memory knowledge map — Cytoscape.js node graph (library owns layout/zoom/pan/drag).
+// Drives the #sub-memmap subtab using the server LOD API:
+//   GET /api/memory/graph?project=X&mode=overview  -> { clusters, cluster_edges, total_nodes, ... }
+//   GET /api/memory/graph?project=X&cluster=<id>   -> { root, nodes, edges }
+// We never hand-roll a force simulation: Cytoscape's built-in 'cose' layout
+// positions nodes, and the cy instance handles wheel-zoom / background-pan /
+// node-drag natively. If the CDN failed to load (offline), window.cytoscape is
+// undefined and we fall back to a plain list instead of crashing.
+let memmapOverview = null;           // last overview payload for the current project
+let memmapProject = '';              // project the overview belongs to
+let memmapSource = 'all';            // 'all' | 'main' | 'subagent'
+let memmapSearch = '';               // cluster label filter substring
+let memmapGroup = 'context';         // grouping basis: context|file|kind|session|source|time
+let memmapBasis = 'auto';            // 문맥 분류 기준: auto|vector(의미)|lexical(어휘)
+let memmapTarget = 320;              // 세밀도: overview bubble target
+let memmapDepth = 0;                 // 깊이: drill leaf cutoff (0 = 자동)
+let memmapMode = 'overview';         // 'overview' | 'group' | 'leaf' (current level kind)
+let memmapCy = null;                 // the single Cytoscape instance, lazily created
+let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
+// 맵 모드: 'brain' (개념 그래프, default) vs 'cluster' (기존 묶음 뷰). The toggle swaps
+// which loader runs; the cy instance, styling, layout + tooltip are shared.
+let memmapViewMode = 'brain';
+let brainGraph = null;               // last brain TOP-LEVEL (communities) payload for the scope
+let brainProject = '';               // project the brain belongs to ('' = global)
+let brainScopeGlobal = false;        // whether the loaded brain is the GLOBAL (merged) brain
+let brainConcept = null;             // when set, we're viewing one concept's memories (drill)
+// Brain is now 3-level: communities → concepts → memories. brainLevel tracks the
+// current depth; brainStack is the breadcrumb of pushed levels (community, then
+// concept) — the communities overview is the implicit "전체(주제)" root.
+//   { kind:'community', id, label }  — a topic community we drilled into
+//   { kind:'concept',   token, label } — a concept we drilled into
+let brainLevel = 'community';        // 'community' | 'concept' | 'memory'
+let brainStack = [];
+let brainCommunity = null;           // the community we're inside, when at concept/memory level
+// Cache concept sub-graphs per community id so breadcrumb pops re-render instantly.
+const brainCommunityCache = new Map();
+// Breadcrumb stack of drilled levels: [{ token, label }, …]. The overview itself
+// is the implicit root (rendered as the "전체" crumb); pushed levels follow.
+let memmapStack = [];
+// Per-level cache keyed by drill token -> the raw level payload (group or leaf).
+// Lets breadcrumb pops / re-opens render instantly without re-fetching.
+const memmapLevelCache = new Map();
 
-  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#2962FF';
-  const muted = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#666';
-  const fg = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim() || '#000';
-  // Entity nodes rendered in green to distinguish from memory nodes (blue) and blocks (purple).
-  const entityColor = '#16a34a';
-
-  // Initialise nodes with random positions; edges reference node ids.
-  const idIdx = new Map();
-  const nodes = data.nodes.map((n, i) => {
-    idIdx.set(n.id, i);
-    return { ...n, x: w/2 + (Math.random()-0.5)*w*0.6, y: h/2 + (Math.random()-0.5)*h*0.6, vx: 0, vy: 0 };
-  });
-  const edges = data.edges
-    .map(e => ({ s: idIdx.get(e.src), d: idIdx.get(e.dst), rel: e.relation }))
-    .filter(e => e.s !== undefined && e.d !== undefined);
-
-  let hover = -1;
-  let drag = -1;
-  function getXY(ev) {
-    const rect = canvas.getBoundingClientRect();
-    return [ev.clientX - rect.left, ev.clientY - rect.top];
-  }
-  function pick(x, y) {
-    for (let i = nodes.length-1; i >= 0; i--) {
-      const n = nodes[i];
-      const dx = x - n.x; const dy = y - n.y;
-      if (dx*dx + dy*dy < 100) return i;
-    }
-    return -1;
-  }
-  canvas.onmousemove = (ev) => {
-    const [x, y] = getXY(ev);
-    if (drag >= 0) { nodes[drag].x = x; nodes[drag].y = y; nodes[drag].vx = 0; nodes[drag].vy = 0; }
-    const h2 = pick(x, y);
-    if (h2 !== hover) {
-      hover = h2;
-      const tip = document.getElementById('graph-tip');
-      if (hover >= 0) {
-        const n = nodes[hover];
-        const label = n.entity_type ? `[${escapeHtml(n.entity_type)}] ` : '';
-        tip.innerHTML = `<code>#${n.id}</code> ${escapeHtml(n.kind || '')} ${label}— ${escapeHtml((n.preview || '').slice(0, 80))}`;
-      } else {
-        tip.textContent = '노드 위에 마우스를 올리면 내용 미리보기.';
-      }
-    }
-  };
-  canvas.onmousedown = (ev) => { const [x, y] = getXY(ev); drag = pick(x, y); canvas.style.cursor = drag >= 0 ? 'grabbing' : 'grab'; };
-  canvas.onmouseup = () => { drag = -1; canvas.style.cursor = 'grab'; };
-  canvas.onmouseleave = () => { drag = -1; hover = -1; };
-
-  function step() {
-    // Spring-electric layout: edges pull, nodes repel.
-    const cw = canvas.clientWidth; const ch = canvas.clientHeight;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      for (let j = i+1; j < nodes.length; j++) {
-        const b = nodes[j];
-        const dx = b.x - a.x; const dy = b.y - a.y;
-        const d2 = dx*dx + dy*dy + 0.01;
-        const f = 1200 / d2;
-        const fx = (dx / Math.sqrt(d2)) * f;
-        const fy = (dy / Math.sqrt(d2)) * f;
-        a.vx -= fx; a.vy -= fy;
-        b.vx += fx; b.vy += fy;
-      }
-    }
-    for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      const dx = b.x - a.x; const dy = b.y - a.y;
-      const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
-      const f = (d - 100) * 0.02;
-      const fx = (dx/d) * f; const fy = (dy/d) * f;
-      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-    }
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      if (i === drag) continue;
-      n.vx *= 0.82; n.vy *= 0.82;
-      n.x += n.vx * 0.5; n.y += n.vy * 0.5;
-      // Centre attractor + bounds.
-      n.vx += (cw/2 - n.x) * 0.0008;
-      n.vy += (ch/2 - n.y) * 0.0008;
-      n.x = Math.max(12, Math.min(cw-12, n.x));
-      n.y = Math.max(12, Math.min(ch-12, n.y));
-    }
-
-    ctx.clearRect(0, 0, cw, ch);
-    // Edges — draw relation labels on longer edges when there is room.
-    ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
-    for (const e of edges) {
-      const a = nodes[e.s]; const b = nodes[e.d];
-      // Colour edges by type: entity relations in green, others in muted.
-      ctx.strokeStyle = e.rel ? entityColor : muted;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-      // Show relation label mid-edge when the edge is long enough.
-      if (e.rel) {
-        const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
-        const edgeLen = Math.hypot(b.x - a.x, b.y - a.y);
-        if (edgeLen > 60) {
-          ctx.globalAlpha = 0.75;
-          ctx.fillStyle = muted;
-          ctx.font = '9px system-ui';
-          ctx.textAlign = 'center';
-          ctx.fillText(e.rel, mx, my - 3);
-        }
-      }
-    }
-    ctx.globalAlpha = 1;
-    ctx.textAlign = 'left';
-    // Nodes.
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      const isBlock = (n.kind || '').startsWith('block:');
-      const isEntity = n.node_type === 'entity';
-      const r = isBlock ? 8 : isEntity ? 7 : 6;
-      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = isBlock ? '#7c3aed' : isEntity ? entityColor : accent;
-      ctx.fill();
-      if (i === hover) {
-        ctx.strokeStyle = fg; ctx.lineWidth = 2; ctx.stroke();
-      }
-    }
-  }
-  if (graphState && graphState.raf) cancelAnimationFrame(graphState.raf);
-  graphState = { canvas, nodes, edges };
-  function loop() { step(); graphState.raf = requestAnimationFrame(loop); }
-  loop();
-}
-
-async function loadGraph(project) {
-  const meta = document.getElementById('graph-meta');
-  meta.textContent = '불러오는 중…';
-  try {
-    const r = await fetch(`/api/memory/graph?project=${encodeURIComponent(project)}`);
-    if (!r.ok) {
-      const text = await r.text();
-      showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
-      meta.innerHTML = `<span style="color:var(--err);">${r.status}: ${text}</span>`;
-      return;
-    }
-    const d = await r.json();
-    meta.innerHTML = `<span class="badge ok">${d.nodes.length} 노드</span> <span class="badge">${d.edges.length} 연결</span>`;
-    if (!d.nodes.length) { document.getElementById('graph-tip').textContent = '아직 메모리 없음.'; return; }
-    initGraph(d);
-  } catch (e) {
-    meta.innerHTML = `<span style="color:var(--err);">네트워크 오류: ${e.message || e}</span>`;
-  }
-}
-
-document.getElementById('graph-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const project = currentProject();
-  if (!project) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
-  await loadGraph(project);
+const MEMMAP_GROUP_KO = {
+  context: '문맥', file: '파일', kind: '종류', session: '세션', source: '출처', time: '시간',
 };
 
-// Entity extraction button — POST /api/memory/entities {project}.
-// Hidden on 404 (feature not compiled in).
-(function wireEntityExtract() {
-  const btn = document.getElementById('entity-extract-btn');
-  if (!btn) return;
-  btn.onclick = async () => {
-    const project = currentProject();
-    if (!project) { showToast('프로젝트를 먼저 선택하세요.', 'err'); return; }
-    btn.disabled = true;
-    const origText = btn.textContent;
-    btn.textContent = '추출 중…';
+function memmapSourceLabelKo(source) {
+  return source === 'subagent' ? '🤖서브' : '🧠메인';
+}
+
+// True only when the Cytoscape CDN script actually loaded.
+function memmapHasCy() {
+  return typeof window !== 'undefined' && typeof window.cytoscape === 'function';
+}
+
+// Flag the catch-all/misc cluster: the lone bucket that is huge versus the rest
+// (>= 8x the median size). Returns its id, or null when no cluster dominates.
+function memmapCatchAllId(clusters) {
+  if (clusters.length < 3) return null;
+  const sizes = clusters.map(c => Number(c.size || 0)).sort((a, b) => a - b);
+  const median = sizes[Math.floor(sizes.length / 2)] || 1;
+  let biggest = null;
+  for (const c of clusters) {
+    if (!biggest || Number(c.size || 0) > Number(biggest.size || 0)) biggest = c;
+  }
+  if (biggest && Number(biggest.size || 0) >= median * 8) return biggest.id;
+  return null;
+}
+
+// Small, purposeful palette keyed to MEANING (source), not a per-id hash —
+// agentmemory-style gold/blue/green. Main = blue, subagent = gold, mixed = green,
+// catch-all/misc = neutral grey. This is what makes the map read as clean +
+// structured instead of an 18-colour rainbow.
+const MEMMAP_PALETTE = {
+  main: '#1D4E89',      // deep blue
+  subagent: '#B8860B',  // gold
+  mixed: '#2D6A4F',     // green
+  misc: '#9CA3AF',      // neutral grey (catch-all)
+};
+// Colour a node by its source bucket ('main' | 'subagent' | 'mixed').
+function memmapColor(source) {
+  return MEMMAP_PALETTE[String(source)] || MEMMAP_PALETTE.mixed;
+}
+
+function memmapCyStyle() {
+  return [
+    {
+      selector: 'node',
+      style: {
+        'background-color': 'data(col)',
+        'background-opacity': 0.92,
+        'shape': 'ellipse',
+        'label': 'data(label)',
+        'width': 'data(size)',
+        'height': 'data(size)',
+        'font-size': '10px',
+        'font-family': 'var(--font-ui, sans-serif)',
+        'color': '#e6edf3',          // light label text on the dark canvas
+        'text-valign': 'bottom',
+        'text-halign': 'center',
+        'text-margin-y': 4,
+        'text-wrap': 'ellipsis',
+        'text-max-width': '130px',
+        // Dark halo keeps labels readable over the glowing nodes/grid.
+        'text-outline-width': 2,
+        'text-outline-color': '#0b0e14',
+        'text-outline-opacity': 0.9,
+        // Soft same-colour glow behind each node = the neural-constellation look.
+        'underlay-color': 'data(col)',
+        'underlay-opacity': 0.28,
+        'underlay-padding': 5,
+        'underlay-shape': 'ellipse',
+        'border-width': 1.5,
+        'border-color': 'rgba(255,255,255,0.22)',
+        'min-zoomed-font-size': 8,
+      },
+    },
+    // SHAPES carry meaning (agentmemory-style): cluster/group bubbles are ellipse
+    // hubs; leaf member nodes are round-rectangles ("things" hanging off a hub).
+    { selector: 'node[kindType = "cluster"]', style: { 'shape': 'ellipse' } },
+    { selector: 'node[kindType = "member"]', style: { 'shape': 'round-rectangle' } },
+    // Brain concept nodes are circular "ideas"; labels are hidden by default
+    // (only hubs + hover show them) so the map reads as a clean constellation.
+    {
+      selector: 'node[kindType = "concept"]',
+      style: { 'shape': 'ellipse', 'text-opacity': 0 },
+    },
+    // Hubs (high degree) keep their label so the brain has anchor points.
+    { selector: 'node[kindType = "concept"][?hub]', style: { 'text-opacity': 1 } },
+    // TOPIC COMMUNITIES (top brain level): hexagon super-nodes so topics read
+    // differently from the round concept "ideas". Labels always on (only a few
+    // dozen of them) with a brighter border to mark them as a level above.
+    {
+      selector: 'node[kindType = "community"]',
+      style: {
+        'shape': 'hexagon',
+        'text-opacity': 1,
+        'font-size': '12px',
+        'border-width': 2,
+        'border-color': 'rgba(255,255,255,0.40)',
+        'underlay-opacity': 0.32,
+      },
+    },
+    // Hovered concept (+ its neighbours) always shows its label.
+    { selector: 'node.label-on', style: { 'text-opacity': 1 } },
+    // Catch-all / misc bubble: neutral, dashed, visually set apart from real groups.
+    {
+      selector: 'node[?misc]',
+      style: { 'border-style': 'dashed', 'border-color': 'rgba(17,17,17,0.20)', 'background-opacity': 0.45 },
+    },
+    {
+      selector: 'node.dim',          // hidden by source filter / search miss
+      style: { 'opacity': 0.12, 'text-opacity': 0.06 },
+    },
+    {
+      selector: 'node.hit',          // search match highlight (red ring, agentmemory)
+      style: { 'border-width': 3, 'border-color': '#CC0000' },
+    },
+    {
+      selector: 'edge',
+      style: {
+        'width': 'mapData(w, 1, 4, 1, 2.5)',
+        'line-color': '#C8C8C2',     // thin light grey
+        'opacity': 0.45,
+        'curve-style': 'straight',   // repositions live with the continuous sim
+      },
+    },
+    // Hover / selection: soft accent glow only here (not a permanent halo).
+    {
+      selector: 'node:selected',
+      style: {
+        'border-width': 3, 'border-color': '#1D4E89',
+        'underlay-color': '#1D4E89', 'underlay-opacity': 0.18,
+        'underlay-padding': 6, 'underlay-shape': 'ellipse',
+      },
+    },
+    // Edges touching a hovered/selected node pop so connections read clearly.
+    {
+      selector: 'edge.hl',
+      style: { 'line-color': '#1D4E89', 'opacity': 0.85, 'width': 'mapData(w, 1, 4, 2, 4)', 'z-index': 9 },
+    },
+  ];
+}
+
+// Create (once) or return the shared Cytoscape instance bound to #cy.
+let memmapFcoseReady = false;
+function memmapRegisterFcose() {
+  if (memmapFcoseReady) return true;
+  if (!memmapHasCy() || typeof window.cytoscapeFcose !== 'function') return false;
+  try { window.cytoscape.use(window.cytoscapeFcose); memmapFcoseReady = true; }
+  catch (_) { memmapFcoseReady = false; }
+  return memmapFcoseReady;
+}
+
+let memmapColaReady = false;
+function memmapRegisterCola() {
+  if (memmapColaReady) return true;
+  if (!memmapHasCy() || typeof window.cytoscapeCola !== 'function') return false;
+  try { window.cytoscape.use(window.cytoscapeCola); memmapColaReady = true; }
+  catch (_) { memmapColaReady = false; }
+  return memmapColaReady;
+}
+
+function memmapEnsureCy() {
+  if (memmapCy) return memmapCy;
+  if (!memmapHasCy()) return null;
+  memmapRegisterFcose();
+  const container = document.getElementById('cy');
+  if (!container) return null;
+  memmapCy = window.cytoscape({
+    container,
+    style: memmapCyStyle(),
+    minZoom: 0.1,
+    maxZoom: 3,
+    wheelSensitivity: 0.2,
+  });
+  // Tap on a node: a bubble (cluster) drills via its token; a member opens the
+  // modal; a concept shows its memories.
+  memmapCy.on('tap', 'node', (ev) => {
+    const data = ev.target.data();
+    if (data.kindType === 'community') {
+      brainDrillCommunity(data.communityId, String(data.rawLabel || data.label || ''));
+      return;
+    }
+    if (data.kindType === 'concept') {
+      brainDrillConcept(String(data.token || data.label || ''));
+      return;
+    }
+    if (data.kindType === 'cluster') {
+      // Not drillable (misc/leaf-of-leaf): just centre it, don't try to drill.
+      if (data.drillable === false || data.misc || !data.token) {
+        try { memmapCy.animate({ center: { eles: ev.target }, duration: 200 }); } catch (_) { /* ignore */ }
+        return;
+      }
+      memmapDrill(String(data.token), String(data.rawLabel || data.token));
+    } else if (data.kindType === 'member') {
+      const num = String(data.memId || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    }
+  });
+  // Hover a node: light up its connecting edges + show the agentmemory-style card.
+  // In brain mode, fade the non-neighbours and reveal the hovered node + its
+  // neighbours' labels (agentmemory focus behaviour).
+  memmapCy.on('mouseover', 'node', (ev) => {
+    ev.target.connectedEdges().addClass('hl');
+    if (memmapViewMode === 'brain' && !brainConcept) {
+      const focus = ev.target.closedNeighborhood();
+      memmapCy.nodes().not(focus).addClass('dim');
+      focus.nodes().addClass('label-on');
+    }
+    memmapShowTooltip(ev.target);
+  });
+  memmapCy.on('mouseout', 'node', () => {
+    memmapCy.edges('.hl').removeClass('hl');
+    if (memmapViewMode === 'brain' && !brainConcept) {
+      memmapCy.nodes().removeClass('dim label-on');
+    }
+    memmapHideTooltip();
+  });
+  // Track the cursor so the card follows it (offset +12px, like agentmemory).
+  memmapCy.on('mousemove', 'node', (ev) => memmapMoveTooltip(ev));
+  // Any pan/zoom/tap-on-background dismisses the card so it never sticks.
+  memmapCy.on('pan zoom', () => memmapHideTooltip());
+  memmapCy.on('tap', (ev) => { if (ev.target === memmapCy) memmapHideTooltip(); });
+  return memmapCy;
+}
+
+// Hover card (agentmemory style): "<name> · <TYPE> · N connections". TYPE is
+// derived from kindType + misc (클러스터 / 메모리 / 미분류); connection count is the
+// live cy node degree. The card is a DOM div positioned over the .memmap-cy-wrap.
+function memmapTooltipMeta(node) {
+  const data = node.data();
+  if (data.misc) return { type: '미분류', col: MEMMAP_PALETTE.misc };
+  if (data.kindType === 'community') return { type: '주제', col: data.col || MEMMAP_PALETTE.mixed };
+  if (data.kindType === 'concept') return { type: '개념', col: data.col || MEMMAP_PALETTE.mixed };
+  if (data.kindType === 'member') return { type: '메모리', col: memmapColor(data.src || 'mixed') };
+  return { type: '클러스터', col: memmapColor(data.src || 'mixed') };
+}
+function memmapShowTooltip(node) {
+  const tip = document.getElementById('memmap-tooltip');
+  if (!tip) return;
+  const data = node.data();
+  const meta = memmapTooltipMeta(node);
+  const name = String(data.rawLabel || data.label || data.id || '');
+  const conns = node.degree(false);   // edges touching this node (live)
+  tip.innerHTML = '';
+  const nm = document.createElement('div');
+  nm.className = 'tt-name';
+  nm.textContent = name || '(이름 없음)';
+  const ty = document.createElement('div');
+  ty.className = 'tt-type';
+  ty.textContent = meta.type;
+  ty.style.backgroundColor = meta.col;
+  const cn = document.createElement('div');
+  cn.className = 'tt-conns';
+  if (data.kindType === 'community') {
+    // Topic super-node: how many concepts it groups + a few representative ones.
+    const tops = Array.isArray(data.topConcepts) ? data.topConcepts : [];
+    const cnt = Number(data.conceptCount || 0);
+    cn.textContent = `${cnt.toLocaleString()}개 개념` + (tops.length ? ` · ${tops.join(', ')}` : '');
+  } else {
+    cn.textContent = `${conns} connections`;
+  }
+  tip.appendChild(nm);
+  tip.appendChild(ty);
+  tip.appendChild(cn);
+  tip.classList.add('visible');
+}
+function memmapMoveTooltip(ev) {
+  const tip = document.getElementById('memmap-tooltip');
+  if (!tip || !ev.renderedPosition) return;
+  // renderedPosition is relative to the cy canvas, which fills .memmap-cy-wrap.
+  tip.style.left = `${Math.round(ev.renderedPosition.x) + 12}px`;
+  tip.style.top = `${Math.round(ev.renderedPosition.y) + 12}px`;
+}
+function memmapHideTooltip() {
+  const tip = document.getElementById('memmap-tooltip');
+  if (tip) tip.classList.remove('visible');
+}
+
+// Set the current level kind and toggle controls. 'overview'/'group' are bubble
+// levels (source filter + search apply); 'leaf' shows individual members (hidden).
+function memmapSetMode(mode) {
+  memmapMode = mode;
+  const isBubble = mode === 'overview' || mode === 'group';
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = memmapStack.length === 0;   // hidden at the root
+  // Source filter + search only apply to bubble levels (overview / group).
+  const filter = document.getElementById('memmap-source-filter');
+  if (filter) filter.style.display = isBubble ? '' : 'none';
+  const search = document.getElementById('memmap-search');
+  if (search) search.style.display = isBubble ? '' : 'none';
+}
+
+// Render the breadcrumb bar: "전체 › 라벨 › 라벨". Each non-current crumb pops back
+// to that depth and re-renders from cache. Root crumb (전체) reloads the overview.
+function memmapRenderCrumbs() {
+  const bar = document.getElementById('memmap-crumbs');
+  if (!bar) return;
+  bar.innerHTML = '';
+  const crumbs = [{ token: null, label: '전체' }].concat(memmapStack);
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = '›';
+      bar.appendChild(sep);
+    }
+    const isLast = i === crumbs.length - 1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (isLast ? ' current' : '');
+    btn.textContent = c.label;
+    if (!isLast) btn.onclick = () => memmapGoToDepth(i);   // i === stack index to keep
+    bar.appendChild(btn);
+  });
+  bar.hidden = false;
+}
+
+// Clear the offline/no-cy fallback list + empty notice + the cy container.
+function memmapResetViews() {
+  memmapStopLayout();   // halt the continuous sim before nodes get removed/replaced
+  const fb = document.getElementById('memmap-fallback');
+  if (fb) { fb.hidden = true; fb.innerHTML = ''; }
+  const empty = document.getElementById('memmap-empty');
+  if (empty) empty.hidden = true;
+}
+
+// Thin a dense edge set down to a "backbone": keep, for every node, only its
+// single strongest edge (dedup by edge). A full 2000-edge / 4000-edge set forms a
+// hairball that the force layout collapses into overlapping blobs; the backbone
+// keeps the map connected without the clutter.
+function memmapBackboneEdges(rawEdges, validIds) {
+  const best = new Map();   // nodeId -> {src,dst,w}
+  for (const e of rawEdges) {
+    const s = String(e.src), d = String(e.dst);
+    if (!validIds.has(s) || !validIds.has(d) || s === d) continue;
+    const w = Number(e.weight || 0);
+    const bs = best.get(s);
+    if (!bs || w > bs.w) best.set(s, { src: s, dst: d, w });
+    const bd = best.get(d);
+    if (!bd || w > bd.w) best.set(d, { src: s, dst: d, w });
+  }
+  const seen = new Set(), out = [];
+  for (const e of best.values()) {
+    const key = e.src < e.dst ? `${e.src}|${e.dst}` : `${e.dst}|${e.src}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+// Build the Cytoscape bubble elements from a clusters[] + cluster_edges[] pair.
+// Used by both the overview and every drilled "group" level (same bubble shape).
+// Each bubble carries `token` + `drillable` so the tap handler can drill deeper.
+function memmapOverviewElements(payload) {
+  payload = payload || memmapOverview || {};
+  const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
+  const edges = Array.isArray(payload.cluster_edges) ? payload.cluster_edges : [];
+  const catchAllId = memmapCatchAllId(clusters);
+  // Size scaling: clamp node diameter so a few hubs read clearly while satellites
+  // stay small (hub-and-spoke). Tighter range than before keeps the map airy.
+  const sizes = clusters.map(c => Number(c.size || 0));
+  const maxSize = Math.max(1, ...sizes);
+  const SCALE_MIN = 18, SCALE_MAX = 58;
+  const ids = new Set();
+  const nodes = clusters.map(c => {
+    const id = String(c.id);
+    ids.add(id);
+    const size = Number(c.size || 0);
+    const isMisc = c.id === catchAllId;
+    const dom = c.dominant_source || 'mixed';
+    // sqrt scale keeps small clusters visible; misc forced small.
+    let diam = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.sqrt(size / maxSize);
+    if (isMisc) diam = SCALE_MIN;
+    const label = isMisc
+      ? `미분류 (${size.toLocaleString()})`
+      : `${String(c.label || '(이름 없음)')} (${size.toLocaleString()})`;
+    return {
+      data: {
+        id, label, size: Math.round(diam), src: dom,
+        // Colour by MEANING (source), neutral grey for the catch-all.
+        col: isMisc ? memmapColor('misc') : memmapColor(dom),
+        misc: isMisc ? 1 : undefined,
+        kindType: 'cluster', clusterId: id, dom,
+        token: c.token != null ? String(c.token) : '',
+        drillable: c.drillable !== false,
+        rawLabel: String(c.label || ''),
+      },
+    };
+  });
+  const edgeEls = memmapBackboneEdges(edges, ids)
+    .map((e, i) => ({
+      data: {
+        id: `ce${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(4, Number(e.w || 1))),
+      },
+    }));
+  return nodes.concat(edgeEls);
+}
+
+// Build the Cytoscape elements for one cluster's members (drill-down).
+function memmapMemberElements(payload) {
+  const members = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  );
+  const ids = new Set(members.map(n => String(n.id)));
+  const nodes = members.map(n => {
+    const source = n.source_kind || 'main';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    return {
+      data: {
+        id: String(n.id), label: preview, size: 24, src: source,
+        // Member colour also keyed to source (main/subagent/mixed), not a hash.
+        col: memmapColor(source),
+        kindType: 'member', memId: String(n.id || ''),
+        rawLabel: preview,
+      },
+    };
+  });
+  const edges = memmapBackboneEdges(payload.edges || [], ids)
+    .map((e, i) => ({
+      data: {
+        id: `me${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(3, Number(e.w || 1))),
+      },
+    }));
+  return nodes.concat(edges);
+}
+
+// Stop the running layout (cola runs continuously; must be stopped before a
+// re-layout or when the user leaves the map tab).
+function memmapStopLayout() {
+  if (memmapLayout) { try { memmapLayout.stop(); } catch (_) { /* ignore */ } memmapLayout = null; }
+}
+
+// Run the layout. Prefers cola — a CONTINUOUS force sim, so dragging a node makes
+// its neighbours spring and the rest avoid in real time (the live motion the
+// static one-shot layouts lacked). Degrades to fcose -> cose -> concentric if the
+// extension fails to load.
+function memmapRunLayout() {
+  if (!memmapCy) return;
+  // Re-sync Cytoscape to the live container size first. Drilling shows/hides the
+  // breadcrumb, which changes #cy's height; without resize() the internal
+  // viewport stays stale and click hit-testing lands on the wrong coordinates.
+  try { memmapCy.resize(); } catch (_) { /* ignore */ }
+  const n = memmapCy.nodes().length;
+  memmapStopLayout();
+  if (memmapRegisterCola()) {
     try {
-      const r = await fetch('/api/memory/entities', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project }),
+      const layout = memmapCy.layout({
+        name: 'cola',
+        animate: true,            // animate every tick (the live motion)
+        infinite: true,           // keep simulating so drags reflow neighbours
+        fit: false,               // we fit once on first settle, not every tick
+        refresh: 1,
+        maxSimulationTime: 4000,
+        nodeSpacing: 16,          // min gap around each node (overlap avoidance)
+        edgeLength: 130,
+        avoidOverlap: true,
+        handleDisconnected: true, // arrange disconnected islands instead of stacking
+        randomize: false,
+        unconstrIter: 10,
+        userConstIter: 10,
       });
-      if (r.status === 404) {
-        // Entity extraction not built into this binary; hide the button.
-        btn.hidden = true;
+      memmapLayout = layout;
+      layout.one('layoutready', () => { try { memmapCy.fit(undefined, 36); } catch (_) { /* ignore */ } });
+      layout.run();
+      return;
+    } catch (_) { memmapStopLayout(); /* fall through */ }
+  }
+  if (memmapRegisterFcose()) {
+    try {
+      memmapCy.layout({
+        name: 'fcose', quality: 'default', randomize: true, animate: true,
+        animationDuration: 600, packComponents: true, nodeRepulsion: 9000,
+        idealEdgeLength: 120, nodeSeparation: 90, gravity: 0.2, gravityRange: 3.0,
+        numIter: n > 600 ? 1500 : 2500, fit: true, padding: 36,
+      }).run();
+      return;
+    } catch (_) { /* fall through to cose */ }
+  }
+  try {
+    memmapCy.layout({
+      name: 'cose', animate: true, nodeRepulsion: 12000, nodeOverlap: 24,
+      componentSpacing: 140, idealEdgeLength: 120, gravity: 0.2, fit: true, padding: 36,
+    }).run();
+  } catch (_) {
+    try { memmapCy.layout({ name: 'concentric', fit: true }).run(); } catch (_e) { /* ignore */ }
+  }
+}
+
+// Render the overview cluster graph (or fallback list when cy is unavailable).
+// The overview is the breadcrumb root: it clears the drill stack.
+function renderMemmapOverview() {
+  const head = document.getElementById('memmap-overview-head');
+  memmapStack = [];
+  memmapSetMode('overview');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  if (!memmapOverview) {
+    if (head) head.textContent = '';
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const clusters = Array.isArray(memmapOverview.clusters) ? memmapOverview.clusters : [];
+  const total = Number(memmapOverview.total_nodes || 0);
+  const groupKo = MEMMAP_GROUP_KO[memmapGroup] || memmapGroup;
+  let caption = `전체 ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹 · 기준: ${groupKo}`;
+  // For the 문맥 (context) basis, show whether the map is using the semantic
+  // (embedding/vector) signal or the keyword (lexical) fallback, plus coverage.
+  if (memmapGroup === 'context') {
+    const emb = Number(memmapOverview.embedded || 0);
+    const totRows = Number(memmapOverview.total_rows || 0);
+    const cov = totRows ? ` (임베딩 ${emb.toLocaleString()}/${totRows.toLocaleString()})` : '';
+    caption += memmapOverview.basis === 'vector'
+      ? ` · 🧠 의미 기반${cov}`
+      : ` · 🔤 어휘 기반${cov}`;
+  }
+  if (head) head.textContent = caption;
+  if (!clusters.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) empty.hidden = false;
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapFallback(clusters); return; }
+  cy.elements().remove();
+  cy.add(memmapOverviewElements(memmapOverview));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Render a drilled "group" level: bubbles again (same builder), with a caption and
+// the source filter/search re-enabled. Assumes the crumb is already on the stack.
+function memmapRenderGroupLevel(payload, label) {
+  const head = document.getElementById('memmap-overview-head');
+  memmapSetMode('group');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
+  const total = Number(payload.total_nodes || 0);
+  if (head) head.textContent =
+    `${label} · ${total.toLocaleString()}개 · ${clusters.length.toLocaleString()} 그룹`;
+  if (!clusters.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) empty.hidden = false;
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapFallback(clusters); return; }
+  cy.elements().remove();
+  cy.add(memmapOverviewElements(payload));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Render a "leaf" level: individual member nodes; tapping one opens the modal.
+function memmapRenderLeafLevel(payload, label) {
+  const head = document.getElementById('memmap-overview-head');
+  memmapSetMode('leaf');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  const memberCount = (payload.nodes || []).filter(
+    n => n.node_type === 'memory' || n.node_type === undefined,
+  ).length;
+  if (head) head.textContent = `${label} · ${memberCount.toLocaleString()}개 메모리`;
+  const cy = memmapEnsureCy();
+  if (!cy) { renderMemmapMemberFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(memmapMemberElements(payload));
+  memmapRunLayout();
+}
+
+// Apply the source filter + search highlight to the overview using cy selectors.
+function memmapApplyFilters() {
+  // Brain mode: only a concept-name search highlight (no source/cluster filter).
+  if (memmapViewMode === 'brain') {
+    if (!memmapCy || brainConcept) return;
+    const needle = memmapSearch.trim().toLowerCase();
+    memmapCy.nodes().removeClass('dim hit');
+    if (needle) {
+      memmapCy.nodes().filter(n => !String(n.data('rawLabel') || '').toLowerCase().includes(needle)).addClass('dim');
+      memmapCy.nodes().filter(n => String(n.data('rawLabel') || '').toLowerCase().includes(needle)).removeClass('dim').addClass('hit');
+    }
+    return;
+  }
+  // Bubble levels only (overview / group); leaf shows members, no cluster filter.
+  if (!memmapCy || (memmapMode !== 'overview' && memmapMode !== 'group')) return;
+  const needle = memmapSearch.trim().toLowerCase();
+  memmapCy.nodes().removeClass('dim hit');
+  // Source filter: dim nodes whose dominant_source doesn't match (mixed always shows).
+  if (memmapSource !== 'all') {
+    memmapCy.nodes().filter(n => {
+      const dom = n.data('dom') || 'mixed';
+      return dom !== 'mixed' && dom !== memmapSource;
+    }).addClass('dim');
+  }
+  // Search: highlight matching cluster labels.
+  if (needle) {
+    memmapCy.nodes().filter(n => !String(n.data('rawLabel') || '').toLowerCase().includes(needle)).addClass('dim');
+    memmapCy.nodes().filter(n => String(n.data('rawLabel') || '').toLowerCase().includes(needle)).removeClass('dim').addClass('hit');
+  }
+}
+
+// Offline / library-load failure: render clusters as a plain clickable list.
+function renderMemmapFallback(clusters) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const catchAllId = memmapCatchAllId(clusters);
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  const rows = clusters
+    .filter(c => c.id !== catchAllId)
+    .sort((a, b) => Number(b.size || 0) - Number(a.size || 0))
+    .map(c => {
+      const size = Number(c.size || 0);
+      const dom = c.dominant_source || 'mixed';
+      const badge = dom === 'subagent' ? 'badge source-subagent' : 'badge';
+      const tok = c.token != null ? String(c.token) : '';
+      const drillable = c.drillable !== false && tok;
+      return `<div class="member-row" data-token="${escapeHtml(tok)}" data-drillable="${drillable ? '1' : '0'}" data-label="${escapeHtml(String(c.label || ''))}">`
+        + `<span class="mr-badge ${badge}">${memmapSourceLabelKo(dom === 'subagent' ? 'subagent' : 'main')}</span>`
+        + `<div class="mr-body"><div class="mr-preview">${escapeHtml(String(c.label || '(이름 없음)'))}</div>`
+        + `<div class="mr-kind">${size.toLocaleString()}건</div></div></div>`;
+    }).join('');
+  fb.innerHTML = note + rows;
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      if (el.dataset.drillable !== '1') return;
+      memmapDrill(el.dataset.token, el.dataset.label || el.dataset.token);
+    };
+  });
+}
+
+// Offline member fallback list for drill-down.
+function renderMemmapMemberFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (payload.nodes || []).filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (!nodes.length) {
+    fb.innerHTML = '<div class="empty">이 클러스터에 메모리가 없습니다.</div>';
+    fb.hidden = false;
+    return;
+  }
+  fb.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    return `<div class="member-row" data-id="${escapeHtml(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      const num = String(el.dataset.id || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Render a cached level payload by its declared mode (group bubbles vs leaf members).
+function memmapRenderLevelPayload(payload, label) {
+  if (payload && payload.mode === 'leaf') memmapRenderLeafLevel(payload, label);
+  else memmapRenderGroupLevel(payload, label);
+}
+
+// Drill into one bubble by token: fetch the level (cached by token), push a crumb,
+// and render it (group bubbles or leaf members). On a stale (HTTP 410) token the
+// whole map is reloaded from the overview.
+async function memmapDrill(token, label) {
+  token = String(token || '');
+  label = String(label || token);
+  if (!token) return;
+  const head = document.getElementById('memmap-overview-head');
+
+  let payload = memmapLevelCache.get(token);
+  if (!payload) {
+    if (head) head.textContent = `${label} · 불러오는 중…`;
+    try {
+      // 깊이(leaf) is re-sent on every drill so the server applies the same
+      // depth at each level (the token only carries the member set).
+      const dp = memmapDepth ? `&leaf=${memmapDepth}` : '';
+      const r = await fetch('/api/memory/graph?token=' + encodeURIComponent(token) + dp);
+      if (r.status === 410) {
+        showToast('맵이 갱신되어 처음부터 다시 불러옵니다', 'err');
+        await loadGraph(currentProject());
         return;
       }
       if (!r.ok) {
-        const text = await r.text();
-        showToast(`엔티티 추출 오류 ${r.status}: ${text}`, 'err');
+        showToast(`그룹 로드 실패 ${r.status}`, 'err');
+        if (head) head.textContent = `${label} · 오류 ${r.status}`;
         return;
       }
-      const d = await r.json();
-      showToast(`엔티티 추출 완료 · ${d.edges}개 관계 추가됨`, 'ok');
-      pushActivity(`entity extract · ${project} · ${d.edges}개 관계`);
-      // Refresh the graph to show newly extracted entities.
-      await loadGraph(project);
+      payload = await r.json();
+      memmapLevelCache.set(token, payload);
     } catch (e) {
       showToast(`네트워크 오류: ${e.message || e}`, 'err');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = origText;
+      if (head) head.textContent = `${label} · 네트워크 오류`;
+      return;
     }
+  }
+  memmapStack.push({ token, label });
+  memmapRenderLevelPayload(payload, label);
+}
+
+// Jump to a breadcrumb depth (number of pushed levels to keep). depth 0 = overview
+// root; depth N renders the Nth pushed level from cache. Pops the stack to match.
+function memmapGoToDepth(depth) {
+  if (depth <= 0) { renderMemmapOverview(); return; }
+  memmapStack = memmapStack.slice(0, depth);
+  const crumb = memmapStack[memmapStack.length - 1];
+  const payload = crumb ? memmapLevelCache.get(crumb.token) : null;
+  if (!payload) { renderMemmapOverview(); return; }
+  memmapRenderLevelPayload(payload, crumb.label);
+}
+
+// ── DIGITAL BRAIN (개념 그래프) ───────────────────────────────────────────────
+// Obsidian-style concept map: nodes are CONCEPTS (salient tokens), edges are
+// co-occurrence between them. Works per-project and GLOBAL (전체 = all projects
+// merged into one brain). Reuses the shared cy instance, styling, layout +
+// hover card. No LLM — the server derives concepts from the token index.
+
+// Concept node radius is driven by DEGREE: r = clamp(8 + degree*2.5, 8, 22)
+// (same spec already used by the cluster view). cy 'width'/'height' want the
+// DIAMETER, so we return 2r.
+function brainNodeDiameter(degree) {
+  const r = Math.max(8, Math.min(22, 8 + Number(degree || 0) * 2.5));
+  return Math.round(r * 2);
+}
+
+// Deterministic palette colour per concept (clean agentmemory gold/blue/green,
+// never an 18-colour rainbow). Hash the token so the same concept keeps its hue.
+const BRAIN_CONCEPT_PALETTE = [
+  MEMMAP_PALETTE.main, MEMMAP_PALETTE.subagent, MEMMAP_PALETTE.mixed,
+];
+function brainConceptColor(token) {
+  const s = String(token || '');
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return BRAIN_CONCEPT_PALETTE[h % BRAIN_CONCEPT_PALETTE.length];
+}
+
+// Build the Cytoscape elements for the brain overview from { nodes, edges }.
+// Nodes carry kindType:'concept', size-by-degree, token for the drill, and a
+// `hub` flag (top-degree nodes keep their label visible).
+function brainOverviewElements(payload) {
+  const rawNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const rawEdges = Array.isArray(payload.edges) ? payload.edges : [];
+  const ids = new Set(rawNodes.map(n => String(n.id)));
+  // Hubs: the top ~12 by degree get a persistent label so the map has anchors.
+  const byDegree = rawNodes.slice().sort((a, b) => Number(b.degree || 0) - Number(a.degree || 0));
+  const hubIds = new Set(byDegree.slice(0, 12).map(n => String(n.id)));
+  const nodes = rawNodes.map(n => {
+    const id = String(n.id);
+    const token = String(n.label != null ? n.label : id.replace(/^c:/, ''));
+    const degree = Number(n.degree || 0);
+    const freq = Number(n.freq || 0);
+    const projects = Array.isArray(n.projects) ? n.projects : [];
+    return {
+      data: {
+        id, label: token, rawLabel: token, token,
+        size: brainNodeDiameter(degree),
+        col: brainConceptColor(token),
+        kindType: 'concept',
+        degree, freq, projects,
+        hub: hubIds.has(id) ? 1 : undefined,
+      },
+    };
+  });
+  const edgeEls = rawEdges
+    .filter(e => ids.has(String(e.src)) && ids.has(String(e.dst)) && e.src !== e.dst)
+    .map((e, i) => ({
+      data: {
+        id: `be${i}`,
+        source: String(e.src),
+        target: String(e.dst),
+        w: Math.max(1, Math.min(4, Number(e.weight || 1))),
+      },
+    }));
+  return nodes.concat(edgeEls);
+}
+
+// Build the Cytoscape elements for the brain TOP LEVEL: TOPIC COMMUNITIES.
+// Nodes carry kindType:'community' (hexagon super-node), sized by the community's
+// SIZE (memories touched) with concept_count as a tie-break, clamped so a few big
+// topics read clearly while small ones stay legible. Inter-community edges are
+// thinned to a backbone (same as concepts) to keep the top view airy.
+function brainCommunityElements(payload) {
+  const rawNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const rawEdges = Array.isArray(payload.edges) ? payload.edges : [];
+  const ids = new Set(rawNodes.map(n => String(n.id)));
+  // Sqrt scale on size keeps small communities visible; clamp to a hexagon range
+  // bigger than concept ideas so topics dominate the canvas.
+  const sizes = rawNodes.map(n => Number(n.size || 0));
+  const maxSize = Math.max(1, ...sizes);
+  const SCALE_MIN = 28, SCALE_MAX = 72;
+  const nodes = rawNodes.map(n => {
+    const id = String(n.id);
+    const label = String(n.label != null ? n.label : id.replace(/^k:/, ''));
+    const size = Number(n.size || 0);
+    const conceptCount = Number(n.concept_count || 0);
+    const tops = Array.isArray(n.top_concepts) ? n.top_concepts.map(String) : [];
+    const diam = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.sqrt(size / maxSize);
+    return {
+      data: {
+        id, label, rawLabel: label,
+        size: Math.round(Math.max(SCALE_MIN, Math.min(SCALE_MAX, diam))),
+        col: brainConceptColor(label),
+        kindType: 'community',
+        // The community id the API drills by (strip the "k:" id prefix).
+        communityId: id.replace(/^k:/, ''),
+        conceptCount, topConcepts: tops,
+      },
+    };
+  });
+  const edgeEls = memmapBackboneEdges(
+    rawEdges.map(e => ({ src: e.src, dst: e.dst, weight: e.weight })), ids,
+  ).map((e, i) => ({
+    data: {
+      id: `ke${i}`,
+      source: String(e.src),
+      target: String(e.dst),
+      w: Math.max(1, Math.min(4, Number(e.w || 1))),
+    },
+  }));
+  return nodes.concat(edgeEls);
+}
+
+// Render the breadcrumb for the brain: 전체(주제) › <주제 label> › <개념 label>.
+// The communities overview is the implicit root; pushed levels follow. Clicking a
+// non-current crumb pops back to that level; the current crumb is inert.
+function brainRenderCrumbs() {
+  const bar = document.getElementById('memmap-crumbs');
+  if (!bar) return;
+  bar.innerHTML = '';
+  // Hidden at the top level — the communities overview shows no breadcrumb.
+  if (!brainStack.length) { bar.hidden = true; return; }
+  const crumbs = [{ kind: 'root', label: '전체(주제)' }].concat(brainStack);
+  crumbs.forEach((c, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = '›';
+      bar.appendChild(sep);
+    }
+    const isLast = i === crumbs.length - 1;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'crumb' + (isLast ? ' current' : '');
+    btn.textContent = c.label;
+    if (!isLast) btn.onclick = () => brainGoToDepth(i);   // i = pushed levels to keep
+    bar.appendChild(btn);
+  });
+  bar.hidden = false;
+}
+
+// Pop the brain breadcrumb to a given depth (number of pushed levels to keep).
+// depth 0 = communities root; depth 1 = the community's concepts (from cache).
+function brainGoToDepth(depth) {
+  if (depth <= 0) { renderBrainOverview(); return; }
+  // Only depth 1 is a re-rendered level (community → concepts). The concept level
+  // (depth 2) is a memory list and is never a "go back" target (it's the leaf).
+  const crumb = brainStack[depth - 1];
+  if (!crumb || crumb.kind !== 'community') { renderBrainOverview(); return; }
+  brainStack = brainStack.slice(0, depth);
+  const payload = brainCommunityCache.get(String(crumb.id));
+  if (!payload) { renderBrainOverview(); return; }
+  renderBrainCommunityLevel(crumb.id, crumb.label, payload);
+}
+
+// #memmap-back pops exactly one brain level:
+//   memory (concept drill) → back to the community's concepts
+//   concept (community drill) → back to the communities overview
+function brainBack() {
+  if (brainLevel === 'memory' && brainCommunity) {
+    const cached = brainCommunityCache.get(String(brainCommunity.id));
+    if (cached) {
+      brainStack = [{ kind: 'community', id: brainCommunity.id, label: brainCommunity.label }];
+      renderBrainCommunityLevel(brainCommunity.id, brainCommunity.label, cached);
+      return;
+    }
+  }
+  renderBrainOverview();
+}
+
+// Render the brain TOP LEVEL = TOPIC COMMUNITIES (or fallback list if cy is
+// unavailable). Resets the drill state so we're back at the topic constellation.
+function renderBrainOverview() {
+  brainConcept = null;
+  brainCommunity = null;
+  brainLevel = 'community';
+  brainStack = [];
+  const head = document.getElementById('memmap-overview-head');
+  memmapResetViews();
+  memmapStack = [];
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = true;   // top level: no 뒤로
+  brainRenderCrumbs();            // hidden at the top
+  if (!brainGraph) {
+    if (head) head.textContent = '';
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const communities = (Array.isArray(brainGraph.nodes) ? brainGraph.nodes : []);
+  const concepts = Number(brainGraph.total_concepts || 0);
+  const mems = Number(brainGraph.total_memories || 0);
+  const scopeLabel = brainScopeGlobal ? '전체' : (brainProject || '');
+  if (head) {
+    head.textContent = `주제 ${communities.length.toLocaleString()}개 · `
+      + `개념 ${concepts.toLocaleString()}개 · 메모리 ${mems.toLocaleString()}개 · ${scopeLabel}`;
+  }
+  if (!communities.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) { empty.textContent = '주제가 충분하지 않습니다 (메모리가 더 쌓이면 나타납니다).'; empty.hidden = false; }
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderBrainCommunityFallback(brainGraph); return; }
+  cy.elements().remove();
+  cy.add(brainCommunityElements(brainGraph));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Drill a TOPIC COMMUNITY → its CONCEPTS. Fetches mode=brain&community=ID for the
+// current scope, pushes a breadcrumb, and renders the member concepts (existing
+// concept node style). Tapping a concept then drills to its memories.
+async function brainDrillCommunity(communityId, label) {
+  communityId = String(communityId || '');
+  label = String(label || communityId);
+  if (communityId === '') return;
+  const head = document.getElementById('memmap-overview-head');
+  let payload = brainCommunityCache.get(communityId);
+  if (!payload) {
+    if (head) head.textContent = `주제 "${label}" · 불러오는 중…`;
+    try {
+      const params = new URLSearchParams({ mode: 'brain', community: communityId });
+      if (!brainScopeGlobal && brainProject) params.set('project', brainProject);
+      const r = await fetch(`/api/memory/graph?${params.toString()}`);
+      if (!r.ok) {
+        showToast(`주제 로드 실패 ${r.status}`, 'err');
+        if (head) head.textContent = `주제 "${label}" · 오류 ${r.status}`;
+        return;
+      }
+      payload = await r.json();
+      payload.nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+      payload.edges = Array.isArray(payload.edges) ? payload.edges : [];
+      brainCommunityCache.set(communityId, payload);
+    } catch (e) {
+      showToast(`네트워크 오류: ${e.message || e}`, 'err');
+      if (head) head.textContent = `주제 "${label}" · 네트워크 오류`;
+      return;
+    }
+  }
+  brainStack = [{ kind: 'community', id: communityId, label }];
+  renderBrainCommunityLevel(communityId, label, payload);
+}
+
+// Render one community's CONCEPTS (the second brain level). Reuses the concept
+// node style + layout. Assumes the crumb is already on brainStack.
+function renderBrainCommunityLevel(communityId, label, payload) {
+  brainConcept = null;
+  brainCommunity = { id: String(communityId), label: String(label) };
+  brainLevel = 'concept';
+  const head = document.getElementById('memmap-overview-head');
+  memmapResetViews();
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = false;
+  brainRenderCrumbs();
+  const concepts = (Array.isArray(payload.nodes) ? payload.nodes : []);
+  if (head) head.textContent = `주제 "${label}" · 개념 ${concepts.length.toLocaleString()}개`;
+  if (!concepts.length) {
+    const empty = document.getElementById('memmap-empty');
+    if (empty) { empty.textContent = '이 주제에 개념이 없습니다.'; empty.hidden = false; }
+    if (memmapCy) memmapCy.elements().remove();
+    return;
+  }
+  const cy = memmapEnsureCy();
+  if (!cy) { renderBrainFallback(payload); return; }
+  cy.elements().remove();
+  cy.add(brainOverviewElements(payload));
+  memmapApplyFilters();
+  memmapRunLayout();
+}
+
+// Offline / no-cy fallback for the TOP LEVEL: list communities as clickable rows.
+function renderBrainCommunityFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (Array.isArray(payload.nodes) ? payload.nodes : [])
+    .slice().sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  fb.innerHTML = note + nodes.map(n => {
+    const id = String(n.id != null ? n.id : '').replace(/^k:/, '');
+    const label = String(n.label != null ? n.label : id);
+    const size = Number(n.size || 0);
+    const cnt = Number(n.concept_count || 0);
+    const tops = Array.isArray(n.top_concepts) ? n.top_concepts.map(String) : [];
+    const sub = tops.length ? ` · ${escapeHtml(tops.join(', '))}` : '';
+    return `<div class="member-row" data-community="${escapeAttr(id)}" data-label="${escapeAttr(label)}">`
+      + `<span class="mr-badge badge">주제</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(label)}</div>`
+      + `<div class="mr-kind">${cnt.toLocaleString()}개 개념 · 메모리 ${size.toLocaleString()}${sub}</div></div></div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => brainDrillCommunity(el.dataset.community, el.dataset.label || el.dataset.community);
+  });
+}
+
+// Offline / no-cy fallback for a community's CONCEPTS: clickable concept rows.
+function renderBrainFallback(payload) {
+  const fb = document.getElementById('memmap-fallback');
+  if (!fb) return;
+  const nodes = (Array.isArray(payload.nodes) ? payload.nodes : [])
+    .slice().sort((a, b) => Number(b.degree || 0) - Number(a.degree || 0));
+  const note = '<div class="empty" style="color:var(--warn);">그래프 라이브러리 로드 실패 (오프라인?) — 목록으로 표시합니다.</div>';
+  fb.innerHTML = note + nodes.map(n => {
+    const token = String(n.label != null ? n.label : String(n.id).replace(/^c:/, ''));
+    const degree = Number(n.degree || 0);
+    const freq = Number(n.freq || 0);
+    return `<div class="member-row" data-concept="${escapeAttr(token)}">`
+      + `<span class="mr-badge badge">개념</span>`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(token)}</div>`
+      + `<div class="mr-kind">${degree} 연결 · ${freq.toLocaleString()}건</div></div></div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => brainDrillConcept(el.dataset.concept);
+  });
+}
+
+// Drill a concept → its MEMORIES (the third/leaf brain level). Fetches
+// mode=brain&concept=TOKEN for the current scope, pushes a breadcrumb, and renders
+// the memories AS member nodes; tapping one opens the memory modal. 뒤로 / the
+// crumb returns to the community's concepts.
+async function brainDrillConcept(concept) {
+  concept = String(concept || '');
+  if (!concept) return;
+  brainConcept = concept;
+  brainLevel = 'memory';
+  // Push the concept crumb (drop any stale concept crumb from a previous drill so
+  // we never stack 전체(주제) › 주제 › 개념A › 개념B).
+  if (brainStack.length && brainStack[brainStack.length - 1].kind === 'concept') {
+    brainStack = brainStack.slice(0, -1);
+  }
+  brainStack.push({ kind: 'concept', token: concept, label: concept });
+  brainRenderCrumbs();
+  const head = document.getElementById('memmap-overview-head');
+  if (head) head.textContent = `개념 "${concept}" · 불러오는 중…`;
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = false;
+  // Clear the graph canvas while the memories load (we show a list, not a graph).
+  if (memmapCy) memmapCy.elements().remove();
+  memmapStopLayout();
+  try {
+    const params = new URLSearchParams({ mode: 'brain', concept });
+    if (!brainScopeGlobal && brainProject) params.set('project', brainProject);
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
+    if (!r.ok) {
+      showToast(`개념 로드 실패 ${r.status}`, 'err');
+      if (head) head.textContent = `개념 "${concept}" · 오류 ${r.status}`;
+      return;
+    }
+    const d = await r.json();
+    const mems = (Array.isArray(d.nodes) ? d.nodes : [])
+      .filter(n => n.node_type === 'memory' || n.node_type === undefined);
+    if (head) head.textContent = `개념 "${concept}" · 메모리 ${mems.length.toLocaleString()}개`;
+    // Render the concept's memories AS NODES inside the same graph (not a hidden
+    // list below the canvas — that left the canvas blank). Member tap -> modal.
+    const cy = memmapEnsureCy();
+    if (!cy) { renderBrainConceptMemories(concept, d); return; }
+    memmapResetViews();
+    cy.elements().remove();
+    cy.add(memmapMemberElements(d));
+    memmapRunLayout();
+  } catch (e) {
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = `개념 "${concept}" · 네트워크 오류`;
+  }
+}
+
+// Render a concept's memories as a clickable list: preview + project badge +
+// source. Clicking a row opens the memory modal.
+function renderBrainConceptMemories(concept, payload) {
+  const head = document.getElementById('memmap-overview-head');
+  const fb = document.getElementById('memmap-fallback');
+  const empty = document.getElementById('memmap-empty');
+  const nodes = (payload && Array.isArray(payload.nodes) ? payload.nodes : [])
+    .filter(n => n.node_type === 'memory' || n.node_type === undefined);
+  if (head) head.textContent = `개념 "${concept}" · 메모리 ${nodes.length.toLocaleString()}개`;
+  if (!fb) return;
+  if (!nodes.length) {
+    if (empty) { empty.textContent = '이 개념의 메모리가 없습니다.'; empty.hidden = false; }
+    fb.hidden = true; fb.innerHTML = '';
+    return;
+  }
+  if (empty) empty.hidden = true;
+  fb.innerHTML = nodes.map(n => {
+    const source = n.source_kind || 'main';
+    const badgeClass = source === 'subagent' ? 'badge source-subagent' : 'badge';
+    const preview = String(n.label || n.preview || n.body || n.id || '');
+    const proj = n.project ? `<span class="mr-badge badge">${escapeHtml(String(n.project))}</span>` : '';
+    const kind = n.kind ? `<div class="mr-kind">${escapeHtml(String(n.kind))}</div>` : '';
+    return `<div class="member-row" data-id="${escapeAttr(String(n.id || ''))}">`
+      + `<span class="mr-badge ${badgeClass}">${memmapSourceLabelKo(source)}</span>${proj}`
+      + `<div class="mr-body"><div class="mr-preview">${escapeHtml(preview)}</div>${kind}</div>`
+      + `</div>`;
+  }).join('');
+  fb.hidden = false;
+  fb.querySelectorAll('.member-row').forEach(el => {
+    el.onclick = () => {
+      const num = String(el.dataset.id || '').replace(/^m/, '');
+      if (/^\d+$/.test(num)) openDetailModal(Number(num));
+    };
+  });
+}
+
+// Load the brain for a project, OR the GLOBAL brain when global is set. Unlike
+// the cluster loader, this NEVER shows the "프로젝트를 선택하세요" message: global
+// scope loads the merged brain (전체).
+async function loadBrain(project) {
+  brainConcept = null;
+  brainCommunity = null;
+  brainLevel = 'community';
+  brainStack = [];
+  brainCommunityCache.clear();   // scope/project changed — drop the old sub-graphs
+  memmapStopLayout();
+  memmapResetViews();
+  const back = document.getElementById('memmap-back');
+  if (back) back.hidden = true;
+  const crumbs = document.getElementById('memmap-crumbs');
+  if (crumbs) { crumbs.hidden = true; crumbs.innerHTML = ''; }
+  const head = document.getElementById('memmap-overview-head');
+  if (memmapCy) memmapCy.elements().remove();
+  const global = isGlobalScope() || isGlobalProjectValue(project) || !project;
+  brainScopeGlobal = global;
+  brainProject = global ? '' : project;
+  if (head) head.textContent = '불러오는 중…';
+  try {
+    const params = new URLSearchParams({ mode: 'brain' });
+    // Omit project for the GLOBAL brain (server treats empty/sentinel as global).
+    if (!global) params.set('project', project);
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`브레인 로드 실패 ${r.status}: ${text}`, 'err');
+      if (head) head.textContent = `오류 ${r.status}`;
+      brainGraph = null;
+      return;
+    }
+    const d = await r.json();
+    d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+    d.edges = Array.isArray(d.edges) ? d.edges : [];
+    brainGraph = d;
+    renderBrainOverview();
+  } catch (e) {
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = '네트워크 오류';
+    brainGraph = null;
+  }
+}
+
+// The map is the digital brain (concept graph). Always loads the brain — works
+// per-project AND global (never the "select a project" message).
+function loadMemmap(project) {
+  loadBrain(project);
+}
+
+// Switch the map between 브레인(개념) and 묶음(클러스터). Hides the cluster-only
+// controls (기준/세밀도/깊이/출처/임베딩) in brain mode and runs the matching loader.
+function memmapSetViewMode(mode, project) {
+  memmapViewMode = mode === 'cluster' ? 'cluster' : 'brain';
+  document.querySelectorAll('#memmap-mode-toggle .sort-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.memmapMode === memmapViewMode);
+  });
+  const isBrain = memmapViewMode === 'brain';
+  const clusterCtl = document.getElementById('memmap-cluster-controls');
+  if (clusterCtl) clusterCtl.style.display = isBrain ? 'none' : 'contents';
+  const srcFilter = document.getElementById('memmap-source-filter');
+  if (srcFilter) srcFilter.style.display = isBrain ? 'none' : '';
+  const embedBtn = document.getElementById('memmap-embed-btn');
+  if (embedBtn) embedBtn.style.display = isBrain ? 'none' : '';
+  const search = document.getElementById('memmap-search');
+  if (search) search.placeholder = isBrain ? '개념 검색' : '클러스터 검색';
+  loadMemmap(project || memmapProject || brainProject || currentProject());
+}
+
+// Load the overview graph for a project with the current grouping basis. Always
+// lands on the overview (resets the breadcrumb stack + per-level token cache).
+async function loadGraph(project) {
+  memmapStack = [];
+  memmapLevelCache.clear();
+  memmapSetMode('overview');
+  memmapRenderCrumbs();
+  memmapResetViews();
+  const head = document.getElementById('memmap-overview-head');
+  if (memmapCy) memmapCy.elements().remove();
+  if (isGlobalScope() || isGlobalProjectValue(project)) {
+    if (head) head.textContent = GLOBAL_SCOPE_MESSAGE;
+    memmapOverview = null;
+    return;
+  }
+  if (head) head.textContent = '불러오는 중…';
+  try {
+    const params = new URLSearchParams({ project, mode: 'overview', group: memmapGroup });
+    // 문맥 기준일 때만 의미/어휘 + 세밀도 노브를 보냄 (메타 facet엔 무의미).
+    if (memmapGroup === 'context') params.set('basis', memmapBasis);
+    params.set('target', String(memmapTarget));
+    const r = await fetch(`/api/memory/graph?${params.toString()}`);
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`지식 맵 로드 실패 ${r.status}: ${text}`, 'err');
+      if (head) head.textContent = `오류 ${r.status}`;
+      memmapOverview = null;
+      return;
+    }
+    const d = await r.json();
+    d.clusters = Array.isArray(d.clusters) ? d.clusters : [];
+    d.cluster_edges = Array.isArray(d.cluster_edges) ? d.cluster_edges : [];
+    d.total_nodes = Number(d.total_nodes || 0);
+    if (d.group) memmapGroup = String(d.group);   // echo the server's resolved basis
+    memmapOverview = d;
+    memmapProject = project;
+    renderMemmapOverview();
+  } catch (e) {
+    showToast(`네트워크 오류: ${e.message || e}`, 'err');
+    if (head) head.textContent = '네트워크 오류';
+    memmapOverview = null;
+  }
+}
+
+// Wire up the controls: search box, group basis, source filter, back, fit.
+(function wireMemmap() {
+  // Map mode toggle: 브레인(개념) ↔ 묶음(클러스터). Default 브레인 (active in markup).
+  document.querySelectorAll('#memmap-mode-toggle .sort-btn').forEach(btn => {
+    btn.onclick = () => memmapSetViewMode(btn.dataset.memmapMode || 'brain');
+  });
+  const search = document.getElementById('memmap-search');
+  if (search) search.oninput = () => { memmapSearch = search.value || ''; memmapApplyFilters(); };
+  // Grouping basis: changing it resets the breadcrumb + cache and reloads overview.
+  const group = document.getElementById('memmap-group');
+  if (group) group.onchange = () => {
+    memmapGroup = group.value || 'context';
+    const project = memmapProject || currentProject();
+    if (project) loadGraph(project);
+  };
+  // 분류 기준(자동/의미/어휘) · 세밀도(버블 수) · 깊이(드릴) — view-level knobs,
+  // each reloads the overview with the new value.
+  const reloadMap = () => {
+    const project = memmapProject || currentProject();
+    if (project && !isGlobalScope() && !isGlobalProjectValue(project)) loadGraph(project);
+  };
+  const basisSel = document.getElementById('memmap-basis');
+  if (basisSel) basisSel.onchange = () => { memmapBasis = basisSel.value || 'auto'; reloadMap(); };
+  const targetSel = document.getElementById('memmap-target');
+  if (targetSel) targetSel.onchange = () => { memmapTarget = Number(targetSel.value) || 320; reloadMap(); };
+  const depthSel = document.getElementById('memmap-depth');
+  if (depthSel) depthSel.onchange = () => { memmapDepth = Number(depthSel.value) || 0; reloadMap(); };
+  document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(btn => {
+    btn.onclick = () => {
+      memmapSource = btn.dataset.memmapSource || 'all';
+      document.querySelectorAll('#memmap-source-filter .sort-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.memmapSource === memmapSource);
+      });
+      memmapApplyFilters();
+    };
+  });
+  // Back: in brain mode, return from a concept's memories to the concept brain;
+  // in cluster mode, pop exactly one breadcrumb level (root reloads the overview).
+  const back = document.getElementById('memmap-back');
+  if (back) back.onclick = () => {
+    if (memmapViewMode === 'brain') { brainBack(); return; }
+    memmapGoToDepth(memmapStack.length - 1);
+  };
+  const fit = document.getElementById('memmap-fit');
+  if (fit) fit.onclick = () => { if (memmapCy) memmapCy.fit(undefined, 30); };
+  // Embed this project (background) right from the map; caption shows progress.
+  const embedBtn = document.getElementById('memmap-embed-btn');
+  if (embedBtn) embedBtn.onclick = async () => {
+    const project = memmapProject || currentProject();
+    if (!project || isGlobalScope() || isGlobalProjectValue(project)) {
+      showToast('프로젝트를 먼저 선택하세요.', 'err');
+      return;
+    }
+    const head = document.getElementById('memmap-overview-head');
+    await startEmbedAndPoll(project, (t) => { if (head) head.textContent = t; });
   };
 })();
+
+document.getElementById('graph-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  // The map is the brain — loads per-project AND global, no scope guard.
+  await loadMemmap(currentProject());
+};
 
 // Show/hide LLM model dropdown when engine switches.
 document.getElementById('compress-mode').addEventListener('change', function () {
@@ -2699,6 +4043,7 @@ document.getElementById('proxy-form').onsubmit = async (ev) => {
 };
 document.getElementById('diagnose-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshDiagnoseScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!projectPath()) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshDiagnoseScope(); return; }
   const body = {
@@ -2723,6 +4068,7 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
 };
 document.getElementById('repomap-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshRepomapScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   const root = projectPath();
   if (!root) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshRepomapScope(); return; }
@@ -2873,13 +4219,35 @@ function populateModelSelects() {
     // Restore previously selected value if it still exists.
     if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
   });
-  // Embeddings model datalist — allows free-text entry plus autocomplete from known models.
-  const dl = document.getElementById('cfg-emb-model-list');
-  if (dl) {
-    dl.innerHTML = MODELS_CACHE.map(m =>
-      `<option value="${escapeHtml(m.id)}">`
-    ).join('');
-  }
+  // Embeddings model <select> — populated from installed Ollama models.
+  populateEmbModelSelect(document.getElementById('cfg-emb-model')?.value || '');
+}
+
+// Installed Ollama models — fetched for the embedding model <select>.
+// GET /api/ollama/models → { models: [{name, ...}] }
+let OLLAMA_MODELS_CACHE = [];
+async function loadOllamaModelsCache() {
+  try {
+    const r = await fetch('/api/ollama/models');
+    if (!r.ok) return; // 404 not compiled / 502 unreachable — leave cache empty
+    const d = await r.json();
+    OLLAMA_MODELS_CACHE = Array.isArray(d.models) ? d.models : [];
+  } catch (_) { /* Ollama not reachable — leave cache empty */ }
+  populateEmbModelSelect(document.getElementById('cfg-emb-model')?.value || '');
+}
+
+// Build/refresh the embedding model <select> from the Ollama cache.
+// `selected` is preserved even if it is not in the installed list (e.g. the
+// configured model is not yet pulled) so the saved value never silently drops.
+function populateEmbModelSelect(selected) {
+  const sel = document.getElementById('cfg-emb-model');
+  if (!sel) return;
+  const names = OLLAMA_MODELS_CACHE.map(m => m.name).filter(Boolean);
+  if (selected && !names.includes(selected)) names.unshift(selected);
+  sel.innerHTML = `<option value="">모델 선택…</option>` + names.map(n =>
+    `<option value="${escapeHtml(n)}"${n === selected ? ' selected' : ''}>${escapeHtml(n)}</option>`
+  ).join('');
+  sel.value = selected || '';
 }
 
 // Settings page — config form.
@@ -2890,6 +4258,10 @@ async function loadConfig() {
   const cap = d.capture || {};
   const ac = d.auto_compress || {};
   const emb = d.embeddings || {};
+  const securityDefaultProfile = d.security?.default_profile;
+  if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+    GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+  }
   const bool = (v) => !!v;
   document.getElementById('cfg-capture-enabled').checked = bool(cap.enabled);
   document.getElementById('cfg-capture-redact').checked = bool(cap.redact);
@@ -2907,8 +4279,9 @@ async function loadConfig() {
   }
   // Embeddings section — fields are present only when the backend includes the key.
   document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
-  document.getElementById('cfg-emb-model').value = emb.model || '';
+  populateEmbModelSelect(emb.model || '');
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
+  await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {
@@ -2933,6 +4306,9 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       model: document.getElementById('cfg-emb-model').value || null,
       base_url: document.getElementById('cfg-emb-base-url').value || null,
     },
+    security: {
+      default_profile: document.getElementById('setting-default-security-profile').value,
+    },
   };
   const result = document.getElementById('settings-save-result');
   result.textContent = '저장 중…';
@@ -2946,13 +4322,19 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
     return;
   }
   result.innerHTML = '<span class="badge ok">✓ 저장됨</span>';
+  GLOBAL_DEFAULT_PROFILE = body.security.default_profile || GLOBAL_DEFAULT_PROFILE;
   pushActivity('설정 저장 완료');
+  showToast('설정 저장 완료', 'ok');
 };
 
 document.getElementById('compress-now-btn').onclick = async () => {
   const project = document.getElementById('compress-now-project').value.trim();
   if (!project) {
     document.getElementById('compress-now-result').innerHTML = '<span style="color:var(--err);">프로젝트 이름을 입력하세요.</span>';
+    return;
+  }
+  if (isGlobalProjectValue(project)) {
+    document.getElementById('compress-now-result').innerHTML = `<span style="color:var(--err);">${GLOBAL_SCOPE_MESSAGE}</span>`;
     return;
   }
   const model = document.getElementById('compress-now-model').value || undefined;
@@ -3312,11 +4694,12 @@ function renderSecurityProfileSummary(profile) {
 }
 
 async function loadSecurityProfiles(selected) {
-  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : 'ai-default';
+  const bound = selectedProject() && selectedProject().security_profile ? selectedProject().security_profile : GLOBAL_DEFAULT_PROFILE;
   await populateSecurityProfileSelect('security-profile-select', selected || bound);
 }
 
 function refreshSecurityScope() {
+  updateGlobalScopeIndicators();
   const msg = projectScopeMessage(true);
   const empty = document.getElementById('security-scope-empty');
   const cards = document.querySelectorAll('#sub-securityscan > .card');
@@ -3327,13 +4710,19 @@ function refreshSecurityScope() {
   cards.forEach(card => { card.hidden = !!msg; });
   const meta = document.getElementById('security-project-meta');
   if (meta) meta.textContent = msg ? '' : `${currentProject()} · ${projectPath()}`;
+  if (isGlobalScope()) {
+    subClick('security-subtabs', 'securityprofiles');
+    loadSecurityGlobalDefaultCard();
+    return;
+  }
   if (!msg) {
     const p = selectedProject();
-    loadSecurityProfiles(p && p.security_profile ? p.security_profile : 'ai-default');
+    loadSecurityProfiles(p && p.security_profile ? p.security_profile : GLOBAL_DEFAULT_PROFILE);
   }
 }
 
 async function runSecurityScan() {
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!currentProject()) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); refreshSecurityScope(); return; }
   const path = projectPath();
   if (!path) { showToast('경로 미설정 — 프로젝트 편집에서 추가하세요', 'err'); refreshSecurityScope(); return; }
@@ -3372,6 +4761,7 @@ async function runSecurityScan() {
 async function applySecurityProfileToProject() {
   const name = currentProject();
   const security_profile = document.getElementById('security-profile-select').value;
+  if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshSecurityScope(); return; }
   if (!name) { showToast('프로젝트를 선택하거나 추가하세요', 'err'); return; }
   if (!security_profile) { showToast('보안 프로파일을 선택하세요.', 'err'); return; }
   try {
@@ -3420,7 +4810,60 @@ async function viewSecurityProfile() {
 
 let ACTIVE_SECURITY_PROFILE = null;
 
+async function loadSecurityGlobalDefaultCard() {
+  const card = document.getElementById('security-global-default-card');
+  if (card) card.hidden = !isGlobalScope();
+  if (!isGlobalScope()) return;
+  try {
+    const r = await fetch('/api/config');
+    if (r.ok) {
+      const d = await r.json();
+      const securityDefaultProfile = d.security?.default_profile;
+      if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
+        GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
+      }
+    }
+  } catch (_) { /* keep cached default */ }
+  await populateSecurityProfileSelect('security-global-default-profile-select', GLOBAL_DEFAULT_PROFILE);
+}
+
+async function saveSecurityGlobalDefaultProfile() {
+  if (!isGlobalScope()) return;
+  const select = document.getElementById('security-global-default-profile-select');
+  const result = document.getElementById('security-global-default-result');
+  const defaultProfile = select ? select.value : '';
+  if (!defaultProfile) { showToast('전역 기본 보안 프로파일을 선택하세요.', 'err'); return; }
+  result.textContent = '저장 중…';
+  try {
+    const cur = await fetch('/api/config');
+    if (!cur.ok) {
+      result.innerHTML = `<span style="color:var(--err);">설정 로드 실패 ${cur.status}</span>`;
+      return;
+    }
+    const body = await cur.json();
+    body.security = { ...(body.security || {}), default_profile: defaultProfile };
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      result.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`;
+      return;
+    }
+    GLOBAL_DEFAULT_PROFILE = defaultProfile;
+    await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
+    result.innerHTML = '<span class="badge ok">✓ 전역 기본 저장됨</span>';
+    pushActivity('전역 기본 보안 프로파일 저장 완료');
+    showToast('전역 기본 저장 완료', 'ok');
+  } catch (e) {
+    result.innerHTML = `<span style="color:var(--err);">오류: ${escapeHtml(e.message || String(e))}</span>`;
+  }
+}
+
 async function loadSecurityProfileSettings() {
+  updateGlobalScopeIndicators();
+  if (isGlobalScope()) loadSecurityGlobalDefaultCard();
   const list = document.getElementById('security-profile-list');
   list.innerHTML = '<div class="empty">로드 중…</div>';
   const profiles = await fetchSecurityProfiles();
@@ -3518,6 +4961,7 @@ document.getElementById('security-view-profile-btn').onclick = viewSecurityProfi
 document.getElementById('security-apply-profile-btn').onclick = applySecurityProfileToProject;
 document.getElementById('security-profile-clone-btn').onclick = cloneSecurityProfileToml;
 document.getElementById('security-profile-save-btn').onclick = saveSecurityProfileToml;
+document.getElementById('security-global-default-save-btn').onclick = saveSecurityGlobalDefaultProfile;
 
 // GET /api/ollama/models → { models: [{name, size, modified_at, digest}] }
 async function loadLlmModels() {

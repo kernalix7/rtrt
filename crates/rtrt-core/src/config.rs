@@ -21,7 +21,32 @@ pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+}
+
+/// Global security defaults applied before any per-project binding. A project
+/// without its own `security_profile` (and any ad-hoc scan) falls back to
+/// `default_profile`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Profile name used when a project has no bound profile. Defaults to
+    /// `ai-default`.
+    #[serde(default = "default_security_profile")]
+    pub default_profile: String,
+}
+
+fn default_security_profile() -> String {
+    "ai-default".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            default_profile: default_security_profile(),
+        }
+    }
 }
 
 /// A registered project. Either a real repo on disk (`path` set) or a
@@ -36,6 +61,11 @@ pub struct ProjectEntry {
     /// Bound profile name; `None` = use ai-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_profile: Option<String>,
+    /// Per-project embedding override: `Some(true)`/`Some(false)` forces the
+    /// semantic (vector) memory map on/off for this project; `None` inherits the
+    /// global `[embeddings] enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings_enabled: Option<bool>,
 }
 
 /// Dense-embedding knobs. When `enabled = true`, the dashboard and CLI route
@@ -60,6 +90,19 @@ pub struct EmbeddingsConfig {
     /// can serve both the OpenAI-compat chat path and the embeddings path.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// When embeddings are enabled, also run the background auto-embed daemon
+    /// that incrementally embeds newly captured rows (so the automatic recall
+    /// loop can go hybrid without a manual backfill). Defaults to `true`; set
+    /// `false` to keep embeddings enabled for manual/on-demand paths only.
+    #[serde(default = "default_true")]
+    pub auto: bool,
+    /// Seconds between auto-embed daemon sweeps. Defaults to 120.
+    #[serde(default = "default_auto_embed_interval")]
+    pub auto_interval_sec: u64,
+    /// Max rows embedded per auto-embed sweep (one batched, capped pass per
+    /// cycle so capture is never blocked). Defaults to 64.
+    #[serde(default = "default_auto_embed_batch")]
+    pub auto_batch: usize,
 }
 
 impl Default for EmbeddingsConfig {
@@ -68,12 +111,23 @@ impl Default for EmbeddingsConfig {
             enabled: false,
             model: default_embed_model_ollama(),
             base_url: None,
+            auto: true,
+            auto_interval_sec: default_auto_embed_interval(),
+            auto_batch: default_auto_embed_batch(),
         }
     }
 }
 
 fn default_embed_model_ollama() -> String {
     "bge-m3".to_string()
+}
+
+fn default_auto_embed_interval() -> u64 {
+    120
+}
+
+fn default_auto_embed_batch() -> usize {
+    64
 }
 
 impl EmbeddingsConfig {
@@ -336,6 +390,47 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_auto_defaults_and_old_configs_load() {
+        // Empty config: auto-embed daemon knobs take their defaults.
+        let c = Config::from_toml_str("").unwrap();
+        assert!(!c.embeddings.enabled);
+        assert!(c.embeddings.auto);
+        assert_eq!(c.embeddings.auto_interval_sec, 120);
+        assert_eq!(c.embeddings.auto_batch, 64);
+
+        // An "old" [embeddings] block that predates the daemon knobs must still
+        // load (serde default) and fill in the new fields.
+        let c = Config::from_toml_str(
+            r#"
+            [embeddings]
+            enabled = true
+            model = "nomic-embed-text"
+            "#,
+        )
+        .unwrap();
+        assert!(c.embeddings.enabled);
+        assert_eq!(c.embeddings.model, "nomic-embed-text");
+        assert!(c.embeddings.auto);
+        assert_eq!(c.embeddings.auto_interval_sec, 120);
+        assert_eq!(c.embeddings.auto_batch, 64);
+
+        // Explicit overrides win.
+        let c = Config::from_toml_str(
+            r#"
+            [embeddings]
+            enabled = true
+            auto = false
+            auto_interval_sec = 300
+            auto_batch = 16
+            "#,
+        )
+        .unwrap();
+        assert!(!c.embeddings.auto);
+        assert_eq!(c.embeddings.auto_interval_sec, 300);
+        assert_eq!(c.embeddings.auto_batch, 16);
+    }
+
+    #[test]
     fn partial_toml_overrides_only_named_fields() {
         let c = Config::from_toml_str(
             r#"
@@ -372,17 +467,20 @@ mod tests {
             name: "alpha".to_string(),
             path: Some("/repo/alpha".to_string()),
             security_profile: None,
+            embeddings_enabled: None,
         });
         c.upsert_project(ProjectEntry {
             name: "beta".to_string(),
             path: None,
             security_profile: Some("strict".to_string()),
+            embeddings_enabled: None,
         });
         // replace alpha
         c.upsert_project(ProjectEntry {
             name: "alpha".to_string(),
             path: Some("/repo/alpha-2".to_string()),
             security_profile: Some("ai-default".to_string()),
+            embeddings_enabled: None,
         });
         assert_eq!(c.projects.len(), 2);
         let alpha = c.project("alpha").unwrap();
@@ -398,6 +496,7 @@ mod tests {
             name: "gamma".to_string(),
             path: None,
             security_profile: None,
+            embeddings_enabled: None,
         });
         assert!(c.project("gamma").is_some());
         assert!(c.project("nope").is_none());

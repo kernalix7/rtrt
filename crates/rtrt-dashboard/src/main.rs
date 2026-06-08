@@ -13,6 +13,9 @@
 //! - `/api/prompts/{name}` — list versions for a single prompt.
 //! - `/api/prompts/{name}/{version}` — full prompt body.
 //! - `/api/budget`     — gateway budget cap + cumulative spend.
+//! - `/api/memory/graph`  — `GET` memory graph: `mode=similarity`/`entity` for
+//!   small graphs, `mode=overview` for LOD cluster bubbles, and `cluster=<root>`
+//!   to drill into one cluster's members (cached `ClusterIndex`, 60s TTL).
 //! - `/api/memory/recall` — `POST` BM25 recall with optional qdrant-style payload filter.
 //! - `/api/memory/stats`  — `GET` aggregate stats for a project (total, by_kind, compressed).
 //! - `/api/memory/save`   — `POST` insert a memory row with optional metadata.
@@ -40,7 +43,10 @@ use axum::{
     response::Html,
     routing::{delete, get, post},
 };
-use rtrt_memory::{DetailedRecord, Embedder, MemoryStore, PayloadFilter, Summariser};
+use rtrt_memory::{
+    ClusterIndex, ConceptHierarchy, DetailedRecord, Embedder, MemoryStore, PayloadFilter,
+    Summariser,
+};
 use rtrt_providers::{
     ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
 };
@@ -65,7 +71,89 @@ struct AppState {
     /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
     /// paths working without an Ollama instance.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Per-`(project, group)` LOD cluster/group index cache
+    /// (`"project\x1fgroup" -> (built_at, index)`), TTL [`CLUSTER_INDEX_TTL`].
+    /// The `overview` mode builds + caches; the legacy `cluster` drill-down
+    /// reads the `context` entry (rebuilding if missing/expired).
+    cluster_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
+    /// Per-scope TOP-LEVEL "digital brain" community hierarchy cache (the
+    /// `mode=brain` community level). Same style + TTL ([`CLUSTER_INDEX_TTL`]) as
+    /// [`AppState::cluster_cache`], keyed `"brainh\x1f<scope>"` and holding a
+    /// [`ConceptHierarchy`] (communities + inter-community edges). The per-
+    /// community concept sub-graph (`community=ID`) and the per-concept memories
+    /// drill (`concept=TOKEN`) are served fresh — only this top level is cached.
+    brainh_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ConceptHierarchy)>>>,
+    /// Opaque drill tokens minted per overview/group build
+    /// (`token -> (built_at, entry)`), TTL [`LEVEL_TOKEN_TTL`]. Each token maps
+    /// to the member-id set of one bubble so the client can drill many levels
+    /// deep without ever sending large id lists over the wire.
+    level_tokens: Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, TokenEntry)>>>,
+    /// On-disk SQLite path, so a background embedding backfill can open its OWN
+    /// connection (WAL = concurrent with the main one) instead of holding the
+    /// shared store mutex for the whole multi-minute job.
+    memory_path: std::path::PathBuf,
+    /// Projects with an embedding backfill currently running (dedup + progress).
+    embedding_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
+
+/// One drill token's payload: which project it belongs to, the member ids it
+/// stands for, and the bubble label (kept for debugging / future reuse).
+#[derive(Clone)]
+struct TokenEntry {
+    project: String,
+    member_ids: Vec<i64>,
+    /// Project total at mint time — drives the dynamic leaf cutoff so the
+    /// "show individual nodes" threshold is consistent across drill levels.
+    total_n: usize,
+    /// Bubble label captured at mint time. Not read on the drill path (the
+    /// child rebuild derives its own labels) but retained for debug logging
+    /// and future "breadcrumb" responses.
+    #[allow(dead_code)]
+    label: String,
+}
+
+/// Monotonic source for unique drill-token suffixes (paired with a coarse
+/// timestamp so tokens are short, opaque, and collision-free across rebuilds).
+static LEVEL_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mint a fresh opaque drill token (e.g. `t-<seq>-<nanos>`).
+fn mint_level_token() -> String {
+    let seq = LEVEL_TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("t-{seq}-{nanos:09}")
+}
+
+/// Time-to-live for a cached [`ClusterIndex`] before it is rebuilt.
+const CLUSTER_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Time-to-live for a minted drill [`TokenEntry`]. Long enough for a user to
+/// drill several levels; short enough that the token cache stays bounded.
+const LEVEL_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Leaf cutoff: a bubble at/under this many members renders its individual
+/// memory nodes instead of splitting further. Dynamic in the project total
+/// (~√total, clamped) so a small project bottoms out in one or two levels while
+/// a huge one does not dump thousands of points into a single leaf.
+fn dynamic_leaf(total: usize) -> usize {
+    ((total as f64).sqrt().round() as usize).clamp(40, 160)
+}
+
+/// Sub-bubble target when re-clustering a bubble of `size` members at a deeper
+/// level. Dynamic in the bucket size (~1.4·√size, clamped): bigger buckets fan
+/// out wider, so drill DEPTH grows with quantity instead of being a fixed step.
+fn dynamic_branch(size: usize) -> usize {
+    (((size as f64).sqrt() * 1.4).round() as usize).clamp(12, 64)
+}
+
+/// A re-cluster "did not split" — its largest child still holds this fraction of
+/// the parent — so semantic clustering cannot break it up (a lexically-disjoint
+/// unclustered mass). The drill path then falls back to a metadata facet.
+const STALL_DOMINANCE: f64 = 0.6;
 
 fn broadcast_event(tx: &broadcast::Sender<String>, payload: serde_json::Value) {
     let _ = tx.send(payload.to_string());
@@ -260,15 +348,22 @@ async fn main() -> Result<()> {
         dedup_window_sec,
         events: events_tx,
         embedder,
+        cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        brainh_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        memory_path: memory_store_path(),
+        embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
+    spawn_auto_embed_daemon(memory_store_path());
     transcripts::spawn_reattribution(memory_for_transcripts.clone());
     transcripts::spawn_transcript_watcher(memory_for_transcripts);
 
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
         .route("/", get(index))
+        .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
         .route("/api/stats", get(stats))
         .route("/api/templates", get(list_templates))
@@ -303,6 +398,7 @@ async fn main() -> Result<()> {
         .route("/api/memory/queue", get(memory_queue))
         .route("/api/memory/delete", post(memory_delete_batch))
         .route("/api/memory/embed", post(memory_embed))
+        .route("/api/memory/coverage", get(memory_coverage))
         .route("/api/memory/entities", post(memory_entities))
         .route("/api/ollama/models", get(ollama_models))
         .route("/api/ollama/{name}", delete(ollama_delete))
@@ -342,12 +438,19 @@ async fn main() -> Result<()> {
 /// `RTRT_CONSOLIDATE_KEEP` (default 1000) using the LLM-free archive path.
 /// Disabled when `RTRT_CONSOLIDATE_INTERVAL_SEC=0`.
 fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
+    // OFF by default: this daemon DELETES the oldest rows beyond `keep` (no LLM
+    // summary), which conflicts with rtrt's permanent-memory promise. Opt in
+    // explicitly with RTRT_CONSOLIDATE_INTERVAL_SEC > 0 if you want a hard cap.
+    // Token growth is handled by the auto-compress daemon, which shrinks bodies
+    // while keeping every row (and the original in body_full).
     let interval_sec: u64 = std::env::var("RTRT_CONSOLIDATE_INTERVAL_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3600);
+        .unwrap_or(0);
     if interval_sec == 0 {
-        tracing::info!("consolidation daemon off (RTRT_CONSOLIDATE_INTERVAL_SEC=0)");
+        tracing::info!(
+            "consolidation daemon off (permanent memory; set RTRT_CONSOLIDATE_INTERVAL_SEC>0 to cap)"
+        );
         return;
     }
     let keep: usize = std::env::var("RTRT_CONSOLIDATE_KEEP")
@@ -532,8 +635,160 @@ fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: 
     });
 }
 
+/// Background auto-embed worker — puts embeddings into the AUTOMATIC loop so new
+/// captures (saved text-only + fast) get a vector without ever blocking capture
+/// or a prompt. Every `embeddings.auto_interval_sec` it opens its OWN
+/// `MemoryStore` on `memory_store_path()` (WAL = concurrent with the main store),
+/// pulls `unembedded_batch(auto_batch)` newest-first, embeds each body with an
+/// `OllamaEmbedder` (`embed_one` already truncates to ~2000 chars), and writes
+/// the vector via `store_embedding`. Capped at `auto_batch` rows per cycle so we
+/// never hammer Ollama.
+///
+/// OPTIONAL / LLM-FREE BY DEFAULT: spawns ONLY when `[embeddings] enabled=true`
+/// AND `auto=true`. When disabled, this returns immediately — the memory loop
+/// stays pure BM25, zero Ollama calls. Probes the embedder reachable ONCE before
+/// engaging; if unreachable it logs once and does not spawn (no per-cycle spam).
+/// An embed error on a single row is logged and skipped — the row is retried next
+/// cycle, the daemon keeps going.
+fn spawn_auto_embed_daemon(path: PathBuf) {
+    let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+    if !ecfg.is_enabled() {
+        tracing::info!(
+            "auto-embed daemon off (set RTRT_EMBED_ENABLED=1 or [embeddings] enabled=true)"
+        );
+        return;
+    }
+    if !ecfg.auto {
+        tracing::info!("auto-embed daemon off ([embeddings] auto=false)");
+        return;
+    }
+    let base_url = ecfg.resolved_base_url(
+        rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.auto_compress.base_url)
+            .as_deref(),
+    );
+    let model = ecfg.effective_model();
+    let interval_sec = ecfg.auto_interval_sec.max(1);
+    let batch = ecfg.auto_batch.max(1);
+
+    tokio::spawn(async move {
+        // Probe the embedder reachable ONCE before engaging. If Ollama is
+        // unreachable, log once and stay BM25 (do NOT spam every cycle).
+        // `OllamaEmbedder` isn't `Clone` (it caches a detected dimension), so we
+        // carry the `base_url`/`model` strings and build a fresh one each time —
+        // the same pattern the `/api/memory/embed` handler uses.
+        let probe = tokio::task::spawn_blocking({
+            let base_url = base_url.clone();
+            let model = model.clone();
+            move || {
+                rtrt_memory::OllamaEmbedder::new(base_url, model).embed_one("rtrt auto-embed probe")
+            }
+        })
+        .await;
+        match probe {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::info!(
+                    "auto-embed daemon off (embedder {base_url} model={model} unreachable: {e}); staying BM25"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::info!("auto-embed daemon off (probe task failed: {e}); staying BM25");
+                return;
+            }
+        }
+        tracing::info!(
+            "auto-embed daemon on: model={model}, base_url={base_url}, every {interval_sec}s, batch={batch}"
+        );
+
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_sec));
+        // First tick fires immediately — skip it so we don't race startup.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let path = path.clone();
+            let base_url = base_url.clone();
+            let model = model.clone();
+            // Do the SQLite + embedding work off the async runtime: this opens its
+            // OWN WAL connection (concurrent with the main store) and blocks on
+            // Ollama HTTP, so it must not run on a tokio worker thread.
+            let embedded = tokio::task::spawn_blocking(move || {
+                let store = match MemoryStore::open(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("auto-embed: open store failed: {e}");
+                        return 0usize;
+                    }
+                };
+                let rows = match store.unembedded_batch(batch) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!("auto-embed: unembedded_batch: {e}");
+                        return 0;
+                    }
+                };
+                if rows.is_empty() {
+                    return 0;
+                }
+                let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
+                let mut done = 0;
+                for (id, _project, body) in rows {
+                    let vector = match embedder.embed_one(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Skip this row and keep going; retried next cycle.
+                            tracing::warn!("auto-embed #{id}: embed: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = store.store_embedding(id, embedder.model_name(), &vector) {
+                        tracing::warn!("auto-embed #{id}: store_embedding: {e}");
+                        continue;
+                    }
+                    done += 1;
+                }
+                done
+            })
+            .await
+            .unwrap_or(0);
+            if embedded > 0 {
+                tracing::info!(embedded, "auto-embed cycle");
+            }
+        }
+    });
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// Serve the vendored graph libraries (Cytoscape + cola/fcose layout deps) from
+/// the binary itself, so the memory map renders WITHOUT any CDN / internet — a
+/// blocked CDN was making the map fall back to a plain list.
+async fn vendor_asset(
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> std::result::Result<([(axum::http::HeaderName, &'static str); 2], &'static str), StatusCode> {
+    let body = match file.as_str() {
+        "cytoscape.min.js" => VENDOR_CYTOSCAPE,
+        "layout-base.js" => VENDOR_LAYOUT_BASE,
+        "cose-base.js" => VENDOR_COSE_BASE,
+        "cytoscape-fcose.js" => VENDOR_FCOSE,
+        "cola.min.js" => VENDOR_COLA,
+        "cytoscape-cola.js" => VENDOR_CYTO_COLA,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    ))
 }
 
 async fn healthz() -> &'static str {
@@ -634,33 +889,13 @@ struct ProjectView {
     name: String,
     path: Option<String>,
     security_profile: Option<String>,
+    /// Per-project embedding override (`None` = inherit global default).
+    embeddings_enabled: Option<bool>,
     mem_count: usize,
 }
 
 /// `GET /api/projects` — union of registered config entries (path /
 /// security_profile) and memory buckets (mem_count), merged by name.
-/// True when a bucket name looks like a stray subagent / git-worktree artifact
-/// rather than a real project: `agent-<hex>`, `p<n>-<branch>` (worktree branch),
-/// or a long `<hex>-<hex>` session hash. Used to keep the project selector clean.
-fn is_stray_bucket(name: &str) -> bool {
-    let b = name.as_bytes();
-    // agent-a...
-    if let Some(rest) = name.strip_prefix("agent-") {
-        if rest.starts_with('a') {
-            return true;
-        }
-    }
-    // p<digit>...-...  (worktree branch dirs like p18-gap)
-    if b.first() == Some(&b'p')
-        && b.get(1).is_some_and(|c| c.is_ascii_digit())
-        && name.contains('-')
-    {
-        return true;
-    }
-    // long hex-...-hex session hash
-    name.len() >= 24 && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 async fn list_projects(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
@@ -678,6 +913,7 @@ async fn list_projects(
                 name: entry.name.clone(),
                 path: entry.path.clone(),
                 security_profile: entry.security_profile.clone(),
+                embeddings_enabled: entry.embeddings_enabled,
                 mem_count: 0,
             },
         );
@@ -691,13 +927,10 @@ async fn list_projects(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         drop(guard);
         for (name, count, _last) in projects {
-            // A registered project always shows; an unregistered memory bucket
-            // that looks like a stray subagent / worktree name is hidden from
-            // the selector (its rows are folded under the parent via the
-            // reattribution migration, but the empty bucket name lingers).
-            if !cfg.projects.iter().any(|p| p.name == name) && is_stray_bucket(&name) {
-                continue;
-            }
+            // No name-pattern filtering: a row's project is decided by the
+            // reattribution pass (transcript parent cwd), which folds stray
+            // subagent / workflow captures under their real project, leaving
+            // those buckets empty so they don't appear here at all.
             views
                 .entry(name.clone())
                 .and_modify(|v| v.mem_count = count)
@@ -705,6 +938,7 @@ async fn list_projects(
                     name,
                     path: None,
                     security_profile: None,
+                    embeddings_enabled: None,
                     mem_count: count,
                 });
         }
@@ -721,6 +955,13 @@ struct ProjectUpsertReq {
     path: Option<String>,
     #[serde(default)]
     security_profile: Option<String>,
+    /// Per-project embedding override as a tri-state string so the handler can
+    /// tell "field absent" (preserve existing) from an explicit choice:
+    /// `"on"` -> Some(true), `"off"` -> Some(false), `"inherit"` -> None.
+    /// (A bare `Option<bool>`/`Option<Option<bool>>` can't distinguish absent
+    /// from JSON `null` — serde maps both to `None`.)
+    #[serde(default)]
+    embeddings_mode: Option<String>,
 }
 
 /// `PUT /api/projects` — upsert a project entry into the config registry.
@@ -730,10 +971,18 @@ async fn upsert_project(
     let mut cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let name = req.name.clone();
+    // Explicit choice wins; an absent field preserves the existing override.
+    let embeddings_enabled = match req.embeddings_mode.as_deref() {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some("inherit") => None,
+        _ => cfg.project(&name).and_then(|p| p.embeddings_enabled),
+    };
     cfg.upsert_project(rtrt_core::ProjectEntry {
         name: req.name,
         path: req.path,
         security_profile: req.security_profile,
+        embeddings_enabled,
     });
 
     let path = rtrt_core::Config::default_path().ok_or((
@@ -933,11 +1182,15 @@ struct MetricsResponse {
     recent: Vec<RequestMetric>,
 }
 
-fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
-    let path = std::env::var("RTRT_MEMORY_PATH")
+fn memory_store_path() -> PathBuf {
+    std::env::var("RTRT_MEMORY_PATH")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"))
+}
+
+fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
+    let path = memory_store_path();
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1164,13 +1417,57 @@ async fn memory_timeline(
 
 #[derive(Debug, Deserialize)]
 struct MemoryGraphQuery {
+    #[serde(default)]
     project: String,
     #[serde(default = "default_graph_limit")]
     limit: usize,
+    /// `similarity` (default — memory↔memory, no LLM), `entity` (bipartite
+    /// memory↔entity, requires entity extraction), or `overview` (LOD cluster
+    /// bubbles for large graphs).
+    #[serde(default)]
+    mode: Option<String>,
+    /// Top-level grouping basis for `mode=overview`: `context` (semantic,
+    /// default) | `file` | `kind` | `session` | `source`.
+    #[serde(default)]
+    group: Option<String>,
+    /// Multi-level drill token (opaque, server-minted). Takes precedence over
+    /// every other param: the server resolves it to a member-id set and either
+    /// re-subclusters (deeper `group` level) or returns a `leaf`.
+    #[serde(default)]
+    token: Option<String>,
+    /// Legacy drill-down by cluster root id (kept for the old frontend path);
+    /// superseded by `token`.
+    #[serde(default)]
+    cluster: Option<i64>,
+    /// Clustering basis the user picked on the map for `group=context`:
+    /// `auto` (default — coverage decides) | `vector` (force semantic/embeddings)
+    /// | `lexical` (force keyword). Overrides the per-project default.
+    #[serde(default)]
+    basis: Option<String>,
+    /// Granularity ("세밀도"): overview bubble target. More bubbles = a smaller
+    /// unclustered/"미분류" catch-all. Clamped server-side. `None` = default.
+    #[serde(default)]
+    target: Option<usize>,
+    /// Drill depth ("깊이"): leaf cutoff — a bubble at/under this many members
+    /// renders individual nodes. `None`/`0` = dynamic (~√total).
+    #[serde(default)]
+    leaf: Option<usize>,
+    /// `mode=brain` concept drill: when set, return the memories containing this
+    /// concept token (the `brain-concept` response) instead of the brain graph.
+    #[serde(default)]
+    concept: Option<String>,
+    /// `mode=brain` community drill: the stable community id (the `mode=brain`
+    /// community-level node's numeric id). When set — and `concept` is not — the
+    /// response is that community's CONCEPT sub-graph (`level:"concept"`) instead
+    /// of the top-level community overview.
+    #[serde(default)]
+    community: Option<i64>,
 }
 
 fn default_graph_limit() -> usize {
-    200
+    // Keep the default modest: a force-directed graph past ~80 nodes is a
+    // hairball, and the BM25 fallback path costs one FTS query per node.
+    80
 }
 
 async fn memory_graph(
@@ -1181,30 +1478,835 @@ async fn memory_graph(
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+
+    // ── Token drill (highest precedence) ────────────────────────────────────
+    // A drill token resolves to a member-id set. Tiny sets render as a `leaf`
+    // (individual memory nodes); larger sets re-subcluster into sub-bubbles
+    // (each minted a fresh child token). All resolved before holding the
+    // `!Send` store guard across an `.await`.
+    if let Some(tok) = q.token.clone() {
+        return memory_graph_drill(&state, store, tok, q.leaf).await;
+    }
+
+    // LOD drill-down (`cluster=<root>`): return the members of one cluster from
+    // the cached index. Rebuilds the index if missing/expired. Checked before
+    // `mode` so a drill-down request needs no extra `mode=` param. Resolved
+    // before the long-lived store guard below so the `!Send` store reference is
+    // never held across an `.await`. Superseded by `token`, kept for the old UI.
+    if let Some(root_id) = q.cluster {
+        let index = cluster_index_cached(&state, store, &q.project).await?;
+        let members = {
+            let guard = store.lock().await;
+            guard
+                .cluster_members(&q.project, root_id, &index)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
+        let nodes: Vec<serde_json::Value> = members
+            .nodes
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": format!("m{}", m.id),
+                    "node_type": "memory",
+                    "label": m.preview,
+                    "kind": m.kind,
+                    "source_kind": m.source_kind,
+                })
+            })
+            .collect();
+        let edges: Vec<serde_json::Value> = members
+            .edges
+            .iter()
+            .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "cluster",
+            "root": root_id,
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // LOD overview (`mode=overview&group=<basis>`): server-side top-level
+    // grouping of the whole project. Returns ONLY bubble summaries (each with a
+    // drill token) + aggregated inter-cluster edges, never individual nodes —
+    // this scales to hundreds of thousands of rows. `group=context` (default)
+    // clusters semantically; any other basis buckets by a metadata facet.
+    if q.mode.as_deref() == Some("overview") {
+        let group = q.group.as_deref().unwrap_or("context");
+        let basis = q.basis.as_deref().unwrap_or("auto");
+        return memory_graph_overview(&state, store, &q.project, group, basis, q.target).await;
+    }
+
+    // Brain mode (`mode=brain`): the three-level "digital brain" map. Scope
+    // resolves the same way the project selector does — a present, non-sentinel
+    // project is one project's brain; an empty string or the `__global__`
+    // sentinel is the GLOBAL brain (all projects merged by concept token). Drill
+    // precedence (per contract):
+    //   1. `concept=TOKEN` → that concept's MEMORIES   (`mode:"brain-concept"`)
+    //   2. `community=ID`   → that community's CONCEPTS (`level:"concept"`)
+    //   3. neither          → TOP-LEVEL communities     (`level:"community"`)
+    if q.mode.as_deref() == Some("brain") {
+        let scope: Option<&str> = brain_scope(&q.project);
+        if let Some(concept) = q.concept.as_deref().filter(|c| !c.is_empty()) {
+            return memory_graph_brain_concept(store, scope, concept).await;
+        }
+        if let Some(community_id) = q.community {
+            return memory_graph_brain_community(store, scope, community_id).await;
+        }
+        return memory_graph_brain(&state, store, &q.project, scope).await;
+    }
+
     let guard = store.lock().await;
-    let records = guard
-        .list_by_project(&q.project, q.limit)
+
+    // Entity mode: bipartite memory↔entity graph (needs extracted entities).
+    if q.mode.as_deref() == Some("entity") {
+        let graph = guard
+            .graph_bipartite(&q.project, q.limit)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut nodes: Vec<serde_json::Value> =
+            Vec::with_capacity(graph.memories.len() + graph.entities.len());
+        for m in &graph.memories {
+            nodes.push(serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+            }));
+        }
+        for e in &graph.entities {
+            nodes.push(serde_json::json!({
+                "id": format!("e{}", e.id),
+                "node_type": "entity",
+                "label": e.name,
+                "degree": e.degree,
+            }));
+        }
+        let edges: Vec<serde_json::Value> = graph
+            .links
+            .iter()
+            .map(|(mem_id, ent_id)| serde_json::json!({"src": format!("m{mem_id}"), "dst": format!("e{ent_id}")}))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "mode": "entity",
+            "nodes": nodes,
+            "edges": edges,
+        })));
+    }
+
+    // Default similarity mode: memory↔memory, no generative LLM (cosine over
+    // stored embeddings, or BM25 lexical fallback).
+    let graph = guard
+        .graph_similarity(&q.project, q.limit, 4, 0.15)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let edges = guard
-        .project_edges(&q.project)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let nodes: Vec<serde_json::Value> = records
-        .into_iter()
-        .map(|r| {
-            let preview: String = r.body.chars().take(60).collect();
+    let nodes: Vec<serde_json::Value> = graph
+        .memories
+        .iter()
+        .map(|m| {
             serde_json::json!({
-                "id": r.id,
-                "kind": r.kind,
-                "scope": r.scope,
-                "preview": preview,
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
             })
         })
         .collect();
-    let edges: Vec<serde_json::Value> = edges
-        .into_iter()
-        .map(|(s, d, rel)| serde_json::json!({"src": s, "dst": d, "relation": rel}))
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
         .collect();
     Ok(Json(serde_json::json!({
+        "mode": "similarity",
+        "basis": graph.basis,
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// LOD parameters for whole-project clustering. `max_nodes` is a safety bound
+/// (newest first); `top_k` peers per node feed union-find; `min_weight` is the
+/// candidate-edge threshold for joining two nodes into one cluster.
+const CLUSTER_MAX_NODES: usize = 200_000;
+const CLUSTER_TOP_K: usize = 4;
+const CLUSTER_MIN_WEIGHT: f32 = 0.15;
+
+/// "Digital brain" min co-occurrence (`mode=brain`): 2 just means "co-occurred
+/// in at least two memories" — a property, not a cap. The concept/edge budget
+/// and the community-fold target are sized dynamically by rtrt-memory (AUTO).
+const BRAIN_MIN_COOCCUR: usize = 2;
+
+/// The global-scope sentinel value the project selector sends for "all projects
+/// merged into one brain" (mirrors `GLOBAL_PROJECT_VALUE` in the frontend). An
+/// empty project string is treated as global too.
+const GLOBAL_PROJECT_SENTINEL: &str = "__global__";
+
+/// Map a raw `project` query param to a [`MemoryStore::concept_graph`] scope:
+/// `None` (GLOBAL, all projects merged) for an empty string or the global
+/// sentinel, else `Some(project)` for one project's brain.
+fn brain_scope(project: &str) -> Option<&str> {
+    if project.is_empty() || project == GLOBAL_PROJECT_SENTINEL {
+        None
+    } else {
+        Some(project)
+    }
+}
+
+/// TOP LEVEL of the brain (`mode=brain`, no `community`/`concept` param): build
+/// (or serve from the 60s cache) the per-scope TOPIC-COMMUNITY hierarchy and
+/// return the documented `level:"community"` JSON. A few dozen super-nodes
+/// (`kind:"community"`) replace the hundreds-of-concepts hairball; drilling a
+/// node (`community=ID`) yields its concepts. Cached in
+/// [`AppState::brainh_cache`] under `"brainh\x1f<scope>"`, the same TTL + style
+/// as the LOD cluster cache.
+///
+/// The store is `!Send`, so the build runs inside a synchronous block with no
+/// `.await` while the guard is held — keeping the future `Send` for axum.
+async fn memory_graph_brain(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    scope: Option<&str>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let hierarchy = brain_hierarchy_cached(state, store, project, scope).await?;
+
+    let nodes: Vec<serde_json::Value> = hierarchy
+        .communities
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": format!("k:{}", c.id),
+                "label": c.label,
+                "size": c.size,
+                "concept_count": c.concept_count,
+                "top_concepts": c.top_concepts,
+                "kind": "community",
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = hierarchy
+        .edges
+        .iter()
+        .map(|(a, b, w)| {
+            serde_json::json!({"src": format!("k:{a}"), "dst": format!("k:{b}"), "weight": w})
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain",
+        "level": "community",
+        "scope": if scope.is_none() { "global" } else { "project" },
+        "total_memories": hierarchy.total_memories,
+        "total_concepts": hierarchy.total_concepts,
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// Build (or serve from the 60s cache) the per-scope [`ConceptHierarchy`].
+/// Cached in [`AppState::brainh_cache`] under `"brainh\x1f<scope>"`, the same
+/// TTL + style as the LOD cluster + flat-brain caches.
+///
+/// The store is `!Send`, so the build runs inside a synchronous block with no
+/// `.await` while the guard is held — keeping the future `Send` for axum.
+async fn brain_hierarchy_cached(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    scope: Option<&str>,
+) -> std::result::Result<ConceptHierarchy, (StatusCode, String)> {
+    let scope_key = if scope.is_none() {
+        GLOBAL_PROJECT_SENTINEL
+    } else {
+        project
+    };
+    let cache_key = format!("brainh\x1f{scope_key}");
+
+    // Fast path: serve a still-fresh cached hierarchy.
+    let cached = {
+        let cache = state.brainh_cache.lock().await;
+        match cache.get(&cache_key) {
+            Some((built_at, h)) if built_at.elapsed() < CLUSTER_INDEX_TTL => Some(h.clone()),
+            _ => None,
+        }
+    };
+    if let Some(h) = cached {
+        return Ok(h);
+    }
+
+    // Miss / expired: rebuild under the store lock (no await inside).
+    let hierarchy = {
+        let guard = store.lock().await;
+        guard
+            .concept_communities(scope, BRAIN_MIN_COOCCUR)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let mut cache = state.brainh_cache.lock().await;
+    cache.insert(cache_key, (std::time::Instant::now(), hierarchy.clone()));
+    Ok(hierarchy)
+}
+
+/// MIDDLE LEVEL of the brain (`mode=brain&community=ID`): the concept sub-graph
+/// for ONE topic community — its member concepts + the intra-community edges,
+/// via [`MemoryStore::community_concepts`]. Returns the documented
+/// `level:"concept"` JSON (concept nodes keyed `c:<token>`). An unknown id
+/// yields an empty graph (the memory layer's contract), rendered as zero nodes.
+async fn memory_graph_brain_community(
+    store: &Arc<Mutex<MemoryStore>>,
+    scope: Option<&str>,
+    community_id: i64,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let graph = {
+        let guard = store.lock().await;
+        guard
+            .community_concepts(scope, community_id, BRAIN_MIN_COOCCUR)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    let nodes: Vec<serde_json::Value> = graph
+        .nodes
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": format!("c:{}", c.name),
+                "label": c.name,
+                "degree": c.degree,
+                "freq": c.freq,
+                "projects": c.projects,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = graph
+        .edges
+        .iter()
+        .map(|(a, b, w)| {
+            serde_json::json!({"src": format!("c:{a}"), "dst": format!("c:{b}"), "weight": w})
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain",
+        "level": "concept",
+        "community": community_id,
+        "nodes": nodes,
+        "edges": edges,
+    })))
+}
+
+/// Drill one concept: return the memories containing `concept` (newest first,
+/// capped) as the documented `mode=brain-concept` JSON.
+async fn memory_graph_brain_concept(
+    store: &Arc<Mutex<MemoryStore>>,
+    scope: Option<&str>,
+    concept: &str,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Show ALL of a concept's memories — the count is naturally its frequency,
+    // not an arbitrary cap. usize::MAX = "no limit".
+    let rows = {
+        let guard = store.lock().await;
+        guard
+            .concept_memories(scope, concept, usize::MAX)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let nodes: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(m, project)| {
+            serde_json::json!({
+                "id": format!("m{}", m.id),
+                "node_type": "memory",
+                "label": m.preview,
+                "kind": m.kind,
+                "source_kind": m.source_kind,
+                "project": project,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "brain-concept",
+        "concept": concept,
+        "nodes": nodes,
+        "edges": [],
+    })))
+}
+
+/// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
+/// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
+/// it via [`MemoryStore::graph_clusters`] and refresh the cache.
+///
+/// The store is `!Send` (it wraps a `rusqlite::Connection`), so the build runs
+/// inside a synchronous block with no `.await` while the store guard is held —
+/// keeping the returned future `Send` for axum.
+async fn cluster_index_cached(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+) -> std::result::Result<ClusterIndex, (StatusCode, String)> {
+    // Fast path: serve a still-fresh cached index.
+    {
+        let cache = state.cluster_cache.lock().await;
+        if let Some((built_at, index)) = cache.get(project)
+            && built_at.elapsed() < CLUSTER_INDEX_TTL
+        {
+            return Ok(index.clone());
+        }
+    }
+    // Miss / expired: rebuild under the store lock (no await inside this block).
+    let index = {
+        let guard = store.lock().await;
+        guard
+            .graph_clusters(
+                project,
+                CLUSTER_MAX_NODES,
+                CLUSTER_TOP_K,
+                CLUSTER_MIN_WEIGHT,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let mut cache = state.cluster_cache.lock().await;
+    cache.insert(
+        project.to_string(),
+        (std::time::Instant::now(), index.clone()),
+    );
+    Ok(index)
+}
+
+/// Cache-key separator for the `(project, group)` overview cache.
+const CACHE_KEY_SEP: char = '\u{1f}';
+
+/// Build (or serve cached) a top-level overview keyed by `(project, group)`.
+///
+/// `group=context` clusters semantically via [`MemoryStore::graph_clusters`];
+/// any other valid basis (`file`/`kind`/`session`/`source`) buckets by that
+/// metadata facet via [`MemoryStore::group_meta`]. Each emitted bubble is
+/// minted a fresh drill token (mapping to its member ids) so the client can
+/// drill arbitrarily deep without ever shipping id lists. Expired tokens (and
+/// stale tokens of this same project) are pruned on every build to bound growth.
+async fn memory_graph_overview(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    project: &str,
+    group: &str,
+    basis_pref: &str,
+    target_pref: Option<usize>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // `context` is semantic; everything else is a metadata facet. Reject an
+    // unknown basis up front (group_meta also rejects, but a 400 is clearer).
+    let is_context = group == "context";
+    if !is_context && !matches!(group, "file" | "kind" | "session" | "source" | "time") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown group `{group}` (expected context|file|kind|session|source|time)"),
+        ));
+    }
+
+    // 자동 default = per-project embedding toggle else global `[embeddings] enabled`.
+    let allow_vector_default = {
+        let cfg = rtrt_core::Config::load().unwrap_or_default();
+        cfg.project(project)
+            .and_then(|p| p.embeddings_enabled)
+            .unwrap_or_else(|| cfg.embeddings.is_enabled())
+    };
+    // The map's 기준 selector: auto | vector(의미) | lexical(어휘).
+    let basis_pref = match basis_pref {
+        "vector" | "lexical" => basis_pref,
+        _ => "auto",
+    };
+    // 세밀도(granularity): bubble target. Explicit value (clamped) wins; otherwise
+    // default to a clean, airy count — agentmemory stays uncluttered by distilling
+    // to few-but-meaningful nodes, so scale gently with project size (~sqrt(n))
+    // and clamp low: a 20k project lands ~140 bubbles, a small project ~60.
+    let target = match target_pref {
+        Some(t) => t.clamp(24, 1000),
+        None => {
+            let n = {
+                let guard = store.lock().await;
+                guard.count_by_project(project).unwrap_or(0)
+            };
+            (n as f64).sqrt().round().clamp(60.0, 200.0) as usize
+        }
+    };
+
+    // Key the cache on every knob so a different selection never serves a stale
+    // opposite-basis / opposite-granularity index.
+    let cache_key = format!(
+        "{project}{CACHE_KEY_SEP}{group}{CACHE_KEY_SEP}{basis_pref}{CACHE_KEY_SEP}{target}{CACHE_KEY_SEP}{}",
+        allow_vector_default as u8
+    );
+
+    // Fast path: serve a still-fresh cached index (re-mint tokens against it).
+    let cached = {
+        let cache = state.cluster_cache.lock().await;
+        cache.get(&cache_key).and_then(|(built_at, index)| {
+            (built_at.elapsed() < CLUSTER_INDEX_TTL).then(|| index.clone())
+        })
+    };
+    let index = match cached {
+        Some(idx) => idx,
+        None => {
+            // Miss / expired: rebuild under the store lock (no await inside).
+            let idx = {
+                let guard = store.lock().await;
+                if is_context {
+                    match basis_pref {
+                        // Force semantic: cluster on vectors even at low coverage
+                        // (the map then covers only the embedded rows).
+                        "vector" => guard
+                            .graph_clusters_vec(project, CLUSTER_MAX_NODES, CLUSTER_TOP_K, target)
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                        // Force keyword.
+                        "lexical" => guard
+                            .graph_clusters_opt(
+                                project,
+                                CLUSTER_MAX_NODES,
+                                CLUSTER_TOP_K,
+                                CLUSTER_MIN_WEIGHT,
+                                false,
+                                target,
+                            )
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                        // Auto: coverage decides (honours the per-project toggle).
+                        _ => guard
+                            .graph_clusters_opt(
+                                project,
+                                CLUSTER_MAX_NODES,
+                                CLUSTER_TOP_K,
+                                CLUSTER_MIN_WEIGHT,
+                                allow_vector_default,
+                                target,
+                            )
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                    }
+                } else {
+                    guard
+                        .group_meta(project, CLUSTER_MAX_NODES, group, target)
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                }
+            };
+            let mut cache = state.cluster_cache.lock().await;
+            cache.insert(cache_key, (std::time::Instant::now(), idx.clone()));
+            idx
+        }
+    };
+
+    // Invert `node_cluster` (member -> root) into `root -> member_ids`.
+    let total_nodes = index.node_cluster.len();
+    let mut members_by_root: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (&mem_id, &root) in &index.node_cluster {
+        members_by_root.entry(root).or_default().push(mem_id);
+    }
+
+    // Prune expired tokens + stale tokens of this same project, then mint one
+    // token per bubble.
+    let clusters = {
+        let mut tokens = state.level_tokens.lock().await;
+        tokens.retain(|_, (built_at, entry)| {
+            built_at.elapsed() < LEVEL_TOKEN_TTL && entry.project != project
+        });
+        index
+            .clusters
+            .iter()
+            .map(|c| {
+                let member_ids = members_by_root.remove(&c.id).unwrap_or_default();
+                let token = mint_level_token();
+                tokens.insert(
+                    token.clone(),
+                    (
+                        std::time::Instant::now(),
+                        TokenEntry {
+                            project: project.to_string(),
+                            member_ids,
+                            total_n: total_nodes,
+                            label: c.label.clone(),
+                        },
+                    ),
+                );
+                serde_json::json!({
+                    "id": c.id,
+                    "token": token,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                    // Every bubble opens: > leaf_cut -> sub-bubbles, else a leaf
+                    // of its members. Only a size-1 bubble is a dead end.
+                    "drillable": c.size > 1,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let cluster_edges: Vec<serde_json::Value> = index
+        .cluster_edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+        .collect();
+
+    // Report which signal the map is actually using so the UI can badge it:
+    // a context overview is "vector" (semantic, embeddings) when the project is
+    // mostly embedded — matching graph_clusters' own auto-dispatch — else
+    // "lexical" (keyword fallback); metadata facets are neither.
+    let (embedded, total_rows) = {
+        let guard = store.lock().await;
+        guard.embedding_coverage(project).unwrap_or((0, 0))
+    };
+    let basis = if !is_context {
+        "metadata"
+    } else {
+        match basis_pref {
+            "vector" => "vector",
+            "lexical" => "lexical",
+            // auto: coverage decides (honours the per-project toggle).
+            _ if allow_vector_default && embedded > 0 && embedded * 2 >= total_rows => "vector",
+            _ => "lexical",
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "mode": "overview",
+        "group": group,
+        "total_nodes": total_nodes,
+        "clusters": clusters,
+        "cluster_edges": cluster_edges,
+        "basis": basis,
+        "embedded": embedded,
+        "total_rows": total_rows,
+    })))
+}
+
+/// Resolve a drill `token` to its member-id set and render the next level.
+///
+/// * missing / expired token  -> `410 stale` (client refetches the overview).
+/// * `ids.len() <= LEAF_THRESHOLD` -> `leaf` (individual memory nodes).
+/// * otherwise re-subcluster; if the subset does not split
+///   (`clusters.len() <= 1`, e.g. all highly similar) fall back to a `leaf`
+///   (anti-stall guard); else emit a `group` of sub-bubbles, each minted a
+///   fresh child token.
+async fn memory_graph_drill(
+    state: &AppState,
+    store: &Arc<Mutex<MemoryStore>>,
+    token: String,
+    leaf_pref: Option<usize>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Resolve the token (honouring TTL) and clone out its payload.
+    let entry = {
+        let tokens = state.level_tokens.lock().await;
+        match tokens.get(&token) {
+            Some((built_at, entry)) if built_at.elapsed() < LEVEL_TOKEN_TTL => entry.clone(),
+            _ => return Err((StatusCode::GONE, "stale".into())),
+        }
+    };
+    let total_n = entry.total_n;
+    let project = entry.project.clone();
+    let ids = entry.member_ids;
+    // 깊이(depth): an explicit leaf cutoff from the map control, else dynamic.
+    // A larger cutoff bottoms out sooner (shallower); smaller drills deeper.
+    let leaf_cut = leaf_pref
+        .filter(|&l| l > 0)
+        .map(|l| l.clamp(8, 2000))
+        .unwrap_or_else(|| dynamic_leaf(total_n));
+
+    // Leaf: small enough to render individual memory nodes.
+    if ids.len() <= leaf_cut {
+        return memory_graph_leaf(store, &token, &ids).await;
+    }
+
+    // Deeper level: semantic re-cluster of the subset. Branch width scales with
+    // the bucket size so drill depth grows with quantity.
+    let branch = dynamic_branch(ids.len());
+    let idx2 = {
+        let guard = store.lock().await;
+        guard
+            .subcluster(&ids, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT, branch)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // Anti-stall: if the semantic split did not actually break the set up — one
+    // dominant child still holds most of it (a lexically-disjoint "unclustered"
+    // mass) — recursing on it would peel only a few rows per level (the 90-deep
+    // pathology). Re-partition by a metadata facet (session) so the mass becomes
+    // navigable sub-bubbles instead of one blob.
+    let largest = idx2.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+    let stalled = idx2.clusters.len() <= 1 || largest as f64 >= ids.len() as f64 * STALL_DOMINANCE;
+    let level = if stalled {
+        // Try metadata facets in turn until one actually distributes the mass
+        // (more than one bucket, no single bucket still holding ~everything).
+        // session -> time(hour) -> kind. `time` almost always splits a
+        // same-session lexical mass chronologically, avoiding a truncated leaf.
+        let chosen = {
+            let guard = store.lock().await;
+            let mut found: Option<ClusterIndex> = None;
+            for facet in ["session", "time", "kind"] {
+                let meta = guard
+                    .group_meta_ids(&ids, facet, branch)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let ml = meta.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+                if meta.clusters.len() > 1 && (ml as f64) < ids.len() as f64 * 0.9 {
+                    found = Some(meta);
+                    break;
+                }
+            }
+            found
+        };
+        // No facet helped (a truly homogeneous mass). Rather than truncate it to
+        // a capped leaf (silent node loss), split it into ordinal time-ordered
+        // PAGE buckets of <= leaf_cut, each of which opens to a full leaf. This
+        // guarantees every memory stays reachable while the graph never has to
+        // render thousands of points at once.
+        match chosen {
+            Some(m) => m,
+            None => {
+                let pages = page_buckets(&ids, leaf_cut);
+                return Ok(emit_group_response(
+                    state,
+                    &pages,
+                    &project,
+                    total_n,
+                    &token,
+                    ids.len(),
+                    true,
+                )
+                .await);
+            }
+        }
+    } else {
+        idx2
+    };
+
+    Ok(emit_group_response(state, &level, &project, total_n, &token, ids.len(), false).await)
+}
+
+/// Last-resort partition for a homogeneous mass no facet could split: sort by id
+/// (≈ chronological) and cut into ordinal pages of `page` members each. Each page
+/// is its own cluster (root = min id) so it opens to a complete leaf — no node is
+/// ever dropped.
+fn page_buckets(ids: &[i64], page: usize) -> ClusterIndex {
+    let page = page.max(1);
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    let mut clusters = Vec::new();
+    let mut node_cluster = std::collections::HashMap::new();
+    for (ci, chunk) in sorted.chunks(page).enumerate() {
+        let root = *chunk.iter().min().expect("non-empty chunk");
+        for &id in chunk {
+            node_cluster.insert(id, root);
+        }
+        let start = ci * page + 1;
+        clusters.push(rtrt_memory::ClusterSummary {
+            id: root,
+            size: chunk.len(),
+            label: format!("{}–{} (시간순)", start, start + chunk.len() - 1),
+            dominant_source: "mixed".to_string(),
+        });
+    }
+    ClusterIndex {
+        clusters,
+        cluster_edges: Vec::new(),
+        node_cluster,
+    }
+}
+
+/// Mint a child drill token per sub-bubble of `index` and render a `group`
+/// level. Shared by the semantic and metadata-fallback drill paths. Prunes
+/// expired tokens before minting so the cache stays bounded on deep drills
+/// (overviews are not always rebuilt between drills).
+async fn emit_group_response(
+    state: &AppState,
+    index: &ClusterIndex,
+    project: &str,
+    total_n: usize,
+    parent: &str,
+    parent_size: usize,
+    force_drillable: bool,
+) -> Json<serde_json::Value> {
+    let mut members_by_root: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (&mem_id, &root) in &index.node_cluster {
+        members_by_root.entry(root).or_default().push(mem_id);
+    }
+    let clusters = {
+        let mut tokens = state.level_tokens.lock().await;
+        tokens.retain(|_, (built_at, _)| built_at.elapsed() < LEVEL_TOKEN_TTL);
+        index
+            .clusters
+            .iter()
+            .map(|c| {
+                let member_ids = members_by_root.remove(&c.id).unwrap_or_default();
+                let child = mint_level_token();
+                tokens.insert(
+                    child.clone(),
+                    (
+                        std::time::Instant::now(),
+                        TokenEntry {
+                            project: project.to_string(),
+                            member_ids,
+                            total_n,
+                            label: c.label.clone(),
+                        },
+                    ),
+                );
+                serde_json::json!({
+                    "id": c.id,
+                    "token": child,
+                    "size": c.size,
+                    "label": c.label,
+                    "dominant_source": c.dominant_source,
+                    // Every bubble opens (sub-bubbles or a member leaf); only a
+                    // size-1 bubble is a dead end. (force_drillable kept for
+                    // symmetry with the overview path / page buckets.)
+                    "drillable": force_drillable || c.size > 1,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let cluster_edges: Vec<serde_json::Value> = index
+        .cluster_edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": a, "dst": b, "weight": w}))
+        .collect();
+
+    Json(serde_json::json!({
+        "mode": "group",
+        "parent": parent,
+        "total_nodes": parent_size,
+        "clusters": clusters,
+        "cluster_edges": cluster_edges,
+    }))
+}
+
+/// Leaf render shared by the token-drill paths: load `ids` as individual
+/// memory nodes + their intra-set edges (capped by the store).
+async fn memory_graph_leaf(
+    store: &Arc<Mutex<MemoryStore>>,
+    parent: &str,
+    ids: &[i64],
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let members = {
+        let guard = store.lock().await;
+        guard
+            .members_for_ids(ids)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let nodes: Vec<serde_json::Value> = members
+        .nodes
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": format!("m{}", n.id),
+                "node_type": "memory",
+                "label": n.preview,
+                "kind": n.kind,
+                "source_kind": n.source_kind,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = members
+        .edges
+        .iter()
+        .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mode": "leaf",
+        "parent": parent,
         "nodes": nodes,
         "edges": edges,
     })))
@@ -2073,6 +3175,7 @@ struct ConfigResponse {
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
     embeddings: rtrt_core::config::EmbeddingsConfig,
+    security: rtrt_core::config::SecurityConfig,
     path: String,
 }
 
@@ -2086,6 +3189,7 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
         capture: cfg.capture,
         auto_compress: cfg.auto_compress,
         embeddings: cfg.embeddings,
+        security: cfg.security,
         path,
     }))
 }
@@ -2102,6 +3206,9 @@ struct ConfigWriteRequest {
     /// when absent the on-disk embeddings section is preserved untouched.
     #[serde(default)]
     embeddings: Option<rtrt_core::config::EmbeddingsConfig>,
+    /// Optional global security defaults (default profile). Preserved when absent.
+    #[serde(default)]
+    security: Option<rtrt_core::config::SecurityConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2120,6 +3227,9 @@ async fn post_config(
     cfg.auto_compress = req.auto_compress;
     if let Some(emb) = req.embeddings {
         cfg.embeddings = emb;
+    }
+    if let Some(sec) = req.security {
+        cfg.security = sec;
     }
 
     let path = rtrt_core::Config::default_path().ok_or((
@@ -2690,23 +3800,89 @@ struct MemoryEmbedRequest {
     project: String,
 }
 
+// Kicks off a NON-BLOCKING background backfill. A big project (20k rows) takes
+// many minutes of Ollama calls; doing that under the shared store mutex would
+// freeze the whole dashboard. Instead a dedicated thread opens its OWN SQLite
+// connection (WAL mode = concurrent with the main one) and backfills there, so
+// the UI stays live and `embedding_coverage` reflects progress as rows commit.
 async fn memory_embed(
     State(state): State<AppState>,
     Json(req): Json<MemoryEmbedRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let embedder = state.embedder.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "embeddings not enabled".into(),
-    ))?;
+    if state.embedder.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embeddings not enabled".into(),
+        ));
+    }
+    // Dedup: refuse a second concurrent job for the same project.
+    {
+        let mut jobs = state.embedding_jobs.lock().unwrap();
+        if jobs.contains(&req.project) {
+            return Ok(Json(
+                serde_json::json!({ "started": false, "running": true }),
+            ));
+        }
+        jobs.insert(req.project.clone());
+    }
+
+    let path = state.memory_path.clone();
+    let project = req.project.clone();
+    let jobs = state.embedding_jobs.clone();
+    // Resolve embed config for the worker's own embedder.
+    let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+    let base_url = ecfg.resolved_base_url(
+        rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.auto_compress.base_url)
+            .as_deref(),
+    );
+    let model = ecfg.effective_model();
+
+    std::thread::spawn(move || {
+        match MemoryStore::open(&path) {
+            Ok(store) => {
+                let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
+                match store.backfill_embeddings(&project, &embedder) {
+                    Ok(n) => tracing::info!("embedding backfill done: {project} (+{n})"),
+                    Err(e) => tracing::warn!("embedding backfill failed for {project}: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("embedding backfill: open store failed: {e}"),
+        }
+        jobs.lock().unwrap().remove(&project);
+    });
+
+    Ok(Json(
+        serde_json::json!({ "started": true, "running": true }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryCoverageQuery {
+    project: String,
+}
+
+// GET /api/memory/coverage?project=X -> { embedded, total, running }
+// Lets the UI poll embedding progress while a background backfill runs.
+async fn memory_coverage(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemoryCoverageQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
-    let guard = store.lock().await;
-    let embedded = guard
-        .backfill_embeddings(&req.project, embedder.as_ref())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "embedded": embedded })))
+    let (embedded, total) = {
+        let guard = store.lock().await;
+        guard
+            .embedding_coverage(&q.project)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let running = state.embedding_jobs.lock().unwrap().contains(&q.project);
+    Ok(Json(
+        serde_json::json!({ "embedded": embedded, "total": total, "running": running }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2766,7 +3942,6 @@ async fn memory_entities(
     };
 
     let summariser = rtrt_memory::LlmSummariser::new(Box::new(GatewayAdapter(llm_gateway)), model);
-    let relation = "mentions";
 
     // `MemoryStore` is `!Sync` (rusqlite `Connection`), so no `&MemoryStore`
     // borrow may live across an `.await`. Mirror the auto-compress daemon: do
@@ -2794,7 +3969,7 @@ async fn memory_entities(
     let new_edges = {
         let guard = store.lock().await;
         guard
-            .link_extracted(&req.project, &extracted, relation)
+            .link_extracted_bipartite(&req.project, &extracted)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "edges": new_edges })))
@@ -2996,3 +4171,11 @@ async fn ollama_delete(
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
+
+// Vendored graph libraries (served at /vendor/*) so the map needs no CDN.
+const VENDOR_CYTOSCAPE: &str = include_str!("../ui/vendor/cytoscape.min.js");
+const VENDOR_LAYOUT_BASE: &str = include_str!("../ui/vendor/layout-base.js");
+const VENDOR_COSE_BASE: &str = include_str!("../ui/vendor/cose-base.js");
+const VENDOR_FCOSE: &str = include_str!("../ui/vendor/cytoscape-fcose.js");
+const VENDOR_COLA: &str = include_str!("../ui/vendor/cola.min.js");
+const VENDOR_CYTO_COLA: &str = include_str!("../ui/vendor/cytoscape-cola.js");

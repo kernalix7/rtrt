@@ -339,35 +339,225 @@ fn token_set(text: &str) -> std::collections::HashSet<String> {
 /// sorted slice below; the section comments above describe intent, but the data
 /// is kept flat-and-sorted for the `binary_search`.
 static STOP_WORDS: &[&str] = &[
-    "about", "add", "added", "adding", "adds", "after", "again", "against",
-    "all", "also", "although", "always", "among", "and", "another", "any",
-    "are", "around", "because", "been", "before", "being", "between",
-    "both", "but", "can", "cannot", "change", "changed", "changes",
-    "changing", "check", "checked", "checking", "checks", "complete",
-    "completed", "completes", "completing", "continue", "continued",
-    "continuing", "could", "create", "created", "creates", "creating",
-    "cross", "did", "does", "doing", "done", "down", "during", "each",
-    "either", "else", "ensure", "ensured", "ensures", "etc", "even", "ever",
-    "every", "facing", "few", "find", "finding", "finds", "fix", "fixed",
-    "fixes", "fixing", "for", "found", "from", "further", "get", "gets",
-    "getting", "got", "had", "has", "have", "having", "here", "hers",
-    "herself", "him", "himself", "his", "how", "however", "into", "its",
-    "itself", "just", "less", "like", "look", "looked", "looking", "looks",
-    "made", "make", "makes", "making", "many", "may", "might", "more",
-    "most", "much", "must", "need", "needed", "needs", "neither", "never",
-    "new", "nor", "not", "now", "off", "once", "one", "only", "onto",
-    "other", "our", "ours", "ourselves", "out", "over", "own", "per", "ran",
-    "rather", "run", "running", "runs", "same", "see", "seen", "shall",
-    "should", "since", "some", "start", "started", "starting", "starts",
-    "such", "than", "that", "the", "their", "theirs", "them", "themselves",
-    "then", "there", "these", "they", "this", "those", "through", "thus",
-    "too", "try", "trying", "two", "under", "understand", "understood",
-    "until", "update", "updated", "updates", "updating", "upon", "use",
-    "used", "uses", "using", "verified", "verifies", "verify", "verifying",
-    "very", "via", "want", "wanted", "wants", "was", "were", "what", "when",
-    "where", "whether", "which", "while", "who", "whom", "whose", "why",
-    "will", "with", "within", "without", "work", "worked", "working",
-    "works", "would", "you", "your", "yours", "yourself",
+    "about",
+    "add",
+    "added",
+    "adding",
+    "adds",
+    "after",
+    "again",
+    "against",
+    "all",
+    "also",
+    "although",
+    "always",
+    "among",
+    "and",
+    "another",
+    "any",
+    "are",
+    "around",
+    "because",
+    "been",
+    "before",
+    "being",
+    "between",
+    "both",
+    "but",
+    "can",
+    "cannot",
+    "change",
+    "changed",
+    "changes",
+    "changing",
+    "check",
+    "checked",
+    "checking",
+    "checks",
+    "complete",
+    "completed",
+    "completes",
+    "completing",
+    "continue",
+    "continued",
+    "continuing",
+    "could",
+    "create",
+    "created",
+    "creates",
+    "creating",
+    "cross",
+    "did",
+    "does",
+    "doing",
+    "done",
+    "down",
+    "during",
+    "each",
+    "either",
+    "else",
+    "ensure",
+    "ensured",
+    "ensures",
+    "etc",
+    "even",
+    "ever",
+    "every",
+    "facing",
+    "few",
+    "find",
+    "finding",
+    "finds",
+    "fix",
+    "fixed",
+    "fixes",
+    "fixing",
+    "for",
+    "found",
+    "from",
+    "further",
+    "get",
+    "gets",
+    "getting",
+    "got",
+    "had",
+    "has",
+    "have",
+    "having",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "however",
+    "into",
+    "its",
+    "itself",
+    "just",
+    "less",
+    "like",
+    "look",
+    "looked",
+    "looking",
+    "looks",
+    "made",
+    "make",
+    "makes",
+    "making",
+    "many",
+    "may",
+    "might",
+    "more",
+    "most",
+    "much",
+    "must",
+    "need",
+    "needed",
+    "needs",
+    "neither",
+    "never",
+    "new",
+    "nor",
+    "not",
+    "now",
+    "off",
+    "once",
+    "one",
+    "only",
+    "onto",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "per",
+    "ran",
+    "rather",
+    "run",
+    "running",
+    "runs",
+    "same",
+    "see",
+    "seen",
+    "shall",
+    "should",
+    "since",
+    "some",
+    "start",
+    "started",
+    "starting",
+    "starts",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "thus",
+    "too",
+    "try",
+    "trying",
+    "two",
+    "under",
+    "understand",
+    "understood",
+    "until",
+    "update",
+    "updated",
+    "updates",
+    "updating",
+    "upon",
+    "use",
+    "used",
+    "uses",
+    "using",
+    "verified",
+    "verifies",
+    "verify",
+    "verifying",
+    "very",
+    "via",
+    "want",
+    "wanted",
+    "wants",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "whether",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "will",
+    "with",
+    "within",
+    "without",
+    "work",
+    "worked",
+    "working",
+    "works",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
 ];
 
 /// `true` when `tok` is in the curated [`STOP_WORDS`] set. Binary search over the
@@ -3931,6 +4121,47 @@ impl MemoryStore {
         Ok(embedded)
     }
 
+    /// Up to `limit` rows (newest first) that have **no** entry in the
+    /// `embeddings` table, as `(id, project, body)` tuples. Lets the background
+    /// auto-embed daemon embed incrementally — one capped batch per sweep —
+    /// instead of scanning the whole project like [`backfill_embeddings`]. The
+    /// `LEFT JOIN … WHERE e.memory_id IS NULL` is the unembedded set; `id DESC`
+    /// makes each sweep prefer the freshest captures.
+    pub fn unembedded_batch(&self, limit: usize) -> Result<Vec<(i64, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.id, m.project, m.body
+                   FROM memories m
+                   LEFT JOIN embeddings e ON e.memory_id = m.id
+                  WHERE e.memory_id IS NULL
+               ORDER BY m.id DESC
+                  LIMIT ?1",
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Store one embedding for `memory_id`. `INSERT OR IGNORE` so a row that was
+    /// concurrently embedded (or re-fed by the daemon) is a no-op rather than an
+    /// error. Companion to [`unembedded_batch`](Self::unembedded_batch): the
+    /// daemon pulls a batch, embeds each body, then calls this per row.
+    pub fn store_embedding(&self, memory_id: i64, model: &str, vector: &[f32]) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                rusqlite::params![memory_id, model, vector_to_blob(vector)],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
     /// Hybrid recall — Reciprocal Rank Fusion of BM25 and dense-vector
     /// rankings. Score per record is `Σ 1 / (rrf_k + rank_i)` over the two
     /// streams; default `rrf_k = 60`. Each stream is fetched at `limit * 2` so
@@ -4120,7 +4351,9 @@ impl MemoryStore {
         // large one more — never a flat hard-coded cap. ~2·√memories, clamped to a
         // renderable range; edges follow at 3× the concept count.
         let max_concepts = if max_concepts == 0 {
-            ((total_memories as f64).sqrt() * 2.0).round().clamp(80.0, 600.0) as usize
+            ((total_memories as f64).sqrt() * 2.0)
+                .round()
+                .clamp(80.0, 600.0) as usize
         } else {
             max_concepts
         };
@@ -4269,13 +4502,11 @@ impl MemoryStore {
             .filter(|&r| gdf[r as usize] <= df_ceiling)
             .collect();
         kept.sort_by(|&a, &b| {
-            gdf[b as usize]
-                .cmp(&gdf[a as usize])
-                .then_with(|| {
-                    tok_ids[group_name[a as usize] as usize]
-                        .as_str()
-                        .cmp(tok_ids[group_name[b as usize] as usize].as_str())
-                })
+            gdf[b as usize].cmp(&gdf[a as usize]).then_with(|| {
+                tok_ids[group_name[a as usize] as usize]
+                    .as_str()
+                    .cmp(tok_ids[group_name[b as usize] as usize].as_str())
+            })
         });
         kept.truncate(max_concepts);
 
@@ -4583,15 +4814,12 @@ fn cluster_concepts(graph: &ConceptGraph) -> (Vec<i64>, ConceptHierarchy) {
     let best_peer: Vec<Option<(u32, f32)>> = peers
         .iter()
         .map(|plist| {
-            plist
-                .iter()
-                .copied()
-                .max_by(|x, y| {
-                    x.1.partial_cmp(&y.1)
+            plist.iter().copied().max_by(|x, y| {
+                x.1.partial_cmp(&y.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         // Prefer the lower neighbour index on a tie — deterministic.
                         .then(y.0.cmp(&x.0))
-                })
+            })
         })
         .collect();
 
@@ -4672,13 +4900,7 @@ fn cluster_concepts(graph: &ConceptGraph) -> (Vec<i64>, ConceptHierarchy) {
 
     // Aggregate inter-community edges: every concept edge whose endpoints fall
     // in different communities contributes its weight to that community pair.
-    let pack = |x: i64, y: i64| -> (i64, i64) {
-        if x < y {
-            (x, y)
-        } else {
-            (y, x)
-        }
-    };
+    let pack = |x: i64, y: i64| -> (i64, i64) { if x < y { (x, y) } else { (y, x) } };
     let mut agg: std::collections::HashMap<(i64, i64), f32> = std::collections::HashMap::new();
     for (a, b, w) in &graph.edges {
         let (Some(&ia), Some(&ib)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) else {
@@ -4732,10 +4954,7 @@ fn community_subgraph(graph: &ConceptGraph, community_id: i64) -> ConceptGraph {
     let kept_names: std::collections::HashSet<&str> =
         keep.iter().map(|&i| graph.nodes[i].name.as_str()).collect();
 
-    let mut nodes: Vec<ConceptNode> = keep
-        .iter()
-        .map(|&i| graph.nodes[i].clone())
-        .collect();
+    let mut nodes: Vec<ConceptNode> = keep.iter().map(|&i| graph.nodes[i].clone()).collect();
     nodes.sort_by(|a, b| {
         b.degree
             .cmp(&a.degree)
@@ -4875,7 +5094,10 @@ mod tests {
         }
         let g = store.concept_graph(Some("p1"), 250, 750, 1).unwrap();
         let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert!(!names.contains(&"could"), "stop word must never be a concept");
+        assert!(
+            !names.contains(&"could"),
+            "stop word must never be a concept"
+        );
         assert!(names.contains(&"podman"), "distinctive term must survive");
         assert!(names.contains(&"jacobian"), "distinctive term must survive");
         assert!(
@@ -4897,7 +5119,9 @@ mod tests {
         // "identifiers" (plural) in 4 more bodies; base "identifier" is attested
         // so the plural must redirect onto it -> ONE merged concept.
         for _ in 0..4 {
-            store.save("p1", "note", "identifiers parser tokens").unwrap();
+            store
+                .save("p1", "note", "identifiers parser tokens")
+                .unwrap();
         }
         // Filler so MIN_DF and the percentile ceiling stay sane.
         for i in 0..6 {
@@ -4922,7 +5146,10 @@ mod tests {
         assert_eq!(node.freq, 12, "df aggregates over the merged group");
         // The merge does not strip a word whose base is unattested: "parser" has
         // no attested "pars" base, so it survives whole.
-        assert!(names.contains(&"parser"), "unattested strip must NOT happen");
+        assert!(
+            names.contains(&"parser"),
+            "unattested strip must NOT happen"
+        );
     }
 
     /// A token in a very high FRACTION of the corpus is generic FOR THIS CORPUS
@@ -4938,11 +5165,36 @@ mod tests {
         // is the part that gets cut. The third token "thingy{i}" is unique per
         // body (hapax, dropped) so only "context" + the distinctive term matter.
         let distinctive = [
-            "tessellate", "jacobian", "podman", "auth", "kernel", "vector",
-            "lexer", "registry", "matrix", "scheduler", "allocator", "raster",
-            "shader", "mutex", "rgba", "quaternion", "bezier", "frustum",
-            "viewport", "sampler", "atlas", "glyph", "kerning", "codepoint",
-            "opcode", "syscall", "epoll", "futex", "cgroup", "namespace",
+            "tessellate",
+            "jacobian",
+            "podman",
+            "auth",
+            "kernel",
+            "vector",
+            "lexer",
+            "registry",
+            "matrix",
+            "scheduler",
+            "allocator",
+            "raster",
+            "shader",
+            "mutex",
+            "rgba",
+            "quaternion",
+            "bezier",
+            "frustum",
+            "viewport",
+            "sampler",
+            "atlas",
+            "glyph",
+            "kerning",
+            "codepoint",
+            "opcode",
+            "syscall",
+            "epoll",
+            "futex",
+            "cgroup",
+            "namespace",
         ];
         let mut tag = 0u32;
         for term in distinctive {
@@ -4963,7 +5215,10 @@ mod tests {
             "corpus-ubiquitous token must be cut by the dynamic ceiling"
         );
         // The distinctive mid-frequency terms survive.
-        assert!(names.contains(&"tessellate"), "distinctive term must survive");
+        assert!(
+            names.contains(&"tessellate"),
+            "distinctive term must survive"
+        );
         assert!(names.contains(&"jacobian"), "distinctive term must survive");
         assert!(names.contains(&"podman"), "distinctive term must survive");
     }
@@ -5150,8 +5405,14 @@ mod tests {
         assert!(!names.contains("hotel"), "cross-community concept leaked");
         // Every returned edge is INTRA-community (both endpoints are members).
         for (a, b, _) in &sub.edges {
-            assert!(names.contains(a.as_str()), "edge endpoint outside community");
-            assert!(names.contains(b.as_str()), "edge endpoint outside community");
+            assert!(
+                names.contains(a.as_str()),
+                "edge endpoint outside community"
+            );
+            assert!(
+                names.contains(b.as_str()),
+                "edge endpoint outside community"
+            );
         }
         // total_memories is carried through unchanged.
         assert_eq!(sub.total_memories, h.total_memories);
@@ -6138,6 +6399,63 @@ mod tests {
             elapsed.as_secs_f64() < 1.0,
             "vec clustering too slow: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn unembedded_batch_returns_only_unembedded_and_honours_limit() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store.save("p", "note", "alpha").unwrap();
+        let b = store.save("p", "note", "beta").unwrap();
+        let c = store.save("p", "note", "gamma").unwrap();
+
+        // All three start unembedded.
+        let batch = store.unembedded_batch(100).unwrap();
+        assert_eq!(batch.len(), 3);
+        // Newest first: gamma, beta, alpha.
+        assert_eq!(
+            batch.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![c, b, a]
+        );
+        // (id, project, body) shape is preserved.
+        assert_eq!(batch[0], (c, "p".to_string(), "gamma".to_string()));
+
+        // Limit caps the batch size, still newest first.
+        let two = store.unembedded_batch(2).unwrap();
+        assert_eq!(
+            two.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![c, b]
+        );
+
+        // Embed `b`; it must drop out of the unembedded set.
+        store
+            .store_embedding(b, "test-model", &[0.1, 0.2, 0.3])
+            .unwrap();
+        let after = store.unembedded_batch(100).unwrap();
+        assert_eq!(
+            after.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![c, a],
+            "embedded row must be excluded"
+        );
+    }
+
+    #[test]
+    fn store_embedding_round_trips_with_coverage() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store.save("p", "note", "alpha").unwrap();
+        let _b = store.save("p", "note", "beta").unwrap();
+
+        // Start: nothing embedded.
+        assert_eq!(store.embedding_coverage("p").unwrap(), (0, 2));
+
+        // Embed one row -> coverage reflects it, and unembedded_batch drops it.
+        store.store_embedding(a, "test-model", &[1.0, 0.0]).unwrap();
+        assert_eq!(store.embedding_coverage("p").unwrap(), (1, 2));
+        let remaining = store.unembedded_batch(100).unwrap();
+        assert!(remaining.iter().all(|(id, _, _)| *id != a));
+
+        // INSERT OR IGNORE: re-storing the same id is a harmless no-op.
+        store.store_embedding(a, "test-model", &[9.0, 9.0]).unwrap();
+        assert_eq!(store.embedding_coverage("p").unwrap(), (1, 2));
     }
 
     /// Hand-insert an embedding row for `id` so vector clustering has dense

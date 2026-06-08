@@ -356,6 +356,7 @@ async fn main() -> Result<()> {
     };
     spawn_consolidation_daemon(memory_for_daemon);
     spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
+    spawn_auto_embed_daemon(memory_store_path());
     transcripts::spawn_reattribution(memory_for_transcripts.clone());
     transcripts::spawn_transcript_watcher(memory_for_transcripts);
 
@@ -629,6 +630,131 @@ fn spawn_auto_compress_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, gateway: 
                         "auto-compressed"
                     );
                 }
+            }
+        }
+    });
+}
+
+/// Background auto-embed worker — puts embeddings into the AUTOMATIC loop so new
+/// captures (saved text-only + fast) get a vector without ever blocking capture
+/// or a prompt. Every `embeddings.auto_interval_sec` it opens its OWN
+/// `MemoryStore` on `memory_store_path()` (WAL = concurrent with the main store),
+/// pulls `unembedded_batch(auto_batch)` newest-first, embeds each body with an
+/// `OllamaEmbedder` (`embed_one` already truncates to ~2000 chars), and writes
+/// the vector via `store_embedding`. Capped at `auto_batch` rows per cycle so we
+/// never hammer Ollama.
+///
+/// OPTIONAL / LLM-FREE BY DEFAULT: spawns ONLY when `[embeddings] enabled=true`
+/// AND `auto=true`. When disabled, this returns immediately — the memory loop
+/// stays pure BM25, zero Ollama calls. Probes the embedder reachable ONCE before
+/// engaging; if unreachable it logs once and does not spawn (no per-cycle spam).
+/// An embed error on a single row is logged and skipped — the row is retried next
+/// cycle, the daemon keeps going.
+fn spawn_auto_embed_daemon(path: PathBuf) {
+    let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+    if !ecfg.is_enabled() {
+        tracing::info!(
+            "auto-embed daemon off (set RTRT_EMBED_ENABLED=1 or [embeddings] enabled=true)"
+        );
+        return;
+    }
+    if !ecfg.auto {
+        tracing::info!("auto-embed daemon off ([embeddings] auto=false)");
+        return;
+    }
+    let base_url = ecfg.resolved_base_url(
+        rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.auto_compress.base_url)
+            .as_deref(),
+    );
+    let model = ecfg.effective_model();
+    let interval_sec = ecfg.auto_interval_sec.max(1);
+    let batch = ecfg.auto_batch.max(1);
+
+    tokio::spawn(async move {
+        // Probe the embedder reachable ONCE before engaging. If Ollama is
+        // unreachable, log once and stay BM25 (do NOT spam every cycle).
+        // `OllamaEmbedder` isn't `Clone` (it caches a detected dimension), so we
+        // carry the `base_url`/`model` strings and build a fresh one each time —
+        // the same pattern the `/api/memory/embed` handler uses.
+        let probe = tokio::task::spawn_blocking({
+            let base_url = base_url.clone();
+            let model = model.clone();
+            move || {
+                rtrt_memory::OllamaEmbedder::new(base_url, model).embed_one("rtrt auto-embed probe")
+            }
+        })
+        .await;
+        match probe {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::info!(
+                    "auto-embed daemon off (embedder {base_url} model={model} unreachable: {e}); staying BM25"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::info!("auto-embed daemon off (probe task failed: {e}); staying BM25");
+                return;
+            }
+        }
+        tracing::info!(
+            "auto-embed daemon on: model={model}, base_url={base_url}, every {interval_sec}s, batch={batch}"
+        );
+
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_sec));
+        // First tick fires immediately — skip it so we don't race startup.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let path = path.clone();
+            let base_url = base_url.clone();
+            let model = model.clone();
+            // Do the SQLite + embedding work off the async runtime: this opens its
+            // OWN WAL connection (concurrent with the main store) and blocks on
+            // Ollama HTTP, so it must not run on a tokio worker thread.
+            let embedded = tokio::task::spawn_blocking(move || {
+                let store = match MemoryStore::open(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("auto-embed: open store failed: {e}");
+                        return 0usize;
+                    }
+                };
+                let rows = match store.unembedded_batch(batch) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!("auto-embed: unembedded_batch: {e}");
+                        return 0;
+                    }
+                };
+                if rows.is_empty() {
+                    return 0;
+                }
+                let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
+                let mut done = 0;
+                for (id, _project, body) in rows {
+                    let vector = match embedder.embed_one(&body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Skip this row and keep going; retried next cycle.
+                            tracing::warn!("auto-embed #{id}: embed: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = store.store_embedding(id, embedder.model_name(), &vector) {
+                        tracing::warn!("auto-embed #{id}: store_embedding: {e}");
+                        continue;
+                    }
+                    done += 1;
+                }
+                done
+            })
+            .await
+            .unwrap_or(0);
+            if embedded > 0 {
+                tracing::info!(embedded, "auto-embed cycle");
             }
         }
     });

@@ -1586,6 +1586,78 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort HYBRID recall for the auto-recall hook.
+///
+/// Returns `Some(hits)` only when a hybrid (BM25 + dense-vector RRF) recall
+/// completed successfully within `timeout`. Returns `None` — the caller's
+/// signal to fall back to pure `recall_bm25` — when any gate is unmet:
+/// embeddings disabled, no meaningful coverage, embedder cannot be built, the
+/// query embedding errors, or the attempt exceeds `timeout` (slow/unreachable
+/// Ollama). The prompt is NEVER blocked beyond `timeout`: the hybrid work runs
+/// on a detached worker thread and we stop waiting on it once `timeout` lapses.
+///
+/// When embeddings are disabled (the LLM-free user) this returns `None`
+/// immediately with zero LLM/Ollama traffic, so the recall hook stays pure
+/// BM25.
+fn try_hybrid_recall(
+    store_path: &std::path::Path,
+    project: &str,
+    query: &str,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> Option<Vec<rtrt_memory::MemoryRecord>> {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let ecfg = cfg.embeddings;
+    // Gate 1: embeddings must be enabled (honours RTRT_EMBED_ENABLED).
+    if !ecfg.is_enabled() {
+        return None;
+    }
+    // Gate 2: meaningful embedding coverage for this project. Probing coverage
+    // is a cheap local SQL read (no network), so do it before touching Ollama.
+    let coverage_store = MemoryStore::open(store_path).ok()?;
+    let (embedded, total) = coverage_store.embedding_coverage(project).ok()?;
+    if embedded == 0 || embedded.saturating_mul(2) < total {
+        return None;
+    }
+    drop(coverage_store);
+
+    // Gate 3: build the embedder (mirrors the dashboard daemon's resolution:
+    // embeddings.base_url → auto_compress.base_url → Ollama default).
+    let base_url = ecfg.resolved_base_url(cfg.auto_compress.base_url.as_deref());
+    let model = ecfg.effective_model();
+
+    // Run the hybrid recall on a worker thread bounded by `timeout`. The thread
+    // opens its OWN MemoryStore on the WAL db (concurrent reads are fine) and
+    // its own embedder, so nothing non-Send crosses the boundary. We wait on a
+    // bounded channel: if Ollama is slow/unreachable we stop waiting after
+    // `timeout` and the caller falls back to BM25. The worker is detached and
+    // simply finishes (or errors) on its own; its result is discarded.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<rtrt_memory::MemoryRecord>>>(1);
+    let store_path = store_path.to_path_buf();
+    let project = project.to_string();
+    let query = query.to_string();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let store = MemoryStore::open(&store_path).ok()?;
+            let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
+            let scored = store
+                .recall_hybrid(&project, &query, limit, &embedder)
+                .ok()?;
+            Some(scored.into_iter().map(|s| s.record).collect::<Vec<_>>())
+        })();
+        // Ignore send errors: the receiver may have already timed out and gone.
+        let _ = tx.send(result);
+    });
+
+    // `recv_timeout` returns Err on both timeout and a dropped sender; either
+    // way we fall back. A successful hybrid yields `Some(hits)`; an inner error
+    // yields `Some(None)` which we also treat as a fall-back signal.
+    match rx.recv_timeout(timeout) {
+        Ok(Some(hits)) => Some(hits),
+        _ => None,
+    }
+}
+
 fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize) -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
@@ -1630,9 +1702,26 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
         return Ok(());
     }
     let query = terms.join(" OR ");
-    let hits = memory
-        .recall_bm25(&project, &query, limit)
-        .unwrap_or_default();
+
+    // Recall strategy: try HYBRID (BM25 + dense vector RRF) only when it can be
+    // done safely, otherwise fall back to pure BM25 — and NEVER stall the
+    // prompt. Hybrid is attempted iff:
+    //   1. embeddings are enabled in config/env, AND
+    //   2. the project already has meaningful embedding coverage
+    //      (embedded > 0 && embedded*2 >= total) — without coverage hybrid
+    //      adds latency for no recall gain, AND
+    //   3. an OllamaEmbedder can be constructed.
+    // The hybrid call runs on a detached worker thread bounded by a short join
+    // timeout, so a slow/unreachable Ollama (ureq has no short default timeout)
+    // falls back to BM25 fast. On ANY error/timeout/absent-embedder we use the
+    // exact previous behaviour: store.recall_bm25(project, query, limit).
+    const HYBRID_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+    let hits = try_hybrid_recall(&store_path, &project, &query, limit, HYBRID_TIMEOUT)
+        .unwrap_or_else(|| {
+            memory
+                .recall_bm25(&project, &query, limit)
+                .unwrap_or_default()
+        });
     if hits.is_empty() {
         return Ok(());
     }

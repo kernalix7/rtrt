@@ -109,6 +109,17 @@
   .badge.err { color: var(--err); border-color: var(--err); }
   .badge.warn { color: var(--warn); border-color: var(--warn); }
 
+  /* Output Optimizer level control */
+  .optimizer-level-panel { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; padding: 0.65rem 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 0.75rem; }
+  .optimizer-level-copy { display: flex; flex-direction: column; gap: 0.12rem; min-width: 180px; }
+  .optimizer-level-copy .label { font-weight: 600; }
+  .optimizer-level-buttons { display: inline-flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .optimizer-level-buttons button { min-width: 58px; border: 0; border-radius: 0; padding: 0.35rem 0.7rem; font-size: 0.82em; background: var(--surface); color: var(--muted); }
+  .optimizer-level-buttons button + button { border-left: 1px solid var(--border); }
+  .optimizer-level-buttons button.active { background: var(--accent); color: white; font-weight: 600; }
+  .optimizer-level-buttons button[data-level="off"].active { background: var(--border); color: var(--muted); }
+  .optimizer-level-status.inactive { color: var(--muted); border-color: var(--border); background: var(--surface); }
+
   /* Live activity strip */
   .activity { position: sticky; bottom: 0; background: var(--surface); border-top: 1px solid var(--border); padding: 0.35rem 1.25rem; font-size: 0.82em; color: var(--muted); display: flex; align-items: center; gap: 0.75rem; max-height: 32px; overflow: hidden; }
   .activity .dot-pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
@@ -777,6 +788,19 @@
     <section id="page-compress" class="page" hidden>
       <div class="card">
         <div class="head"><h2>텍스트 압축</h2><span class="hint">기본 full 레벨 룰 엔진</span></div>
+        <div class="optimizer-level-panel">
+          <div class="optimizer-level-copy">
+            <span class="label">Terse mode</span>
+            <span class="hint">Output Optimizer response style</span>
+          </div>
+          <div class="optimizer-level-buttons" id="optimizer-level-buttons" aria-label="Output Optimizer level">
+            <button type="button" data-level="off">off</button>
+            <button type="button" data-level="lite">lite</button>
+            <button type="button" data-level="full">full</button>
+            <button type="button" data-level="ultra">ultra</button>
+          </div>
+          <span id="optimizer-level-status" class="badge optimizer-level-status inactive">Terse mode: off</span>
+        </div>
         <form id="compress-form">
           <textarea id="compress-input" rows="6" placeholder="줄일 텍스트" required></textarea>
           <div style="display:flex;gap:0.5rem;align-items:center;">
@@ -2068,6 +2092,7 @@ function navigate(page, opts = {}) {
     refreshSecurityScope();
   }
   if (page === 'compress') {
+    loadOptimizerLevel();
     setCompressEngine(opts.compressEngine, opts.compressLevel);
     if (opts.focus === 'proxy') focusCommandProxy();
   }
@@ -4089,6 +4114,58 @@ document.getElementById('compress-mode').addEventListener('change', function () 
     // Populate from cache in case it wasn't there at page-load time.
     document.getElementById('compress-llm-model').innerHTML = buildModelOptions('');
   }
+});
+
+function renderOptimizerLevel(level, active) {
+  const normalized = ['off', 'lite', 'full', 'ultra'].includes(level) ? level : 'off';
+  document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.level === normalized);
+    btn.disabled = false;
+  });
+  const status = document.getElementById('optimizer-level-status');
+  if (status) {
+    status.classList.toggle('ok', !!active);
+    status.classList.toggle('inactive', !active);
+    status.textContent = active ? `Terse mode: ${normalized.toUpperCase()}` : 'Terse mode: off';
+  }
+}
+
+async function loadOptimizerLevel() {
+  try {
+    const r = await fetch('/api/optimizer/level');
+    if (!r.ok) return;
+    const d = await r.json();
+    renderOptimizerLevel(d.level || 'off', !!d.active);
+  } catch (_) { /* keep current UI state */ }
+}
+
+async function setOptimizerLevel(level) {
+  document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => { btn.disabled = true; });
+  const status = document.getElementById('optimizer-level-status');
+  if (status) status.textContent = '저장 중…';
+  try {
+    const r = await fetch('/api/optimizer/level', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level }),
+    });
+    if (!r.ok) {
+      const msg = await r.text();
+      showToast(`레벨 저장 실패 ${r.status}: ${msg}`, 'err');
+      await loadOptimizerLevel();
+      return;
+    }
+    const d = await r.json();
+    renderOptimizerLevel(d.level || level, !!d.active);
+    pushActivity(`terse mode · ${d.level || level}`);
+  } catch (e) {
+    showToast(`레벨 저장 오류: ${e.message || e}`, 'err');
+    await loadOptimizerLevel();
+  }
+}
+
+document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => {
+  btn.onclick = () => setOptimizerLevel(btn.dataset.level || 'off');
 });
 
 // Tools — compress

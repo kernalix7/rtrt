@@ -41,9 +41,10 @@ use axum::{
     Json, Router,
     extract::{Path as AxPath, State},
     http::StatusCode,
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{delete, get, post},
 };
+use rtrt_core::{OutputStyleLevel, read_output_style_level, write_output_style_level};
 use rtrt_memory::{
     ClusterIndex, ConceptHierarchy, DetailedRecord, Embedder, MemoryStore, PayloadFilter,
     Summariser,
@@ -369,6 +370,10 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/overview", get(optimizer_overview))
         .route("/api/optimizer/overview", get(optimizer_overview))
+        .route(
+            "/api/optimizer/level",
+            get(get_optimizer_level).post(post_optimizer_level),
+        )
         .route("/api/templates", get(list_templates))
         .route("/api/templates/{name}", get(get_template))
         .route("/api/templates/scaffold", post(scaffold))
@@ -804,6 +809,41 @@ async fn stats() -> Json<serde_json::Value> {
         "output_saved": 0,
         "provider": null,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetLevelRequest {
+    level: String,
+}
+
+async fn get_optimizer_level() -> impl IntoResponse {
+    let level = read_output_style_level();
+    Json(serde_json::json!({
+        "level": level.as_str(),
+        "active": level.is_active(),
+    }))
+}
+
+async fn post_optimizer_level(Json(body): Json<SetLevelRequest>) -> impl IntoResponse {
+    let Some(level) = OutputStyleLevel::parse(&body.level) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown level" })),
+        )
+            .into_response();
+    };
+    if let Err(e) = write_output_style_level(level) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "level": level.as_str(),
+        "active": level.is_active(),
+    }))
+    .into_response()
 }
 
 fn metadata_saved_chars(raw: &str, expected_source: &str) -> Option<i64> {

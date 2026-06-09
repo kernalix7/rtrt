@@ -150,8 +150,8 @@ enum Cmd {
         binary: Option<PathBuf>,
     },
     /// Reverse a previous `rtrt setup`. Drops the `rtrt` MCP entry from the
-    /// agent's config; with `--plugin`, also removes the twelve rtrt
-    /// hook entries from `~/.claude/settings.json`. Dry-run by default;
+    /// agent's config; with `--plugin`, also removes the rtrt hook entries
+    /// from `~/.claude/settings.json`. Dry-run by default;
     /// pass `--apply` to actually delete.
     Uninstall {
         #[arg(short, long, value_enum)]
@@ -175,7 +175,7 @@ enum Cmd {
     /// Print the Output Optimizer statusline badge.
     Statusline,
     /// Wire RTRT into a popular coding agent's MCP config. `--plugin`
-    /// (Claude only) also merges twelve hook entries into
+    /// (Claude only) also merges hook entries into
     /// `~/.claude/settings.json` so every PreToolUse / PostToolUse /
     /// SessionStart etc. auto-captures into the memory store.
     Setup {
@@ -191,10 +191,8 @@ enum Cmd {
         /// Override the discovered `rtrt-mcp` binary path.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// Also install the Claude Code hook plugin (only valid with
-        /// `--agent claude`). Writes the embedded plugin tree to
-        /// `~/.claude/plugins/cache/rtrt/` and adds `"rtrt"` to the
-        /// `plugins` array in `~/.claude/settings.json`.
+        /// Also install the Claude Code hook entries and status line
+        /// (only valid with `--agent claude`).
         #[arg(long)]
         plugin: bool,
     },
@@ -1989,29 +1987,11 @@ fn print_hook_block(reason: &str) {
 }
 
 fn style_reinforcement(level: OutputStyleLevel) -> String {
-    format!(
-        "OUTPUT-OPTIMIZER: stay terse (level {}). Detect the conversation language and answer terse in that same language. Keep code/commits/PRs/security normal; do not compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests.",
-        level.as_str()
-    )
+    setup::style_reinforcement(level)
 }
 
 fn style_session_block(level: OutputStyleLevel) -> String {
-    let rules = match level {
-        OutputStyleLevel::Lite => {
-            "Lite: trim filler and hedging only. Drop language-appropriate filler, for example English filler phrases, Korean 군더더기, Japanese 冗長な表現, or Spanish relleno. Keep normal grammar."
-        }
-        OutputStyleLevel::Full => {
-            "Full: also drop grammatically optional function words where the language allows. Examples, not limits: English articles a/an/the; Korean 불필요한 조사·군더더기 존댓말 축약; Japanese 冗長な助詞・敬語; Chinese 虚词. Use readable fragments when natural in the user's language."
-        }
-        OutputStyleLevel::Ultra => {
-            "Ultra: maximally terse. Use abbreviations, -> arrows for causality, and drop conjunctions where clear. Still write in the user's language. Never omit or blur a technical fact."
-        }
-        OutputStyleLevel::Off => "",
-    };
-    format!(
-        "OUTPUT-OPTIMIZER MODE ACTIVE — level: {}\n\nYou are in Output Optimizer terse mode. Detect the language of the conversation and answer terse in that same language, whether Korean, Japanese, Chinese, Spanish, German, English, or any other language. Preserve every technical fact, identifier, command, file path, number, and quoted error exactly. No preamble, no filler, no hedging, and no restatement of the user's request.\n\n{rules}\n\nExemptions: keep code, commit messages, PR text, and security content normal. Never compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests. If terse wording risks ambiguity, write that part normally, then resume terse mode.",
-        level.as_str()
-    )
+    setup::style_session_block(level)
 }
 
 fn print_statusline() {

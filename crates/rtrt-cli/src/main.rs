@@ -1674,7 +1674,7 @@ fn print_hook_block(reason: &str) {
 
 fn style_reinforcement(level: OutputStyleLevel) -> String {
     format!(
-        "OUTPUT-OPTIMIZER: stay terse (level {}). Keep code/commits/PRs/security normal; do not compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests.",
+        "OUTPUT-OPTIMIZER: stay terse (level {}). Detect the conversation language and answer terse in that same language. Keep code/commits/PRs/security normal; do not compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests.",
         level.as_str()
     )
 }
@@ -1682,18 +1682,18 @@ fn style_reinforcement(level: OutputStyleLevel) -> String {
 fn style_session_block(level: OutputStyleLevel) -> String {
     let rules = match level {
         OutputStyleLevel::Lite => {
-            "Lite: remove filler, hedging, greetings, and restatements. Keep articles and full professional sentences."
+            "Lite: trim filler and hedging only. Drop language-appropriate filler, for example English filler phrases, Korean 군더더기, Japanese 冗長な表現, or Spanish relleno. Keep normal grammar."
         }
         OutputStyleLevel::Full => {
-            "Full: also drop articles a/an/the where clear, use fragments when readable, and prefer short direct wording."
+            "Full: also drop grammatically optional function words where the language allows. Examples, not limits: English articles a/an/the; Korean 불필요한 조사·군더더기 존댓말 축약; Japanese 冗長な助詞・敬語; Chinese 虚词. Use readable fragments when natural in the user's language."
         }
         OutputStyleLevel::Ultra => {
-            "Ultra: also abbreviate common prose terms, strip safe conjunctions, use arrows for causality, and use one word when one word is enough."
+            "Ultra: maximally terse. Use abbreviations, -> arrows for causality, and drop conjunctions where clear. Still write in the user's language. Never omit or blur a technical fact."
         }
         OutputStyleLevel::Off => "",
     };
     format!(
-        "OUTPUT-OPTIMIZER MODE ACTIVE — level: {}\n\nYou are in Output Optimizer terse mode. Preserve every technical fact, identifier, command, file path, number, and quoted error exactly. Write concise answers with no preamble, no filler, no hedging, and no restatement of the user's request.\n\n{rules}\n\nExemptions: keep code, commit messages, PR text, and security content normal. Never compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests. If terse wording would create ambiguity, write normally for that portion, then resume terse mode.",
+        "OUTPUT-OPTIMIZER MODE ACTIVE — level: {}\n\nYou are in Output Optimizer terse mode. Detect the language of the conversation and answer terse in that same language, whether Korean, Japanese, Chinese, Spanish, German, English, or any other language. Preserve every technical fact, identifier, command, file path, number, and quoted error exactly. No preamble, no filler, no hedging, and no restatement of the user's request.\n\n{rules}\n\nExemptions: keep code, commit messages, PR text, and security content normal. Never compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests. If terse wording risks ambiguity, write that part normally, then resume terse mode.",
         level.as_str()
     )
 }

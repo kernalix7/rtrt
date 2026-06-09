@@ -17,6 +17,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use rtrt_core::CompressionLevel;
+use whatlang::{Lang, detect};
 
 pub mod ml;
 #[cfg(feature = "onnx")]
@@ -53,11 +54,20 @@ impl Compressor {
     /// 4. Restore placeholders.
     pub fn compress(&self, input: &str) -> String {
         let redacted = redact_secrets(input);
+        let detected_lang = detect_language(&redacted);
         let (placeheld, slots) = stash_protected(&redacted);
         let mut out = placeheld;
-        for (regex, replacement) in rules_for(self.level) {
-            out = regex.replace_all(&out, *replacement).into_owned();
+        if detected_lang == Some(Lang::Eng) {
+            for (regex, replacement) in english_rules_for(self.level) {
+                out = regex.replace_all(&out, *replacement).into_owned();
+            }
         }
+        if applies_language_pack(self.level)
+            && let Some(pack) = detected_lang.and_then(language_pack_for)
+        {
+            out = apply_language_pack(&out, pack);
+        }
+        out = apply_universal_passes(&out);
         restore_protected(&out, &slots)
     }
 
@@ -131,6 +141,280 @@ fn xml_escape(input: &str) -> String {
 }
 
 type Rule = (&'static Regex, &'static str);
+
+#[derive(Debug, Clone, Copy)]
+struct LanguagePack {
+    fillers: &'static [&'static str],
+    discourse_markers: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LanguagePackEntry {
+    langs: &'static [Lang],
+    pack: LanguagePack,
+}
+
+static LANGUAGE_PACKS: &[LanguagePackEntry] = &[
+    LanguagePackEntry {
+        langs: &[Lang::Kor],
+        pack: LanguagePack {
+            fillers: &[
+                "음",
+                "그",
+                "뭐랄까",
+                "사실상",
+                "기본적으로",
+                "제 생각에는",
+                "어",
+                "에",
+            ],
+            discourse_markers: &[],
+        },
+    },
+    LanguagePackEntry {
+        langs: &[Lang::Jpn],
+        pack: LanguagePack {
+            fillers: &[
+                "えーと",
+                "まあ",
+                "なんか",
+                "ちょっと",
+                "一応",
+                "基本的に",
+                "実は",
+            ],
+            discourse_markers: &[],
+        },
+    },
+    LanguagePackEntry {
+        langs: &[Lang::Cmn],
+        pack: LanguagePack {
+            fillers: &["其实", "基本上", "说实话", "嗯", "那个", "就是说"],
+            discourse_markers: &[],
+        },
+    },
+    LanguagePackEntry {
+        langs: &[Lang::Spa],
+        pack: LanguagePack {
+            fillers: &["bueno", "o sea", "en realidad", "pues", "mira", "claro que"],
+            discourse_markers: &[],
+        },
+    },
+    LanguagePackEntry {
+        langs: &[Lang::Fra],
+        pack: LanguagePack {
+            fillers: &["enfin", "bref", "tu vois", "genre", "quoi", "franchement"],
+            discourse_markers: &[],
+        },
+    },
+    LanguagePackEntry {
+        langs: &[Lang::Deu],
+        pack: LanguagePack {
+            fillers: &[
+                "also",
+                "eigentlich",
+                "sozusagen",
+                "irgendwie",
+                "naja",
+                "halt",
+            ],
+            discourse_markers: &[],
+        },
+    },
+];
+
+fn detect_language(text: &str) -> Option<Lang> {
+    detect(text)
+        .filter(|info| info.confidence() >= minimum_detection_confidence(text))
+        .map(|info| info.lang())
+}
+
+fn minimum_detection_confidence(text: &str) -> f64 {
+    let signal_chars = text.chars().filter(|ch| !ch.is_whitespace()).count();
+    if signal_chars == 0 {
+        return f64::INFINITY;
+    }
+    1.0 / signal_chars as f64
+}
+
+fn applies_language_pack(level: CompressionLevel) -> bool {
+    matches!(
+        level,
+        CompressionLevel::Full | CompressionLevel::Ultra | CompressionLevel::Extreme
+    )
+}
+
+fn language_pack_for(lang: Lang) -> Option<&'static LanguagePack> {
+    LANGUAGE_PACKS
+        .iter()
+        .find(|entry| entry.langs.contains(&lang))
+        .map(|entry| &entry.pack)
+}
+
+fn apply_language_pack(input: &str, pack: &LanguagePack) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if let Some((start, end)) = matching_pack_term(input, index, pack) {
+            out.push_str(&input[index..start]);
+            index = skip_trailing_filler_gap(input, end);
+        } else if let Some((_, ch)) = input[index..].char_indices().next() {
+            out.push(ch);
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn matching_pack_term(input: &str, index: usize, pack: &LanguagePack) -> Option<(usize, usize)> {
+    pack.fillers
+        .iter()
+        .chain(pack.discourse_markers.iter())
+        .filter_map(|term| matched_term_end(input, index, term).map(|end| (index, end)))
+        .filter(|(start, end)| has_term_boundaries(input, *start, *end))
+        .max_by_key(|(start, end)| input[*start..*end].chars().count())
+}
+
+fn matched_term_end(input: &str, index: usize, term: &str) -> Option<usize> {
+    if term.is_ascii() {
+        input
+            .get(index..index + term.len())
+            .filter(|candidate| candidate.eq_ignore_ascii_case(term))
+            .map(|_| index + term.len())
+    } else {
+        input[index..]
+            .starts_with(term)
+            .then_some(index + term.len())
+    }
+}
+
+fn has_term_boundaries(input: &str, start: usize, end: usize) -> bool {
+    let prev_clear = input[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_word_char(ch));
+    let next_clear = input[end..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_word_char(ch));
+    prev_clear && next_clear
+}
+
+fn skip_trailing_filler_gap(input: &str, mut index: usize) -> usize {
+    if let Some(ch) = input[index..].chars().next()
+        && matches!(ch, ',' | '.' | '!' | '?' | '、' | '。')
+    {
+        index += ch.len_utf8();
+    }
+    while let Some(ch) = input[index..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn apply_universal_passes(input: &str) -> String {
+    let out = MULTI_SPACE.replace_all(input, " ").into_owned();
+    let out = MULTI_NEWLINE.replace_all(&out, "\n\n").into_owned();
+    let out = dedup_immediate_words(&out);
+    trim_redundant_punctuation(&out)
+}
+
+fn dedup_immediate_words(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut pending_whitespace: Option<&str> = None;
+    let mut previous_word: Option<String> = None;
+
+    while index < input.len() {
+        let (end, token_kind) = next_token(input, index);
+        let token = &input[index..end];
+        match token_kind {
+            TokenKind::Word => {
+                let token_key = token.to_lowercase();
+                if pending_whitespace.is_some() && previous_word.as_deref() == Some(&token_key) {
+                    pending_whitespace = None;
+                } else {
+                    if let Some(whitespace) = pending_whitespace.take() {
+                        out.push_str(whitespace);
+                    }
+                    out.push_str(token);
+                    previous_word = Some(token_key);
+                }
+            }
+            TokenKind::Whitespace => {
+                if let Some(whitespace) = pending_whitespace.take() {
+                    out.push_str(whitespace);
+                }
+                pending_whitespace = Some(token);
+            }
+            TokenKind::Other => {
+                if let Some(whitespace) = pending_whitespace.take() {
+                    out.push_str(whitespace);
+                }
+                out.push_str(token);
+                previous_word = None;
+            }
+        }
+        index = end;
+    }
+
+    if let Some(whitespace) = pending_whitespace {
+        out.push_str(whitespace);
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Word,
+    Whitespace,
+    Other,
+}
+
+fn next_token(input: &str, start: usize) -> (usize, TokenKind) {
+    let mut chars = input[start..].char_indices();
+    let Some((_, first)) = chars.next() else {
+        return (start, TokenKind::Other);
+    };
+    let kind = if is_word_char(first) {
+        TokenKind::Word
+    } else if first.is_whitespace() {
+        TokenKind::Whitespace
+    } else {
+        TokenKind::Other
+    };
+    for (offset, ch) in chars {
+        let same_kind = match kind {
+            TokenKind::Word => is_word_char(ch),
+            TokenKind::Whitespace => ch.is_whitespace(),
+            TokenKind::Other => !is_word_char(ch) && !ch.is_whitespace(),
+        };
+        if !same_kind {
+            return (start + offset, kind);
+        }
+    }
+    (input.len(), kind)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+static EXTRA_PERIODS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.{4,}").unwrap());
+static EXTRA_EXCLAMATION: Lazy<Regex> = Lazy::new(|| Regex::new(r"!{2,}").unwrap());
+static EXTRA_QUESTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"\?{2,}").unwrap());
+
+fn trim_redundant_punctuation(input: &str) -> String {
+    let out = EXTRA_PERIODS.replace_all(input, "...").into_owned();
+    let out = EXTRA_EXCLAMATION.replace_all(&out, "!").into_owned();
+    EXTRA_QUESTION.replace_all(&out, "?").into_owned()
+}
 
 // ---------- atomic rule regexes ----------
 
@@ -390,7 +674,7 @@ static EXTREME_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     ]
 });
 
-fn rules_for(level: CompressionLevel) -> &'static [Rule] {
+fn english_rules_for(level: CompressionLevel) -> &'static [Rule] {
     match level {
         CompressionLevel::Lite => LITE_RULES.as_slice(),
         CompressionLevel::Full => FULL_RULES.as_slice(),
@@ -563,5 +847,54 @@ mod tests {
         assert_eq!(OutputFormat::parse("xml"), Some(OutputFormat::Xml));
         assert_eq!(OutputFormat::parse("text"), Some(OutputFormat::Plain));
         assert_eq!(OutputFormat::parse("nope"), None);
+    }
+
+    #[test]
+    fn test_ko_filler() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out =
+            c.compress("음 저는 기본적으로 이 압축기가 한국어 문장을 더 짧게 만든다고 생각해요.");
+        assert!(!out.contains("음"), "{out}");
+        assert!(!out.contains("기본적으로"), "{out}");
+    }
+
+    #[test]
+    fn test_ja_filler() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("まあ この圧縮器は なんか 日本語の文章を短くできます。");
+        assert!(!out.contains("まあ"), "{out}");
+        assert!(!out.contains("なんか"), "{out}");
+    }
+
+    #[test]
+    fn test_es_filler() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress(
+            "bueno, o sea, este compresor reduce texto en español sin cambiar el código.",
+        );
+        assert!(!out.to_lowercase().contains("bueno"), "{out}");
+        assert!(!out.to_lowercase().contains("o sea"), "{out}");
+    }
+
+    #[test]
+    fn test_en_article_drop() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("the cat sat");
+        assert!(!out.to_lowercase().contains("the"), "{out}");
+    }
+
+    #[test]
+    fn test_ko_particle_safety() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("저는 학교에 갔어요. 오늘 저는 학교에 갔어요.");
+        assert!(out.contains("저는"), "{out}");
+        assert!(out.contains("학교에"), "{out}");
+    }
+
+    #[test]
+    fn test_cjk_code_span() {
+        let c = Compressor::new(CompressionLevel::Ultra);
+        let out = c.compress("函数 `foo()` 返回值");
+        assert!(out.contains("`foo()`"), "{out}");
     }
 }

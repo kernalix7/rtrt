@@ -14,7 +14,7 @@ mod setup;
 use rtrt_compress::{
     AsyncCompressor, Compressor, Language as TsLanguage, LlmCompressor, SignatureExtractor,
 };
-use rtrt_core::CompressionLevel;
+use rtrt_core::{CompressionLevel, OutputStyleLevel};
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
@@ -161,6 +161,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HookCmd,
     },
+    /// Print the Output Optimizer statusline badge.
+    Statusline,
     /// Wire RTRT into a popular coding agent's MCP config. `--plugin`
     /// (Claude only) also merges twelve hook entries into
     /// `~/.claude/settings.json` so every PreToolUse / PostToolUse /
@@ -339,6 +341,12 @@ enum HookCmd {
         #[arg(long, env = "RTRT_MEMORY_PATH")]
         store: Option<PathBuf>,
     },
+    /// Update or reinforce Output Optimizer terse mode on user prompts.
+    Style,
+    /// Inject Output Optimizer terse-mode rules at session start.
+    StyleInject,
+    /// Print the Output Optimizer statusline badge.
+    Statusline,
     /// Recall memory relevant to the stdin prompt and print it to stdout as
     /// a context block. Wired onto `UserPromptSubmit` so Claude Code injects
     /// the project's relevant history into the model's context automatically
@@ -930,11 +938,20 @@ async fn main() -> Result<()> {
                     store,
                     limit,
                 } => run_hook_session_inject(project, store, limit),
+                HookCmd::Style => run_hook_style(),
+                HookCmd::StyleInject => run_hook_style_inject(),
+                HookCmd::Statusline => {
+                    print_statusline();
+                    Ok(())
+                }
                 other => run_hook_capture(other),
             };
             if let Err(e) = result {
                 eprintln!("rtrt hook: {e}");
             }
+        }
+        Cmd::Statusline => {
+            print_statusline();
         }
         Cmd::Setup {
             agent,
@@ -1523,7 +1540,12 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
 
 fn run_hook_capture(cmd: HookCmd) -> Result<()> {
     match cmd {
-        HookCmd::Recall { .. } | HookCmd::Compress { .. } | HookCmd::SessionInject { .. } => {}
+        HookCmd::Recall { .. }
+        | HookCmd::Compress { .. }
+        | HookCmd::SessionInject { .. }
+        | HookCmd::Style
+        | HookCmd::StyleInject
+        | HookCmd::Statusline => {}
         HookCmd::Capture {
             kind,
             project,
@@ -1587,6 +1609,100 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_hook_style() -> Result<()> {
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok();
+    let prompt = extract_json_str(&raw, "prompt").unwrap_or_else(|| raw.trim().to_string());
+    if let Some(level) = parse_output_switch(&prompt) {
+        rtrt_core::write_output_style_level(level)?;
+        let reason = if level.is_active() {
+            format!("Output Optimizer terse mode set to {}.", level.as_str())
+        } else {
+            "Output Optimizer terse mode off.".to_string()
+        };
+        print_hook_block(&reason);
+        return Ok(());
+    }
+
+    let level = rtrt_core::read_output_style_level();
+    if level.is_active() {
+        print_hook_context(&style_reinforcement(level));
+    }
+    Ok(())
+}
+
+fn run_hook_style_inject() -> Result<()> {
+    let level = rtrt_core::read_output_style_level();
+    if level.is_active() {
+        println!("{}", style_session_block(level));
+    }
+    Ok(())
+}
+
+fn parse_output_switch(prompt: &str) -> Option<OutputStyleLevel> {
+    let mut parts = prompt.split_whitespace();
+    let cmd = parts.next()?;
+    if cmd != "/output" {
+        return None;
+    }
+    let level = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    OutputStyleLevel::parse(level)
+}
+
+fn print_hook_context(context: &str) {
+    let payload = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context
+        }
+    });
+    println!("{payload}");
+}
+
+fn print_hook_block(reason: &str) {
+    let payload = serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    });
+    println!("{payload}");
+}
+
+fn style_reinforcement(level: OutputStyleLevel) -> String {
+    format!(
+        "OUTPUT-OPTIMIZER: stay terse (level {}). Keep code/commits/PRs/security normal; do not compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests.",
+        level.as_str()
+    )
+}
+
+fn style_session_block(level: OutputStyleLevel) -> String {
+    let rules = match level {
+        OutputStyleLevel::Lite => {
+            "Lite: remove filler, hedging, greetings, and restatements. Keep articles and full professional sentences."
+        }
+        OutputStyleLevel::Full => {
+            "Full: also drop articles a/an/the where clear, use fragments when readable, and prefer short direct wording."
+        }
+        OutputStyleLevel::Ultra => {
+            "Ultra: also abbreviate common prose terms, strip safe conjunctions, use arrows for causality, and use one word when one word is enough."
+        }
+        OutputStyleLevel::Off => "",
+    };
+    format!(
+        "OUTPUT-OPTIMIZER MODE ACTIVE — level: {}\n\nYou are in Output Optimizer terse mode. Preserve every technical fact, identifier, command, file path, number, and quoted error exactly. Write concise answers with no preamble, no filler, no hedging, and no restatement of the user's request.\n\n{rules}\n\nExemptions: keep code, commit messages, PR text, and security content normal. Never compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests. If terse wording would create ambiguity, write normally for that portion, then resume terse mode.",
+        level.as_str()
+    )
+}
+
+fn print_statusline() {
+    let level = rtrt_core::read_output_style_level();
+    if level.is_active() {
+        print!("[OPT:{}]", level.as_str().to_ascii_uppercase());
+    }
 }
 
 /// Best-effort HYBRID recall for the auto-recall hook.

@@ -1,14 +1,15 @@
 //! rtrt-compress — terse-mode rewriter for AI agent output.
 //!
-//! Rules-based string transforms inspired by `JuliusBrussee/caveman`.
+//! Rules-based string transforms for Output Optimizer terse mode.
 //! Code blocks, inline code, URLs, and quoted error strings are preserved.
 //!
 //! Four levels:
 //! - `lite`   — fillers (just/really/basically/…) + multi-space collapse only.
 //! - `full`   — `lite` + pleasantries (sure/certainly/happy to/…) + hedging
-//!   (I think/perhaps/maybe/…) + discourse markers (moreover/however/…).
-//! - `ultra`  — `full` + articles (a/an/the) + phrase shortening
-//!   (due to the fact that → because, in order to → to, …).
+//!   (I think/perhaps/maybe/…) + discourse markers (moreover/however/…) +
+//!   articles (a/an/the).
+//! - `ultra`  — `full` + arrows for causality, abbreviations, conjunction
+//!   stripping, and phrase shortening.
 //! - `extreme` — `ultra` + verbose qualifiers (very/extremely/…) +
 //!   meta-phrases (it should be noted that, it is worth mentioning that, …)
 //!   collapsed away. Readable but terse.
@@ -174,7 +175,7 @@ static QUALIFIERS: Lazy<Regex> = Lazy::new(|| {
 });
 
 // Meta-phrases that announce intent without adding info. Always-on at full+ to
-// match caveman's "drop hedging" philosophy.
+// match Output Optimizer's "drop hedging" rule.
 static META_PHRASES: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)(it is important to (note|remember|understand|mention) that |it should be noted that |it is worth (mentioning|noting|pointing out) that |as we (mentioned|noted|discussed) (earlier|above|previously),? )",
@@ -204,6 +205,50 @@ static PHRASE_ON_THE_BASIS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bon the basis of\b").unwrap());
 static PHRASE_FOR_INSTANCE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\bfor (instance|example)\b").unwrap());
+static CAUSAL_CONNECTORS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\s*,?\s+\b(because(?:\s+of)?|therefore|thus|leads\s+to)\b\s+").unwrap()
+});
+static CAUSAL_SO: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(^|[.;,])\s*\bso\b\s+").unwrap());
+static COORDINATING_CONJUNCTIONS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\s+\b(and|but|yet)\b\s+").unwrap());
+
+static ABBR_AUTHENTICATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bauthentication\b").unwrap());
+static ABBR_AUTHORIZATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bauthorization\b").unwrap());
+static ABBR_CONFIGURATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bconfiguration\b").unwrap());
+static ABBR_IMPLEMENTATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bimplementation\b").unwrap());
+static ABBR_REPOSITORY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\brepository\b").unwrap());
+static ABBR_DIRECTORY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdirectory\b").unwrap());
+static ABBR_FUNCTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bfunction\b").unwrap());
+static ABBR_REQUEST: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\brequest\b").unwrap());
+static ABBR_RESPONSE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bresponse\b").unwrap());
+static ABBR_DATABASE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdatabase\b").unwrap());
+static ABBR_OBJECT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bobject\b").unwrap());
+static ABBR_REFERENCE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\breference\b").unwrap());
+static ABBR_CONNECTION: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bconnection\b").unwrap());
+static ABBR_COMMAND: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bcommand\b").unwrap());
+static ABBR_APPLICATION: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bapplication\b").unwrap());
+static ABBR_DEPENDENCY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdependency\b").unwrap());
+static ABBR_DEPENDENCIES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdependencies\b").unwrap());
+static ABBR_PARAMETER: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bparameter\b").unwrap());
+static ABBR_PARAMETERS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bparameters\b").unwrap());
+static ABBR_ARGUMENT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bargument\b").unwrap());
+static ABBR_ARGUMENTS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\barguments\b").unwrap());
+static ABBR_ENVIRONMENT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\benvironment\b").unwrap());
+static ABBR_VARIABLE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bvariable\b").unwrap());
+static ABBR_VARIABLES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bvariables\b").unwrap());
+static ABBR_MESSAGE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bmessage\b").unwrap());
+static ABBR_ERROR: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\berror\b").unwrap());
+static ABBR_DOCUMENTATION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bdocumentation\b").unwrap());
+static ABBR_DOCUMENT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdocument\b").unwrap());
+static ABBR_PACKAGE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bpackage\b").unwrap());
+static ABBR_SOURCE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bsource\b").unwrap());
+static ABBR_DESTINATION: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bdestination\b").unwrap());
+static ABBR_TEMPORARY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\btemporary\b").unwrap());
 
 static LITE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
@@ -220,6 +265,7 @@ static FULL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         (&*HEDGES, ""),
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
+        (&*ARTICLES, ""),
         (&*MULTI_SPACE, " "),
         (&*MULTI_NEWLINE, "\n\n"),
     ]
@@ -232,6 +278,10 @@ static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         (&*HEDGES, ""),
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
+        (&*ARTICLES, ""),
+        (&*CAUSAL_CONNECTORS, " -> "),
+        (&*CAUSAL_SO, "$1 -> "),
+        (&*COORDINATING_CONJUNCTIONS, " "),
         (&*PHRASE_DUE_TO, "because"),
         (&*PHRASE_IN_ORDER_TO, "to"),
         (&*PHRASE_AT_THIS_POINT, "now"),
@@ -243,7 +293,38 @@ static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         (&*PHRASE_IN_SPITE_OF, "despite"),
         (&*PHRASE_ON_THE_BASIS, "based on"),
         (&*PHRASE_FOR_INSTANCE, "e.g."),
-        (&*ARTICLES, ""),
+        (&*ABBR_AUTHENTICATION, "auth"),
+        (&*ABBR_AUTHORIZATION, "authz"),
+        (&*ABBR_CONFIGURATION, "config"),
+        (&*ABBR_IMPLEMENTATION, "impl"),
+        (&*ABBR_REPOSITORY, "repo"),
+        (&*ABBR_DIRECTORY, "dir"),
+        (&*ABBR_FUNCTION, "fn"),
+        (&*ABBR_REQUEST, "req"),
+        (&*ABBR_RESPONSE, "res"),
+        (&*ABBR_DATABASE, "DB"),
+        (&*ABBR_OBJECT, "obj"),
+        (&*ABBR_REFERENCE, "ref"),
+        (&*ABBR_CONNECTION, "conn"),
+        (&*ABBR_COMMAND, "cmd"),
+        (&*ABBR_APPLICATION, "app"),
+        (&*ABBR_DEPENDENCIES, "deps"),
+        (&*ABBR_DEPENDENCY, "dep"),
+        (&*ABBR_PARAMETERS, "params"),
+        (&*ABBR_PARAMETER, "param"),
+        (&*ABBR_ARGUMENTS, "args"),
+        (&*ABBR_ARGUMENT, "arg"),
+        (&*ABBR_ENVIRONMENT, "env"),
+        (&*ABBR_VARIABLES, "vars"),
+        (&*ABBR_VARIABLE, "var"),
+        (&*ABBR_MESSAGE, "msg"),
+        (&*ABBR_ERROR, "err"),
+        (&*ABBR_DOCUMENTATION, "docs"),
+        (&*ABBR_DOCUMENT, "doc"),
+        (&*ABBR_PACKAGE, "pkg"),
+        (&*ABBR_SOURCE, "src"),
+        (&*ABBR_DESTINATION, "dst"),
+        (&*ABBR_TEMPORARY, "temp"),
         (&*MULTI_SPACE, " "),
         (&*MULTI_NEWLINE, "\n\n"),
     ]
@@ -257,6 +338,10 @@ static EXTREME_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
         (&*QUALIFIERS, ""),
+        (&*ARTICLES, ""),
+        (&*CAUSAL_CONNECTORS, " -> "),
+        (&*CAUSAL_SO, "$1 -> "),
+        (&*COORDINATING_CONJUNCTIONS, " "),
         (&*PHRASE_DUE_TO, "because"),
         (&*PHRASE_IN_ORDER_TO, "to"),
         (&*PHRASE_AT_THIS_POINT, "now"),
@@ -268,7 +353,38 @@ static EXTREME_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         (&*PHRASE_IN_SPITE_OF, "despite"),
         (&*PHRASE_ON_THE_BASIS, "based on"),
         (&*PHRASE_FOR_INSTANCE, "e.g."),
-        (&*ARTICLES, ""),
+        (&*ABBR_AUTHENTICATION, "auth"),
+        (&*ABBR_AUTHORIZATION, "authz"),
+        (&*ABBR_CONFIGURATION, "config"),
+        (&*ABBR_IMPLEMENTATION, "impl"),
+        (&*ABBR_REPOSITORY, "repo"),
+        (&*ABBR_DIRECTORY, "dir"),
+        (&*ABBR_FUNCTION, "fn"),
+        (&*ABBR_REQUEST, "req"),
+        (&*ABBR_RESPONSE, "res"),
+        (&*ABBR_DATABASE, "DB"),
+        (&*ABBR_OBJECT, "obj"),
+        (&*ABBR_REFERENCE, "ref"),
+        (&*ABBR_CONNECTION, "conn"),
+        (&*ABBR_COMMAND, "cmd"),
+        (&*ABBR_APPLICATION, "app"),
+        (&*ABBR_DEPENDENCIES, "deps"),
+        (&*ABBR_DEPENDENCY, "dep"),
+        (&*ABBR_PARAMETERS, "params"),
+        (&*ABBR_PARAMETER, "param"),
+        (&*ABBR_ARGUMENTS, "args"),
+        (&*ABBR_ARGUMENT, "arg"),
+        (&*ABBR_ENVIRONMENT, "env"),
+        (&*ABBR_VARIABLES, "vars"),
+        (&*ABBR_VARIABLE, "var"),
+        (&*ABBR_MESSAGE, "msg"),
+        (&*ABBR_ERROR, "err"),
+        (&*ABBR_DOCUMENTATION, "docs"),
+        (&*ABBR_DOCUMENT, "doc"),
+        (&*ABBR_PACKAGE, "pkg"),
+        (&*ABBR_SOURCE, "src"),
+        (&*ABBR_DESTINATION, "dst"),
+        (&*ABBR_TEMPORARY, "temp"),
         (&*MULTI_SPACE, " "),
         (&*MULTI_NEWLINE, "\n\n"),
     ]
@@ -320,8 +436,8 @@ mod tests {
     }
 
     #[test]
-    fn ultra_drops_articles_outside_code() {
-        let c = Compressor::new(CompressionLevel::Ultra);
+    fn full_drops_articles_outside_code() {
+        let c = Compressor::new(CompressionLevel::Full);
         let out = c.compress("the bug is in the parser");
         assert!(!out.contains("the bug"), "{out}");
     }
@@ -340,14 +456,51 @@ mod tests {
         let out = c.compress("I think the parser has a bug, perhaps in the lexer.");
         assert!(!out.to_lowercase().contains("i think"), "{out}");
         assert!(!out.to_lowercase().contains("perhaps"), "{out}");
+        assert!(!out.to_lowercase().contains(" a "), "{out}");
+        assert!(!out.to_lowercase().contains(" the "), "{out}");
     }
 
     #[test]
-    fn ultra_rewrites_phrases() {
+    fn ultra_rewrites_phrases_arrows_and_abbreviations() {
+        let c = Compressor::new(CompressionLevel::Ultra);
+        let out = c.compress("The implementation is a function because of the configuration.");
+        assert!(out.contains("impl"), "{out}");
+        assert!(out.contains("fn"), "{out}");
+        assert!(out.contains("config"), "{out}");
+        assert!(out.contains(" -> "), "{out}");
+        assert!(!out.to_lowercase().contains("because"), "{out}");
+    }
+
+    #[test]
+    fn ultra_rewrites_long_phrases() {
         let c = Compressor::new(CompressionLevel::Ultra);
         let out = c.compress("Due to the fact that we forgot to escape the input, in order to fix the bug, we need to add quotes.");
-        assert!(out.to_lowercase().contains("because"), "{out}");
+        assert!(
+            !out.to_lowercase().contains("due to the fact that"),
+            "{out}"
+        );
         assert!(!out.to_lowercase().contains("in order to"), "{out}");
+    }
+
+    #[test]
+    fn code_spans_survive_all_levels() {
+        let input = "The implementation is `the function because of configuration`.\n```rust\nlet the_value = \"because\";\n```";
+        for level in [
+            CompressionLevel::Lite,
+            CompressionLevel::Full,
+            CompressionLevel::Ultra,
+            CompressionLevel::Extreme,
+        ] {
+            let out = Compressor::new(level).compress(input);
+            assert!(
+                out.contains("`the function because of configuration`"),
+                "{level:?}: {out}"
+            );
+            assert!(
+                out.contains("```rust\nlet the_value = \"because\";\n```"),
+                "{level:?}: {out}"
+            );
+        }
     }
 
     #[test]

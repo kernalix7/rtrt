@@ -5,7 +5,7 @@
 //! the OpenAI-compatible API) and asks the model to rewrite the passage tersely
 //! while preserving every piece of technical content.
 //!
-//! This is the path to caveman-class 50–75% savings on natural prose — those
+//! This is the path to Output Optimizer 50-75% savings on natural prose — those
 //! numbers come from LLM-driven rewriting, not from regex deletion. Pair with
 //! [`crate::Compressor`] only when you also want the rule-based stripping on
 //! top of the LLM output.

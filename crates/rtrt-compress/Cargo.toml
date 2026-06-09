@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "RTRT output compression engine (caveman-style terse mode)."
+description = "RTRT output compression engine (Output Optimizer terse mode)."
 
 [dependencies]
 rtrt-core.workspace = true
@@ -26,7 +26,7 @@ ndarray = { workspace = true, optional = true }
 
 [features]
 default = []
-# Enables LlmCompressor — caveman-class compression by routing the passage
+# Enables LlmCompressor — terse-mode compression by routing the passage
 # through any rtrt-providers Provider (Anthropic / OpenAI / Ollama-compatible).
 # Off by default so the workspace builds without pulling reqwest into the
 # compression dep tree for users who only need the rule pass.

@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rtrt_core::OutputStyleLevel;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum AgentKind {
@@ -54,7 +55,15 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionEnd", "session-end"),
 ];
 
-const CLAUDE_PLUGIN_REL: &str = "~/.claude/plugins/cache/rtrt";
+const CLAUDE_SKILLS_ROOT_REL: &str = "~/.claude/skills";
+const CLAUDE_AGENTS_ROOT_REL: &str = "~/.claude/agents";
+const CURSOR_RULES_REL: &str = "~/.cursor/rules/rtrt-output-optimizer.mdc";
+const WINDSURF_RULES_REL: &str = "~/.codeium/windsurf/memories/global_rules.md";
+const CODEX_RULES_REL: &str = "~/.codex/AGENTS.md";
+const AIDER_RULES_REL: &str = "~/.aider/conventions.md";
+const TERSE_BLOCK_BEGIN: &str = "# BEGIN rtrt-output-optimizer";
+const TERSE_BLOCK_END: &str = "# END rtrt-output-optimizer";
+const DEFAULT_AGENT_STYLE_LEVEL: OutputStyleLevel = OutputStyleLevel::Full;
 
 struct SkillSpec {
     name: &'static str,
@@ -149,7 +158,8 @@ const CLAUDE_AGENTS: &[AgentSpec] = &[
         body: r#"---
 name: output-investigator
 description: Read-only code locator. Returns a compact file:line table for 'where is X / what calls Y / map this dir'. No fixes.
-tools: [read_file, search_files, list_directory]
+tools: Read, Grep, Glob
+model: inherit
 ---
 
 Terse, technically exact. Reply in the user's language. Return only a Markdown table of file:line matches, one row per hit. No explanations, no fixes, no praise. Refuse requests that ask for edits.
@@ -161,7 +171,8 @@ Terse, technically exact. Reply in the user's language. Return only a Markdown t
         body: r#"---
 name: output-builder
 description: Surgical 1–2 file edit (typo fix, single-function rewrite, mechanical rename). Refuses 3+ file scope.
-tools: [read_file, edit_file, search_files]
+tools: Read, Edit, Grep
+model: sonnet
 ---
 
 Terse, technically exact. Reply in the user's language. Accept only tasks touching ≤2 files. For any larger scope say 'Scope too wide — use a full agent.' Return a terse unified diff receipt (file path, lines changed, what changed). No prose.
@@ -173,13 +184,47 @@ Terse, technically exact. Reply in the user's language. Accept only tasks touchi
         body: r#"---
 name: output-reviewer
 description: Diff/branch/file reviewer. One finding per line: path:line: <severity>: <problem>. <fix>.
-tools: [read_file, search_files, list_directory]
+tools: Read, Grep, Bash
+model: sonnet
 ---
 
 Terse, technically exact. Reply in the user's language. Output format is strictly: path:line: <severity>: <problem>. <fix>. Severity values: error | warn | note. No praise. No scope creep. No summaries. Stop when findings are exhausted.
 "#,
     },
 ];
+
+pub fn style_reinforcement(level: OutputStyleLevel) -> String {
+    format!(
+        "OUTPUT-OPTIMIZER: stay terse (level {}). Detect the conversation language and answer terse in that same language. Keep code/commits/PRs/security normal; do not compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests.",
+        level.as_str()
+    )
+}
+
+pub fn style_session_block(level: OutputStyleLevel) -> String {
+    let rules = match level {
+        OutputStyleLevel::Lite => {
+            "Lite: trim filler and hedging only. Drop language-appropriate filler, for example English filler phrases, Korean 군더더기, Japanese 冗長な表現, or Spanish relleno. Keep normal grammar."
+        }
+        OutputStyleLevel::Full => {
+            "Full: also drop grammatically optional function words where the language allows. Examples, not limits: English articles a/an/the; Korean 불필요한 조사·군더더기 존댓말 축약; Japanese 冗長な助詞・敬語; Chinese 虚词. Use readable fragments when natural in the user's language."
+        }
+        OutputStyleLevel::Ultra => {
+            "Ultra: maximally terse. Use abbreviations, -> arrows for causality, and drop conjunctions where clear. Still write in the user's language. Never omit or blur a technical fact."
+        }
+        OutputStyleLevel::Off => "",
+    };
+    format!(
+        "OUTPUT-OPTIMIZER MODE ACTIVE — level: {}\n\nYou are in Output Optimizer terse mode. Detect the language of the conversation and answer terse in that same language, whether Korean, Japanese, Chinese, Spanish, German, English, or any other language. Preserve every technical fact, identifier, command, file path, number, and quoted error exactly. No preamble, no filler, no hedging, and no restatement of the user's request.\n\n{rules}\n\nExemptions: keep code, commit messages, PR text, and security content normal. Never compress security warnings, irreversible-action confirmations, ambiguous multi-step sequences, or clarification requests. If terse wording risks ambiguity, write that part normally, then resume terse mode.",
+        level.as_str()
+    )
+}
+
+fn terse_rules_block() -> String {
+    format!(
+        "{TERSE_BLOCK_BEGIN}\n{}\n{TERSE_BLOCK_END}\n",
+        style_session_block(DEFAULT_AGENT_STYLE_LEVEL)
+    )
+}
 
 pub fn run(plan: SetupPlan) -> Result<()> {
     let binary = plan.binary.to_string_lossy().to_string();
@@ -198,11 +243,15 @@ pub fn run(plan: SetupPlan) -> Result<()> {
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
     }
+    if matches!(plan.agent, AgentKind::Claude) {
+        install_claude_skills_agents(plan.apply)?;
+    }
     if plan.plugin {
         install_claude_plugin(plan.apply)?;
     }
     match plan.agent {
         AgentKind::Aider => {
+            install_terse_rules(plan.agent, plan.apply)?;
             println!(
                 "aider has no MCP config file. To use RTRT alongside aider:\n\
                  \n\
@@ -212,14 +261,24 @@ pub fn run(plan: SetupPlan) -> Result<()> {
                  \n\
                  2. Use RTRT's CLI from inside aider (e.g. `/run rtrt compress -l ultra < ...`).\n",
             );
+            println!(
+                "For aider prompt rules, start aider with `--read {AIDER_RULES_REL}` if it does not load that file automatically."
+            );
             Ok(())
         }
         AgentKind::Claude => apply_json(&plan, "~/.claude.json", &binary, &memory_path),
-        AgentKind::Cursor => apply_json(&plan, "~/.cursor/mcp.json", &binary, &memory_path),
+        AgentKind::Cursor => {
+            install_terse_rules(plan.agent, plan.apply)?;
+            apply_json(&plan, "~/.cursor/mcp.json", &binary, &memory_path)
+        }
         AgentKind::Windsurf => {
+            install_terse_rules(plan.agent, plan.apply)?;
             apply_json(&plan, "~/.windsurf/mcp_config.json", &binary, &memory_path)
         }
-        AgentKind::Codex => apply_codex_toml(&plan, &binary, &memory_path),
+        AgentKind::Codex => {
+            install_terse_rules(plan.agent, plan.apply)?;
+            apply_codex_toml(&plan, &binary, &memory_path)
+        }
     }
 }
 
@@ -253,7 +312,9 @@ fn apply_json(
     if !root.is_object() {
         bail!("{}: root is not a JSON object", path.display());
     }
-    let obj = root.as_object_mut().unwrap();
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: root is not a JSON object", path.display()))?;
     let servers = obj
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}));
@@ -262,7 +323,7 @@ fn apply_json(
     }
     servers
         .as_object_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("{}: mcpServers is not an object", path.display()))?
         .insert("rtrt".to_string(), entry);
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&path, rendered).with_context(|| format!("write {}", path.display()))?;
@@ -359,44 +420,15 @@ fn dirs_home() -> Result<PathBuf> {
     bail!("cannot resolve home dir: neither HOME nor USERPROFILE is set")
 }
 
-/// Merges twelve rtrt hook entries into `~/.claude/settings.json`. Each
+/// Merges rtrt hook entries into `~/.claude/settings.json`. Each
 /// entry shells out to `rtrt hook capture <kind>` so the binary itself
 /// owns the redact / dedup / save pipeline; no auxiliary shell scripts
-/// are required on disk. This replaces the earlier "drop files into
-/// `~/.claude/plugins/cache/rtrt/`" approach — Claude Code's plugin
-/// loader expects a marketplace layout that an out-of-band copy can't
-/// satisfy, but its `settings.json` hooks engine is well-documented and
-/// stable.
+/// are required on disk.
 fn install_claude_plugin(apply: bool) -> Result<()> {
     let settings = expand_home("~/.claude/settings.json")?;
-    let plugin_dir = expand_home(CLAUDE_PLUGIN_REL)?;
     let rtrt_cmd = locate_rtrt_binary();
     if !apply {
         println!("[dry-run] target:      {}", settings.display());
-        println!(
-            "[dry-run] skill root:  {}",
-            plugin_dir.join("skills").display()
-        );
-        println!(
-            "[dry-run] agent root:  {}",
-            plugin_dir.join("agents").display()
-        );
-        for skill in CLAUDE_SKILLS {
-            println!(
-                "[dry-run] skill file:  {}",
-                skill_path(&plugin_dir, skill).display()
-            );
-        }
-        for agent in CLAUDE_AGENTS {
-            println!(
-                "[dry-run] agent file:  {}",
-                agent_path(&plugin_dir, agent).display()
-            );
-        }
-        println!(
-            "[dry-run] skill manifest: {}",
-            plugin_dir.join("manifest.json").display()
-        );
         println!("[dry-run] command:     {rtrt_cmd} hook capture <kind>");
         println!("[dry-run] hook events: {} entries", HOOK_EVENTS.len());
         println!("[dry-run] style hooks: {rtrt_cmd} hook style, {rtrt_cmd} hook style-inject");
@@ -404,7 +436,6 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
     }
-    write_claude_plugin_tree(&plugin_dir)?;
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -424,15 +455,18 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
     if !root.is_object() {
         bail!("{}: root is not a JSON object", settings.display());
     }
-    let hooks = root
+    let root_obj = root
         .as_object_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("{}: root is not a JSON object", settings.display()))?;
+    let hooks = root_obj
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
         bail!("{}: hooks exists but is not an object", settings.display());
     }
-    let hooks_obj = hooks.as_object_mut().unwrap();
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: hooks is not an object", settings.display()))?;
     for (event, kind) in HOOK_EVENTS {
         let command = format!("{rtrt_cmd} hook capture {kind}");
         let entry = serde_json::json!({
@@ -454,7 +488,9 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                 settings.display()
             );
         }
-        let arr_mut = arr.as_array_mut().unwrap();
+        let arr_mut = arr.as_array_mut().ok_or_else(|| {
+            anyhow::anyhow!("{}: hooks.{event} is not an array", settings.display())
+        })?;
         // Drop any prior rtrt entry so re-running setup is idempotent.
         arr_mut.retain(|item| item.get("matcher").and_then(|v| v.as_str()) != Some("rtrt"));
         arr_mut.push(entry);
@@ -530,25 +566,13 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             }));
         }
     }
-    root.as_object_mut().unwrap().insert(
+    root_obj.insert(
         "statusLine".to_string(),
         serde_json::json!({
             "type": "command",
             "command": format!("{rtrt_cmd} statusline")
         }),
     );
-    let plugins = root
-        .as_object_mut()
-        .unwrap()
-        .entry("plugins")
-        .or_insert_with(|| serde_json::json!([]));
-    if !plugins.is_array() {
-        bail!("{}: plugins exists but is not an array", settings.display());
-    }
-    let plugins_arr = plugins.as_array_mut().unwrap();
-    if !plugins_arr.iter().any(|v| v.as_str() == Some("rtrt")) {
-        plugins_arr.push(serde_json::json!("rtrt"));
-    }
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
     println!(
@@ -559,23 +583,42 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
     Ok(())
 }
 
-fn skill_path(plugin_dir: &Path, skill: &SkillSpec) -> PathBuf {
-    plugin_dir.join("skills").join(skill.name).join("SKILL.md")
+fn claude_skill_path(skills_root: &Path, skill: &SkillSpec) -> PathBuf {
+    skills_root.join(skill.name).join("SKILL.md")
 }
 
-fn agent_path(plugin_dir: &Path, agent: &AgentSpec) -> PathBuf {
-    plugin_dir.join("agents").join(format!("{}.md", agent.name))
+fn claude_agent_path(agents_root: &Path, agent: &AgentSpec) -> PathBuf {
+    agents_root.join(format!("{}.md", agent.name))
 }
 
-fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
-    let skills_dir = plugin_dir.join("skills");
-    let agents_dir = plugin_dir.join("agents");
-    std::fs::create_dir_all(&skills_dir)
-        .with_context(|| format!("mkdir {}", skills_dir.display()))?;
-    std::fs::create_dir_all(&agents_dir)
-        .with_context(|| format!("mkdir {}", agents_dir.display()))?;
+fn install_claude_skills_agents(apply: bool) -> Result<()> {
+    let skills_root = expand_home(CLAUDE_SKILLS_ROOT_REL)?;
+    let agents_root = expand_home(CLAUDE_AGENTS_ROOT_REL)?;
+    if !apply {
+        println!("[dry-run] Claude skill root: {}", skills_root.display());
+        println!("[dry-run] Claude agent root: {}", agents_root.display());
+        for skill in CLAUDE_SKILLS {
+            println!(
+                "[dry-run] Claude skill file: {} ({})",
+                claude_skill_path(&skills_root, skill).display(),
+                skill.description
+            );
+        }
+        for agent in CLAUDE_AGENTS {
+            println!(
+                "[dry-run] Claude agent file: {} ({})",
+                claude_agent_path(&agents_root, agent).display(),
+                agent.description
+            );
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(&skills_root)
+        .with_context(|| format!("mkdir {}", skills_root.display()))?;
+    std::fs::create_dir_all(&agents_root)
+        .with_context(|| format!("mkdir {}", agents_root.display()))?;
     for skill in CLAUDE_SKILLS {
-        let path = skill_path(plugin_dir, skill);
+        let path = claude_skill_path(&skills_root, skill);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
@@ -583,64 +626,118 @@ fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
         std::fs::write(&path, skill.body).with_context(|| format!("write {}", path.display()))?;
     }
     for agent in CLAUDE_AGENTS {
-        let path = agent_path(plugin_dir, agent);
+        let path = claude_agent_path(&agents_root, agent);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
         std::fs::write(&path, agent.body).with_context(|| format!("write {}", path.display()))?;
     }
-    let manifest_skills: Vec<serde_json::Value> = CLAUDE_SKILLS
-        .iter()
-        .map(|skill| {
-            serde_json::json!({
-                "name": skill.name,
-                "description": skill.description,
-                "path": format!("skills/{}/SKILL.md", skill.name),
-            })
-        })
-        .collect();
-    let manifest_agents: Vec<serde_json::Value> = CLAUDE_AGENTS
-        .iter()
-        .map(|agent| {
-            serde_json::json!({
-                "name": agent.name,
-                "description": agent.description,
-                "path": format!("agents/{}.md", agent.name),
-            })
-        })
-        .collect();
-    let manifest = serde_json::json!({
-        "name": "rtrt",
-        "description": "rtrt Output Optimizer Claude Code plugin.",
-        "version": env!("CARGO_PKG_VERSION"),
-        "skills": manifest_skills,
-        "agents": manifest_agents,
-    });
-    let manifest_path = plugin_dir.join("manifest.json");
-    let rendered = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, rendered)
-        .with_context(|| format!("write {}", manifest_path.display()))?;
     println!(
         "wrote {} rtrt Output Optimizer skill files under {}",
         CLAUDE_SKILLS.len(),
-        skills_dir.display()
+        skills_root.display()
     );
     println!(
         "wrote {} rtrt Output Optimizer agent files under {}",
         CLAUDE_AGENTS.len(),
-        agents_dir.display()
+        agents_root.display()
     );
     Ok(())
 }
 
+fn terse_rules_path(agent: AgentKind) -> Option<&'static str> {
+    match agent {
+        AgentKind::Claude => None,
+        AgentKind::Cursor => Some(CURSOR_RULES_REL),
+        AgentKind::Windsurf => Some(WINDSURF_RULES_REL),
+        AgentKind::Codex => Some(CODEX_RULES_REL),
+        AgentKind::Aider => Some(AIDER_RULES_REL),
+    }
+}
+
+fn install_terse_rules(agent: AgentKind, apply: bool) -> Result<()> {
+    let Some(rel_path) = terse_rules_path(agent) else {
+        return Ok(());
+    };
+    let path = expand_home(rel_path)?;
+    let block = terse_rules_block();
+    if !apply {
+        println!("[dry-run] terse rules target: {}", path.display());
+        println!("[dry-run] terse rules block:\n{block}");
+        if matches!(agent, AgentKind::Aider) {
+            println!(
+                "[dry-run] aider note: start aider with `--read {rel_path}` if it does not load that file automatically."
+            );
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let existing = if path.exists() {
+        backup_if_needed(&path)?;
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let rendered = upsert_terse_block(&existing, &block);
+    std::fs::write(&path, rendered).with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "wrote rtrt Output Optimizer terse rules to {}",
+        path.display()
+    );
+    if matches!(agent, AgentKind::Aider) {
+        println!(
+            "For aider prompt rules, start aider with `--read {rel_path}` if it does not load that file automatically."
+        );
+    }
+    Ok(())
+}
+
+fn upsert_terse_block(existing: &str, block: &str) -> String {
+    let (mut out, _) = remove_terse_block_from_text(existing);
+    if !out.trim().is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.trim().is_empty() {
+        out.push('\n');
+    }
+    out.push_str(block);
+    out
+}
+
+fn remove_terse_block_from_text(existing: &str) -> (String, bool) {
+    let mut out = String::with_capacity(existing.len());
+    let mut skipping = false;
+    let mut removed = false;
+    for line in existing.split_inclusive('\n') {
+        let marker = line.trim_end_matches(['\r', '\n']).trim();
+        if marker == TERSE_BLOCK_BEGIN {
+            skipping = true;
+            removed = true;
+            continue;
+        }
+        if skipping {
+            if marker == TERSE_BLOCK_END {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    (out, removed)
+}
+
 /// Reverse of `install_claude_plugin`. Removes every rtrt-tagged hook
-/// from `~/.claude/settings.json`. Older installs also dropped the
-/// plugin cache directory + a `plugins` array entry — those are cleared
-/// here too so an upgrade-in-place is clean.
+/// from `~/.claude/settings.json`. Older installs also dropped a plugin
+/// cache directory and a `plugins` array entry; those are cleared here too
+/// so an upgrade-in-place is clean.
 pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
     let settings = expand_home("~/.claude/settings.json")?;
     let legacy_plugin_dir = expand_home("~/.claude/plugins/cache/rtrt")?;
+    uninstall_claude_skills_agents(apply)?;
+    remove_all_terse_rules(apply)?;
     if !apply {
         println!(
             "[dry-run] would unset rtrt hook entries in {}",
@@ -714,6 +811,87 @@ pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
     Ok(())
 }
 
+fn uninstall_claude_skills_agents(apply: bool) -> Result<()> {
+    let skills_root = expand_home(CLAUDE_SKILLS_ROOT_REL)?;
+    let agents_root = expand_home(CLAUDE_AGENTS_ROOT_REL)?;
+    if !apply {
+        for skill in CLAUDE_SKILLS {
+            println!(
+                "[dry-run] would remove Claude skill dir {}",
+                skills_root.join(skill.name).display()
+            );
+        }
+        for agent in CLAUDE_AGENTS {
+            println!(
+                "[dry-run] would remove Claude agent file {}",
+                claude_agent_path(&agents_root, agent).display()
+            );
+        }
+        return Ok(());
+    }
+    for skill in CLAUDE_SKILLS {
+        let path = skills_root.join(skill.name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
+            println!("removed Claude skill dir {}", path.display());
+        }
+    }
+    for agent in CLAUDE_AGENTS {
+        let path = claude_agent_path(&agents_root, agent);
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
+            println!("removed Claude agent file {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn remove_terse_rules(agent: AgentKind, apply: bool) -> Result<()> {
+    let Some(rel_path) = terse_rules_path(agent) else {
+        return Ok(());
+    };
+    let path = expand_home(rel_path)?;
+    if !path.exists() {
+        println!("{}: not present", path.display());
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "[dry-run] would remove rtrt Output Optimizer terse rules block from {}",
+            path.display()
+        );
+        return Ok(());
+    }
+    backup_if_needed(&path)?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let (rendered, removed) = remove_terse_block_from_text(&raw);
+    if removed {
+        std::fs::write(&path, rendered).with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "removed rtrt Output Optimizer terse rules block from {}",
+            path.display()
+        );
+    } else {
+        println!(
+            "{}: rtrt Output Optimizer terse rules block not present",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remove_all_terse_rules(apply: bool) -> Result<()> {
+    for agent in [
+        AgentKind::Cursor,
+        AgentKind::Windsurf,
+        AgentKind::Codex,
+        AgentKind::Aider,
+    ] {
+        remove_terse_rules(agent, apply)?;
+    }
+    Ok(())
+}
+
 /// Pick the `rtrt` command to embed in the hook line. Prefers the binary
 /// next to the running CLI; falls back to the bare `rtrt` symbol so
 /// `PATH` lookup still works on machines without `~/.local/bin` quoting.
@@ -734,13 +912,26 @@ fn locate_rtrt_binary() -> String {
 pub fn uninstall_agent(agent: AgentKind, apply: bool) -> Result<()> {
     match agent {
         AgentKind::Aider => {
+            remove_terse_rules(agent, apply)?;
             println!("aider has no MCP config — nothing to remove.");
             Ok(())
         }
-        AgentKind::Claude => drop_json_entry("~/.claude.json", apply),
-        AgentKind::Cursor => drop_json_entry("~/.cursor/mcp.json", apply),
-        AgentKind::Windsurf => drop_json_entry("~/.windsurf/mcp_config.json", apply),
-        AgentKind::Codex => drop_codex_toml(apply),
+        AgentKind::Claude => {
+            uninstall_claude_skills_agents(apply)?;
+            drop_json_entry("~/.claude.json", apply)
+        }
+        AgentKind::Cursor => {
+            remove_terse_rules(agent, apply)?;
+            drop_json_entry("~/.cursor/mcp.json", apply)
+        }
+        AgentKind::Windsurf => {
+            remove_terse_rules(agent, apply)?;
+            drop_json_entry("~/.windsurf/mcp_config.json", apply)
+        }
+        AgentKind::Codex => {
+            remove_terse_rules(agent, apply)?;
+            drop_codex_toml(apply)
+        }
     }
 }
 

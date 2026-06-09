@@ -62,6 +62,12 @@ struct SkillSpec {
     body: &'static str,
 }
 
+struct AgentSpec {
+    name: &'static str,
+    description: &'static str,
+    body: &'static str,
+}
+
 const CLAUDE_SKILLS: &[SkillSpec] = &[
     SkillSpec {
         name: "output-commit",
@@ -116,6 +122,61 @@ description: rtrt Output Optimizer: quick reference for /output levels.
 ---
 
 Use rtrt Output Optimizer style. Provide a quick reference for `/output lite`, `/output full`, `/output ultra`, and `/output off`. Explain what each level does in the user's language. Keep it short and do not add unrelated setup text.
+"#,
+    },
+    SkillSpec {
+        name: "output-crew",
+        description: "rtrt Output Optimizer: decision guide for compact code-location, edit, and review delegation.",
+        body: r#"---
+name: output-crew
+description: rtrt Output Optimizer: decision guide for compact code-location, edit, and review delegation.
+---
+
+Use this decision guide when the main thread can save context by delegating a narrow task:
+- Locate code / map a dir / find callers -> output-investigator
+- Bounded 1–2 file edit -> output-builder
+- Review a diff, branch, or file -> output-reviewer
+
+All three agents reply terse and in the user's language to save context window. Keep delegation scoped to the listed task shapes.
+"#,
+    },
+];
+
+const CLAUDE_AGENTS: &[AgentSpec] = &[
+    AgentSpec {
+        name: "output-investigator",
+        description: "Read-only code locator. Returns a compact file:line table for 'where is X / what calls Y / map this dir'. No fixes.",
+        body: r#"---
+name: output-investigator
+description: Read-only code locator. Returns a compact file:line table for 'where is X / what calls Y / map this dir'. No fixes.
+tools: [read_file, search_files, list_directory]
+---
+
+Terse, technically exact. Reply in the user's language. Return only a Markdown table of file:line matches, one row per hit. No explanations, no fixes, no praise. Refuse requests that ask for edits.
+"#,
+    },
+    AgentSpec {
+        name: "output-builder",
+        description: "Surgical 1–2 file edit (typo fix, single-function rewrite, mechanical rename). Refuses 3+ file scope.",
+        body: r#"---
+name: output-builder
+description: Surgical 1–2 file edit (typo fix, single-function rewrite, mechanical rename). Refuses 3+ file scope.
+tools: [read_file, edit_file, search_files]
+---
+
+Terse, technically exact. Reply in the user's language. Accept only tasks touching ≤2 files. For any larger scope say 'Scope too wide — use a full agent.' Return a terse unified diff receipt (file path, lines changed, what changed). No prose.
+"#,
+    },
+    AgentSpec {
+        name: "output-reviewer",
+        description: "Diff/branch/file reviewer. One finding per line: path:line: <severity>: <problem>. <fix>.",
+        body: r#"---
+name: output-reviewer
+description: Diff/branch/file reviewer. One finding per line: path:line: <severity>: <problem>. <fix>.
+tools: [read_file, search_files, list_directory]
+---
+
+Terse, technically exact. Reply in the user's language. Output format is strictly: path:line: <severity>: <problem>. <fix>. Severity values: error | warn | note. No praise. No scope creep. No summaries. Stop when findings are exhausted.
 "#,
     },
 ];
@@ -316,10 +377,20 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             "[dry-run] skill root:  {}",
             plugin_dir.join("skills").display()
         );
+        println!(
+            "[dry-run] agent root:  {}",
+            plugin_dir.join("agents").display()
+        );
         for skill in CLAUDE_SKILLS {
             println!(
                 "[dry-run] skill file:  {}",
                 skill_path(&plugin_dir, skill).display()
+            );
+        }
+        for agent in CLAUDE_AGENTS {
+            println!(
+                "[dry-run] agent file:  {}",
+                agent_path(&plugin_dir, agent).display()
             );
         }
         println!(
@@ -492,10 +563,17 @@ fn skill_path(plugin_dir: &Path, skill: &SkillSpec) -> PathBuf {
     plugin_dir.join("skills").join(skill.name).join("SKILL.md")
 }
 
+fn agent_path(plugin_dir: &Path, agent: &AgentSpec) -> PathBuf {
+    plugin_dir.join("agents").join(format!("{}.md", agent.name))
+}
+
 fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
     let skills_dir = plugin_dir.join("skills");
+    let agents_dir = plugin_dir.join("agents");
     std::fs::create_dir_all(&skills_dir)
         .with_context(|| format!("mkdir {}", skills_dir.display()))?;
+    std::fs::create_dir_all(&agents_dir)
+        .with_context(|| format!("mkdir {}", agents_dir.display()))?;
     for skill in CLAUDE_SKILLS {
         let path = skill_path(plugin_dir, skill);
         if let Some(parent) = path.parent() {
@@ -503,6 +581,14 @@ fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
         std::fs::write(&path, skill.body).with_context(|| format!("write {}", path.display()))?;
+    }
+    for agent in CLAUDE_AGENTS {
+        let path = agent_path(plugin_dir, agent);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::write(&path, agent.body).with_context(|| format!("write {}", path.display()))?;
     }
     let manifest_skills: Vec<serde_json::Value> = CLAUDE_SKILLS
         .iter()
@@ -514,11 +600,22 @@ fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
             })
         })
         .collect();
+    let manifest_agents: Vec<serde_json::Value> = CLAUDE_AGENTS
+        .iter()
+        .map(|agent| {
+            serde_json::json!({
+                "name": agent.name,
+                "description": agent.description,
+                "path": format!("agents/{}.md", agent.name),
+            })
+        })
+        .collect();
     let manifest = serde_json::json!({
         "name": "rtrt",
         "description": "rtrt Output Optimizer Claude Code plugin.",
         "version": env!("CARGO_PKG_VERSION"),
         "skills": manifest_skills,
+        "agents": manifest_agents,
     });
     let manifest_path = plugin_dir.join("manifest.json");
     let rendered = serde_json::to_string_pretty(&manifest)?;
@@ -528,6 +625,11 @@ fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
         "wrote {} rtrt Output Optimizer skill files under {}",
         CLAUDE_SKILLS.len(),
         skills_dir.display()
+    );
+    println!(
+        "wrote {} rtrt Output Optimizer agent files under {}",
+        CLAUDE_AGENTS.len(),
+        agents_dir.display()
     );
     Ok(())
 }

@@ -32,10 +32,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Compress text read from stdin.
+    /// Compress text read from stdin or --file.
     Compress {
         #[arg(short, long, value_enum, default_value = "full")]
         level: LevelArg,
+        /// Read input from a file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Overwrite --file with the compressed output.
+        #[arg(long)]
+        in_place: bool,
+        /// Before --in-place overwrite, copy --file to <PATH>.original.
+        #[arg(long)]
+        backup: bool,
         /// Use an LLM (any Provider) to rewrite tersely instead of the rule
         /// pass. Required when --provider is set.
         #[arg(long)]
@@ -69,6 +78,8 @@ enum Cmd {
         #[arg(long, env = "RTRT_ONNX_TOKENIZER")]
         onnx_tokenizer: Option<PathBuf>,
     },
+    /// Report session token usage and Output Optimizer savings.
+    Stats,
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
         /// Command being run (e.g. "git status").
@@ -642,6 +653,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Cmd::Compress {
             level,
+            file,
+            in_place,
+            backup,
             llm,
             provider,
             model,
@@ -652,35 +666,25 @@ async fn main() -> Result<()> {
             onnx_model,
             onnx_tokenizer,
         } => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            if llm {
-                let model = model.ok_or_else(|| anyhow::anyhow!("--llm requires --model"))?;
-                let kind = provider.unwrap_or_else(|| detect_provider(&model));
-                let provider = build_provider(kind, base_url, &model)?;
-                let compressor = LlmCompressor::new(provider, model);
-                let out = compressor.compress(&buf).await?;
-                print!("{out}");
-            } else if ml {
-                let target = rtrt_compress::CompressionTarget::new(ratio)?;
-                let compressor = match (&onnx_model, &onnx_tokenizer) {
-                    #[cfg(feature = "onnx")]
-                    (Some(m), Some(t)) => rtrt_compress::MlCompressor::onnx(m, t)?,
-                    #[cfg(not(feature = "onnx"))]
-                    (Some(_), Some(_)) => anyhow::bail!(
-                        "--onnx-model requires the `onnx` cargo feature; rebuild with `cargo build --features onnx`"
-                    ),
-                    (Some(_), None) | (None, Some(_)) => {
-                        anyhow::bail!("--onnx-model and --onnx-tokenizer must be set together")
-                    }
-                    (None, None) => rtrt_compress::MlCompressor::heuristic(),
-                };
-                print!("{}", compressor.compress(&buf, target));
-            } else {
-                let compressor = Compressor::new(level.into());
-                let out = compressor.compress_to(&buf, format.into());
-                print!("{out}");
-            }
+            let opts = CompressCliOptions {
+                level,
+                file,
+                in_place,
+                backup,
+                llm,
+                provider,
+                model,
+                base_url,
+                format,
+                ml,
+                ratio,
+                onnx_model,
+                onnx_tokenizer,
+            };
+            run_compress(opts).await?;
+        }
+        Cmd::Stats => {
+            run_stats()?;
         }
         Cmd::Proxy { command } => {
             let mut buf = String::new();
@@ -1161,6 +1165,327 @@ batch = 20                # RTRT_AUTO_COMPRESS_BATCH — max rows per sweep
 max_tokens = 512          # RTRT_AUTO_COMPRESS_MAX_TOKENS
 "#;
 
+const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
+const TOKEN_LOG_TRAILING_TEXT_FIELDS: usize = 2;
+const TOKEN_LOG_TIMESTAMP_FIELDS: usize = 1;
+const TOKEN_LOG_MIN_FIELDS: usize = TOKEN_LOG_TIMESTAMP_FIELDS + TOKEN_LOG_TRAILING_TEXT_FIELDS + 1;
+const TOKEN_LOG_METRIC_LABELS: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+];
+const SAVINGS_SOURCES: &[&str] = &["compress", "proxy"];
+
+struct CompressCliOptions {
+    level: LevelArg,
+    file: Option<PathBuf>,
+    in_place: bool,
+    backup: bool,
+    llm: bool,
+    provider: Option<ProviderArg>,
+    model: Option<String>,
+    base_url: Option<String>,
+    format: FormatArg,
+    ml: bool,
+    ratio: f32,
+    onnx_model: Option<PathBuf>,
+    onnx_tokenizer: Option<PathBuf>,
+}
+
+async fn run_compress(opts: CompressCliOptions) -> Result<()> {
+    if opts.in_place && opts.file.is_none() {
+        bail!("--in-place requires --file <PATH>");
+    }
+    if opts.backup && !opts.in_place {
+        bail!("--backup requires --in-place");
+    }
+
+    let input = match opts.file.as_deref() {
+        Some(path) => {
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
+        }
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read stdin")?;
+            buf
+        }
+    };
+
+    let out = if opts.llm {
+        let model = opts
+            .model
+            .ok_or_else(|| anyhow::anyhow!("--llm requires --model"))?;
+        let kind = opts.provider.unwrap_or_else(|| detect_provider(&model));
+        let provider = build_provider(kind, opts.base_url, &model)?;
+        let compressor = LlmCompressor::new(provider, model);
+        compressor.compress(&input).await?
+    } else if opts.ml {
+        let target = rtrt_compress::CompressionTarget::new(opts.ratio)?;
+        let compressor = match (&opts.onnx_model, &opts.onnx_tokenizer) {
+            #[cfg(feature = "onnx")]
+            (Some(m), Some(t)) => rtrt_compress::MlCompressor::onnx(m, t)?,
+            #[cfg(not(feature = "onnx"))]
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--onnx-model requires the `onnx` cargo feature; rebuild with `cargo build --features onnx`"
+            ),
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--onnx-model and --onnx-tokenizer must be set together")
+            }
+            (None, None) => rtrt_compress::MlCompressor::heuristic(),
+        };
+        compressor.compress(&input, target)
+    } else {
+        let compressor = Compressor::new(opts.level.into());
+        compressor.compress_to(&input, opts.format.into())
+    };
+
+    if opts.in_place {
+        let path = opts
+            .file
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--in-place requires --file <PATH>"))?;
+        if opts.backup {
+            let backup = original_backup_path(path);
+            std::fs::copy(path, &backup)
+                .with_context(|| format!("backup {} to {}", path.display(), backup.display()))?;
+        }
+        std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    } else {
+        print!("{out}");
+    }
+    Ok(())
+}
+
+fn original_backup_path(path: &std::path::Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".original");
+    PathBuf::from(raw)
+}
+
+fn run_stats() -> Result<()> {
+    println!("Output Optimizer stats");
+    print_token_log_stats()?;
+    print_memory_savings();
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TokenLogRow {
+    timestamp: u64,
+    metrics: Vec<u64>,
+    model: String,
+    session_id: String,
+}
+
+fn print_token_log_stats() -> Result<()> {
+    let path = PathBuf::from(".priv-storage")
+        .join("sessions")
+        .join("token-log.tsv");
+    if !path.exists() {
+        println!("token-log: unavailable ({} not found)", path.display());
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < TOKEN_LOG_MIN_FIELDS {
+            skipped += 1;
+            continue;
+        }
+        let Ok(timestamp) = fields[0].parse::<u64>() else {
+            skipped += 1;
+            continue;
+        };
+        let metric_end = fields.len().saturating_sub(TOKEN_LOG_TRAILING_TEXT_FIELDS);
+        let mut metrics = Vec::new();
+        let mut valid = true;
+        for value in &fields[TOKEN_LOG_TIMESTAMP_FIELDS..metric_end] {
+            match value.parse::<u64>() {
+                Ok(n) => metrics.push(n),
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid || metrics.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        rows.push(TokenLogRow {
+            timestamp,
+            metrics,
+            model: fields[fields.len() - 2].to_string(),
+            session_id: fields[fields.len() - 1].to_string(),
+        });
+    }
+
+    let Some(latest) = rows.iter().max_by_key(|row| row.timestamp) else {
+        println!(
+            "token-log: unavailable ({} had no parseable rows)",
+            path.display()
+        );
+        if skipped > 0 {
+            println!("token-log skipped rows: {skipped}");
+        }
+        return Ok(());
+    };
+    let session_rows = rows
+        .iter()
+        .filter(|row| row.session_id == latest.session_id)
+        .count();
+    let latest_total: u64 = latest.metrics.iter().sum();
+    println!("token-log: available ({})", path.display());
+    println!(
+        "  latest session: {} model={} rows={}",
+        latest.session_id, latest.model, session_rows
+    );
+    for (idx, value) in latest.metrics.iter().enumerate() {
+        let label = TOKEN_LOG_METRIC_LABELS
+            .get(idx)
+            .copied()
+            .unwrap_or("metric");
+        if label == "metric" {
+            println!("  metric_{}: {}", idx + 1, value);
+        } else {
+            println!("  {label}: {value}");
+        }
+    }
+    println!("  latest total tokens: {latest_total}");
+    if skipped > 0 {
+        println!("  skipped rows: {skipped}");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct SourceSavings {
+    saved_chars: u64,
+    rows: usize,
+}
+
+fn print_memory_savings() {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_memory_path);
+    if !path.exists() {
+        println!("memory: unavailable ({} not found)", path.display());
+        println!("savings: unavailable (memory store unavailable)");
+        for source in SAVINGS_SOURCES {
+            println!("  {source}: unavailable");
+        }
+        return;
+    }
+    let store = match MemoryStore::open(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            println!("memory: unavailable ({}: {e})", path.display());
+            println!("savings: unavailable (memory store unavailable)");
+            for source in SAVINGS_SOURCES {
+                println!("  {source}: unavailable");
+            }
+            return;
+        }
+    };
+    let projects = match store.projects() {
+        Ok(projects) => projects,
+        Err(e) => {
+            println!("memory: unavailable ({}: {e})", path.display());
+            println!("savings: unavailable (memory metadata query failed)");
+            for source in SAVINGS_SOURCES {
+                println!("  {source}: unavailable");
+            }
+            return;
+        }
+    };
+
+    let mut by_source: BTreeMap<String, SourceSavings> = SAVINGS_SOURCES
+        .iter()
+        .map(|source| (source.to_string(), SourceSavings::default()))
+        .collect();
+    let mut metadata_errors = 0usize;
+    let mut invalid_saved_chars = 0usize;
+    for (project, count, _) in &projects {
+        let rows = match store.list_by_project(project, *count) {
+            Ok(rows) => rows,
+            Err(_) => {
+                metadata_errors += *count;
+                continue;
+            }
+        };
+        for row in rows {
+            let meta = match store.get_metadata(row.id) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    metadata_errors += 1;
+                    continue;
+                }
+            };
+            let Some(source) = meta.get("source").map(String::as_str) else {
+                continue;
+            };
+            if !SAVINGS_SOURCES.contains(&source) {
+                continue;
+            }
+            let Some(saved) = meta
+                .get("saved_chars")
+                .and_then(|value| parse_saved_chars(value))
+            else {
+                invalid_saved_chars += 1;
+                continue;
+            };
+            if let Some(stats) = by_source.get_mut(source) {
+                stats.saved_chars = stats.saved_chars.saturating_add(saved);
+                stats.rows = stats.rows.saturating_add(1);
+            }
+        }
+    }
+
+    println!("memory: available ({})", path.display());
+    println!("savings (tokens estimate ~= chars/{ESTIMATED_CHARS_PER_TOKEN}):");
+    let mut total_chars = 0u64;
+    let mut total_rows = 0usize;
+    for source in SAVINGS_SOURCES {
+        let stats = by_source.get(*source).cloned().unwrap_or_default();
+        total_chars = total_chars.saturating_add(stats.saved_chars);
+        total_rows = total_rows.saturating_add(stats.rows);
+        println!(
+            "  {source}: {} chars ~= {} tokens ({} rows)",
+            stats.saved_chars,
+            estimated_tokens(stats.saved_chars),
+            stats.rows
+        );
+    }
+    println!(
+        "  total: {} chars ~= {} tokens ({} rows)",
+        total_chars,
+        estimated_tokens(total_chars),
+        total_rows
+    );
+    if metadata_errors > 0 {
+        println!("  metadata rows unavailable: {metadata_errors}");
+    }
+    if invalid_saved_chars > 0 {
+        println!("  rows with invalid saved_chars: {invalid_saved_chars}");
+    }
+}
+
+fn parse_saved_chars(value: &str) -> Option<u64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .and_then(|n| u64::try_from(n.max(0)).ok())
+}
+
+fn estimated_tokens(chars: u64) -> u64 {
+    chars / ESTIMATED_CHARS_PER_TOKEN
+}
+
 fn run_config(cmd: ConfigCmd) -> Result<()> {
     let path = rtrt_core::Config::default_path()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve config path (no HOME?)"))?;
@@ -1476,15 +1801,6 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     let batch: usize = env_or("RTRT_AUTO_COMPRESS_BATCH", cfg.batch);
     let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL").unwrap_or_else(|_| cfg.model.clone());
     let max_tokens: u32 = env_or("RTRT_AUTO_COMPRESS_MAX_TOKENS", cfg.max_tokens);
-    // Feed the config's base_url to Gateway::from_env when the env var is
-    // unset, so a fully-file-driven local setup still routes to Ollama.
-    if std::env::var_os("RTRT_PROVIDER_BASE_URL").is_none()
-        && std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_none()
-        && let Some(url) = cfg.base_url.as_deref()
-    {
-        // SAFETY: hook process is single-threaded at this point.
-        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", url) };
-    }
     let memory = MemoryStore::open(&store_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1494,7 +1810,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     if candidates.is_empty() {
         return Ok(());
     }
-    let gateway = rtrt_providers::Gateway::from_env();
+    let gateway = gateway_from_env_or_config(cfg.base_url.as_deref());
     let mut compressed = 0usize;
     for (id, body) in candidates {
         let req = ChatRequest {
@@ -2197,6 +2513,25 @@ fn build_provider(
         }
     };
     Ok(provider)
+}
+
+fn gateway_from_env_or_config(config_base_url: Option<&str>) -> rtrt_providers::Gateway {
+    let gateway = rtrt_providers::Gateway::from_env();
+    if std::env::var_os("RTRT_PROVIDER_BASE_URL").is_some()
+        || std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_some()
+    {
+        return gateway;
+    }
+    let Some(url) = config_base_url else {
+        return gateway;
+    };
+    let mut provider = OpenAICompatibleProvider::new("openai-compat", url.to_string());
+    if let Ok(key) = std::env::var("RTRT_OPENAI_COMPAT_API_KEY") {
+        provider = provider.with_api_key(key);
+    }
+    gateway
+        .register("openai-compat", Box::new(provider), [] as [&'static str; 0])
+        .with_default_last()
 }
 
 /// Iterative directory walk. Yields every regular file under `root`. Skips

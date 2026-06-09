@@ -328,7 +328,7 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Compress text via the RTRT caveman-style rewriter. Levels: lite, full, ultra."
+        description = "Compress text via the RTRT Output Optimizer rule-based rewriter. Levels: lite, full, ultra."
     )]
     async fn compress(
         &self,

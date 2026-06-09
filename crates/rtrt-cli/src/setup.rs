@@ -54,6 +54,72 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionEnd", "session-end"),
 ];
 
+const CLAUDE_PLUGIN_REL: &str = "~/.claude/plugins/cache/rtrt";
+
+struct SkillSpec {
+    name: &'static str,
+    description: &'static str,
+    body: &'static str,
+}
+
+const CLAUDE_SKILLS: &[SkillSpec] = &[
+    SkillSpec {
+        name: "output-commit",
+        description: "rtrt Output Optimizer: generate terse Conventional Commits messages for staged diffs.",
+        body: r#"---
+name: output-commit
+description: rtrt Output Optimizer: generate terse Conventional Commits messages for staged diffs.
+---
+
+Use rtrt Output Optimizer style. Generate a terse Conventional Commits message for the staged diff. Subject must be <=50 chars. Add a body only when the why is non-obvious. Reply in the user's language unless commit syntax or repository convention requires otherwise. No praise, no filler, no AI attribution.
+"#,
+    },
+    SkillSpec {
+        name: "output-review",
+        description: "rtrt Output Optimizer: code review findings as one line per finding.",
+        body: r#"---
+name: output-review
+description: rtrt Output Optimizer: code review findings as one line per finding.
+---
+
+Use rtrt Output Optimizer style. Review code with one line per finding: location -> problem -> fix. Lead with defects, regressions, security issues, and missing tests. Reply in the user's language. No praise, no filler, no summary unless asked.
+"#,
+    },
+    SkillSpec {
+        name: "output-compress-file",
+        description: "rtrt Output Optimizer: compress a notes or memory file in place with backup.",
+        body: r#"---
+name: output-compress-file
+description: rtrt Output Optimizer: compress a notes or memory file in place with backup.
+---
+
+Use rtrt Output Optimizer style. Compress the target notes or memory file in place by running `rtrt compress --file <p> --in-place --backup`. Preserve technical facts, paths, commands, identifiers, numbers, and quoted errors. Reply in the user's language and report the file path plus backup path only.
+"#,
+    },
+    SkillSpec {
+        name: "output-stats",
+        description: "rtrt Output Optimizer: show saved-character and estimated-token stats.",
+        body: r#"---
+name: output-stats
+description: rtrt Output Optimizer: show saved-character and estimated-token stats.
+---
+
+Use rtrt Output Optimizer style. Show savings by running `rtrt stats`. Report real sources only; if token-log or memory data is unavailable, say unavailable. Reply in the user's language. Keep the summary compact.
+"#,
+    },
+    SkillSpec {
+        name: "output-help",
+        description: "rtrt Output Optimizer: quick reference for /output levels.",
+        body: r#"---
+name: output-help
+description: rtrt Output Optimizer: quick reference for /output levels.
+---
+
+Use rtrt Output Optimizer style. Provide a quick reference for `/output lite`, `/output full`, `/output ultra`, and `/output off`. Explain what each level does in the user's language. Keep it short and do not add unrelated setup text.
+"#,
+    },
+];
+
 pub fn run(plan: SetupPlan) -> Result<()> {
     let binary = plan.binary.to_string_lossy().to_string();
     // Default to ~/.rtrt/memory.sqlite (absolute) so the MCP server, the
@@ -242,9 +308,24 @@ fn dirs_home() -> Result<PathBuf> {
 /// stable.
 fn install_claude_plugin(apply: bool) -> Result<()> {
     let settings = expand_home("~/.claude/settings.json")?;
+    let plugin_dir = expand_home(CLAUDE_PLUGIN_REL)?;
     let rtrt_cmd = locate_rtrt_binary();
     if !apply {
         println!("[dry-run] target:      {}", settings.display());
+        println!(
+            "[dry-run] skill root:  {}",
+            plugin_dir.join("skills").display()
+        );
+        for skill in CLAUDE_SKILLS {
+            println!(
+                "[dry-run] skill file:  {}",
+                skill_path(&plugin_dir, skill).display()
+            );
+        }
+        println!(
+            "[dry-run] skill manifest: {}",
+            plugin_dir.join("manifest.json").display()
+        );
         println!("[dry-run] command:     {rtrt_cmd} hook capture <kind>");
         println!("[dry-run] hook events: {} entries", HOOK_EVENTS.len());
         println!("[dry-run] style hooks: {rtrt_cmd} hook style, {rtrt_cmd} hook style-inject");
@@ -252,6 +333,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
     }
+    write_claude_plugin_tree(&plugin_dir)?;
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -384,12 +466,68 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             "command": format!("{rtrt_cmd} statusline")
         }),
     );
+    let plugins = root
+        .as_object_mut()
+        .unwrap()
+        .entry("plugins")
+        .or_insert_with(|| serde_json::json!([]));
+    if !plugins.is_array() {
+        bail!("{}: plugins exists but is not an array", settings.display());
+    }
+    let plugins_arr = plugins.as_array_mut().unwrap();
+    if !plugins_arr.iter().any(|v| v.as_str() == Some("rtrt")) {
+        plugins_arr.push(serde_json::json!("rtrt"));
+    }
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
     println!(
         "merged {} hook entries (+ auto-recall on UserPromptSubmit) into {}",
         HOOK_EVENTS.len(),
         settings.display()
+    );
+    Ok(())
+}
+
+fn skill_path(plugin_dir: &Path, skill: &SkillSpec) -> PathBuf {
+    plugin_dir.join("skills").join(skill.name).join("SKILL.md")
+}
+
+fn write_claude_plugin_tree(plugin_dir: &Path) -> Result<()> {
+    let skills_dir = plugin_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir)
+        .with_context(|| format!("mkdir {}", skills_dir.display()))?;
+    for skill in CLAUDE_SKILLS {
+        let path = skill_path(plugin_dir, skill);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::write(&path, skill.body).with_context(|| format!("write {}", path.display()))?;
+    }
+    let manifest_skills: Vec<serde_json::Value> = CLAUDE_SKILLS
+        .iter()
+        .map(|skill| {
+            serde_json::json!({
+                "name": skill.name,
+                "description": skill.description,
+                "path": format!("skills/{}/SKILL.md", skill.name),
+            })
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "name": "rtrt",
+        "description": "rtrt Output Optimizer Claude Code plugin.",
+        "version": env!("CARGO_PKG_VERSION"),
+        "skills": manifest_skills,
+    });
+    let manifest_path = plugin_dir.join("manifest.json");
+    let rendered = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(&manifest_path, rendered)
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+    println!(
+        "wrote {} rtrt Output Optimizer skill files under {}",
+        CLAUDE_SKILLS.len(),
+        skills_dir.display()
     );
     Ok(())
 }

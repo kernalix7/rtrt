@@ -33,13 +33,19 @@
   .topbar #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.3rem 0.6rem; border-radius: 6px; font-size: 0.9em; }
 
   /* Layout: sidebar + main */
-  .layout { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 53px - 32px); }
+  .layout { display: grid; grid-template-columns: 250px 1fr; min-height: calc(100vh - 53px - 32px); }
   aside { background: var(--surface); border-right: 1px solid var(--border); padding: 1rem 0.5rem; }
-  aside .group { color: var(--muted); font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.6rem 0.75rem 0.25rem; }
-  aside a.nav { display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 0.75rem; border-radius: 8px; color: var(--fg); margin: 0.1rem 0; }
+  aside .nav-group { margin-bottom: 0.55rem; }
+  aside .group { color: var(--muted); font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.7rem 0.75rem 0.25rem; }
+  aside .nav-subtitle { color: var(--muted); font-size: 0.74rem; padding: 0 0.75rem 0.3rem; }
+  aside a.nav { display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.5rem 0.75rem; border-radius: 8px; color: var(--fg); margin: 0.08rem 0; }
   aside a.nav:hover { background: var(--bg); }
   aside a.nav.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-  aside a.nav .icon { width: 18px; text-align: center; }
+  aside a.nav .icon { width: 18px; text-align: center; line-height: 1.35; flex-shrink: 0; }
+  aside a.nav .nav-copy { min-width: 0; display: flex; flex-direction: column; line-height: 1.25; }
+  aside a.nav .nav-label { font-size: 0.92rem; }
+  aside a.nav .nav-sub { color: var(--muted); font-size: 0.74rem; font-weight: 400; margin-top: 0.08rem; }
+  aside a.nav.active .nav-sub { color: var(--accent); opacity: 0.82; }
   .project-picker { padding: 0 0.25rem 0.75rem; border-bottom: 1px solid var(--border); margin-bottom: 0.35rem; }
   .project-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.4rem; padding: 0 0.25rem; color: var(--muted); font-size: 0.78em; letter-spacing: 0.06em; text-transform: uppercase; }
   .project-selector-row { display: grid; grid-template-columns: 1fr 34px; gap: 0.35rem; }
@@ -399,35 +405,64 @@
         <button id="project-add-btn" class="ghost icon-btn" type="button" title="프로젝트 추가/편집">＋</button>
       </div>
     </div>
-    <div class="group">프로젝트</div>
-    <a class="nav active" data-page="overview"><span class="icon">🏠</span>개요</a>
-    <a class="nav" data-page="memory"><span class="icon">🧠</span>메모리</a>
-    <a class="nav" data-page="security"><span class="icon">🛡️</span>보안</a>
-    <a class="nav" data-page="repomap"><span class="icon">🗺</span>코드맵</a>
-    <a class="nav" data-page="diagnose"><span class="icon">🩺</span>진단</a>
-    <div class="group">도구</div>
-    <a class="nav" data-page="compress"><span class="icon">🗜</span>압축</a>
-    <a class="nav" data-page="llm"><span class="icon">🤖</span>로컬 LLM</a>
-    <a class="nav" data-page="prompts"><span class="icon">📝</span>프롬프트</a>
-    <a class="nav" data-page="templates"><span class="icon">📁</span>템플릿</a>
-    <a class="nav" data-page="connect"><span class="icon">🔌</span>에이전트 연결</a>
-    <a class="nav" data-page="settings"><span class="icon">🎛</span>설정</a>
+    <div class="nav-group">
+      <div class="group">Overview</div>
+      <a class="nav active" data-page="overview"><span class="icon">⌂</span><span class="nav-copy"><span class="nav-label">Token Savings</span><span class="nav-sub">all optimizers</span></span></a>
+    </div>
+    <div class="nav-group">
+      <div class="group">Memory</div>
+      <div class="nav-subtitle">(replaces agentmemory)</div>
+      <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Recall</span><span class="nav-sub">search and hybrid recall</span></span></a>
+      <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
+      <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">captured activity</span></span></a>
+      <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
+      <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Brain Map</span><span class="nav-sub">concept graph</span></span></a>
+      <a class="nav" data-page="memory" data-sub="memgovern"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Profile</span><span class="nav-sub">governance and backup</span></span></a>
+    </div>
+    <div class="nav-group">
+      <div class="group">Output Optimizer</div>
+      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="lite"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Lite</span><span class="nav-sub">rule compression</span></span></a>
+      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="full"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Full</span><span class="nav-sub">rule compression</span></span></a>
+      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="ultra"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Ultra</span><span class="nav-sub">rule compression</span></span></a>
+      <a class="nav" data-page="compress" data-compress-engine="ml"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">compress_ml</span><span class="nav-sub">ML heuristic</span></span></a>
+      <a class="nav" data-page="settings"><span class="icon">◉</span><span class="nav-copy"><span class="nav-label">Output Style Status</span><span class="nav-sub">auto-compress settings</span></span></a>
+    </div>
+    <div class="nav-group">
+      <div class="group">Command Optimizer</div>
+      <a class="nav" data-page="compress" data-focus="proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">git / cargo filters</span></span></a>
+      <a class="nav" data-page="repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
+    </div>
+    <div class="nav-group">
+      <div class="group">System</div>
+      <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">local models</span></span></a>
+      <a class="nav" data-page="templates"><span class="icon">□</span><span class="nav-copy"><span class="nav-label">Templates</span><span class="nav-sub">project scaffolds</span></span></a>
+      <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
+      <a class="nav" data-page="connect"><span class="icon">⛓</span><span class="nav-copy"><span class="nav-label">Setup</span><span class="nav-sub">MCP snippets</span></span></a>
+      <a class="nav" data-page="prompts"><span class="icon">¶</span><span class="nav-copy"><span class="nav-label">Prompts</span><span class="nav-sub">version registry</span></span></a>
+      <a class="nav" data-page="security"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">Security</span><span class="nav-sub">profiles and scans</span></span></a>
+      <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Settings</span><span class="nav-sub">capture defaults</span></span></a>
+    </div>
   </aside>
 
   <main>
     <!-- 개요 -->
     <section id="page-overview" class="page">
       <div class="section-head">
-        <h1>오늘의 절감</h1>
-        <div class="lede">RTRT가 줄여준 토큰과 비용을 한눈에.</div>
+        <h1>Token Savings Overview</h1>
+        <div class="lede">Combined savings from memory, output, and command optimizers.</div>
       </div>
       <div class="card">
         <div class="kpis">
-          <div class="kpi accent"><div class="label">절감 토큰</div><div class="value countup" id="kpi-saved" data-target="0">0</div><div class="sub">입력+출력 합산</div></div>
+          <div class="kpi accent"><div class="label">Known tokens saved</div><div class="value countup" id="kpi-saved" data-target="0">0</div><div class="sub" id="kpi-saved-sub">no token counter yet</div></div>
+          <div class="kpi"><div class="label">Saved characters</div><div class="value countup" id="kpi-saved-chars" data-target="0">0</div><div class="sub">exact persisted total</div></div>
           <div class="kpi"><div class="label">호출 수</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">게이트웨이 누적</div></div>
           <div class="kpi"><div class="label">평균 지연</div><div class="value" id="kpi-latency">— ms</div><div class="sub">최근 50건</div></div>
-          <div class="kpi"><div class="label">사용 비용</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">한도 미설정</div></div>
         </div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Optimizer Savings</h2><span class="hint">Exact characters saved; token counters shown only when persisted</span></div>
+        <table id="optimizer-savings-tbl"><thead><tr><th>Optimizer</th><th>Saved chars</th><th>Estimated tokens</th><th>Source</th></tr></thead><tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody></table>
+        <div id="optimizer-notes" class="out-meta"></div>
       </div>
       <div class="card">
         <div class="head"><h2>응답 추이</h2><span class="hint">최근 요청 50건</span></div>
@@ -439,6 +474,12 @@
       <div class="card">
         <div class="head"><h2>최근 호출</h2><a id="overview-refresh">새로고침</a></div>
         <table id="recent-tbl"><thead><tr><th>시각</th><th>프로바이더</th><th>모델</th><th>in</th><th>out</th><th>지연</th><th>상태</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Budget</h2><span class="hint">Gateway spend and cache status</span></div>
+        <div class="kpis">
+          <div class="kpi"><div class="label">사용 비용</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">한도 미설정</div></div>
+        </div>
       </div>
     </section>
 
@@ -799,8 +840,12 @@
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- Command Optimizer: proxy -->
+    <section id="page-proxy" class="page" hidden>
       <div class="card">
-        <div class="head"><h2>명령 출력 필터</h2><span class="hint">git / cargo 노이즈 정리</span></div>
+        <div class="head"><h2>Command Output Proxy</h2><span class="hint">git / cargo output filters</span></div>
         <form id="proxy-form">
           <input id="proxy-command" placeholder="명령 (예: git status)">
           <textarea id="proxy-raw" rows="6" placeholder="원본 stdout / stderr" required></textarea>
@@ -909,12 +954,12 @@
     <!-- 에이전트 연결 -->
     <section id="page-connect" class="page" hidden>
         <div class="card">
-          <div class="head"><h2>MCP 설정 스니펫</h2><span class="hint">Claude Code / Cursor / Codex · 디스크 미기록</span></div>
+          <div class="head"><h2>MCP 설정 스니펫</h2><span class="hint">agent client snippets · 디스크 미기록</span></div>
           <form id="setup-form">
             <div class="row">
               <select id="setup-agent">
-                <option value="claude-code">claude-code</option>
-                <option value="cursor">cursor</option>
+                <option value="claude-code">desktop agent</option>
+                <option value="cursor">editor agent</option>
                 <option value="codex">codex</option>
               </select>
               <input id="setup-memory" placeholder="memory 경로" value=".rtrt/memory.sqlite">
@@ -1209,7 +1254,15 @@ document.getElementById('theme-toggle').onclick = () => {
 };
 
 // Sidebar nav
-document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => navigate(a.dataset.page));
+document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => {
+  navigate(a.dataset.page, {
+    source: a,
+    sub: a.dataset.sub || null,
+    compressEngine: a.dataset.compressEngine || null,
+    compressLevel: a.dataset.compressLevel || null,
+    focus: a.dataset.focus || null,
+  });
+});
 
 // Global project selector
 let PROJECTS_CACHE = [];
@@ -1891,6 +1944,7 @@ const SAMPLES = {
     pushActivity('압축 예시 채움');
   },
   proxy() {
+    navigate('compress', { focus: 'proxy' });
     document.getElementById('proxy-command').value = 'cargo build';
     const ta = document.getElementById('proxy-raw');
     ta.value = '   Compiling rtrt-core v0.1.0\n   Compiling rtrt-compress v0.1.0\n   Compiling rtrt-memory v0.1.0\nerror[E0599]: no method named `foo` found for struct `Bar`\n   --> crates/rtrt-memory/src/lib.rs:204:18\n    |\n204 |         store.foo();\n    |               ^^^ method not found\n   Compiling rtrt-providers v0.1.0\nwarning: unused variable `x`\n   --> src/lib.rs:42:9\nerror: could not compile `rtrt-memory` due to previous error';
@@ -1910,22 +1964,29 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
 
 // Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
 const PALETTE_ITEMS = [
-  { label: '프로젝트 · 개요', hint: '프로젝트 / overview', run: () => navigate('overview') },
-  { label: '프로젝트 · 메모리', hint: '프로젝트 / memory', run: () => navigate('memory') },
-  { label: '프로젝트 · 보안', hint: '프로젝트 / security', run: () => navigate('security') },
-  { label: '프로젝트 · 코드맵', hint: '프로젝트 / repo-map', run: () => navigate('repomap') },
-  { label: '프로젝트 · 진단', hint: '프로젝트 / diagnose', run: () => navigate('diagnose') },
+  { label: 'Overview · Token Savings', hint: 'overview / optimizer savings', run: () => navigate('overview') },
+  { label: 'Memory · Recall', hint: 'memory / recall', run: () => navigate('memory', { sub: 'memquery' }) },
+  { label: 'Memory · Timeline', hint: 'memory / timeline', run: () => navigate('memory', { sub: 'memhistory' }) },
+  { label: 'Memory · Brain Map', hint: 'memory / graph', run: () => navigate('memory', { sub: 'memmap' }) },
+  { label: 'Memory · Blocks', hint: 'memory / blocks', run: () => navigate('memory', { sub: 'memblocks' }) },
   { label: '프로젝트 추가/편집', hint: '프로젝트 / selector', run: () => openProjectModal(false) },
-  { label: '도구 · 압축', hint: '도구 / compress / proxy', run: () => { navigate('compress'); document.getElementById('compress-input').focus(); } },
-  { label: '도구 · 로컬 LLM', hint: '도구 / ollama · models · pull', run: () => navigate('llm') },
-  { label: '도구 · 프롬프트', hint: '도구 / prompts', run: () => navigate('prompts') },
-  { label: '도구 · 템플릿', hint: '도구 / project scaffolds', run: () => navigate('templates') },
-  { label: '도구 · 연결', hint: '도구 / mcp setup', run: () => navigate('connect') },
-  { label: '도구 · 설정', hint: '도구 / config / auto-compress', run: () => navigate('settings') },
+  { label: 'Output Optimizer · Compress Lite', hint: 'rules / lite', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'lite' }); document.getElementById('compress-input').focus(); } },
+  { label: 'Output Optimizer · Compress Full', hint: 'rules / full', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'full' }); document.getElementById('compress-input').focus(); } },
+  { label: 'Output Optimizer · Compress Ultra', hint: 'rules / ultra', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'ultra' }); document.getElementById('compress-input').focus(); } },
+  { label: 'Output Optimizer · compress_ml', hint: 'ml / compress', run: () => { navigate('compress', { compressEngine: 'ml' }); document.getElementById('compress-input').focus(); } },
+  { label: 'Command Optimizer · Proxy', hint: 'git / cargo filters', run: () => navigate('compress', { focus: 'proxy' }) },
+  { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('repomap') },
+  { label: 'System · Providers', hint: 'providers / local models', run: () => navigate('llm') },
+  { label: 'System · Prompts', hint: 'prompts', run: () => navigate('prompts') },
+  { label: 'System · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
+  { label: 'System · Setup', hint: 'mcp setup', run: () => navigate('connect') },
+  { label: 'System · Diagnose', hint: 'diagnose', run: () => navigate('diagnose') },
+  { label: 'System · Security', hint: 'security', run: () => navigate('security') },
+  { label: 'System · Settings', hint: 'config / auto-compress', run: () => navigate('settings') },
   { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
-  { label: '도구 · 예시: 압축', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
-  { label: '도구 · 예시: 필터', hint: 'sample · proxy', run: () => { navigate('compress'); SAMPLES.proxy(); } },
-  { label: '프로젝트 · 예시: 진단', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
+  { label: 'Output Optimizer · sample', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
+  { label: 'Command Optimizer · sample', hint: 'sample · proxy', run: () => { navigate('compress', { focus: 'proxy' }); SAMPLES.proxy(); } },
+  { label: 'System · sample diagnose', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
 ];
 function refreshMemoryScope() {
   openProject(currentProject());
@@ -1948,16 +2009,41 @@ function refreshProjectScopePage() {
   if (page === 'repomap') refreshRepomapScope();
   if (page === 'diagnose') refreshDiagnoseScope();
 }
-function navigate(page) {
+function setCompressEngine(engine, level) {
+  if (!engine) return;
+  const select = document.getElementById('compress-mode');
+  if (!select) return;
+  select.value = engine;
+  select.dispatchEvent(new Event('change'));
+  if (level) {
+    const levelSelect = document.getElementById('compress-level');
+    if (levelSelect) levelSelect.value = level;
+  }
+}
+function focusCommandProxy() {
+  const form = document.getElementById('proxy-form');
+  if (!form) return;
+  form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const raw = document.getElementById('proxy-raw');
+  if (raw) raw.focus({ preventScroll: true });
+}
+
+function navigate(page, opts = {}) {
   updateGlobalScopeIndicators();
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
-  const link = document.querySelector(`aside a.nav[data-page="${page}"]`);
+  let link = opts.source || null;
+  if (!link && opts.sub) link = document.querySelector(`aside a.nav[data-page="${page}"][data-sub="${opts.sub}"]`);
+  if (!link && opts.focus) link = document.querySelector(`aside a.nav[data-page="${page}"][data-focus="${opts.focus}"]`);
+  if (!link && opts.compressEngine && opts.compressLevel) link = document.querySelector(`aside a.nav[data-page="${page}"][data-compress-engine="${opts.compressEngine}"][data-compress-level="${opts.compressLevel}"]`);
+  if (!link && opts.compressEngine) link = document.querySelector(`aside a.nav[data-page="${page}"][data-compress-engine="${opts.compressEngine}"]`);
+  if (!link) link = document.querySelector(`aside a.nav[data-page="${page}"]`);
   if (link) link.classList.add('active');
   const target = document.getElementById('page-' + page);
   if (target) target.hidden = false;
   if (page === 'memory') {
     refreshMemoryScope();
+    if (opts.sub) subClick('memory-subtabs', opts.sub);
   }
   if (page === 'repomap') {
     refreshRepomapScope();
@@ -1980,6 +2066,10 @@ function navigate(page) {
   if (page === 'security') {
     loadSecurityProfiles();
     refreshSecurityScope();
+  }
+  if (page === 'compress') {
+    setCompressEngine(opts.compressEngine, opts.compressLevel);
+    if (opts.focus === 'proxy') focusCommandProxy();
   }
 }
 function subClick(navId, sub) {
@@ -2099,19 +2189,41 @@ function spark(svgId, values, color) {
 }
 
 async function loadOverview() {
-  const [mRes, bRes] = await Promise.all([
+  const overviewParams = new URLSearchParams();
+  if (currentProject() && !isGlobalScope()) overviewParams.set('project', currentProject());
+  const overviewUrl = `/api/overview${overviewParams.toString() ? '?' + overviewParams.toString() : ''}`;
+  const [mRes, bRes, oRes] = await Promise.all([
     fetch('/api/metrics').then(r => r.ok ? r.json() : ({summary:{}, recent:[]})).catch(() => ({summary:{}, recent:[]})),
     fetch('/api/budget').then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(overviewUrl).then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
   const s = mRes.summary || {};
   const calls = s.calls || 0;
-  const saved = (s.total_input_tokens || 0) + (s.total_output_tokens || 0);
+  const savedChars = oRes ? Number(oRes.total_saved_chars || 0) : 0;
+  const savedTokens = oRes && oRes.total_saved_tokens != null ? Number(oRes.total_saved_tokens) : 0;
   const avgLatency = calls ? (s.total_latency_ms / Math.max(1, calls)).toFixed(0) : '—';
-  animateCount(document.getElementById('kpi-saved'), saved);
+  animateCount(document.getElementById('kpi-saved'), savedTokens);
+  animateCount(document.getElementById('kpi-saved-chars'), savedChars);
   animateCount(document.getElementById('kpi-calls'), calls);
+  document.getElementById('kpi-saved-sub').textContent = oRes && oRes.total_saved_tokens != null ? 'exact persisted total' : 'no token counter yet';
   document.getElementById('kpi-latency').textContent = `${avgLatency} ms`;
   document.getElementById('kpi-spent').textContent = bRes ? fmtUsd(bRes.spent_usd) : '—';
   document.getElementById('kpi-spent-sub').textContent = bRes && bRes.cap_usd ? `한도 ${fmtUsd(bRes.cap_usd)}` : '한도 미설정';
+
+  const optBody = document.querySelector('#optimizer-savings-tbl tbody');
+  if (optBody) {
+    const sources = oRes && Array.isArray(oRes.sources) ? oRes.sources : [];
+    optBody.innerHTML = sources.map(c => {
+      const chars = c.saved_chars == null ? '—' : Number(c.saved_chars || 0).toLocaleString();
+      const tokens = c.saved_tokens == null ? '—' : Number(c.saved_tokens || 0).toLocaleString();
+      const status = c.available === false ? '<span class="badge warn">no counter</span> ' : '<span class="badge ok">available</span> ';
+      return `<tr><td>${escapeHtml(c.label || c.name || 'Optimizer')}</td><td>${chars}</td><td>${tokens}</td><td>${status}${escapeHtml(c.source || '')}</td></tr>`;
+    }).join('') || '<tr><td colspan="4" class="empty">No persisted savings yet.</td></tr>';
+  }
+  const notes = document.getElementById('optimizer-notes');
+  if (notes) {
+    notes.textContent = oRes && oRes.note ? oRes.note : 'Aggregate endpoint unavailable.';
+  }
 
   setPill('pill-gateway', calls > 0, calls > 0 ? '게이트웨이 활성' : '게이트웨이 대기');
   setPill('pill-memory', null, '메모리');

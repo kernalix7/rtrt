@@ -247,6 +247,8 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         println!("[dry-run] target:      {}", settings.display());
         println!("[dry-run] command:     {rtrt_cmd} hook capture <kind>");
         println!("[dry-run] hook events: {} entries", HOOK_EVENTS.len());
+        println!("[dry-run] style hooks: {rtrt_cmd} hook style, {rtrt_cmd} hook style-inject");
+        println!("[dry-run] statusLine:  {rtrt_cmd} statusline");
         println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
     }
@@ -303,6 +305,20 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         // Drop any prior rtrt entry so re-running setup is idempotent.
         arr_mut.retain(|item| item.get("matcher").and_then(|v| v.as_str()) != Some("rtrt"));
         arr_mut.push(entry);
+        // On UserPromptSubmit, update `/output <level>` state and reinforce
+        // active Output Optimizer terse mode before memory recall output.
+        if *event == "UserPromptSubmit" {
+            arr_mut.push(serde_json::json!({
+                "matcher": "rtrt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{rtrt_cmd} hook style"),
+                        "timeout": 5
+                    }
+                ]
+            }));
+        }
         // On UserPromptSubmit, also inject relevant memory back into the
         // model's context. The capture entry above saves the prompt; this
         // one recalls the project's related history so the agent doesn't
@@ -323,6 +339,16 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         // context so background knowledge is available from turn 1 without
         // waiting for a UserPromptSubmit recall.
         if *event == "SessionStart" {
+            arr_mut.push(serde_json::json!({
+                "matcher": "rtrt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{rtrt_cmd} hook style-inject"),
+                        "timeout": 5
+                    }
+                ]
+            }));
             arr_mut.push(serde_json::json!({
                 "matcher": "rtrt",
                 "hooks": [
@@ -351,6 +377,13 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             }));
         }
     }
+    root.as_object_mut().unwrap().insert(
+        "statusLine".to_string(),
+        serde_json::json!({
+            "type": "command",
+            "command": format!("{rtrt_cmd} statusline")
+        }),
+    );
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
     println!(

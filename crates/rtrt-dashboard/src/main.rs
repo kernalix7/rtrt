@@ -4,6 +4,7 @@
 //! - `/`               — bundled HTML index (mini-app: stats / templates / metrics).
 //! - `/healthz`        — liveness probe.
 //! - `/api/stats`      — compression / proxy savings JSON.
+//! - `/api/overview`   — aggregate persisted optimizer savings.
 //! - `/api/templates`  — list built-in + custom templates.
 //! - `/api/templates/{name}` — full manifest for one template.
 //! - `/api/templates/scaffold` — `POST` scaffold a project.
@@ -366,6 +367,8 @@ async fn main() -> Result<()> {
         .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
         .route("/api/stats", get(stats))
+        .route("/api/overview", get(optimizer_overview))
+        .route("/api/optimizer/overview", get(optimizer_overview))
         .route("/api/templates", get(list_templates))
         .route("/api/templates/{name}", get(get_template))
         .route("/api/templates/scaffold", post(scaffold))
@@ -800,6 +803,186 @@ async fn stats() -> Json<serde_json::Value> {
         "input_saved": 0,
         "output_saved": 0,
         "provider": null,
+    }))
+}
+
+fn metadata_saved_chars(raw: &str, expected_source: &str) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = value.as_object()?;
+    if obj.get("source")?.as_str()? != expected_source {
+        return None;
+    }
+    let saved = obj.get("saved_chars")?;
+    if let Some(n) = saved.as_i64() {
+        return Some(n.max(0));
+    }
+    saved.as_str()?.parse::<i64>().ok().map(|n| n.max(0))
+}
+
+fn savings_component(
+    name: &str,
+    label: &str,
+    saved_chars: i64,
+    count: i64,
+    source: &str,
+    available: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "label": label,
+        "saved_chars": saved_chars.max(0),
+        "saved_tokens": serde_json::Value::Null,
+        "count": count.max(0),
+        "source": source,
+        "available": available,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OverviewQuery {
+    project: Option<String>,
+}
+
+async fn optimizer_overview(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<OverviewQuery>,
+) -> Json<serde_json::Value> {
+    let project = q.project.as_deref().filter(|p| !p.is_empty());
+    let mut notes = vec![
+        "Token savings counters are not persisted yet; exact saved-character totals are shown."
+            .to_string(),
+    ];
+
+    let mut memory_saved = 0_i64;
+    let mut memory_count = 0_i64;
+    let mut output_saved = 0_i64;
+    let mut output_count = 0_i64;
+    let mut command_saved = 0_i64;
+    let mut command_count = 0_i64;
+    let mut db_available = true;
+
+    if !state.memory_path.exists() {
+        db_available = false;
+        notes.push(format!(
+            "Memory database not found at {}.",
+            state.memory_path.display()
+        ));
+    } else {
+        match rusqlite::Connection::open(&state.memory_path) {
+            Ok(conn) => {
+                match conn.prepare(
+                    "SELECT LENGTH(body), LENGTH(body_full) FROM memories \
+                     WHERE body_full IS NOT NULL \
+                       AND (?1 IS NULL OR project = ?1) \
+                       AND COALESCE(json_extract(metadata, '$.source'), '') NOT IN ('compress', 'proxy')",
+                ) {
+                    Ok(mut stmt) => {
+                        match stmt
+                            .query_map([project], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                        {
+                            Ok(rows) => {
+                                for (body_len, full_len) in rows.flatten() {
+                                    if full_len > 0 {
+                                        memory_count += 1;
+                                        memory_saved += (full_len - body_len).max(0);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                db_available = false;
+                                notes.push(format!("Memory compression query unavailable: {e}."));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        db_available = false;
+                        notes.push(format!("Memory compression query unavailable: {e}."));
+                    }
+                }
+
+                match conn.prepare(
+                    "SELECT metadata FROM memories \
+                     WHERE metadata IS NOT NULL AND (?1 IS NULL OR project = ?1)",
+                ) {
+                    Ok(mut stmt) => {
+                        match stmt.query_map([project], |row| row.get::<_, String>(0)) {
+                            Ok(rows) => {
+                                for raw in rows.flatten() {
+                                    if let Some(saved) = metadata_saved_chars(&raw, "compress") {
+                                        output_saved += saved;
+                                        output_count += 1;
+                                    }
+                                    if let Some(saved) = metadata_saved_chars(&raw, "proxy") {
+                                        command_saved += saved;
+                                        command_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                db_available = false;
+                                notes.push(format!("Optimizer metadata query unavailable: {e}."));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        db_available = false;
+                        notes.push(format!("Optimizer metadata query unavailable: {e}."));
+                    }
+                }
+            }
+            Err(e) => {
+                db_available = false;
+                notes.push(format!("Memory database unavailable: {e}."));
+            }
+        }
+    }
+
+    let recall_component = savings_component(
+        "memory_recall",
+        "Memory Recall",
+        0,
+        0,
+        "recall retrieval does not persist savings counters",
+        false,
+    );
+    let memory_component = savings_component(
+        "memory_compression",
+        "Memory Compression",
+        memory_saved,
+        memory_count,
+        "memories.body_full - memories.body",
+        db_available,
+    );
+    let output_component = savings_component(
+        "output_optimizer",
+        "Output Optimizer",
+        output_saved,
+        output_count,
+        "metadata.source=compress saved_chars",
+        db_available,
+    );
+    let command_component = savings_component(
+        "command_optimizer",
+        "Command Optimizer",
+        command_saved,
+        command_count,
+        "metadata.source=proxy saved_chars",
+        db_available,
+    );
+
+    let total_saved_chars = memory_saved + output_saved + command_saved;
+    let sources = vec![
+        recall_component,
+        memory_component,
+        output_component,
+        command_component,
+    ];
+    Json(serde_json::json!({
+        "scope": project.unwrap_or("all"),
+        "total_saved_chars": total_saved_chars.max(0),
+        "total_saved_tokens": serde_json::Value::Null,
+        "sources": sources,
+        "note": notes.join(" "),
     }))
 }
 

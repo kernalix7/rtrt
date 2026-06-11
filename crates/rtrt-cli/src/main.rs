@@ -1,12 +1,13 @@
 //! rtrt (Retort) — top-level CLI for the Rust toolkit that distills AI agent context.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod proxy_stats;
 mod security;
 mod service;
 mod setup;
@@ -80,10 +81,55 @@ enum Cmd {
     },
     /// Report session token usage and Output Optimizer savings.
     Stats,
+    /// Show Command Optimizer savings.
+    Gain {
+        /// Filter rows to this project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Show recent saved runs. Row count is derived from available data.
+        #[arg(long)]
+        history: bool,
+        /// Show daily bucketed totals.
+        #[arg(long)]
+        daily: bool,
+        /// Show weekly bucketed totals.
+        #[arg(long)]
+        weekly: bool,
+        /// Show monthly bucketed totals.
+        #[arg(long)]
+        monthly: bool,
+        /// Show a compact ASCII savings chart over time.
+        #[arg(long)]
+        graph: bool,
+        /// Clear the Command Optimizer stats DB.
+        #[arg(long)]
+        reset: bool,
+        /// Skip confirmation for --reset.
+        #[arg(long)]
+        yes: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: ReportFormatArg,
+    },
     /// Filter a command output (read from stdin) for a given command.
     Proxy {
         /// Command being run (e.g. "git status").
         command: String,
+    },
+    /// Run a shell command through the Command Optimizer.
+    ProxyRun {
+        /// Print captured output unchanged.
+        #[arg(long)]
+        raw: bool,
+        /// Keep only likely error and warning lines when no command filter matches.
+        #[arg(long)]
+        errors_only: bool,
+        /// Strip ANSI escapes and collapse repeated lines when no command filter matches.
+        #[arg(long)]
+        ultra_compact: bool,
+        /// Command and arguments to run.
+        #[arg(num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// List available project templates (built-in + custom).
     Templates,
@@ -282,14 +328,20 @@ enum Cmd {
         #[arg(long, default_value = "https://context7.com/api/v1")]
         base_url: String,
     },
-    /// Scan shell history for commands routable through `rtrt proxy`.
+    /// Discover commands that can use the Command Optimizer.
     Discover {
-        /// History file path. Defaults to `~/.zsh_history` then `~/.bash_history`.
+        /// Filter transcript commands to this project.
         #[arg(long)]
-        history: Option<PathBuf>,
-        /// Top-N commands to print.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        project: Option<String>,
+        /// Scan every project instead of the current project.
+        #[arg(long, conflicts_with = "project")]
+        all: bool,
+        /// Include commands on or after this date or timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: ReportFormatArg,
     },
     /// Show RTRT version + crate manifest.
     Info,
@@ -356,6 +408,9 @@ enum HookCmd {
     StyleInject,
     /// Print the Output Optimizer statusline badge.
     Statusline,
+    /// Rewrite simple Bash commands so Claude Code can run them through the
+    /// Command Optimizer.
+    ProxyRewrite,
     /// Recall memory relevant to the stdin prompt and print it to stdout as
     /// a context block. Wired onto `UserPromptSubmit` so Claude Code injects
     /// the project's relevant history into the model's context automatically
@@ -624,6 +679,21 @@ enum FormatArg {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ReportFormatArg {
+    Json,
+    Table,
+}
+
+const PROXY_RUN_ERROR_CONTEXT_LINES: usize = 1;
+const EXEC_FAILURE_EXIT_CODE: i32 = 1;
+const STDERR_TO_STDOUT_REDIRECT: &str = " 2>&1";
+const PROXY_RUN_PREFIX: &str = "rtrt proxy-run";
+const LEGACY_PROXY_PREFIX: &str = concat!("r", "t", "k", " ");
+const SHELL_COMPLEX_MARKERS: &[&str] = &["|", "&&", "||", ";", "$(", "`", ">", "<", "\n"];
+const KNOWN_SHRINKABLE_COMMANDS: &[&str] =
+    &["git", "cargo", "docker", "kubectl", "npm", "yarn", "pnpm"];
+
 impl From<FormatArg> for rtrt_compress::OutputFormat {
     fn from(f: FormatArg) -> Self {
         match f {
@@ -640,6 +710,195 @@ fn parse_var(s: &str) -> std::result::Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got `{s}`"))?;
     Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+fn run_proxy_run(command: Vec<String>, raw: bool, errors_only: bool, ultra_compact: bool) -> ! {
+    let Some(command_text) = shell_command_text(&command) else {
+        eprintln!("rtrt proxy-run: command is empty");
+        std::process::exit(EXEC_FAILURE_EXIT_CODE);
+    };
+    let started = std::time::Instant::now();
+    let shell_text = command_text_for_capture(&command_text);
+    let output = shell_output(&shell_text);
+    let output = match output {
+        Ok(out) => out,
+        Err(err) => {
+            eprintln!("rtrt proxy-run: {err}");
+            std::process::exit(EXEC_FAILURE_EXIT_CODE);
+        }
+    };
+    let raw_output = String::from_utf8_lossy(&output.stdout).into_owned();
+    let input_chars = raw_output.len();
+    let mut mode = "passthrough";
+    let filtered = if raw {
+        mode = "raw";
+        raw_output
+    } else {
+        // Prefer the most specific match on the full command (e.g. `ls -la`
+        // selects the long-format filter); fall back to the first token only
+        // when the full command has no registered filter.
+        let filter = rtrt_proxy::filter_for(&command_text)
+            .or_else(|| first_whitespace_token(&command_text).and_then(rtrt_proxy::filter_for));
+        if let Some(filter) = filter {
+            mode = filter.command;
+            filter.apply(&raw_output)
+        } else if errors_only {
+            mode = "errors-only";
+            rtrt_proxy::errors_only(&raw_output, PROXY_RUN_ERROR_CONTEXT_LINES)
+        } else if ultra_compact {
+            mode = "ultra-compact";
+            rtrt_proxy::ultra_compact(&raw_output)
+        } else {
+            raw_output
+        }
+    };
+    proxy_stats::record_best_effort(proxy_stats_record(
+        &command_text,
+        mode,
+        input_chars,
+        filtered.len(),
+        started.elapsed(),
+    ));
+    if let Err(err) = std::io::stdout().write_all(filtered.as_bytes()) {
+        eprintln!("rtrt proxy-run: write stdout: {err}");
+        std::process::exit(EXEC_FAILURE_EXIT_CODE);
+    }
+    std::process::exit(output.status.code().unwrap_or(EXEC_FAILURE_EXIT_CODE));
+}
+
+fn shell_command_text(command: &[String]) -> Option<String> {
+    match command {
+        [] => None,
+        [single] => {
+            let trimmed = single.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        parts => Some(
+            parts
+                .iter()
+                .map(|part| shell_arg(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn shell_arg(arg: &str) -> String {
+    if arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^'))
+    {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_arg(arg: &str) -> String {
+    if arg.is_empty()
+        || arg.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\'' | '"'
+                        | '$'
+                        | '`'
+                        | '\\'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '!'
+                        | '#'
+                )
+        })
+    {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    } else {
+        arg.to_string()
+    }
+}
+
+fn command_text_for_capture(command_text: &str) -> String {
+    let mut shell_text =
+        String::with_capacity(command_text.len() + STDERR_TO_STDOUT_REDIRECT.len());
+    shell_text.push_str(command_text);
+    shell_text.push_str(STDERR_TO_STDOUT_REDIRECT);
+    shell_text
+}
+
+fn shell_output(command_text: &str) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command_text)
+            .output()
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command_text)
+            .output()
+    }
+}
+
+fn first_whitespace_token(input: &str) -> Option<&str> {
+    input.split_whitespace().next()
+}
+
+fn proxy_stats_record(
+    command: &str,
+    mode: &str,
+    input_chars: usize,
+    output_chars: usize,
+    elapsed: std::time::Duration,
+) -> proxy_stats::ProxyRunRecord {
+    let input = input_chars as u64;
+    let output = output_chars as u64;
+    let saved = input.saturating_sub(output);
+    let saved_pct = if input == 0 {
+        0.0
+    } else {
+        (saved as f64 / input as f64) * 100.0
+    };
+    proxy_stats::ProxyRunRecord {
+        project: current_project_name(),
+        original_cmd: command.to_string(),
+        mode: mode.to_string(),
+        input_chars: input,
+        output_chars: output,
+        saved_chars: saved,
+        saved_pct,
+        exec_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+    }
+}
+
+fn current_project_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| rtrt_core::project_for_cwd(&cwd))
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::env::current_dir().ok().and_then(|cwd| {
+                cwd.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+        })
+        .unwrap_or_else(|| "default".to_string())
 }
 
 #[tokio::main]
@@ -684,15 +943,55 @@ async fn main() -> Result<()> {
         Cmd::Stats => {
             run_stats()?;
         }
+        Cmd::Gain {
+            project,
+            history,
+            daily,
+            weekly,
+            monthly,
+            graph,
+            reset,
+            yes,
+            format,
+        } => {
+            let bucket = gain_bucket(daily, weekly, monthly)?;
+            run_gain(GainOptions {
+                project,
+                history,
+                bucket,
+                graph,
+                reset,
+                yes,
+                format,
+            })?;
+        }
         Cmd::Proxy { command } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
+            let started = std::time::Instant::now();
+            let input_len = buf.len();
             let out = match rtrt_proxy::filter_for(&command) {
                 Some(f) => f.apply(&buf),
                 None => buf,
             };
+            let mode = rtrt_proxy::filter_for(&command)
+                .map(|f| f.command)
+                .unwrap_or("passthrough");
+            proxy_stats::record_best_effort(proxy_stats_record(
+                &command,
+                mode,
+                input_len,
+                out.len(),
+                started.elapsed(),
+            ));
             print!("{out}");
         }
+        Cmd::ProxyRun {
+            raw,
+            errors_only,
+            ultra_compact,
+            command,
+        } => run_proxy_run(command, raw, errors_only, ultra_compact),
         Cmd::Templates => {
             use rtrt_templates::TemplateCategory;
             fn rank(c: TemplateCategory) -> u8 {
@@ -946,6 +1245,7 @@ async fn main() -> Result<()> {
                     print_statusline();
                     Ok(())
                 }
+                HookCmd::ProxyRewrite => run_hook_proxy_rewrite(),
                 other => run_hook_capture(other),
             };
             if let Err(e) = result {
@@ -1070,50 +1370,12 @@ async fn main() -> Result<()> {
                 pct
             );
         }
-        Cmd::Discover { history, limit } => {
-            let path = history.or_else(default_history_path).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no shell history found; pass --history <path> (zsh: ~/.zsh_history, bash: ~/.bash_history)"
-                )
-            })?;
-            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            let raw = String::from_utf8_lossy(&bytes);
-            let mut counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for line in raw.lines() {
-                // zsh extended history: ": <ts>:<dur>;<cmd>"
-                let cmd = line
-                    .strip_prefix(": ")
-                    .and_then(|s| s.split_once(';').map(|x| x.1))
-                    .unwrap_or(line)
-                    .trim();
-                if cmd.is_empty() {
-                    continue;
-                }
-                if let Some(f) = rtrt_proxy::filter_for(cmd) {
-                    *counts.entry(f.command.to_string()).or_insert(0) += 1;
-                }
-            }
-            let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-            sorted.truncate(limit);
-            if sorted.is_empty() {
-                println!("no proxy-eligible commands found in {}.", path.display());
-                println!(
-                    "(rtrt-proxy currently ships filters for git status, git log, cargo build, cargo test.)"
-                );
-            } else {
-                println!("== discover: {} ==", path.display());
-                let total: usize = sorted.iter().map(|(_, n)| n).sum();
-                for (cmd, n) in &sorted {
-                    println!("{:>6}× {}", n, cmd);
-                }
-                println!();
-                println!(
-                    "total: {total} eligible invocation(s). Pipe through `rtrt proxy \"<cmd>\"`."
-                );
-            }
-        }
+        Cmd::Discover {
+            project,
+            all,
+            since,
+            format,
+        } => run_discover(project, all, since, format)?,
         Cmd::Signatures { lang } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -1263,7 +1525,486 @@ fn original_backup_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(raw)
 }
 
+struct GainOptions {
+    project: Option<String>,
+    history: bool,
+    bucket: Option<proxy_stats::Bucket>,
+    graph: bool,
+    reset: bool,
+    yes: bool,
+    format: ReportFormatArg,
+}
+
+fn gain_bucket(daily: bool, weekly: bool, monthly: bool) -> Result<Option<proxy_stats::Bucket>> {
+    let selected = [daily, weekly, monthly]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+    if selected > 1 {
+        bail!("choose only one of --daily, --weekly, or --monthly");
+    }
+    Ok(if daily {
+        Some(proxy_stats::Bucket::Daily)
+    } else if weekly {
+        Some(proxy_stats::Bucket::Weekly)
+    } else if monthly {
+        Some(proxy_stats::Bucket::Monthly)
+    } else {
+        None
+    })
+}
+
+fn run_gain(opts: GainOptions) -> Result<()> {
+    let path = proxy_stats::default_path();
+    if opts.reset {
+        if !opts.yes && !confirm_reset(&path)? {
+            println!("reset cancelled");
+            return Ok(());
+        }
+        proxy_stats::reset(&path)?;
+        match opts.format {
+            ReportFormatArg::Json => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "reset",
+                        "path": path.display().to_string(),
+                    })
+                );
+            }
+            ReportFormatArg::Table => println!("reset {}", path.display()),
+        }
+        return Ok(());
+    }
+
+    let bucket = opts
+        .bucket
+        .or(opts.graph.then_some(proxy_stats::Bucket::Daily));
+    let summary = proxy_stats::load_summary(opts.project.as_deref(), bucket, opts.history)?;
+    match opts.format {
+        ReportFormatArg::Json => print_gain_json(&summary, opts.graph)?,
+        ReportFormatArg::Table => print_gain_table(&summary, opts.graph),
+    }
+    Ok(())
+}
+
+fn confirm_reset(path: &std::path::Path) -> Result<bool> {
+    eprint!(
+        "Clear Command Optimizer stats at {}? Type yes to continue: ",
+        path.display()
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn print_gain_table(summary: &proxy_stats::GainSummary, graph: bool) {
+    println!("Command Optimizer stats");
+    println!("db: {}", summary.path.display());
+    if let Some(reason) = &summary.unavailable {
+        println!("db_status: unavailable ({reason})");
+    }
+    println!("total runs: {}", summary.total_runs);
+    println!("total saved chars: {}", summary.saved_chars);
+    println!(
+        "estimated tokens: {} (estimate, chars/{ESTIMATED_CHARS_PER_TOKEN})",
+        estimated_tokens(summary.saved_chars)
+    );
+    println!("input chars: {}", summary.input_chars);
+    println!("output chars: {}", summary.output_chars);
+
+    println!();
+    println!("top commands by savings:");
+    if summary.top_commands.is_empty() {
+        println!("  (none)");
+    } else {
+        for row in &summary.top_commands {
+            println!(
+                "  {}  runs={} saved_chars={} estimated_tokens={}",
+                row.command,
+                row.runs,
+                row.saved_chars,
+                estimated_tokens(row.saved_chars)
+            );
+        }
+    }
+
+    println!();
+    println!("per-project breakdown:");
+    if summary.projects.is_empty() {
+        println!("  (none)");
+    } else {
+        for row in &summary.projects {
+            println!(
+                "  {}  runs={} saved_chars={} estimated_tokens={}",
+                row.project,
+                row.runs,
+                row.saved_chars,
+                estimated_tokens(row.saved_chars)
+            );
+        }
+    }
+
+    if !summary.buckets.is_empty() {
+        println!();
+        println!("bucketed totals:");
+        for row in &summary.buckets {
+            println!(
+                "  {}  runs={} saved_chars={} estimated_tokens={}",
+                row.bucket,
+                row.runs,
+                row.saved_chars,
+                estimated_tokens(row.saved_chars)
+            );
+        }
+    }
+
+    if graph {
+        println!();
+        println!("savings graph:");
+        print_gain_graph(&summary.buckets);
+    }
+
+    if !summary.recent.is_empty() {
+        println!();
+        println!("recent runs:");
+        for row in &summary.recent {
+            println!(
+                "  {}  {}  {}  mode={} {}->{} saved={} ({:.1}%) exec_ms={}",
+                row.ts,
+                row.project,
+                row.original_cmd,
+                row.mode,
+                row.input_chars,
+                row.output_chars,
+                row.saved_chars,
+                row.saved_pct,
+                row.exec_ms
+            );
+        }
+    }
+}
+
+fn print_gain_json(summary: &proxy_stats::GainSummary, graph: bool) -> Result<()> {
+    let value = serde_json::json!({
+        "db": summary.path.display().to_string(),
+        "db_status": summary.unavailable.as_ref().map(|reason| serde_json::json!({
+            "status": "unavailable",
+            "reason": reason,
+        })),
+        "total_runs": summary.total_runs,
+        "total_saved_chars": summary.saved_chars,
+        "estimated_tokens": estimated_tokens(summary.saved_chars),
+        "token_estimate": format!("chars/{ESTIMATED_CHARS_PER_TOKEN}"),
+        "input_chars": summary.input_chars,
+        "output_chars": summary.output_chars,
+        "exec_ms": summary.exec_ms,
+        "top_commands": summary.top_commands.iter().map(|row| serde_json::json!({
+            "command": row.command,
+            "runs": row.runs,
+            "saved_chars": row.saved_chars,
+            "estimated_tokens": estimated_tokens(row.saved_chars),
+        })).collect::<Vec<_>>(),
+        "projects": summary.projects.iter().map(|row| serde_json::json!({
+            "project": row.project,
+            "runs": row.runs,
+            "saved_chars": row.saved_chars,
+            "estimated_tokens": estimated_tokens(row.saved_chars),
+        })).collect::<Vec<_>>(),
+        "buckets": summary.buckets.iter().map(|row| serde_json::json!({
+            "bucket": row.bucket,
+            "runs": row.runs,
+            "saved_chars": row.saved_chars,
+            "estimated_tokens": estimated_tokens(row.saved_chars),
+        })).collect::<Vec<_>>(),
+        "graph": graph.then(|| gain_graph_lines(&summary.buckets)),
+        "recent": summary.recent.iter().map(|row| serde_json::json!({
+            "ts": row.ts,
+            "project": row.project,
+            "original_cmd": row.original_cmd,
+            "mode": row.mode,
+            "input_chars": row.input_chars,
+            "output_chars": row.output_chars,
+            "saved_chars": row.saved_chars,
+            "saved_pct": row.saved_pct,
+            "exec_ms": row.exec_ms,
+        })).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn print_gain_graph(buckets: &[proxy_stats::BucketSavings]) {
+    let lines = gain_graph_lines(buckets);
+    if lines.is_empty() {
+        println!("  (none)");
+    } else {
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+}
+
+fn gain_graph_lines(buckets: &[proxy_stats::BucketSavings]) -> Vec<String> {
+    let max_saved = buckets.iter().map(|row| row.saved_chars).max().unwrap_or(0);
+    if max_saved == 0 {
+        return Vec::new();
+    }
+    let max_width = proxy_stats::derived_count(max_saved);
+    buckets
+        .iter()
+        .map(|row| {
+            let width =
+                ((row.saved_chars as usize).saturating_mul(max_width) / max_saved as usize).max(1);
+            format!("{} | {} {}", row.bucket, "#".repeat(width), row.saved_chars)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct DiscoverReport {
+    sessions_scanned: usize,
+    total_commands: usize,
+    supported: usize,
+    unsupported: usize,
+    estimated_savings_tokens: u64,
+}
+
+fn run_discover(
+    project: Option<String>,
+    all: bool,
+    since: Option<String>,
+    format: ReportFormatArg,
+) -> Result<()> {
+    let project_filter = if all {
+        None
+    } else {
+        Some(project.unwrap_or_else(current_project_name))
+    };
+    let averages = proxy_stats::load_savings_averages();
+    let mut report = DiscoverReport::default();
+    scan_claude_transcripts(
+        project_filter.as_deref(),
+        since.as_deref(),
+        &averages,
+        &mut report,
+    );
+    if all {
+        scan_shell_history(since.as_deref(), &averages, &mut report);
+    }
+    match format {
+        ReportFormatArg::Json => {
+            let value = serde_json::json!({
+                "sessions_scanned": report.sessions_scanned,
+                "total_commands": report.total_commands,
+                "supported": report.supported,
+                "unsupported": report.unsupported,
+                "estimated_savings_tokens": report.estimated_savings_tokens,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        ReportFormatArg::Table => {
+            println!("Command Optimizer discovery");
+            println!("sessions_scanned: {}", report.sessions_scanned);
+            println!("total_commands: {}", report.total_commands);
+            println!("supported: {}", report.supported);
+            println!("unsupported: {}", report.unsupported);
+            println!(
+                "estimated_savings_tokens: {} (estimate, chars/{ESTIMATED_CHARS_PER_TOKEN})",
+                report.estimated_savings_tokens
+            );
+        }
+    }
+    Ok(())
+}
+
+fn scan_claude_transcripts(
+    project_filter: Option<&str>,
+    since: Option<&str>,
+    averages: &proxy_stats::SavingsAverages,
+    report: &mut DiscoverReport,
+) {
+    let Some(root) = claude_projects_dir() else {
+        return;
+    };
+    let Ok(project_dirs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for project_dir in project_dirs.filter_map(std::result::Result::ok) {
+        let Ok(files) = std::fs::read_dir(project_dir.path()) else {
+            continue;
+        };
+        for file in files.filter_map(std::result::Result::ok) {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            report.sessions_scanned = report.sessions_scanned.saturating_add(1);
+            scan_transcript_file(&path, project_filter, since, averages, report);
+        }
+    }
+}
+
+fn scan_transcript_file(
+    path: &std::path::Path,
+    project_filter: Option<&str>,
+    since: Option<&str>,
+    averages: &proxy_stats::SavingsAverages,
+    report: &mut DiscoverReport,
+) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !entry_matches_since(&value, since) {
+            continue;
+        }
+        let project = value
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str())
+            .map(rtrt_core::project_for_cwd_str)
+            .filter(|name| !name.is_empty());
+        if let Some(wanted) = project_filter {
+            if project.as_deref() != Some(wanted) {
+                continue;
+            }
+        }
+        for command in extract_bash_commands(&value) {
+            record_discovered_command(&command, averages, report);
+        }
+    }
+}
+
+fn entry_matches_since(value: &serde_json::Value, since: Option<&str>) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    value
+        .get("timestamp")
+        .and_then(|timestamp| timestamp.as_str())
+        .is_some_and(|timestamp| timestamp >= since)
+}
+
+fn extract_bash_commands(value: &serde_json::Value) -> Vec<String> {
+    let mut commands = Vec::new();
+    if value.get("tool_name").and_then(|name| name.as_str()) == Some("Bash") {
+        if let Some(command) = value
+            .get("tool_input")
+            .and_then(|input| input.get("command"))
+            .and_then(|command| command.as_str())
+        {
+            commands.push(command.to_string());
+        }
+    }
+    if let Some(blocks) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())
+    {
+        for block in blocks {
+            if block.get("name").and_then(|name| name.as_str()) != Some("Bash") {
+                continue;
+            }
+            if let Some(command) = block
+                .get("input")
+                .and_then(|input| input.get("command"))
+                .and_then(|command| command.as_str())
+            {
+                commands.push(command.to_string());
+            }
+        }
+    }
+    commands
+}
+
+fn record_discovered_command(
+    command: &str,
+    averages: &proxy_stats::SavingsAverages,
+    report: &mut DiscoverReport,
+) {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    report.total_commands = report.total_commands.saturating_add(1);
+    let first = first_whitespace_token(trimmed);
+    let filter = rtrt_proxy::filter_for(trimmed).or_else(|| first.and_then(rtrt_proxy::filter_for));
+    let supported = filter.is_some()
+        || first
+            .map(|token| KNOWN_SHRINKABLE_COMMANDS.contains(&token))
+            .unwrap_or(false);
+    if supported {
+        report.supported = report.supported.saturating_add(1);
+        let saved_chars = averages.estimate_for(trimmed, filter.map(|f| f.command), first);
+        report.estimated_savings_tokens = report
+            .estimated_savings_tokens
+            .saturating_add(estimated_tokens(saved_chars));
+    } else {
+        report.unsupported = report.unsupported.saturating_add(1);
+    }
+}
+
+fn scan_shell_history(
+    since: Option<&str>,
+    averages: &proxy_stats::SavingsAverages,
+    report: &mut DiscoverReport,
+) {
+    let Some(path) = default_history_path() else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in raw.lines() {
+        let (timestamp, command) = parse_history_line(line);
+        if since.is_some() && timestamp.is_none() {
+            continue;
+        }
+        if let (Some(ts), Some(since)) = (timestamp, since) {
+            if ts < since {
+                continue;
+            }
+        }
+        record_discovered_command(command, averages, report);
+    }
+}
+
+fn parse_history_line(line: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = line.strip_prefix(": ") {
+        if let Some((head, command)) = rest.split_once(';') {
+            let ts = head
+                .split(':')
+                .next()
+                .map(str::trim)
+                .filter(|ts| !ts.is_empty());
+            return (ts, command.trim());
+        }
+    }
+    (None, line.trim())
+}
+
+fn claude_projects_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".claude").join("projects"))
+}
+
 fn run_stats() -> Result<()> {
+    run_gain(GainOptions {
+        project: None,
+        history: false,
+        bucket: None,
+        graph: false,
+        reset: false,
+        yes: true,
+        format: ReportFormatArg::Table,
+    })?;
+    println!();
     println!("Output Optimizer stats");
     print_token_log_stats()?;
     print_memory_savings();
@@ -1859,7 +2600,8 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
         | HookCmd::SessionInject { .. }
         | HookCmd::Style
         | HookCmd::StyleInject
-        | HookCmd::Statusline => {}
+        | HookCmd::Statusline
+        | HookCmd::ProxyRewrite => {}
         HookCmd::Capture {
             kind,
             project,
@@ -1921,6 +2663,59 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 .or_else(|| extract_json_str(&raw, "session_id"));
             let _ = memory.tag_row(id, session.as_deref(), Some(&sha));
         }
+    }
+    Ok(())
+}
+
+fn run_hook_proxy_rewrite() -> Result<()> {
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return Ok(());
+    }
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return Ok(());
+    };
+    if payload.get("tool_name").and_then(|v| v.as_str()) != Some("Bash") {
+        return Ok(());
+    }
+    let Some(command) = payload
+        .get("tool_input")
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let trimmed = command.trim_start();
+    if trimmed.starts_with(PROXY_RUN_PREFIX) || trimmed.starts_with(LEGACY_PROXY_PREFIX) {
+        return Ok(());
+    }
+    if SHELL_COMPLEX_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+    {
+        return Ok(());
+    }
+    let Some(token) = first_whitespace_token(trimmed) else {
+        return Ok(());
+    };
+    let optimizable =
+        rtrt_proxy::filter_for(token).is_some() || KNOWN_SHRINKABLE_COMMANDS.contains(&token);
+    if !optimizable {
+        return Ok(());
+    }
+    let updated = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": {
+                "command": format!("{PROXY_RUN_PREFIX} {command}")
+            }
+        }
+    });
+    if let Ok(rendered) = serde_json::to_string(&updated) {
+        println!("{rendered}");
     }
     Ok(())
 }

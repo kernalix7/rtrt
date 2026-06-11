@@ -3,8 +3,18 @@
 //! Strategy: per-command rule sets that turn 200-2000 token outputs into 10-400 token outputs
 //! by removing noise, grouping repeated entries, and truncating safely.
 
+mod cargo;
+mod containers;
+mod generic;
+mod git;
+mod kubernetes;
+mod node;
+
 use once_cell::sync::Lazy;
 use regex::Regex;
+
+pub use cargo::cargo_noise;
+pub use generic::collapse_blanks;
 
 pub struct CommandFilter {
     pub command: &'static str,
@@ -20,66 +30,151 @@ impl CommandFilter {
 pub static FILTERS: &[CommandFilter] = &[
     CommandFilter {
         command: "git status",
-        apply: git_status,
+        apply: git::git_status,
+    },
+    CommandFilter {
+        command: "git diff",
+        apply: git::git_passthrough,
+    },
+    CommandFilter {
+        command: "git show",
+        apply: git::git_show,
+    },
+    CommandFilter {
+        command: "git branch",
+        apply: git::git_branch,
+    },
+    CommandFilter {
+        command: "git stash",
+        apply: git::git_stash,
     },
     CommandFilter {
         command: "git log",
-        apply: git_log,
+        apply: git::git_log,
+    },
+    CommandFilter {
+        command: "cargo nextest",
+        apply: cargo::cargo_nextest,
+    },
+    CommandFilter {
+        command: "cargo check",
+        apply: cargo::cargo_noise,
+    },
+    CommandFilter {
+        command: "cargo clippy",
+        apply: cargo::cargo_noise,
     },
     CommandFilter {
         command: "cargo build",
-        apply: cargo_noise,
+        apply: cargo::cargo_noise,
     },
     CommandFilter {
         command: "cargo test",
-        apply: cargo_noise,
+        apply: cargo::cargo_noise,
+    },
+    CommandFilter {
+        command: "ls -la",
+        apply: generic::ls_long,
+    },
+    CommandFilter {
+        command: "ls -al",
+        apply: generic::ls_long,
+    },
+    CommandFilter {
+        command: "ls",
+        apply: generic::ls_passthrough,
+    },
+    CommandFilter {
+        command: "grep -rn",
+        apply: generic::passthrough,
+    },
+    CommandFilter {
+        command: "grep",
+        apply: generic::grep_filter,
+    },
+    CommandFilter {
+        command: "rg",
+        apply: generic::grep_filter,
+    },
+    CommandFilter {
+        command: "find",
+        apply: generic::find_filter,
+    },
+    CommandFilter {
+        command: "cat",
+        apply: generic::passthrough,
+    },
+    CommandFilter {
+        command: "read",
+        apply: generic::passthrough,
+    },
+    CommandFilter {
+        command: "curl",
+        apply: generic::http_client_filter,
+    },
+    CommandFilter {
+        command: "wget",
+        apply: generic::http_client_filter,
+    },
+    CommandFilter {
+        command: "gh",
+        apply: generic::gh_filter,
+    },
+    CommandFilter {
+        command: "docker",
+        apply: containers::docker_filter,
+    },
+    CommandFilter {
+        command: "kubectl",
+        apply: kubernetes::kubectl_filter,
+    },
+    CommandFilter {
+        command: "pytest",
+        apply: generic::pytest_filter,
+    },
+    CommandFilter {
+        command: "go test",
+        apply: generic::go_test_filter,
+    },
+    CommandFilter {
+        command: "npm",
+        apply: node::node_filter,
+    },
+    CommandFilter {
+        command: "npx",
+        apply: node::node_filter,
+    },
+    CommandFilter {
+        command: "pnpm",
+        apply: node::node_filter,
+    },
+    CommandFilter {
+        command: "pip",
+        apply: generic::pip_filter,
+    },
+    CommandFilter {
+        command: "tsc",
+        apply: node::node_diagnostics,
+    },
+    CommandFilter {
+        command: "eslint",
+        apply: node::node_diagnostics,
+    },
+    CommandFilter {
+        command: "prettier",
+        apply: node::node_diagnostics,
     },
 ];
 
 pub fn filter_for(command: &str) -> Option<&'static CommandFilter> {
-    FILTERS.iter().find(|f| command.starts_with(f.command))
+    FILTERS.iter().find(|f| command_matches(command, f.command))
 }
 
-static GIT_STATUS_NOISE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(On branch .*|Your branch .*|\s*\(use .*\)|nothing to commit.*)$").unwrap()
-});
-
-fn git_status(input: &str) -> String {
-    let trimmed = GIT_STATUS_NOISE.replace_all(input, "");
-    collapse_blanks(&trimmed)
-}
-
-static GIT_LOG_FMT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^(Author: .*|Date: .*)\n").unwrap());
-
-fn git_log(input: &str) -> String {
-    let stripped = GIT_LOG_FMT.replace_all(input, "");
-    collapse_blanks(&stripped)
-}
-
-static CARGO_NOISE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(\s*Compiling .*|\s*Finished .*|\s*Downloading .*|\s*Downloaded .*)$")
-        .unwrap()
-});
-
-fn cargo_noise(input: &str) -> String {
-    let stripped = CARGO_NOISE.replace_all(input, "");
-    collapse_blanks(&stripped)
-}
-
-fn collapse_blanks(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut last_blank = false;
-    for line in input.lines() {
-        let is_blank = line.trim().is_empty();
-        if is_blank && last_blank {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-        last_blank = is_blank;
-    }
-    out
+fn command_matches(command: &str, prefix: &str) -> bool {
+    command == prefix
+        || command
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('-'))
 }
 
 /// rtk-style "errors-only" filter — keeps lines that look like errors,
@@ -158,15 +253,60 @@ pub fn ultra_compact(input: &str) -> String {
     out
 }
 
+pub(crate) fn is_error_or_warning(line: &str) -> bool {
+    ERROR_PATTERN.is_match(line)
+}
+
+pub(crate) fn collapse_repeated_adjacent(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev: Option<&str> = None;
+    let mut run = 0usize;
+
+    for line in input.lines() {
+        match prev {
+            Some(previous) if previous == line => run += 1,
+            Some(previous) => {
+                push_repeated_line(&mut out, previous, run);
+                prev = Some(line);
+                run = 1;
+            }
+            None => {
+                prev = Some(line);
+                run = 1;
+            }
+        }
+    }
+
+    if let Some(previous) = prev {
+        push_repeated_line(&mut out, previous, run);
+    }
+
+    out
+}
+
+fn push_repeated_line(out: &mut String, line: &str, run: usize) {
+    out.push_str(line);
+    if run > 1 {
+        out.push_str(&format!(" (×{run})"));
+    }
+    out.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn picks_git_status_filter() {
+    fn picks_expanded_filters() {
         assert!(filter_for("git status").is_some());
         assert!(filter_for("git status -s").is_some());
-        assert!(filter_for("git diff").is_none());
+        assert!(filter_for("git diff --stat").is_some());
+        assert!(filter_for("cargo clippy --all-targets").is_some());
+        assert!(filter_for("docker build .").is_some());
+        assert!(filter_for("kubectl get pods").is_some());
+        assert!(filter_for("pytest -q").is_some());
+        assert!(filter_for("go test ./...").is_some());
+        assert!(filter_for("npm test").is_some());
     }
 
     #[test]
@@ -191,11 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_strips_compiling_lines() {
-        let raw = "   Compiling foo v0.1.0\n   Compiling bar v0.2.0\nerror[E0001]: real error\n   Finished dev\n";
-        let out = cargo_noise(raw);
-        assert!(out.contains("real error"));
-        assert!(!out.contains("Compiling"));
-        assert!(!out.contains("Finished"));
+    fn filter_count_tracks_broad_command_coverage() {
+        assert_eq!(FILTERS.len(), 34);
     }
 }

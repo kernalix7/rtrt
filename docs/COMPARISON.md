@@ -35,9 +35,9 @@ RTRT consolidates several existing token-reduction techniques into one Rust tool
 | | rtk | RTRT (`rtrt-proxy`) |
 |---|---|---|
 | Language | Rust | Rust |
-| Strategy | Per-command rule sets, auto-rewrite hook | Per-command rule sets, CLI subcommand |
-| Coverage | 100+ commands | 4 commands today (git status, git log, cargo build, cargo test); expanding |
-| Hook integration | Claude Code `PreToolUse` auto-rewrites `git status` → `rtk git status` | CLI invocation: `git status \| rtrt proxy "git status"`; hook helper planned |
+| Strategy | Per-command rule sets, auto-rewrite hook | Per-command rule sets, explicit CLI filtering, and transparent hook rewrite |
+| Coverage | 100+ commands | 34 commands across git, Rust, filesystem/search, HTTP, GitHub, containers/Kubernetes, Python, Go, Node/package-manager, TypeScript, and formatter/linter domains |
+| Hook integration | Claude Code `PreToolUse` auto-rewrites `git status` → `rtk git status` | Claude Code `PreToolUse` Bash matcher auto-rewrites shrinkable commands to `rtrt proxy-run ...`; skips pipes, `&&`, redirects, and already-wrapped commands. Other agents get the Command Optimizer through MCP. |
 | Token savings | 60–90% reduction | Targeted to match; benchmark harness planned |
 | Bundling | Standalone CLI | Part of `rtrt` CLI; also exposed as MCP tool |
 

@@ -61,7 +61,71 @@ git status | rtrt proxy "git status"
 cargo build 2>&1 | rtrt proxy "cargo build"
 ```
 
-Built-in filter rules cover `git status`, `git log`, `cargo build`, `cargo test`. When the command does not match a built-in, output passes through unchanged.
+### `rtrt proxy-run`
+
+Run a command and filter its captured output before it reaches the agent. `proxy-run` preserves the wrapped command's exit code.
+
+```bash
+rtrt proxy-run git status
+rtrt proxy-run cargo test -p rtrt-memory
+rtrt proxy-run --errors-only npm test
+rtrt proxy-run --ultra-compact docker ps
+rtrt proxy-run --raw cargo build
+```
+
+Flags:
+
+- `--raw` — print captured output unchanged while still recording the run.
+- `--errors-only` — keep likely error and warning lines when no command-specific filter matches.
+- `--ultra-compact` — strip ANSI escapes and collapse repeated lines when no command-specific filter matches.
+
+Built-in filter rules cover 34 command patterns across `git status/diff/show/branch/stash/log`, `cargo check/clippy/build/test/nextest`, `ls`, `grep`, `rg`, `find`, `cat`, `curl`, `wget`, `gh`, `docker`, `kubectl`, `pytest`, `go test`, `npm` / `npx` / `pnpm`, `pip`, `tsc`, `eslint`, and `prettier`. The filters are split into per-domain modules.
+
+`rtrt proxy` remains available for explicit pipe workflows. When the command does not match a built-in, output passes through unchanged.
+
+### `rtrt hook proxy-rewrite`
+
+Claude Code can run the Command Optimizer transparently through a `PreToolUse` Bash hook:
+
+```bash
+rtrt setup --agent claude --apply
+```
+
+The installed matcher targets Bash tool calls and rewrites shrinkable commands to `rtrt proxy-run ...`. It skips commands that already include pipes, `&&`, redirects, or an existing `rtrt proxy-run` wrapper. Cursor, Codex, Windsurf, and other MCP-aware agents receive the Command Optimizer tools through `rtrt-mcp` instead of the Claude-specific hook.
+
+The hook implementation can also be invoked directly by hook runners:
+
+```bash
+rtrt hook proxy-rewrite
+```
+
+### `rtrt gain`
+
+Show Command Optimizer savings from `~/.rtrt/proxy-stats.sqlite`. Token counts are labelled estimates using `chars / 4`.
+
+```bash
+rtrt gain
+rtrt gain --project rtrt
+rtrt gain --history
+rtrt gain --daily --graph
+rtrt gain --weekly
+rtrt gain --monthly
+rtrt gain --format json
+rtrt gain --reset --yes
+```
+
+The report includes totals, top commands, per-project totals, optional recent history, and daily / weekly / monthly bucketed views.
+
+### `rtrt discover`
+
+Scan Claude Code transcripts for commands that can be shrunk by the Command Optimizer and estimate the possible savings.
+
+```bash
+rtrt discover
+rtrt discover --project rtrt
+rtrt discover --all --since 2026-06-01
+rtrt discover --format json
+```
 
 ### `rtrt templates`
 

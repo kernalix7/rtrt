@@ -66,7 +66,71 @@ git status | rtrt proxy "git status"
 cargo build 2>&1 | rtrt proxy "cargo build"
 ```
 
-빌트인 필터는 `git status`, `git log`, `cargo build`, `cargo test`입니다. 매칭되지 않는 명령은 원문이 그대로 통과합니다.
+### `rtrt proxy-run`
+
+명령을 실행하고 캡처한 출력을 에이전트에 전달하기 전에 필터링합니다. `proxy-run`은 감싼 명령의 종료 코드를 보존합니다.
+
+```bash
+rtrt proxy-run git status
+rtrt proxy-run cargo test -p rtrt-memory
+rtrt proxy-run --errors-only npm test
+rtrt proxy-run --ultra-compact docker ps
+rtrt proxy-run --raw cargo build
+```
+
+플래그:
+
+- `--raw` — 실행 기록은 남기되 캡처한 출력을 그대로 출력.
+- `--errors-only` — 명령 전용 필터가 없을 때 오류/경고로 보이는 줄만 유지.
+- `--ultra-compact` — 명령 전용 필터가 없을 때 ANSI escape 제거 + 반복 줄 접기.
+
+빌트인 필터는 `git status/diff/show/branch/stash/log`, `cargo check/clippy/build/test/nextest`, `ls`, `grep`, `rg`, `find`, `cat`, `curl`, `wget`, `gh`, `docker`, `kubectl`, `pytest`, `go test`, `npm` / `npx` / `pnpm`, `pip`, `tsc`, `eslint`, `prettier` 전반의 34개 명령 패턴을 지원합니다. 필터는 도메인별 모듈로 나뉩니다.
+
+`rtrt proxy`는 명시적 파이프 워크플로용으로 계속 사용할 수 있습니다. 매칭되지 않는 명령은 원문이 그대로 통과합니다.
+
+### `rtrt hook proxy-rewrite`
+
+Claude Code는 `PreToolUse` Bash 훅으로 Command Optimizer를 투명하게 실행할 수 있습니다.
+
+```bash
+rtrt setup --agent claude --apply
+```
+
+설치된 matcher는 Bash 도구 호출을 대상으로 하며, 축소 가능한 명령을 `rtrt proxy-run ...`으로 재작성합니다. 파이프, `&&`, 리다이렉트, 이미 `rtrt proxy-run`으로 감싼 명령은 건너뜁니다. Cursor, Codex, Windsurf 등 MCP 인지 에이전트는 Claude 전용 훅 대신 `rtrt-mcp`를 통해 Command Optimizer 도구를 받습니다.
+
+훅 러너가 직접 호출할 수도 있습니다.
+
+```bash
+rtrt hook proxy-rewrite
+```
+
+### `rtrt gain`
+
+`~/.rtrt/proxy-stats.sqlite`에 저장된 Command Optimizer 절감량을 보여줍니다. 토큰 수는 `chars / 4` 기준의 라벨 달린 추정치입니다.
+
+```bash
+rtrt gain
+rtrt gain --project rtrt
+rtrt gain --history
+rtrt gain --daily --graph
+rtrt gain --weekly
+rtrt gain --monthly
+rtrt gain --format json
+rtrt gain --reset --yes
+```
+
+리포트에는 전체 합계, 상위 명령, 프로젝트별 합계, 선택적 최근 히스토리, 일간/주간/월간 버킷 뷰가 포함됩니다.
+
+### `rtrt discover`
+
+Claude Code transcript를 스캔해 Command Optimizer로 축소 가능한 명령을 찾고 예상 절감량을 계산합니다.
+
+```bash
+rtrt discover
+rtrt discover --project rtrt
+rtrt discover --all --since 2026-06-01
+rtrt discover --format json
+```
 
 ### `rtrt templates`
 

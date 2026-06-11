@@ -103,10 +103,11 @@ CLI surface (everything below is one process, no daemon required):
 rtrt compress -l ultra < verbose.md             # Caveman-style rule rewrite
 rtrt compress --llm --provider openai-compat \  # LLM rewrite (Ollama / any provider)
    --base-url http://127.0.0.1:11434/v1 --model llama3.2 < verbose.md
-rtrt proxy "git status" < git-status-output     # Filter command output
+rtrt proxy-run git status                       # Run + filter output, preserving exit code
+rtrt gain --daily --graph                       # Command Optimizer savings analytics
 rtrt signatures --lang rust < src/file.rs       # tree-sitter signature map
 rtrt repo-map crates/rtrt-core                  # signature map of a directory
-rtrt discover                                   # find proxy candidates in shell history
+rtrt discover                                   # find proxy candidates in Claude transcripts
 rtrt templates                                  # list built-in templates
 rtrt new rust-cli ./hello --var project_name=hello
 rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
@@ -142,9 +143,12 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 </td><td width="50%">
 
 **Command-output filtering**
-- `rtrt proxy "<cmd>"` collapses noisy CLI output before it reaches the LLM
-- Built-in filters for `git status`, `git log`, `cargo build`, `cargo test`
-- Drop-in proxy hook compatible with Claude Code `PreToolUse`
+- `rtrt proxy-run <command>` executes a command, filters captured output, and preserves the command's exit code
+- Flags: `--raw`, `--errors-only`, `--ultra-compact`; `rtrt proxy "<cmd>"` remains available for explicit pipe workflows
+- 34 built-in command filters across git, Rust, filesystem/search, HTTP, GitHub, containers/Kubernetes, Python, Go, Node/package-manager, TypeScript, and formatter/linter domains
+- Claude Code `PreToolUse` Bash hook rewrites shrinkable commands to `rtrt proxy-run ...`; it skips pipes, `&&`, redirects, and already-wrapped commands. `rtrt setup --agent claude --apply` installs the wiring; other agents receive Command Optimizer tools through MCP.
+- `rtrt gain` reports totals, top commands, per-project totals, history, daily/weekly/monthly views, ASCII graphs, `--reset`, and `--format json` from `~/.rtrt/proxy-stats.sqlite` (tokens are labelled `chars / 4` estimates)
+- `rtrt discover` scans Claude Code transcripts for shrinkable commands and estimates savings
 - [Details →](docs/FEATURES.md#command-output-filtering)
 
 </td></tr>

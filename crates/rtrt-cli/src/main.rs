@@ -1,4 +1,4 @@
-//! rtrt — top-level CLI for the Rust Token Reduction Toolkit.
+//! rtrt (Retort) — top-level CLI for the Rust toolkit that distills AI agent context.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -24,7 +24,7 @@ use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
 
 #[derive(Debug, Parser)]
-#[command(name = "rtrt", version, about = "Rust-based Token Reduction Toolkit", long_about = None)]
+#[command(name = "rtrt", version, about = "Retort — a Rust toolkit that distills AI agent context (memory, compression, proxy, routing)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,

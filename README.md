@@ -1,8 +1,8 @@
 <div align="center">
 
-# RTRT
+# rtrt
 
-### A Unix toolkit for AI agents — cut tokens, keep memory.
+### Retort — the Rust toolkit that distills agent context. Cut tokens, keep memory.
 
 <p>Single-purpose binaries: <code>compress</code>, <code>memory</code>,<br>
 <code>signatures</code>, plus a stdio / Streamable HTTP MCP server.<br>

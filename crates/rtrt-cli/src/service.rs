@@ -57,7 +57,7 @@ fn systemd_unit_body(binary: &str) -> String {
     // the same memory store as the CLI/MCP/hooks (`~/.rtrt/memory.sqlite`).
     format!(
         "[Unit]\n\
-         Description=RTRT dashboard (token-reduction toolkit web UI)\n\
+         Description=Retort (rtrt) dashboard — agent-context distillery web UI\n\
          After=network.target\n\
          \n\
          [Service]\n\

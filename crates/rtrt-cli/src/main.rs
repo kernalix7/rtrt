@@ -1,7 +1,7 @@
 //! rtrt (Retort) — top-level CLI for the Rust toolkit that distills AI agent context.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -84,6 +84,21 @@ enum Cmd {
     Proxy {
         /// Command being run (e.g. "git status").
         command: String,
+    },
+    /// Run a shell command through the Command Optimizer.
+    ProxyRun {
+        /// Print captured output unchanged.
+        #[arg(long)]
+        raw: bool,
+        /// Keep only likely error and warning lines when no command filter matches.
+        #[arg(long)]
+        errors_only: bool,
+        /// Strip ANSI escapes and collapse repeated lines when no command filter matches.
+        #[arg(long)]
+        ultra_compact: bool,
+        /// Command and arguments to run.
+        #[arg(num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// List available project templates (built-in + custom).
     Templates,
@@ -356,6 +371,9 @@ enum HookCmd {
     StyleInject,
     /// Print the Output Optimizer statusline badge.
     Statusline,
+    /// Rewrite simple Bash commands so Claude Code can run them through the
+    /// Command Optimizer.
+    ProxyRewrite,
     /// Recall memory relevant to the stdin prompt and print it to stdout as
     /// a context block. Wired onto `UserPromptSubmit` so Claude Code injects
     /// the project's relevant history into the model's context automatically
@@ -624,6 +642,15 @@ enum FormatArg {
     Json,
 }
 
+const PROXY_RUN_ERROR_CONTEXT_LINES: usize = 1;
+const EXEC_FAILURE_EXIT_CODE: i32 = 1;
+const STDERR_TO_STDOUT_REDIRECT: &str = " 2>&1";
+const PROXY_RUN_PREFIX: &str = "rtrt proxy-run";
+const LEGACY_PROXY_PREFIX: &str = concat!("r", "t", "k", " ");
+const SHELL_COMPLEX_MARKERS: &[&str] = &["|", "&&", "||", ";", "$(", "`", ">", "<", "\n"];
+const KNOWN_SHRINKABLE_COMMANDS: &[&str] =
+    &["git", "cargo", "docker", "kubectl", "npm", "yarn", "pnpm"];
+
 impl From<FormatArg> for rtrt_compress::OutputFormat {
     fn from(f: FormatArg) -> Self {
         match f {
@@ -640,6 +667,140 @@ fn parse_var(s: &str) -> std::result::Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got `{s}`"))?;
     Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+fn run_proxy_run(command: Vec<String>, raw: bool, errors_only: bool, ultra_compact: bool) -> ! {
+    let Some(command_text) = shell_command_text(&command) else {
+        eprintln!("rtrt proxy-run: command is empty");
+        std::process::exit(EXEC_FAILURE_EXIT_CODE);
+    };
+    let shell_text = command_text_for_capture(&command_text);
+    let output = shell_output(&shell_text);
+    let output = match output {
+        Ok(out) => out,
+        Err(err) => {
+            eprintln!("rtrt proxy-run: {err}");
+            std::process::exit(EXEC_FAILURE_EXIT_CODE);
+        }
+    };
+    let raw_output = String::from_utf8_lossy(&output.stdout).into_owned();
+    let filtered = if raw {
+        raw_output
+    } else {
+        // Prefer the most specific match on the full command (e.g. `ls -la`
+        // selects the long-format filter); fall back to the first token only
+        // when the full command has no registered filter.
+        let filter = rtrt_proxy::filter_for(&command_text)
+            .or_else(|| first_whitespace_token(&command_text).and_then(rtrt_proxy::filter_for));
+        if let Some(filter) = filter {
+            filter.apply(&raw_output)
+        } else if errors_only {
+            rtrt_proxy::errors_only(&raw_output, PROXY_RUN_ERROR_CONTEXT_LINES)
+        } else if ultra_compact {
+            rtrt_proxy::ultra_compact(&raw_output)
+        } else {
+            raw_output
+        }
+    };
+    if let Err(err) = std::io::stdout().write_all(filtered.as_bytes()) {
+        eprintln!("rtrt proxy-run: write stdout: {err}");
+        std::process::exit(EXEC_FAILURE_EXIT_CODE);
+    }
+    std::process::exit(output.status.code().unwrap_or(EXEC_FAILURE_EXIT_CODE));
+}
+
+fn shell_command_text(command: &[String]) -> Option<String> {
+    match command {
+        [] => None,
+        [single] => {
+            let trimmed = single.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        parts => Some(
+            parts
+                .iter()
+                .map(|part| shell_arg(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn shell_arg(arg: &str) -> String {
+    if arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^'))
+    {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_arg(arg: &str) -> String {
+    if arg.is_empty()
+        || arg.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '\'' | '"'
+                        | '$'
+                        | '`'
+                        | '\\'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '!'
+                        | '#'
+                )
+        })
+    {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    } else {
+        arg.to_string()
+    }
+}
+
+fn command_text_for_capture(command_text: &str) -> String {
+    let mut shell_text =
+        String::with_capacity(command_text.len() + STDERR_TO_STDOUT_REDIRECT.len());
+    shell_text.push_str(command_text);
+    shell_text.push_str(STDERR_TO_STDOUT_REDIRECT);
+    shell_text
+}
+
+fn shell_output(command_text: &str) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command_text)
+            .output()
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command_text)
+            .output()
+    }
+}
+
+fn first_whitespace_token(input: &str) -> Option<&str> {
+    input.split_whitespace().next()
 }
 
 #[tokio::main]
@@ -693,6 +854,12 @@ async fn main() -> Result<()> {
             };
             print!("{out}");
         }
+        Cmd::ProxyRun {
+            raw,
+            errors_only,
+            ultra_compact,
+            command,
+        } => run_proxy_run(command, raw, errors_only, ultra_compact),
         Cmd::Templates => {
             use rtrt_templates::TemplateCategory;
             fn rank(c: TemplateCategory) -> u8 {
@@ -946,6 +1113,7 @@ async fn main() -> Result<()> {
                     print_statusline();
                     Ok(())
                 }
+                HookCmd::ProxyRewrite => run_hook_proxy_rewrite(),
                 other => run_hook_capture(other),
             };
             if let Err(e) = result {
@@ -1859,7 +2027,8 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
         | HookCmd::SessionInject { .. }
         | HookCmd::Style
         | HookCmd::StyleInject
-        | HookCmd::Statusline => {}
+        | HookCmd::Statusline
+        | HookCmd::ProxyRewrite => {}
         HookCmd::Capture {
             kind,
             project,
@@ -1921,6 +2090,59 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 .or_else(|| extract_json_str(&raw, "session_id"));
             let _ = memory.tag_row(id, session.as_deref(), Some(&sha));
         }
+    }
+    Ok(())
+}
+
+fn run_hook_proxy_rewrite() -> Result<()> {
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return Ok(());
+    }
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return Ok(());
+    };
+    if payload.get("tool_name").and_then(|v| v.as_str()) != Some("Bash") {
+        return Ok(());
+    }
+    let Some(command) = payload
+        .get("tool_input")
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let trimmed = command.trim_start();
+    if trimmed.starts_with(PROXY_RUN_PREFIX) || trimmed.starts_with(LEGACY_PROXY_PREFIX) {
+        return Ok(());
+    }
+    if SHELL_COMPLEX_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+    {
+        return Ok(());
+    }
+    let Some(token) = first_whitespace_token(trimmed) else {
+        return Ok(());
+    };
+    let optimizable =
+        rtrt_proxy::filter_for(token).is_some() || KNOWN_SHRINKABLE_COMMANDS.contains(&token);
+    if !optimizable {
+        return Ok(());
+    }
+    let updated = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": {
+                "command": format!("{PROXY_RUN_PREFIX} {command}")
+            }
+        }
+    });
+    if let Ok(rendered) = serde_json::to_string(&updated) {
+        println!("{rendered}");
     }
     Ok(())
 }

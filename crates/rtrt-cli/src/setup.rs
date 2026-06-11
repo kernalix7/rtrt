@@ -64,6 +64,11 @@ const AIDER_RULES_REL: &str = "~/.aider/conventions.md";
 const TERSE_BLOCK_BEGIN: &str = "# BEGIN rtrt-output-optimizer";
 const TERSE_BLOCK_END: &str = "# END rtrt-output-optimizer";
 const DEFAULT_AGENT_STYLE_LEVEL: OutputStyleLevel = OutputStyleLevel::Full;
+const HOOK_COMMAND_TIMEOUT_SECONDS: u64 = 5;
+const PROXY_REWRITE_EVENT: &str = "PreToolUse";
+const PROXY_REWRITE_MATCHER: &str = "Bash";
+const PROXY_REWRITE_COMMAND: &str = "rtrt hook proxy-rewrite";
+const COMMAND_HOOK_TYPE: &str = "command";
 
 struct SkillSpec {
     name: &'static str,
@@ -420,6 +425,41 @@ fn dirs_home() -> Result<PathBuf> {
     bail!("cannot resolve home dir: neither HOME nor USERPROFILE is set")
 }
 
+fn proxy_rewrite_hook_entry() -> serde_json::Value {
+    serde_json::json!({
+        "matcher": PROXY_REWRITE_MATCHER,
+        "hooks": [
+            {
+                "type": COMMAND_HOOK_TYPE,
+                "command": PROXY_REWRITE_COMMAND,
+                "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
+            }
+        ]
+    })
+}
+
+fn push_hook_entry_if_missing(entries: &mut Vec<serde_json::Value>, candidate: serde_json::Value) {
+    if entries.iter().any(proxy_rewrite_entry_matches) {
+        return;
+    }
+    entries.push(candidate);
+}
+
+fn proxy_rewrite_entry_matches(entry: &serde_json::Value) -> bool {
+    if entry.get("matcher").and_then(|v| v.as_str()) != Some(PROXY_REWRITE_MATCHER) {
+        return false;
+    }
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("type").and_then(|v| v.as_str()) == Some(COMMAND_HOOK_TYPE)
+                    && hook.get("command").and_then(|v| v.as_str()) == Some(PROXY_REWRITE_COMMAND)
+            })
+        })
+}
+
 /// Merges rtrt hook entries into `~/.claude/settings.json`. Each
 /// entry shells out to `rtrt hook capture <kind>` so the binary itself
 /// owns the redact / dedup / save pipeline; no auxiliary shell scripts
@@ -432,6 +472,11 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         println!("[dry-run] command:     {rtrt_cmd} hook capture <kind>");
         println!("[dry-run] hook events: {} entries", HOOK_EVENTS.len());
         println!("[dry-run] style hooks: {rtrt_cmd} hook style, {rtrt_cmd} hook style-inject");
+        println!(
+            "[dry-run] Command Optimizer hook:\n{}",
+            serde_json::to_string_pretty(&proxy_rewrite_hook_entry())
+                .unwrap_or_else(|_| String::new())
+        );
         println!("[dry-run] statusLine:  {rtrt_cmd} statusline");
         println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
@@ -475,7 +520,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                 {
                     "type": "command",
                     "command": command,
-                    "timeout": 5
+                    "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
                 }
             ]
         });
@@ -503,7 +548,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                     {
                         "type": "command",
                         "command": format!("{rtrt_cmd} hook style"),
-                        "timeout": 5
+                        "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
                     }
                 ]
             }));
@@ -519,7 +564,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                     {
                         "type": "command",
                         "command": format!("{rtrt_cmd} hook recall"),
-                        "timeout": 5
+                        "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
                     }
                 ]
             }));
@@ -534,7 +579,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                     {
                         "type": "command",
                         "command": format!("{rtrt_cmd} hook style-inject"),
-                        "timeout": 5
+                        "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
                     }
                 ]
             }));
@@ -544,7 +589,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
                     {
                         "type": "command",
                         "command": format!("{rtrt_cmd} hook session-inject"),
-                        "timeout": 5
+                        "timeout": HOOK_COMMAND_TIMEOUT_SECONDS
                     }
                 ]
             }));
@@ -566,6 +611,22 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             }));
         }
     }
+    let arr = hooks_obj
+        .entry(PROXY_REWRITE_EVENT.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !arr.is_array() {
+        bail!(
+            "{}: hooks.{PROXY_REWRITE_EVENT} exists but is not an array",
+            settings.display()
+        );
+    }
+    let arr_mut = arr.as_array_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: hooks.{PROXY_REWRITE_EVENT} is not an array",
+            settings.display()
+        )
+    })?;
+    push_hook_entry_if_missing(arr_mut, proxy_rewrite_hook_entry());
     root_obj.insert(
         "statusLine".to_string(),
         serde_json::json!({

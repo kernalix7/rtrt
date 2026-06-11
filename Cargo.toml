@@ -25,7 +25,7 @@ authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
 license = "MIT"
 repository = "https://github.com/kernalix7/rtrt"
 homepage = "https://github.com/kernalix7/rtrt"
-description = "RTRT — Rust-based Token Reduction Toolkit for AI agents"
+description = "Retort — a Rust toolkit that distills AI agent context: memory, compression, command filtering, model routing"
 readme = "README.md"
 
 [workspace.dependencies]

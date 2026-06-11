@@ -16,7 +16,7 @@
 # released tarball, and bump the `version` line to match the tag.
 
 class Rtrt < Formula
-  desc "Rust-based Token Reduction Toolkit — rule-based compression, multi-provider gateway, MCP server"
+  desc "Retort — a Rust toolkit that distills AI agent context: compression, memory, multi-provider gateway, MCP server"
   homepage "https://github.com/kernalix7/rtrt"
   license "MIT"
 

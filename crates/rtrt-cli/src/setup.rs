@@ -69,6 +69,7 @@ const PROXY_REWRITE_EVENT: &str = "PreToolUse";
 const PROXY_REWRITE_MATCHER: &str = "Bash";
 const PROXY_REWRITE_COMMAND: &str = "rtrt hook proxy-rewrite";
 const COMMAND_HOOK_TYPE: &str = "command";
+const STATUSLINE_COMMAND_SUFFIX: &str = "statusline --rich";
 
 struct SkillSpec {
     name: &'static str,
@@ -253,6 +254,8 @@ pub fn run(plan: SetupPlan) -> Result<()> {
     }
     if plan.plugin {
         install_claude_plugin(plan.apply)?;
+    } else if matches!(plan.agent, AgentKind::Claude) {
+        install_claude_statusline(plan.apply)?;
     }
     match plan.agent {
         AgentKind::Aider => {
@@ -477,7 +480,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
             serde_json::to_string_pretty(&proxy_rewrite_hook_entry())
                 .unwrap_or_else(|_| String::new())
         );
-        println!("[dry-run] statusLine:  {rtrt_cmd} statusline");
+        println!("[dry-run] statusLine:  {rtrt_cmd} {STATUSLINE_COMMAND_SUFFIX}");
         println!("Re-run with --apply to merge the hook entries.");
         return Ok(());
     }
@@ -627,13 +630,7 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         )
     })?;
     push_hook_entry_if_missing(arr_mut, proxy_rewrite_hook_entry());
-    root_obj.insert(
-        "statusLine".to_string(),
-        serde_json::json!({
-            "type": "command",
-            "command": format!("{rtrt_cmd} statusline")
-        }),
-    );
+    root_obj.insert("statusLine".to_string(), claude_statusline_entry(&rtrt_cmd));
     let rendered = serde_json::to_string_pretty(&root)?;
     std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
     println!(
@@ -642,6 +639,51 @@ fn install_claude_plugin(apply: bool) -> Result<()> {
         settings.display()
     );
     Ok(())
+}
+
+fn install_claude_statusline(apply: bool) -> Result<()> {
+    let settings = expand_home("~/.claude/settings.json")?;
+    let rtrt_cmd = locate_rtrt_binary();
+    if !apply {
+        println!("[dry-run] target:      {}", settings.display());
+        println!("[dry-run] statusLine:  {rtrt_cmd} {STATUSLINE_COMMAND_SUFFIX}");
+        println!("Re-run with --apply to merge the statusLine entry.");
+        return Ok(());
+    }
+    if let Some(parent) = settings.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut root: serde_json::Value = if settings.exists() {
+        backup_if_needed(&settings)?;
+        let raw = std::fs::read_to_string(&settings)
+            .with_context(|| format!("read {}", settings.display()))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw)
+                .with_context(|| format!("{}: not valid JSON", settings.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        bail!("{}: root is not a JSON object", settings.display());
+    }
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: root is not a JSON object", settings.display()))?;
+    root_obj.insert("statusLine".to_string(), claude_statusline_entry(&rtrt_cmd));
+    let rendered = serde_json::to_string_pretty(&root)?;
+    std::fs::write(&settings, rendered).with_context(|| format!("write {}", settings.display()))?;
+    println!("merged rich statusLine into {}", settings.display());
+    Ok(())
+}
+
+fn claude_statusline_entry(rtrt_cmd: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "command",
+        "command": format!("{rtrt_cmd} {STATUSLINE_COMMAND_SUFFIX}")
+    })
 }
 
 fn claude_skill_path(skills_root: &Path, skill: &SkillSpec) -> PathBuf {
@@ -1086,4 +1128,20 @@ fn backup_if_needed(path: &Path) -> Result<()> {
         std::fs::copy(path, &bak).with_context(|| format!("backup {}", bak.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_statusline_entry_uses_rich_command() {
+        let entry = claude_statusline_entry("rtrt");
+
+        assert_eq!(entry.get("type").and_then(|v| v.as_str()), Some("command"));
+        assert_eq!(
+            entry.get("command").and_then(|v| v.as_str()),
+            Some("rtrt statusline --rich")
+        );
+    }
 }

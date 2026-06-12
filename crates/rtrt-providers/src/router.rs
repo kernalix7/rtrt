@@ -67,26 +67,105 @@ struct Candidate<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadroomScore {
-    Known { remaining: u64, limit: u64 },
+    Known {
+        tokens: Option<HeadroomDimension>,
+        requests: Option<HeadroomDimension>,
+    },
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadroomDimension {
+    remaining: u64,
+    limit: u64,
 }
 
 impl HeadroomScore {
     fn from_usage(target: &str, usage: &UsageSnapshot) -> Self {
         usage
             .headroom(target)
-            .map(|quota| Self::Known {
-                remaining: quota.remaining,
-                limit: quota.limit,
+            .map(|quota| {
+                let tokens = quota.token_limit_configured.then_some(HeadroomDimension {
+                    remaining: quota.remaining,
+                    limit: quota.limit,
+                });
+                let requests = quota
+                    .request_limit
+                    .zip(quota.request_remaining)
+                    .map(|(limit, remaining)| HeadroomDimension { remaining, limit });
+                Self::Known { tokens, requests }
             })
             .unwrap_or(Self::Unknown)
     }
 
     fn label(self) -> String {
         match self {
-            Self::Known { remaining, limit } => format!("{remaining}/{limit} tokens remaining"),
+            Self::Known { tokens, requests } => {
+                let mut parts = Vec::new();
+                if let Some(tokens) = tokens {
+                    parts.push(format!(
+                        "{}/{} tokens remaining ({:.1}%)",
+                        tokens.remaining,
+                        tokens.limit,
+                        tokens.remaining_percent()
+                    ));
+                }
+                if let Some(requests) = requests {
+                    parts.push(format!(
+                        "{}/{} requests remaining ({:.1}%)",
+                        requests.remaining,
+                        requests.limit,
+                        requests.remaining_percent()
+                    ));
+                }
+                if parts.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    parts.join(", ")
+                }
+            }
             Self::Unknown => "unknown".to_string(),
         }
+    }
+
+    fn limiting_dimension(self) -> Option<HeadroomDimension> {
+        match self {
+            Self::Known { tokens, requests } => match (tokens, requests) {
+                (Some(tokens), Some(requests)) => {
+                    Some(if tokens.remaining_fraction_cmp(requests).is_lt() {
+                        tokens
+                    } else {
+                        requests
+                    })
+                }
+                (Some(tokens), None) => Some(tokens),
+                (None, Some(requests)) => Some(requests),
+                (None, None) => None,
+            },
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl HeadroomDimension {
+    fn remaining_percent(self) -> f64 {
+        if self.limit == 0 {
+            return 0.0;
+        }
+        self.remaining as f64 / self.limit as f64 * 100.0
+    }
+
+    fn remaining_fraction_cmp(self, other: Self) -> Ordering {
+        if self.limit == 0 || other.limit == 0 {
+            return match (self.limit == 0, other.limit == 0) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => Ordering::Equal,
+            };
+        }
+        (self.remaining as u128 * other.limit as u128)
+            .cmp(&(other.remaining as u128 * self.limit as u128))
     }
 }
 
@@ -310,24 +389,15 @@ fn compare_quality_first(left: &Candidate<'_>, right: &Candidate<'_>) -> Orderin
 }
 
 fn compare_headroom_desc(left: HeadroomScore, right: HeadroomScore) -> Ordering {
-    match (left, right) {
-        (
-            HeadroomScore::Known {
-                remaining: left_remaining,
-                limit: left_limit,
-            },
-            HeadroomScore::Known {
-                remaining: right_remaining,
-                limit: right_limit,
-            },
-        ) => (right_remaining as u128 * left_limit as u128)
-            .cmp(&(left_remaining as u128 * right_limit as u128))
-            .then_with(|| right_remaining.cmp(&left_remaining)),
-        (HeadroomScore::Known { remaining: 0, .. }, HeadroomScore::Unknown) => Ordering::Greater,
-        (HeadroomScore::Unknown, HeadroomScore::Known { remaining: 0, .. }) => Ordering::Less,
-        (HeadroomScore::Known { .. }, HeadroomScore::Unknown) => Ordering::Less,
-        (HeadroomScore::Unknown, HeadroomScore::Known { .. }) => Ordering::Greater,
-        (HeadroomScore::Unknown, HeadroomScore::Unknown) => Ordering::Equal,
+    match (left.limiting_dimension(), right.limiting_dimension()) {
+        (Some(left), Some(right)) => right
+            .remaining_fraction_cmp(left)
+            .then_with(|| right.remaining.cmp(&left.remaining)),
+        (Some(HeadroomDimension { remaining: 0, .. }), None) => Ordering::Greater,
+        (None, Some(HeadroomDimension { remaining: 0, .. })) => Ordering::Less,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -493,6 +563,26 @@ mod tests {
         let decision = select_route(&req, &tools, &usage).unwrap();
 
         assert_eq!(decision.target, "openai");
+    }
+
+    #[test]
+    fn request_limit_headroom_tie_break() {
+        let tools = vec![
+            tool("anthropic", CostClass::ApiMetered, &[Capability::Code]),
+            tool("openai", CostClass::ApiMetered, &[Capability::Code]),
+        ];
+        let usage = UsageSnapshot::from_usage_limits_and_requests_for_tests(
+            [],
+            [],
+            [("anthropic", 99), ("openai", 10)],
+            [("anthropic", 100), ("openai", 100)],
+        );
+        let req = request(Capability::Code, Prefer::Cheapest);
+
+        let decision = select_route(&req, &tools, &usage).unwrap();
+
+        assert_eq!(decision.target, "openai");
+        assert!(decision.reason.contains("90/100 requests remaining"));
     }
 
     fn request(capability: Capability, prefer: Prefer) -> RouteRequest {

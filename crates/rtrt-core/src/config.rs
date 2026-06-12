@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +73,50 @@ pub struct ProjectEntry {
     /// global `[embeddings] enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings_enabled: Option<bool>,
+}
+
+/// Per-project customization overrides, layered on top of the global config.
+/// Stored at `<repo>/.rtrt/config.toml`. Only the customization layer is
+/// overridable here — the base kernel (hooks / MCP / statusLine command
+/// binding) stays global and immutable except via `rtrt setup`. Every field is
+/// optional: an absent field inherits the global default.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// Terse output level override: `off` | `lite` | `full` | `ultra`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_level: Option<String>,
+    /// Output-compression override (level + enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionConfig>,
+    /// Per-project agent enable/disable overlay (merged over global).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsConfig>,
+    /// Per-project provider enable/disable + active overlay (merged over global).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<ProvidersConfig>,
+    /// Opaque statusline override; shape owned by the dashboard schema so the
+    /// core does not need to know it. Stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline: Option<toml::Value>,
+}
+
+impl ProjectConfig {
+    pub fn from_toml_str(s: &str) -> Result<Self> {
+        toml::from_str(s).map_err(|e| Error::Config(format!("project config TOML: {e}")))
+    }
+
+    /// True when no override is set — used to delete the file and keep the repo
+    /// clean rather than leave an empty `.rtrt/config.toml`.
+    pub fn is_empty(&self) -> bool {
+        self.output_level.is_none()
+            && self.compression.is_none()
+            && self.agents.as_ref().is_none_or(|a| a.enabled.is_empty())
+            && self
+                .providers
+                .as_ref()
+                .is_none_or(|p| p.enabled.is_empty() && p.active.is_none())
+            && self.statusline.is_none()
+    }
 }
 
 /// Dense-embedding knobs. When `enabled = true`, the dashboard and CLI route
@@ -456,6 +503,70 @@ impl Config {
         } else {
             self.set_agent_enabled(name, enabled);
         }
+    }
+
+    /// Per-project override file: `<repo>/.rtrt/config.toml`.
+    pub fn project_config_path(repo: &Path) -> PathBuf {
+        repo.join(".rtrt").join("config.toml")
+    }
+
+    /// Load a project's override file if present (empty default otherwise).
+    pub fn load_project(repo: &Path) -> Result<ProjectConfig> {
+        match std::fs::read_to_string(Self::project_config_path(repo)) {
+            Ok(raw) => ProjectConfig::from_toml_str(&raw),
+            Err(_) => Ok(ProjectConfig::default()),
+        }
+    }
+
+    /// Load the global config and overlay a project's customization overrides.
+    /// The base kernel is never overlaid — only the customization layer
+    /// (output level, compression, enabled agents/providers).
+    pub fn load_effective(repo: Option<&Path>) -> Result<Self> {
+        let mut base = Self::load()?;
+        if let Some(repo) = repo {
+            let over = Self::load_project(repo)?;
+            base.apply_project_overrides(&over);
+        }
+        Ok(base)
+    }
+
+    /// Overlay one project's customization overrides onto this config.
+    pub fn apply_project_overrides(&mut self, over: &ProjectConfig) {
+        if let Some(compression) = &over.compression {
+            self.compression = compression.clone();
+        }
+        if let Some(agents) = &over.agents {
+            for (name, enabled) in &agents.enabled {
+                self.agents.enabled.insert(name.clone(), *enabled);
+            }
+        }
+        if let Some(providers) = &over.providers {
+            for (name, enabled) in &providers.enabled {
+                self.providers.enabled.insert(name.clone(), *enabled);
+            }
+            if providers.active.is_some() {
+                self.providers.active = providers.active.clone();
+            }
+        }
+    }
+
+    /// Write a project override file, creating `.rtrt/` as needed. When the
+    /// override is empty the file is removed so the repo stays clean.
+    pub fn save_project(repo: &Path, over: &ProjectConfig) -> Result<()> {
+        let path = Self::project_config_path(repo);
+        if over.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Config(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let body = toml::to_string_pretty(over)
+            .map_err(|e| Error::Config(format!("serialize project config: {e}")))?;
+        std::fs::write(&path, body)
+            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
+        Ok(())
     }
 }
 

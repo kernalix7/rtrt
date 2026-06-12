@@ -144,6 +144,11 @@ pub fn standardization_template() -> Result<Template> {
         .ok_or_else(|| Error::Config("built-in standardization template is unavailable".into()))
 }
 
+/// Return a project-contract template by name.
+pub fn contract_template(name: &str) -> Result<Template> {
+    crate::find(name).ok_or_else(|| Error::Config(format!("unknown template: {name}")))
+}
+
 /// Return managed section metadata from the rendered standardization contract.
 pub fn expected_sections(root: impl AsRef<Path>) -> Result<Vec<(u8, String)>> {
     let rendered = rendered_standardization(root)?;
@@ -166,8 +171,17 @@ pub fn expected_agents() -> Result<Vec<PathBuf>> {
 
 /// Inspect a project for standardization contract and managed agents.
 pub fn inspect_project(root: impl AsRef<Path>) -> Result<ProjectInspection> {
+    inspect_project_with_vars(root, "standardization", BTreeMap::new())
+}
+
+/// Inspect a project using a named project-contract template and explicit vars.
+pub fn inspect_project_with_vars(
+    root: impl AsRef<Path>,
+    template_name: &str,
+    vars: BTreeMap<String, String>,
+) -> Result<ProjectInspection> {
     let root = validate_project_path(root)?;
-    let rendered = rendered_standardization(&root)?;
+    let rendered = rendered_contract_template(&root, template_name, vars)?;
     let expected = parse_sections(&rendered.contract_content);
     let expected_by_number = expected
         .iter()
@@ -243,9 +257,18 @@ pub fn inspect_project(root: impl AsRef<Path>) -> Result<ProjectInspection> {
 
 /// Build a create-only and append-only repair plan for missing managed content.
 pub fn plan_repair(root: impl AsRef<Path>) -> Result<ProjectRepairPlan> {
+    plan_repair_with_vars(root, "standardization", BTreeMap::new())
+}
+
+/// Build a repair plan from a named project-contract template and explicit vars.
+pub fn plan_repair_with_vars(
+    root: impl AsRef<Path>,
+    template_name: &str,
+    vars: BTreeMap<String, String>,
+) -> Result<ProjectRepairPlan> {
     let root = validate_project_path(root)?;
-    let rendered = rendered_standardization(&root)?;
-    let inspection = inspect_project(&root)?;
+    let rendered = rendered_contract_template(&root, template_name, vars.clone())?;
+    let inspection = inspect_project_with_vars(&root, template_name, vars)?;
     let mut actions = Vec::new();
     let mut missing_sections = Vec::new();
     let contract_rel = PathBuf::from(CONTRACT_PATH);
@@ -306,6 +329,17 @@ pub fn plan_repair(root: impl AsRef<Path>) -> Result<ProjectRepairPlan> {
 /// Apply a project repair plan without overwriting existing managed content.
 pub fn apply_repair(plan: &ProjectRepairPlan) -> Result<()> {
     let contract_path = plan.root.join(CONTRACT_PATH);
+    // If CLAUDE.md is a symlink (e.g. a prior external tool pointing it at a
+    // private store), materialize the resolved content into a real file first.
+    // rtrt then manages a normal repo file instead of writing through the link.
+    if std::fs::symlink_metadata(&contract_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let resolved = std::fs::read_to_string(&contract_path).unwrap_or_default();
+        std::fs::remove_file(&contract_path).map_err(Error::Io)?;
+        std::fs::write(&contract_path, resolved).map_err(Error::Io)?;
+    }
     if !contract_path.exists() {
         std::fs::write(&contract_path, &plan.contract_content).map_err(Error::Io)?;
     } else if !plan.missing_sections.is_empty() {
@@ -348,7 +382,26 @@ struct RenderedStandardization {
 fn rendered_standardization(root: impl AsRef<Path>) -> Result<RenderedStandardization> {
     let template = standardization_template()?;
     let vars = default_vars(root.as_ref());
-    let plan = render::plan(&template, root.as_ref(), vars)?;
+    rendered_contract(&template, root, vars)
+}
+
+fn rendered_contract_template(
+    root: impl AsRef<Path>,
+    template_name: &str,
+    vars: BTreeMap<String, String>,
+) -> Result<RenderedStandardization> {
+    let template = contract_template(template_name)?;
+    let mut merged = default_vars(root.as_ref());
+    merged.extend(vars);
+    rendered_contract(&template, root, merged)
+}
+
+fn rendered_contract(
+    template: &Template,
+    root: impl AsRef<Path>,
+    vars: BTreeMap<String, String>,
+) -> Result<RenderedStandardization> {
+    let plan = render::plan(template, root.as_ref(), vars)?;
     let mut contract_content = None;
     let mut agent_files = Vec::new();
     for file in plan.files {
@@ -477,16 +530,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expected_sections_cover_full_contract_range() {
+    fn expected_sections_are_the_project_contract_set() {
+        // The standardization contract carries only the project-contract
+        // sections. 8/9/10 (and 12/13) are reserved for rtrt-owned tooling and
+        // are deliberately absent, so "11. Agent Teams" keeps its number with a
+        // gap — the template must never invade rtrt's feature territory.
         let root = std::env::temp_dir();
         let sections = expected_sections(&root).expect("sections");
         let numbers = sections
             .iter()
             .map(|(number, _title)| *number)
             .collect::<Vec<_>>();
-        assert_eq!(
-            numbers,
-            (FIRST_MANAGED_SECTION..=LAST_MANAGED_SECTION).collect::<Vec<_>>()
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5, 6, 7, 11]);
+        assert!(
+            numbers
+                .iter()
+                .all(|n| (FIRST_MANAGED_SECTION..=LAST_MANAGED_SECTION).contains(n))
         );
     }
 

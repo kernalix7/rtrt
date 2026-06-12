@@ -172,6 +172,24 @@ enum Cmd {
         #[arg(long = "var", value_parser = parse_var)]
         vars: Vec<(String, String)>,
     },
+    /// Migrate an existing repository to the rtrt project standard.
+    Migrate {
+        /// Template name (defaults to standardization).
+        #[arg(long)]
+        template: Option<String>,
+        /// Existing repository directory (defaults to cwd).
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+        /// Print the full migration plan without writing. This is the default.
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Apply the migration. Without this, migration is dry-run.
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Variables: `--var key=value` (repeatable). Overrides detected values.
+        #[arg(long = "var", value_parser = parse_var)]
+        vars: Vec<(String, String)>,
+    },
     /// Inspect and repair the project-standardization lifecycle contract.
     Project {
         #[command(subcommand)]
@@ -484,6 +502,23 @@ enum ProjectCmd {
         /// Preview the repair actions without writing files.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// One-command project integration (alias for `rtrt migrate`): render the
+    /// project contract, activate rtrt features to canonical settings, and
+    /// audit whole-project consistency. Dry-run by default; `--apply` to write.
+    Refresh {
+        /// Repository root to refresh. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+        /// Template name (defaults to standardization).
+        #[arg(long)]
+        template: Option<String>,
+        /// Apply the changes. Without this, refresh is dry-run.
+        #[arg(long)]
+        apply: bool,
+        /// Variables: `--var key=value` (repeatable). Overrides detected values.
+        #[arg(long = "var", value_parser = parse_var)]
+        vars: Vec<(String, String)>,
     },
 }
 
@@ -909,6 +944,16 @@ const DETECT_COST_WIDTH: usize = 17;
 const DETECT_ENABLED_WIDTH: usize = 7;
 const DETECT_DETAIL_WIDTH: usize = 72;
 const DEFAULT_INIT_TEMPLATE: &str = "standardization";
+// Ignore only the per-project runtime artifacts under `.rtrt/`; keep
+// `.rtrt/config.toml` (the per-project customization override) tracked so it
+// travels with the repo for the whole team.
+const MIGRATE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".rtrt/*.sqlite",
+    ".rtrt/*.sqlite-journal",
+    ".rtrt/*.sqlite-wal",
+    ".rtrt/*.sqlite-shm",
+    ".claude/settings.local.json",
+];
 const PROJECT_STATE_WIDTH: usize = 4;
 const PROJECT_CHECK_WIDTH: usize = 18;
 const PROJECT_STATUSLINE_NEEDLE: &str = "statusline --rich";
@@ -1014,6 +1059,379 @@ fn run_init(
     Ok(())
 }
 
+/// rtrt-owned settings keys whose canonical value lives in the global
+/// `~/.claude/settings.json`. A project-level `<repo>/.claude/settings.json`
+/// that re-declares them shadows the global rtrt config (Claude Code merges
+/// project over user), so migrate strips them and lets the project defer to
+/// the global base kernel.
+const RTRT_OWNED_SETTINGS_KEYS: &[&str] = &["statusLine"];
+
+/// Detect rtrt-owned keys declared at the project level that would shadow the
+/// global base kernel. Returns the settings path and the offending key list.
+fn project_settings_override(root: &Path) -> Option<(PathBuf, Vec<String>)> {
+    let path = root.join(".claude").join("settings.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let obj = value.as_object()?;
+    let keys: Vec<String> = RTRT_OWNED_SETTINGS_KEYS
+        .iter()
+        .filter(|k| obj.contains_key(**k))
+        .map(|k| (*k).to_string())
+        .collect();
+    if keys.is_empty() {
+        None
+    } else {
+        Some((path, keys))
+    }
+}
+
+/// Remove the rtrt-owned keys from a project-level settings file so the project
+/// defers to the global base kernel. Writes a `.bak` of the original first.
+fn strip_project_settings_override(path: &Path, keys: &[String]) -> Result<()> {
+    let raw = std::fs::read_to_string(path).context("read project settings.json")?;
+    std::fs::write(path.with_extension("json.bak"), &raw).context("back up project settings")?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).context("parse project settings.json")?;
+    if let Some(obj) = value.as_object_mut() {
+        for key in keys {
+            obj.remove(key);
+        }
+    }
+    let pretty = serde_json::to_string_pretty(&value).context("serialize project settings")?;
+    std::fs::write(path, format!("{pretty}\n")).context("write project settings.json")?;
+    Ok(())
+}
+
+fn run_migrate(
+    template: Option<String>,
+    path: Option<PathBuf>,
+    apply: bool,
+    vars: Vec<(String, String)>,
+) -> Result<()> {
+    let root = resolve_project_path(path)?;
+    let template_name = template.unwrap_or_else(|| DEFAULT_INIT_TEMPLATE.to_string());
+    let tmpl = rtrt_templates::project::contract_template(&template_name)
+        .with_context(|| format!("unknown template: {template_name}"))?;
+    validate_contract_template_paths(&tmpl)?;
+
+    let mut map = detect_init_vars(&root);
+    for (key, value) in vars {
+        map.insert(key, value);
+    }
+
+    let dry_run = !apply;
+    let repair =
+        rtrt_templates::project::plan_repair_with_vars(&root, &template_name, map.clone())?;
+    let gitignore_missing = missing_gitignore_entries(&root)?;
+    let mcp_binary = resolve_mcp_binary();
+
+    println!("rtrt migrate template {} -> {}", tmpl.name, root.display());
+    println!(
+        "mode: {}",
+        if dry_run {
+            "dry-run (pass --apply to write)"
+        } else {
+            "apply"
+        }
+    );
+    print_migrate_vars(&map);
+    println!("3-step plan:");
+    println!("1. Render template project contract");
+    println!("2. Activate rtrt features to canonical settings");
+    println!("3. Audit whole-project consistency");
+
+    println!("\nSTEP 1 — Render template project contract");
+    if repair.actions.is_empty() {
+        println!("skip: CLAUDE.md managed sections and project agents already present");
+    } else {
+        for action in &repair.actions {
+            print_repair_action(action, dry_run);
+        }
+    }
+    if apply {
+        backup_repo_files_for_repair(&repair)?;
+        rtrt_templates::project::apply_repair(&repair)?;
+    }
+
+    println!("\nSTEP 2 — Activate rtrt features to canonical settings");
+    setup::run(SetupPlan {
+        agent: AgentKind::Claude,
+        apply,
+        memory_path: None,
+        binary: mcp_binary,
+        plugin: true,
+    })?;
+
+    println!("\nSTEP 3 — Audit whole-project consistency");
+    match project_settings_override(&root) {
+        Some((settings_path, keys)) if dry_run => {
+            println!(
+                "[dry-run] would remove project-level {} override in {} (defer to global rtrt)",
+                keys.join(", "),
+                settings_path.display()
+            );
+        }
+        Some((settings_path, keys)) => {
+            strip_project_settings_override(&settings_path, &keys)?;
+            println!(
+                "removed project-level {} override in {} -> defers to global rtrt (backup .bak)",
+                keys.join(", "),
+                settings_path.display()
+            );
+        }
+        None => {
+            println!("project settings: no rtrt-owned key shadows the global base kernel");
+        }
+    }
+    if gitignore_missing.is_empty() {
+        println!("gitignore: rtrt/agent local state entries present");
+    } else if dry_run {
+        println!(
+            "[dry-run] would update .gitignore with {}",
+            gitignore_missing.join(", ")
+        );
+    } else {
+        apply_gitignore_entries(&root, &gitignore_missing)?;
+        println!("updated .gitignore with {}", gitignore_missing.join(", "));
+    }
+
+    if dry_run {
+        println!(
+            "[dry-run] would ensure memory DB is reachable at {}",
+            default_memory_path().display()
+        );
+    } else {
+        let path = default_memory_path();
+        let _store = MemoryStore::open(&path).map_err(anyhow::Error::from)?;
+        println!("memory DB reachable at {}", path.display());
+    }
+
+    let inspection =
+        rtrt_templates::project::inspect_project_with_vars(&root, &template_name, map)?;
+    print_migrate_audit(&inspection, &root);
+    Ok(())
+}
+
+fn print_migrate_vars(vars: &BTreeMap<String, String>) {
+    let keys = ["project_name", "language", "framework"];
+    let rendered = keys
+        .into_iter()
+        .filter_map(|key| vars.get(key).map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>();
+    if !rendered.is_empty() {
+        println!("vars: {}", rendered.join(", "));
+    }
+}
+
+fn validate_contract_template_paths(template: &rtrt_templates::Template) -> Result<()> {
+    validate_init_template_paths(template)?;
+    for file in &template.files {
+        let path = Path::new(&file.path);
+        if path != Path::new(rtrt_templates::project::CONTRACT_PATH)
+            && !path.starts_with(rtrt_templates::project::AGENTS_DIR)
+        {
+            bail!(
+                "template {} contains non-contract file: {}",
+                template.name,
+                file.path
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mcp_binary() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("rtrt-mcp")))
+        .unwrap_or_else(|| PathBuf::from("rtrt-mcp"))
+}
+
+fn backup_repo_files_for_repair(plan: &rtrt_templates::project::ProjectRepairPlan) -> Result<()> {
+    let edits_contract = plan.actions.iter().any(|action| {
+        matches!(
+            action,
+            rtrt_templates::project::RepairAction::AppendSection { .. }
+        )
+    });
+    if edits_contract {
+        backup_repo_file(&plan.root.join(rtrt_templates::project::CONTRACT_PATH))?;
+    }
+    Ok(())
+}
+
+fn missing_gitignore_entries(root: &Path) -> Result<Vec<String>> {
+    let path = root.join(".gitignore");
+    let raw = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let present = raw
+        .lines()
+        .map(|line| line.trim())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(MIGRATE_GITIGNORE_ENTRIES
+        .iter()
+        .filter(|entry| !present.contains(**entry))
+        .map(|entry| (*entry).to_string())
+        .collect())
+}
+
+fn apply_gitignore_entries(root: &Path, missing: &[String]) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let path = root.join(".gitignore");
+    if path.exists() {
+        backup_repo_file(&path)?;
+    }
+    let mut out = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("# rtrt local state\n");
+    for entry in missing {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn backup_repo_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let bak = path.with_extension({
+        let mut ext = path
+            .extension()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !ext.is_empty() {
+            ext.push('.');
+        }
+        ext.push_str("bak");
+        ext
+    });
+    if !bak.exists() {
+        std::fs::copy(path, &bak)
+            .with_context(|| format!("backup {} to {}", path.display(), bak.display()))?;
+    }
+    Ok(())
+}
+
+fn print_migrate_audit(inspection: &rtrt_templates::project::ProjectInspection, root: &Path) {
+    let settings = claude_settings_status(true);
+    let memory = memory_reachable_status(true);
+    let gitignore_missing = missing_gitignore_entries(root).unwrap_or_default();
+    println!("audit:");
+    print_project_rows(&[
+        sections_check_row(inspection, true),
+        agents_check_row(inspection, true),
+        stale_sections_check_row(inspection),
+        duplicate_sections_check_row(inspection),
+        ProjectCheckRow {
+            state: settings.hooks_state,
+            check: "hooks",
+            detail: settings.hooks_detail.clone(),
+        },
+        ProjectCheckRow {
+            state: settings.statusline_state,
+            check: "statusLine",
+            detail: settings.statusline_detail.clone(),
+        },
+        ProjectCheckRow {
+            state: memory.0,
+            check: "memory DB",
+            detail: memory.1.clone(),
+        },
+        ProjectCheckRow {
+            state: if gitignore_missing.is_empty() {
+                ProjectCheckState::Pass
+            } else {
+                ProjectCheckState::Warn
+            },
+            check: ".gitignore",
+            detail: if gitignore_missing.is_empty() {
+                "rtrt/agent local state ignored".into()
+            } else {
+                format!("missing {}", gitignore_missing.join(", "))
+            },
+        },
+    ]);
+    let blockers = migrate_manual_followups(inspection, &settings, &memory, &gitignore_missing);
+    if blockers.is_empty() {
+        println!("manual follow-up: none");
+    } else {
+        println!("manual follow-up:");
+        for blocker in blockers {
+            println!("- {blocker}");
+        }
+    }
+}
+
+fn migrate_manual_followups(
+    inspection: &rtrt_templates::project::ProjectInspection,
+    settings: &ClaudeSettingsStatus,
+    memory: &(ProjectCheckState, String),
+    gitignore_missing: &[String],
+) -> Vec<String> {
+    let mut items = Vec::new();
+    let stale = inspection
+        .sections
+        .iter()
+        .filter(|section| section.stale)
+        .map(|section| section.number.to_string())
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        items.push(format!(
+            "CLAUDE.md section titles differ from template: {}",
+            stale.join(",")
+        ));
+    }
+    if !inspection.duplicate_sections.is_empty() {
+        items.push(format!(
+            "duplicate managed CLAUDE.md sections require manual merge: {}",
+            inspection
+                .duplicate_sections
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if settings.hooks_state != ProjectCheckState::Pass {
+        items.push(format!(
+            "rtrt hooks not confirmed: {}",
+            settings.hooks_detail
+        ));
+    }
+    if settings.statusline_state != ProjectCheckState::Pass {
+        items.push(format!(
+            "rtrt statusLine not confirmed: {}",
+            settings.statusline_detail
+        ));
+    }
+    if memory.0 != ProjectCheckState::Pass {
+        items.push(format!("memory DB not reachable: {}", memory.1));
+    }
+    if !gitignore_missing.is_empty() {
+        items.push(format!(
+            ".gitignore still missing {}",
+            gitignore_missing.join(", ")
+        ));
+    }
+    items
+}
+
 fn run_project(cmd: ProjectCmd) -> Result<()> {
     match cmd {
         ProjectCmd::Status { path } => {
@@ -1028,6 +1446,12 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             let root = resolve_project_path(path)?;
             run_project_repair(&root, dry_run)
         }
+        ProjectCmd::Refresh {
+            path,
+            template,
+            apply,
+            vars,
+        } => run_migrate(template, path, apply, vars),
     }
 }
 
@@ -2076,6 +2500,13 @@ async fn main() -> Result<()> {
             dry_run,
             vars,
         } => run_init(template, path, force, dry_run, vars)?,
+        Cmd::Migrate {
+            template,
+            path,
+            dry_run: _,
+            apply,
+            vars,
+        } => run_migrate(template, path, apply, vars)?,
         Cmd::Project { cmd } => run_project(cmd)?,
         Cmd::Call {
             target,
@@ -4055,22 +4486,51 @@ fn run_hook_proxy_rewrite() -> Result<()> {
     Ok(())
 }
 
+/// Walk up from `start` to the enclosing repo root (first ancestor with a
+/// `.git` or `.rtrt`), falling back to `start` itself. Used to resolve which
+/// `<repo>/.rtrt/config.toml` a hook or status line should read its
+/// per-project customization from.
+fn repo_root_from_cwd(start: &std::path::Path) -> PathBuf {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() || dir.join(".rtrt").exists() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent();
+    }
+    start.to_path_buf()
+}
+
+/// Resolve the repo root from a hook payload's `cwd` field, if present.
+fn hook_repo_root(raw: &str) -> Option<PathBuf> {
+    extract_json_str(raw, "cwd").map(|cwd| repo_root_from_cwd(std::path::Path::new(&cwd)))
+}
+
 fn run_hook_style() -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
+    let repo = hook_repo_root(&raw);
     let prompt = extract_json_str(&raw, "prompt").unwrap_or_else(|| raw.trim().to_string());
     if let Some(level) = parse_output_switch(&prompt) {
-        rtrt_core::write_output_style_level(level)?;
-        let reason = if level.is_active() {
-            format!("Output Optimizer terse mode set to {}.", level.as_str())
+        rtrt_core::write_output_style_level_for(repo.as_deref(), level)?;
+        let scope = if repo.is_some() {
+            "this project"
         } else {
-            "Output Optimizer terse mode off.".to_string()
+            "globally"
+        };
+        let reason = if level.is_active() {
+            format!(
+                "Output Optimizer terse mode set to {} for {scope}.",
+                level.as_str()
+            )
+        } else {
+            format!("Output Optimizer terse mode off for {scope}.")
         };
         print_hook_block(&reason);
         return Ok(());
     }
 
-    let level = rtrt_core::read_output_style_level();
+    let level = rtrt_core::read_output_style_level_for(repo.as_deref());
     if level.is_active() {
         print_hook_context(&style_reinforcement(level));
     }
@@ -4078,7 +4538,10 @@ fn run_hook_style() -> Result<()> {
 }
 
 fn run_hook_style_inject() -> Result<()> {
-    let level = rtrt_core::read_output_style_level();
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok();
+    let repo = hook_repo_root(&raw);
+    let level = rtrt_core::read_output_style_level_for(repo.as_deref());
     if level.is_active() {
         println!("{}", style_session_block(level));
     }
@@ -4164,24 +4627,29 @@ struct TranscriptTokenUsage {
 }
 
 const DEFAULT_STATUSLINE_ENABLED_SEGMENTS: &[&str] = &[
-    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "codex", "savings",
+    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "agents",
+    "savings",
 ];
 const LEGACY_STATUSLINE_ENABLED_SEGMENTS: &[&str] = &[
     "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
 ];
 const DEFAULT_STATUSLINE_FORMAT: &str =
-    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}";
+    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model} {agents}";
 const LEGACY_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
+const PRE_AGENTS_STATUSLINE_FORMAT: &str =
+    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}";
 const DEFAULT_STATUSLINE_LINE2_FORMAT: &str = "{usage}";
-const DEFAULT_STATUSLINE_LINE3_FORMAT: &str = "{codex} | {savings}";
-const DEFAULT_CODEX_CHECK_TIMEOUT_MS: u64 = 200;
+const DEFAULT_STATUSLINE_LINE3_FORMAT: &str = "{savings}";
+const PRE_AGENTS_STATUSLINE_LINE3_FORMAT: &str = "{agents} | {savings}";
+const LEGACY_STATUSLINE_LINE3_FORMAT: &str = "{codex} | {savings}";
+const DEFAULT_CODEX_CHECK_TIMEOUT_MS: u64 = 600;
 /// Claude Code refreshes this often, so transcript parsing only considers the
 /// newest JSONL records. This keeps statusline latency bounded on long sessions.
 const TRANSCRIPT_RECENT_LINE_CAP: usize = 4_000;
 /// Best-effort "today" session count uses a rolling day when local calendar
 /// data is unavailable from std alone.
 const SESSION_TODAY_WINDOW_SECS: u64 = 24 * 60 * 60;
-const CODEX_STATUS_CACHE_TTL_SECS: u64 = 30;
+const AGENTS_STATUS_CACHE_TTL_SECS: u64 = 30;
 
 /// Context-window lookup used by `rtrt statusline`.
 ///
@@ -4277,15 +4745,14 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     if let Some(model) = input.model_display_name.or(input.model_id) {
         segments.insert("model".to_string(), model);
     }
-    let opt_level = rtrt_core::read_output_style_level();
+    let opt_level = rtrt_core::read_output_style_level_for(Some(&repo_root_from_cwd(&cwd)));
     segments.insert("opt".to_string(), format!("opt:{}", opt_level.as_str()));
     if let Some(usage) = usage_window_segment() {
         segments.insert("usage".to_string(), usage);
     }
-    segments.insert(
-        "codex".to_string(),
-        format!("🤖cdx:{}", codex_status(cfg.codex_check_timeout_ms)),
-    );
+    let agents = agents_segment(cfg.codex_check_timeout_ms, statusline_agents_width_budget());
+    segments.insert("agents".to_string(), agents.clone());
+    segments.insert("codex".to_string(), agents);
     segments.insert(
         "savings".to_string(),
         format!("💯Σ:{}", total_savings_tokens()),
@@ -4382,8 +4849,13 @@ fn upgrade_legacy_statusline_config(mut cfg: StatuslineConfig) -> StatuslineConf
             .map(|item| (*item).to_string())
             .collect();
     }
-    if cfg.format == LEGACY_STATUSLINE_FORMAT {
+    if cfg.format == LEGACY_STATUSLINE_FORMAT || cfg.format == PRE_AGENTS_STATUSLINE_FORMAT {
         cfg.format = DEFAULT_STATUSLINE_FORMAT.to_string();
+    }
+    if cfg.line3_format == LEGACY_STATUSLINE_LINE3_FORMAT
+        || cfg.line3_format == PRE_AGENTS_STATUSLINE_LINE3_FORMAT
+    {
+        cfg.line3_format = DEFAULT_STATUSLINE_LINE3_FORMAT.to_string();
     }
     cfg
 }
@@ -4816,40 +5288,186 @@ fn usage_window_segment() -> Option<String> {
     Some("5h:n/a ↻n/a | wk:n/a ↻n/a".to_string())
 }
 
-fn codex_status(timeout_ms: u64) -> &'static str {
-    if let Some(cached) = read_codex_status_cache() {
+fn agents_segment(timeout_ms: u64, width_budget: usize) -> String {
+    if let Some(cached) = read_agents_status_cache() {
         return cached;
     }
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
-    let status = if run_command_timeout("codex", &["--version"], timeout).is_some() {
-        "ready"
-    } else {
-        "unavailable"
-    };
-    write_codex_status_cache(status);
-    status
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("rtrt-statusline-agents".into())
+        .spawn(move || {
+            let names = detected_statusline_agents();
+            let _ = tx.send(names);
+        });
+    let names = rx
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| cheap_statusline_agents());
+    let segment = format_agents_segment(&names, width_budget);
+    write_agents_status_cache(&segment);
+    segment
 }
 
-fn read_codex_status_cache() -> Option<&'static str> {
-    let path = codex_status_cache_path();
+fn detected_statusline_agents() -> Vec<String> {
+    let mut names = Vec::new();
+    for tool in rtrt_core::detect_tools().into_iter().filter(|tool| {
+        matches!(tool.kind, ToolKind::CodingAgent | ToolKind::LocalRuntime)
+            && tool.installed
+            && tool.enabled
+    }) {
+        let name = short_tool_name(&tool.name).to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn short_tool_name(name: &str) -> &str {
+    match name {
+        "gh-copilot" => "gh",
+        "llama" => "llama",
+        other => other,
+    }
+}
+
+fn cheap_statusline_agents() -> Vec<String> {
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("claude", &["claude"]),
+        ("codex", &["codex"]),
+        ("opencode", &["opencode"]),
+        ("ollama", &["ollama"]),
+        ("aider", &["aider"]),
+        ("cursor", &["cursor-agent", "cursor"]),
+        ("gemini", &["gemini"]),
+        ("gh", &["gh"]),
+    ];
+    CANDIDATES
+        .iter()
+        .filter(|(_name, bins)| bins.iter().any(|bin| binary_on_path(bin)))
+        .map(|(name, _bins)| (*name).to_string())
+        .collect()
+}
+
+fn binary_on_path(binary: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        executable_path_candidates(&dir, binary)
+            .into_iter()
+            .any(|path| is_executable_path(&path))
+    })
+}
+
+fn executable_path_candidates(dir: &Path, binary: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let path = Path::new(binary);
+        if path.extension().is_some() {
+            return vec![dir.join(binary)];
+        }
+        let exts = std::env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]);
+        exts.into_iter()
+            .map(|ext| dir.join(format!("{binary}{ext}")))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(binary)]
+    }
+}
+
+fn is_executable_path(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & UNIX_EXECUTE_BITS != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn statusline_agents_width_budget() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|columns| (columns / 3).clamp(18, 56))
+        .unwrap_or(40)
+}
+
+fn format_agents_segment(names: &[String], width_budget: usize) -> String {
+    if names.is_empty() {
+        return "🤖 none".to_string();
+    }
+    let prefix = "🤖 ";
+    let mut shown = Vec::new();
+    let mut used = prefix.chars().count();
+    for (idx, name) in names.iter().enumerate() {
+        let sep = usize::from(idx > 0);
+        let candidate_len = name.chars().count() + sep;
+        let remaining = names.len().saturating_sub(shown.len() + 1);
+        let suffix_len = if remaining > 0 {
+            format!("+{remaining}").chars().count() + 1
+        } else {
+            0
+        };
+        if !shown.is_empty() && used + candidate_len + suffix_len > width_budget {
+            break;
+        }
+        if shown.is_empty() && used + candidate_len + suffix_len > width_budget {
+            shown.push(name.clone());
+            break;
+        }
+        shown.push(name.clone());
+        used += candidate_len;
+    }
+    let hidden = names.len().saturating_sub(shown.len());
+    let mut out = format!("{prefix}{}", shown.join("·"));
+    if hidden > 0 {
+        out.push('·');
+        out.push_str(&format!("+{hidden}"));
+    }
+    out
+}
+
+fn read_agents_status_cache() -> Option<String> {
+    let path = agents_status_cache_path();
     let meta = std::fs::metadata(&path).ok()?;
     let modified = meta.modified().ok()?;
-    if modified.elapsed().ok()?.as_secs() > CODEX_STATUS_CACHE_TTL_SECS {
+    if modified.elapsed().ok()?.as_secs() > AGENTS_STATUS_CACHE_TTL_SECS {
         return None;
     }
-    match std::fs::read_to_string(path).ok()?.trim() {
-        "ready" => Some("ready"),
-        "unavailable" => Some("unavailable"),
-        _ => None,
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed == "🤖 none" {
+        return None;
     }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn write_codex_status_cache(status: &str) {
-    let _ = std::fs::write(codex_status_cache_path(), status);
+fn write_agents_status_cache(status: &str) {
+    let _ = std::fs::write(agents_status_cache_path(), status);
 }
 
-fn codex_status_cache_path() -> PathBuf {
-    std::env::temp_dir().join("rtrt-codex-status.cache")
+fn agents_status_cache_path() -> PathBuf {
+    std::env::temp_dir().join("rtrt-agents-status.cache")
 }
 
 fn total_savings_tokens() -> u64 {
@@ -5475,13 +6093,13 @@ mod statusline_tests {
             ("opt", "opt:full"),
             ("model", "Opus 4.8"),
             ("usage", "5h:8% ↻52m | wk:28% ↻5d17h"),
-            ("codex", "🤖cdx:ready"),
+            ("agents", "🤖 claude·codex"),
             ("savings", "💯Σ:0"),
         ]);
 
         assert_eq!(
             render_statusline(&cfg, &segments),
-            "00G_rtrt [feature/orchestrator-polish] wip:1 sess:1 ctx:74%(740k/1.0M) cache:97% opt:full Opus 4.8\n5h:8% ↻52m | wk:28% ↻5d17h\n🤖cdx:ready | 💯Σ:0"
+            "00G_rtrt [feature/orchestrator-polish] wip:1 sess:1 ctx:74%(740k/1.0M) cache:97% opt:full Opus 4.8 🤖 claude·codex\n5h:8% ↻52m | wk:28% ↻5d17h\n💯Σ:0"
         );
     }
 
@@ -5502,7 +6120,7 @@ mod statusline_tests {
             ("ctx", "ctx:74%(740k/1.0M)"),
             ("opt", "opt:full"),
             ("model", "Opus 4.8"),
-            ("codex", "🤖cdx:ready"),
+            ("agents", "🤖 claude·codex"),
             ("savings", "💯Σ:0"),
         ]);
         let rendered = render_statusline(&cfg, &segments);
@@ -5515,7 +6133,7 @@ mod statusline_tests {
         assert!(!rendered.contains("sess:1"));
         assert!(!rendered.contains("ctx:"));
         assert!(!rendered.contains("opt:"));
-        assert!(!rendered.contains("🤖cdx"));
+        assert!(!rendered.contains("🤖 claude"));
     }
 
     #[test]
@@ -5539,5 +6157,15 @@ mod statusline_tests {
         assert_eq!(cfg.line2_format, "{model}");
         assert_eq!(cfg.line3_format, "");
         assert_eq!(cfg.codex_check_timeout_ms, 75);
+    }
+
+    #[test]
+    fn formats_agents_segment_with_width_budget() {
+        let names = ["claude", "codex", "opencode", "ollama"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(format_agents_segment(&names, 24), "🤖 claude·codex·+2");
     }
 }

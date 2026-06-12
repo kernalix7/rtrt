@@ -49,7 +49,10 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, post},
 };
-use rtrt_core::{OutputStyleLevel, read_output_style_level, write_output_style_level};
+use rtrt_core::{
+    OutputStyleLevel, read_output_style_level, read_output_style_level_for,
+    write_output_style_level_for,
+};
 use rtrt_memory::{
     ClusterIndex, ConceptHierarchy, DetailedRecord, Embedder, MemoryStore, PayloadFilter,
     Summariser,
@@ -837,15 +840,60 @@ struct SetLevelRequest {
     level: String,
 }
 
-async fn get_optimizer_level() -> impl IntoResponse {
-    let level = read_output_style_level();
+/// Optional `?project=<name>` selector shared by the project-aware endpoints.
+/// An absent value, the empty string, or the literal `"global"` all resolve to
+/// the global scope (back-compat with existing UI calls).
+#[derive(Debug, Deserialize, Default)]
+struct ProjectQuery {
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// Resolve a `?project=` selector to an on-disk repo path.
+///
+/// Returns `Some(path)` only when the named project exists in the global config
+/// and carries an absolute `.path` (a real, on-disk repo). `None` (the global
+/// scope) is returned for the `"global"`/empty sentinel, an unknown project, or
+/// a memory-only project with no path.
+fn resolve_project_repo(project: Option<&str>) -> Option<PathBuf> {
+    let name = project.map(str::trim).filter(|n| !n.is_empty())?;
+    if name.eq_ignore_ascii_case("global") {
+        return None;
+    }
+    let cfg = rtrt_core::Config::load().ok()?;
+    let path = cfg.project(name)?.path.as_deref()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+async fn get_optimizer_level(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let level = read_output_style_level_for(repo.as_deref());
+    let scope = if repo.is_some() { "project" } else { "global" };
+    // `inherited` is true when a project scope falls back to the global value
+    // because the project has no `output_level` of its own.
+    let inherited = match &repo {
+        Some(path) => rtrt_core::Config::load_project(path)
+            .map(|p| p.output_level.is_none())
+            .unwrap_or(true),
+        None => false,
+    };
     Json(serde_json::json!({
         "level": level.as_str(),
         "active": level.is_active(),
+        "scope": scope,
+        "inherited": inherited,
     }))
 }
 
-async fn post_optimizer_level(Json(body): Json<SetLevelRequest>) -> impl IntoResponse {
+async fn post_optimizer_level(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    Json(body): Json<SetLevelRequest>,
+) -> impl IntoResponse {
     let Some(level) = OutputStyleLevel::parse(&body.level) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -853,16 +901,21 @@ async fn post_optimizer_level(Json(body): Json<SetLevelRequest>) -> impl IntoRes
         )
             .into_response();
     };
-    if let Err(e) = write_output_style_level(level) {
+    let repo = resolve_project_repo(q.project.as_deref());
+    if let Err(e) = write_output_style_level_for(repo.as_deref(), level) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
     }
+    let scope = if repo.is_some() { "project" } else { "global" };
+    // After a project write the value is the project's own, so never inherited.
     Json(serde_json::json!({
         "level": level.as_str(),
         "active": level.is_active(),
+        "scope": scope,
+        "inherited": false,
     }))
     .into_response()
 }
@@ -4503,7 +4556,34 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Jso
     )
 }
 
-async fn get_statusline_config() -> DashboardJsonResult<StatuslineConfig> {
+async fn get_statusline_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> DashboardJsonResult<StatuslineConfig> {
+    // Per-project override wins: when the project carries its own `statusline`
+    // value in `<repo>/.rtrt/config.toml`, return it; otherwise fall through to
+    // the global statusline config (inherit).
+    if let Some(repo) = resolve_project_repo(q.project.as_deref()) {
+        let project = rtrt_core::Config::load_project(&repo).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load project config {}: {e}", repo.display()),
+            )
+        })?;
+        if let Some(statusline) = project.statusline {
+            let cfg = statusline.try_into().map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "parse [statusline] in {}/.rtrt/config.toml: {e}",
+                        repo.display()
+                    ),
+                )
+            })?;
+            return Ok(Json(upgrade_legacy_statusline_config(cfg)));
+        }
+        // no project override — inherit the global config below
+    }
+
     let path = statusline_config_path()?;
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
@@ -4542,9 +4622,36 @@ fn upgrade_legacy_statusline_config(mut cfg: StatuslineConfig) -> StatuslineConf
 }
 
 async fn post_statusline_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     Json(req): Json<StatuslineConfig>,
 ) -> DashboardJsonResult<StatuslineOk> {
     validate_statusline_segments(&req.enabled_segments)?;
+
+    // Per-project override: persist the serialized statusline config into the
+    // project's `<repo>/.rtrt/config.toml` (`ProjectConfig.statusline`) instead
+    // of the global file.
+    if let Some(repo) = resolve_project_repo(q.project.as_deref()) {
+        let mut project = rtrt_core::Config::load_project(&repo).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load project config {}: {e}", repo.display()),
+            )
+        })?;
+        let statusline_value = toml::Value::try_from(&req).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialize statusline config: {e}"),
+            )
+        })?;
+        project.statusline = Some(statusline_value);
+        rtrt_core::Config::save_project(&repo, &project).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write project config {}: {e}", repo.display()),
+            )
+        })?;
+        return Ok(Json(StatuslineOk { ok: true }));
+    }
 
     let path = statusline_config_path()?;
     let mut root = match tokio::fs::read_to_string(&path).await {

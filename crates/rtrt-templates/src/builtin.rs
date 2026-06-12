@@ -468,24 +468,6 @@ cargo fmt --check
 - **Commit convention**: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`.
 - **Merge strategy**: squash merge reviewed changes to the main branch.
 
-## 8. AI Config Storage
-
-- Keep repository-specific agent instructions in this file.
-- Keep global agent configuration outside the repository.
-- Do not commit local secrets, credentials, or machine-specific paths.
-
-## 9. Work Status
-
-- Track active work in the issue, task, or pull request that owns the change.
-- Keep status updates factual: completed work, current blocker, next step.
-- Call out verification gaps before handoff.
-
-## 10. Memory
-
-- Preserve durable project decisions in committed docs.
-- Keep transient notes in local memory or scratch files outside version control.
-- Promote repeated context into this contract when it becomes a standing rule.
-
 ## 11. Agent Teams
 
 | Agent | Owned Paths | Domain | Model |

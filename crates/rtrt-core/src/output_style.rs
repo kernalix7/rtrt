@@ -67,6 +67,39 @@ pub fn write_output_style_level(level: OutputStyleLevel) -> std::io::Result<()> 
     std::fs::write(path, format!("{}\n", level.as_str()))
 }
 
+/// Read the effective terse level for a repo: a project override in
+/// `<repo>/.rtrt/config.toml` wins, else the global `~/.rtrt/output-style`.
+/// `repo = None` reads the global level only.
+pub fn read_output_style_level_for(repo: Option<&std::path::Path>) -> OutputStyleLevel {
+    if let Some(repo) = repo
+        && let Ok(over) = crate::Config::load_project(repo)
+        && let Some(level) = over
+            .output_level
+            .as_deref()
+            .and_then(OutputStyleLevel::parse)
+    {
+        return level;
+    }
+    read_output_style_level()
+}
+
+/// Write the terse level for a repo as a project override
+/// (`<repo>/.rtrt/config.toml`). `repo = None` writes the global level.
+pub fn write_output_style_level_for(
+    repo: Option<&std::path::Path>,
+    level: OutputStyleLevel,
+) -> std::io::Result<()> {
+    match repo {
+        Some(repo) => {
+            let mut over = crate::Config::load_project(repo).unwrap_or_default();
+            over.output_level = Some(level.as_str().to_string());
+            crate::Config::save_project(repo, &over)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }
+        None => write_output_style_level(level),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

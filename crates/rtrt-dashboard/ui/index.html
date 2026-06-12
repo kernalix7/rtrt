@@ -252,34 +252,45 @@
   .statusline-preview { background: #0b0e14; color: #e6edf3; border-color: #232a35; min-height: 108px; margin: 0; }
   .placeholder-hint { color: var(--muted); font-size: 0.78em; }
 
-  /* Template category cards */
-  .tpl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
-  .tpl-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem 1.1rem; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
-  .tpl-card:hover { transform: translateY(-3px); border-color: var(--accent); box-shadow: var(--shadow); }
-  .tpl-card .num { color: var(--muted); font-size: 0.78em; letter-spacing: 0.08em; }
-  .tpl-card h3 { margin: 0.4rem 0 0.4rem; font-size: 1.35rem; }
-  .tpl-card .desc { color: var(--muted); font-size: 0.92em; line-height: 1.5; }
-  .tpl-card .go { color: var(--accent); font-weight: 600; margin-top: 0.85rem; display: inline-block; }
-  .tpl-editor-layout { display: grid; grid-template-columns: minmax(260px, 0.75fr) minmax(0, 1.25fr); gap: 1rem; align-items: start; }
+  /* Template workspace */
+  .tpl-editor-layout { display: grid; grid-template-columns: minmax(300px, 0.8fr) minmax(0, 1.2fr); gap: 1rem; align-items: start; }
   .tpl-toolbar { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; }
-  .tpl-list { display: grid; gap: 0.55rem; }
-  .tpl-list-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; display: grid; gap: 0.5rem; }
+  .tpl-list { display: grid; gap: 1rem; }
+  .tpl-kind-group { display: grid; gap: 0.6rem; }
+  .tpl-kind-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; color: var(--muted); font-size: 0.78em; letter-spacing: 0.06em; text-transform: uppercase; }
+  .tpl-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; }
+  .tpl-list-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.85rem; display: grid; gap: 0.6rem; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
   .tpl-list-item.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+  .tpl-list-item:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow); }
   .tpl-list-item .tpl-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.5rem; }
   .tpl-list-item .tpl-name { font-weight: 700; overflow-wrap: anywhere; }
-  .tpl-list-item .tpl-desc { color: var(--muted); font-size: 0.88em; overflow-wrap: anywhere; }
+  .tpl-list-item .tpl-desc { color: var(--muted); font-size: 0.88em; overflow-wrap: anywhere; min-height: 2.6em; }
   .tpl-list-item .tpl-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; }
-  .tpl-list-item .tpl-actions button { padding: 0.3rem 0.5rem; font-size: 0.82em; }
+  .tpl-list-item .tpl-actions button { padding: 0.3rem 0.55rem; font-size: 0.82em; }
+  .tpl-spinner { width: 22px; height: 22px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: tpl-spin .75s linear infinite; margin: 1rem auto; }
+  @keyframes tpl-spin { to { transform: rotate(360deg); } }
   .tpl-form-grid { display: grid; gap: 0.75rem; }
+  .tpl-description { min-height: 78px; resize: vertical; }
   .tpl-table input { width: 100%; }
+  .tpl-table input.invalid { border-color: var(--err); box-shadow: 0 0 0 3px rgba(220,38,38,.12); }
   .tpl-var-required { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
-  .tpl-file-list { display: grid; gap: 0.65rem; }
-  .tpl-file-item { border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem; background: var(--bg); display: grid; gap: 0.55rem; }
-  .tpl-file-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.45rem; align-items: center; }
-  .tpl-file-item textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
+  .tpl-var-status { color: var(--muted); font-size: 0.82em; min-height: 1.2em; margin-top: 0.35rem; }
+  .tpl-file-shell { display: grid; grid-template-columns: minmax(190px, 0.55fr) minmax(0, 1fr); gap: 0.75rem; align-items: stretch; }
+  .tpl-file-tree { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.45rem; min-height: 260px; max-height: 460px; overflow: auto; }
+  .tpl-tree-row { width: 100%; display: flex; align-items: center; gap: 0.35rem; border: 0; border-radius: 6px; background: transparent; color: var(--fg); padding: 0.32rem 0.4rem; text-align: left; cursor: pointer; }
+  .tpl-tree-row:hover, .tpl-tree-row.active { background: var(--accent-soft); color: var(--accent); }
+  .tpl-tree-row.dir { color: var(--muted); cursor: default; font-weight: 600; }
+  .tpl-tree-row.dir:hover { background: transparent; color: var(--muted); }
+  .tpl-tree-row .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tpl-file-editor { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; display: grid; gap: 0.6rem; min-width: 0; }
+  .tpl-file-editor textarea { min-height: 290px; resize: vertical; font-family: ui-monospace, monospace; }
+  .tpl-file-head { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; }
+  .tpl-file-head code { overflow-wrap: anywhere; }
+  .tpl-placeholder-strip { color: var(--muted); font-size: 0.82em; display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
   .tpl-editor-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
   .tpl-editor-actions .spacer { flex: 1; }
   .tpl-slug-status { min-height: 1.2em; color: var(--muted); font-size: 0.82em; }
+  .tpl-preview-tree { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem; max-height: 50vh; overflow: auto; }
 
   /* Modal */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
@@ -468,7 +479,7 @@
     .route-form-grid, .route-alt-row { grid-template-columns: 1fr; }
     .statusline-grid { grid-template-columns: 1fr; }
     .tpl-editor-layout { grid-template-columns: 1fr; }
-    .tpl-file-head { grid-template-columns: 1fr; }
+    .tpl-file-shell { grid-template-columns: 1fr; }
     .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
@@ -1241,7 +1252,7 @@
               <button id="tpl-refresh-btn" class="ghost" type="button">Refresh</button>
             </div>
           </div>
-          <div id="tpl-list" class="tpl-list"></div>
+          <div id="tpl-list" class="tpl-list" aria-live="polite"></div>
         </div>
         <div id="tpl-editor-card" class="card" hidden>
           <div class="head">
@@ -1251,39 +1262,50 @@
           <form id="tpl-editor-form" class="tpl-form-grid">
             <input id="tpl-original-name" type="hidden">
             <div class="row">
-              <label class="field-label"><span>Name</span><input id="tpl-name" placeholder="custom-rust-cli" required pattern="[A-Za-z0-9_-]+"></label>
+              <label class="field-label"><span>Name</span><input id="tpl-name" placeholder="custom-rust-cli" required pattern="[a-z0-9_-]+"></label>
               <label class="field-label"><span>Category</span><select id="tpl-category">
-                <option value="rust-cli">rust-cli</option>
-                <option value="rust-lib">rust-lib</option>
-                <option value="rust-axum">rust-axum</option>
-                <option value="node-typescript">node-typescript</option>
-                <option value="python-uv">python-uv</option>
-                <option value="go-cli">go-cli</option>
+                <option value="scaffold">scaffold</option>
+                <option value="doc-chain">doc-chain</option>
                 <option value="custom">custom</option>
               </select></label>
             </div>
             <div id="tpl-slug-status" class="tpl-slug-status"></div>
-            <label class="field-label"><span>Description</span><input id="tpl-description" placeholder="Short scaffold description"></label>
+            <label class="field-label"><span>Description</span><textarea id="tpl-description" class="tpl-description" placeholder="Short template description"></textarea></label>
             <div>
               <div class="head"><h2>Variables</h2><button id="tpl-var-add" class="ghost" type="button">Add variable</button></div>
               <table class="tpl-table">
                 <thead><tr><th>Name</th><th>Default</th><th>Description</th><th>Required</th><th></th></tr></thead>
                 <tbody id="tpl-vars-body"></tbody>
               </table>
+              <div id="tpl-var-status" class="tpl-var-status"></div>
             </div>
             <div>
               <div class="head"><h2>Files</h2><button id="tpl-file-add" class="ghost" type="button">Add file</button></div>
-              <div class="hint">Use {{variable_name}} placeholders — substituted at scaffold time</div>
-              <div id="tpl-files-list" class="tpl-file-list"></div>
+              <div class="tpl-file-shell">
+                <div id="tpl-file-tree" class="tpl-file-tree"></div>
+                <div id="tpl-file-editor" class="tpl-file-editor"></div>
+              </div>
             </div>
             <div class="tpl-editor-actions">
               <button id="tpl-save" class="primary" type="submit">Save</button>
               <button id="tpl-preview" class="ghost" type="button">Preview</button>
+              <button id="tpl-duplicate-current" class="ghost" type="button" hidden>Duplicate as custom</button>
               <span class="spacer"></span>
               <button id="tpl-delete" class="danger-confirm" type="button" hidden>Delete</button>
+              <button id="tpl-cancel" class="ghost" type="button">Cancel</button>
             </div>
           </form>
           <div id="tpl-editor-result" class="out-meta"></div>
+        </div>
+      </div>
+      <div id="tpl-preview-modal" class="modal-backdrop" hidden>
+        <div class="modal detail-modal">
+          <div class="modal-head">
+            <h2 id="tpl-preview-title">Preview</h2>
+            <button id="tpl-preview-close" class="ghost" aria-label="Close">✕</button>
+          </div>
+          <div id="tpl-preview-meta" class="out-meta"></div>
+          <div id="tpl-preview-tree" class="tpl-preview-tree"></div>
         </div>
       </div>
       <div id="scaffold-modal" class="modal-backdrop" hidden>
@@ -2599,14 +2621,16 @@ function pushActivity(msg) {
   document.getElementById('activity-feed').textContent = FEED[0] || '';
 }
 
-// Toast notifications — auto-dismiss after 3.5 s.
+const TOAST_DISMISS_MS = 4000;
+
+// Toast notifications — auto-dismiss after 4 s.
 function showToast(msg, kind /* 'ok' | 'err' */ = 'ok') {
   const container = document.getElementById('toast-container');
   const div = document.createElement('div');
   div.className = `toast ${kind}`;
   div.textContent = msg;
   container.appendChild(div);
-  setTimeout(() => { if (div.parentNode) div.parentNode.removeChild(div); }, 3500);
+  setTimeout(() => { if (div.parentNode) div.parentNode.removeChild(div); }, TOAST_DISMISS_MS);
 }
 
 // Utility
@@ -5391,18 +5415,23 @@ const CAT_LABEL = {
   development: '개발',
   design: '디자인',
   planning: '설계',
-  'rust-cli': 'rust-cli',
-  'rust-lib': 'rust-lib',
-  'rust-axum': 'rust-axum',
-  'node-typescript': 'node-typescript',
-  'python-uv': 'python-uv',
-  'go-cli': 'go-cli',
+  scaffold: 'scaffold',
+  'doc-chain': 'doc-chain',
   custom: 'custom',
 };
 let LOADED_TEMPLATES = [];
-let TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '' };
-const TEMPLATE_SLUG_RE = /^[A-Za-z0-9_-]+$/;
-const TEMPLATE_CATEGORY_VALUES = ['rust-cli', 'rust-lib', 'rust-axum', 'node-typescript', 'python-uv', 'go-cli', 'custom'];
+let TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '', sourceName: '' };
+let TEMPLATE_WORKING = null;
+let TEMPLATE_SELECTED_FILE_PATH = '';
+const TEMPLATE_SLUG_RE = /^[a-z0-9_-]+$/;
+const TEMPLATE_VARIABLE_RE = /^\S+$/;
+const TEMPLATE_CATEGORY_VALUES = ['scaffold', 'doc-chain', 'custom'];
+const TEMPLATE_DOC_CHAIN_NAMES = new Set(['dev', 'design', 'plan']);
+const TEMPLATE_PROJECT_KEYWORDS = ['scaffold', 'project', 'standardization', 'contract', 'starter', 'cli', 'lib', 'service', 'rust', 'node', 'python', 'go', 'typescript'];
+const TEMPLATE_TREE_INDENT_REM = 1.05;
+const TEMPLATE_TREE_BASE_PAD_REM = 0.35;
+const TEMPLATE_DUPLICATE_START_INDEX = 2;
+const TEMPLATE_PREVIEW_TARGET_PREFIX = './preview-';
 
 function templateSource(t) {
   return String(t.source || '').toLowerCase().replace(/_/g, '');
@@ -5410,59 +5439,95 @@ function templateSource(t) {
 function isBuiltinTemplate(t) {
   return templateSource(t) === 'builtin';
 }
+function isCustomTemplate(t) {
+  return templateSource(t) === 'custom';
+}
 function categoryLabel(cat) {
   return CAT_LABEL[cat] || cat || 'custom';
 }
-function categoryEditorValue(cat) {
-  return TEMPLATE_CATEGORY_VALUES.includes(cat) ? cat : 'custom';
+function templateKind(t) {
+  const name = String(t.name || '').toLowerCase();
+  if (name === 'standardization') return 'project';
+  if (TEMPLATE_DOC_CHAIN_NAMES.has(name)) return 'doc-chain';
+  if (String(t.category || '').toLowerCase() === 'development') return 'project';
+  const text = `${t.category || ''} ${t.description || ''}`.toLowerCase();
+  return TEMPLATE_PROJECT_KEYWORDS.some(keyword => text.includes(keyword)) ? 'project' : 'doc-chain';
+}
+function categoryEditorValue(cat, template = {}) {
+  const raw = String(cat || '').toLowerCase();
+  if (TEMPLATE_CATEGORY_VALUES.includes(raw)) return raw;
+  return templateKind(template) === 'doc-chain' ? 'doc-chain' : 'scaffold';
 }
 function isSafeTemplateSlug(name) {
   return TEMPLATE_SLUG_RE.test(name || '');
+}
+function isSafeTemplateVariableName(name) {
+  return TEMPLATE_VARIABLE_RE.test(name || '');
 }
 function isSafeTemplateFilePath(path) {
   if (!path || path.startsWith('/') || path.includes('\\')) return false;
   return path.split('/').every(part => part && part !== '.' && part !== '..');
 }
 async function loadTemplates() {
-  const tpls = await fetch('/api/templates').then(r => r.ok ? r.json() : []).catch(() => []);
-  LOADED_TEMPLATES = tpls;
+  const list = document.getElementById('tpl-list');
+  if (list) list.innerHTML = '<div class="tpl-spinner" aria-label="Loading templates"></div>';
+  try {
+    const r = await fetch('/api/templates');
+    if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+    LOADED_TEMPLATES = await r.json();
+  } catch (e) {
+    LOADED_TEMPLATES = [];
+    showToast(`Template load failed: ${e.message || e}`, 'err');
+  }
   renderTemplateList();
 }
 function renderTemplateList() {
   const list = document.getElementById('tpl-list');
   if (!list) return;
-  const sorted = LOADED_TEMPLATES.slice().sort((a, b) => {
-    const sourceRank = Number(isBuiltinTemplate(b)) - Number(isBuiltinTemplate(a));
-    return sourceRank || String(a.name).localeCompare(String(b.name));
-  });
-  if (!sorted.length) {
+  if (!LOADED_TEMPLATES.length) {
     list.innerHTML = '<div class="empty">No templates found.</div>';
     return;
   }
-  const active = TEMPLATE_EDITOR_STATE.originalName || document.getElementById('tpl-name')?.value || '';
-  list.innerHTML = sorted.map(t => {
-    const builtin = isBuiltinTemplate(t);
-    const activeClass = active === t.name ? ' active' : '';
-    const badge = builtin ? '<span class="badge warn">read-only</span>' : '<span class="badge ok">custom</span>';
-    const editButtons = builtin
-      ? `<button type="button" class="ghost" data-tpl-duplicate="${escapeAttr(t.name)}">Duplicate as custom</button>`
-      : `<button type="button" class="ghost" data-tpl-edit="${escapeAttr(t.name)}">Edit</button><button type="button" class="ghost" data-tpl-delete="${escapeAttr(t.name)}">Delete</button>`;
-    return `<div class="tpl-list-item${activeClass}">
-      <div class="tpl-top">
-        <div><div class="tpl-name">${escapeHtml(t.name)}</div><div class="tpl-desc">${escapeHtml(t.description || '')}</div></div>
-        ${badge}
-      </div>
-      <div class="hint">${escapeHtml(categoryLabel(t.category))} · ${(t.variables || []).length} variables</div>
-      <div class="tpl-actions">
-        <button type="button" class="ghost" data-tpl-scaffold="${escapeAttr(t.name)}">Scaffold</button>
-        ${editButtons}
-      </div>
-    </div>`;
-  }).join('');
-  list.querySelectorAll('[data-tpl-scaffold]').forEach(btn => btn.onclick = () => openScaffoldModal(btn.dataset.tplScaffold));
+  const sorted = LOADED_TEMPLATES.slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  const projectTemplates = sorted.filter(t => templateKind(t) === 'project');
+  const documentChains = sorted.filter(t => templateKind(t) === 'doc-chain');
+  const hasCustom = sorted.some(isCustomTemplate);
+  const customEmpty = hasCustom ? '' : '<div class="empty">No custom templates yet — duplicate a built-in to start, or create one from scratch.</div>';
+  list.innerHTML = [
+    renderTemplateGroup('Project Templates', projectTemplates),
+    renderTemplateGroup('Document Chains', documentChains),
+    customEmpty,
+  ].join('');
   list.querySelectorAll('[data-tpl-duplicate]').forEach(btn => btn.onclick = () => duplicateTemplate(btn.dataset.tplDuplicate));
   list.querySelectorAll('[data-tpl-edit]').forEach(btn => btn.onclick = () => editTemplate(btn.dataset.tplEdit));
   list.querySelectorAll('[data-tpl-delete]').forEach(btn => btn.onclick = () => deleteTemplate(btn.dataset.tplDelete));
+}
+function renderTemplateGroup(title, templates) {
+  const count = templates.length;
+  const body = count
+    ? `<div class="tpl-card-grid">${templates.map(templateCard).join('')}</div>`
+    : '<div class="empty">No templates in this group.</div>';
+  return `<section class="tpl-kind-group">
+    <div class="tpl-kind-head"><span>${escapeHtml(title)}</span><span>${count}</span></div>
+    ${body}
+  </section>`;
+}
+function templateCard(t) {
+  const active = TEMPLATE_EDITOR_STATE.originalName || document.getElementById('tpl-name')?.value || '';
+  const builtin = isBuiltinTemplate(t);
+  const activeClass = active === t.name ? ' active' : '';
+  const badge = builtin ? '<span class="badge warn">read-only</span>' : '<span class="badge ok">custom</span>';
+  const actions = builtin
+    ? `<button type="button" class="ghost" data-tpl-duplicate="${escapeAttr(t.name)}">Duplicate as custom</button>`
+    : `<button type="button" class="ghost" data-tpl-edit="${escapeAttr(t.name)}">Edit</button><button type="button" class="ghost" data-tpl-delete="${escapeAttr(t.name)}">Delete</button>`;
+  return `<article class="tpl-list-item${activeClass}">
+    <div class="tpl-top">
+      <div><div class="tpl-name">${escapeHtml(t.name || '')}</div><div class="tpl-desc">${escapeHtml(t.description || '')}</div></div>
+      ${badge}
+    </div>
+    <div class="hint">${escapeHtml(categoryLabel(t.category))} · ${(t.variables || []).length} variables</div>
+    <div class="tpl-actions">${actions}</div>
+  </article>`;
 }
 async function fetchTemplate(name) {
   const r = await fetch(`/api/templates/${encodeURIComponent(name)}`);
@@ -5473,35 +5538,66 @@ function emptyTemplate() {
   return {
     name: '',
     description: '',
-    category: 'rust-cli',
+    category: 'custom',
     variables: [{ name: 'project_name', description: '', default: '', required: true }],
     files: [{ path: 'README.md', content: '# {{project_name}}\n', executable: false }],
   };
 }
 function openTemplateEditor(template, state) {
   TEMPLATE_EDITOR_STATE = state;
+  TEMPLATE_WORKING = normalizeTemplateForEditor(template);
+  TEMPLATE_SELECTED_FILE_PATH = TEMPLATE_WORKING.files[0]?.path || '';
   document.getElementById('tpl-editor-card').hidden = false;
-  document.getElementById('tpl-editor-title').textContent = state.isNew ? 'New Template' : `Edit ${template.name}`;
+  document.getElementById('tpl-editor-title').textContent = state.isNew ? 'New Template' : `Edit ${TEMPLATE_WORKING.name}`;
   document.getElementById('tpl-editor-mode').textContent = state.isNew ? 'new custom' : 'custom';
   document.getElementById('tpl-original-name').value = state.originalName || '';
   const nameInput = document.getElementById('tpl-name');
-  nameInput.value = template.name || '';
+  nameInput.value = TEMPLATE_WORKING.name || '';
   nameInput.readOnly = !state.isNew;
-  document.getElementById('tpl-description').value = template.description || '';
-  document.getElementById('tpl-category').value = categoryEditorValue(template.category);
+  document.getElementById('tpl-description').value = TEMPLATE_WORKING.description || '';
+  document.getElementById('tpl-category').value = categoryEditorValue(TEMPLATE_WORKING.category, TEMPLATE_WORKING);
   document.getElementById('tpl-delete').hidden = state.isNew;
+  document.getElementById('tpl-duplicate-current').hidden = true;
   document.getElementById('tpl-editor-result').textContent = '';
-  renderTemplateVariables(template.variables || []);
-  renderTemplateFiles(template.files || []);
+  renderTemplateVariables(TEMPLATE_WORKING.variables || []);
+  renderTemplateFiles();
   validateTemplateSlugUi();
+  validateTemplateVariablesUi(false);
   renderTemplateList();
   setTimeout(() => (state.isNew ? nameInput : document.getElementById('tpl-description')).focus(), 0);
+}
+function normalizeTemplateForEditor(template) {
+  return {
+    name: template.name || '',
+    description: template.description || '',
+    category: categoryEditorValue(template.category, template),
+    variables: (template.variables || []).map(v => ({
+      name: v.name || '',
+      default: v.default || '',
+      description: v.description || '',
+      required: v.required !== false,
+    })),
+    files: (template.files || []).map(f => ({
+      path: f.path || '',
+      content: f.content || '',
+      executable: Boolean(f.executable),
+    })),
+  };
+}
+function closeTemplateEditor() {
+  TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '', sourceName: '' };
+  TEMPLATE_WORKING = null;
+  TEMPLATE_SELECTED_FILE_PATH = '';
+  document.getElementById('tpl-editor-card').hidden = true;
+  renderTemplateList();
 }
 function renderTemplateVariables(vars) {
   const body = document.getElementById('tpl-vars-body');
   body.innerHTML = vars.map(v => templateVariableRow(v)).join('');
+  body.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => validateTemplateVariablesUi(false)));
   body.querySelectorAll('[data-var-remove]').forEach(btn => btn.onclick = () => {
     btn.closest('tr').remove();
+    validateTemplateVariablesUi(false);
   });
 }
 function templateVariableRow(v = {}) {
@@ -5513,43 +5609,150 @@ function templateVariableRow(v = {}) {
     <td><button class="ghost" type="button" data-var-remove>Remove</button></td>
   </tr>`;
 }
-function renderTemplateFiles(files) {
-  const list = document.getElementById('tpl-files-list');
-  list.innerHTML = files.map((file, idx) => templateFileItem(file, idx)).join('');
-  bindTemplateFileButtons();
+function collectVariableRows(markInvalid = true) {
+  const errors = [];
+  const variables = Array.from(document.querySelectorAll('#tpl-vars-body tr')).map(row => {
+    const nameInput = row.querySelector('[data-var-name]');
+    const variable = {
+      name: nameInput.value.trim(),
+      default: row.querySelector('[data-var-default]').value || undefined,
+      description: row.querySelector('[data-var-description]').value || undefined,
+      required: row.querySelector('[data-var-required]').checked,
+    };
+    const valid = isSafeTemplateVariableName(variable.name);
+    nameInput.classList.toggle('invalid', markInvalid && !valid);
+    if (!valid) errors.push('Variable names are required and cannot contain spaces.');
+    return variable;
+  }).filter(v => v.name || v.default || v.description);
+  return { variables, errors };
 }
-function templateFileItem(file = {}, idx = 0) {
-  return `<div class="tpl-file-item" data-file-index="${idx}">
-    <div class="tpl-file-head">
-      <input data-file-path value="${escapeAttr(file.path || '')}" placeholder="src/main.rs">
-      <label class="tpl-var-required"><input data-file-executable type="checkbox" ${file.executable ? 'checked' : ''}> Executable</label>
-      <button class="ghost" type="button" data-file-remove>Remove</button>
-    </div>
-    <textarea data-file-content spellcheck="false" placeholder="File content">${escapeHtml(file.content || '')}</textarea>
-  </div>`;
+function validateTemplateVariablesUi(markInvalid = true) {
+  const { errors } = collectVariableRows(markInvalid);
+  const status = document.getElementById('tpl-var-status');
+  status.innerHTML = errors.length ? `<span style="color:var(--err);">${escapeHtml(errors[0])}</span>` : '';
+  return errors.length === 0;
 }
-function bindTemplateFileButtons() {
-  document.querySelectorAll('#tpl-files-list [data-file-remove]').forEach(btn => btn.onclick = () => {
-    btn.closest('.tpl-file-item').remove();
+function renderTemplateFiles() {
+  const tree = document.getElementById('tpl-file-tree');
+  const editor = document.getElementById('tpl-file-editor');
+  const files = TEMPLATE_WORKING?.files || [];
+  if (!files.length) {
+    tree.innerHTML = '<div class="empty">No files yet.</div>';
+    editor.innerHTML = '<div class="empty">Add a file to edit its content.</div>';
+    return;
+  }
+  if (!files.some(f => f.path === TEMPLATE_SELECTED_FILE_PATH)) {
+    TEMPLATE_SELECTED_FILE_PATH = files[0].path;
+  }
+  tree.innerHTML = renderFileTree(files, TEMPLATE_SELECTED_FILE_PATH);
+  tree.querySelectorAll('[data-file-select]').forEach(btn => btn.onclick = () => {
+    TEMPLATE_SELECTED_FILE_PATH = btn.dataset.fileSelect;
+    renderTemplateFiles();
   });
+  renderSelectedFileEditor(editor);
+}
+function renderFileTree(files, selectedPath) {
+  const root = { dirs: new Map(), files: [] };
+  files.slice().sort((a, b) => String(a.path || '').localeCompare(String(b.path || ''))).forEach(file => {
+    const parts = String(file.path || '').split('/').filter(Boolean);
+    let node = root;
+    parts.slice(0, -1).forEach(part => {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    });
+    node.files.push({ name: parts[parts.length - 1] || file.path, path: file.path });
+  });
+  return renderTreeNode(root, selectedPath);
+}
+function renderTreeNode(node, selectedPath, depth = 0) {
+  const pad = (TEMPLATE_TREE_BASE_PAD_REM + (depth * TEMPLATE_TREE_INDENT_REM)).toFixed(2);
+  const dirs = Array.from(node.dirs.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([name, child]) =>
+    `<div class="tpl-tree-row dir" style="padding-left:${pad}rem;"><span>▾</span><span class="tree-label">${escapeHtml(name)}</span></div>` +
+    renderTreeNode(child, selectedPath, depth + 1)
+  );
+  const files = node.files.sort((a, b) => a.name.localeCompare(b.name)).map(file => {
+    const active = file.path === selectedPath ? ' active' : '';
+    return `<button type="button" class="tpl-tree-row${active}" data-file-select="${escapeAttr(file.path)}" style="padding-left:${pad}rem;"><span>□</span><span class="tree-label">${escapeHtml(file.name)}</span></button>`;
+  });
+  return dirs.concat(files).join('');
+}
+function renderSelectedFileEditor(editor) {
+  const file = (TEMPLATE_WORKING?.files || []).find(f => f.path === TEMPLATE_SELECTED_FILE_PATH);
+  if (!file) {
+    editor.innerHTML = '<div class="empty">Select a file.</div>';
+    return;
+  }
+  const placeholders = placeholdersInContent(file.content);
+  const placeholderHtml = placeholders.length
+    ? placeholders.map(name => `<span class="badge">{{${escapeHtml(name)}}}</span>`).join('')
+    : '<span class="hint">none</span>';
+  editor.innerHTML = `<div class="tpl-file-head">
+      <code>${escapeHtml(file.path)}</code>
+      <label class="tpl-var-required"><input id="tpl-file-executable" type="checkbox" ${file.executable ? 'checked' : ''}> Executable</label>
+      <button id="tpl-file-remove" class="ghost" type="button">Remove file</button>
+    </div>
+    <div id="tpl-placeholder-strip" class="tpl-placeholder-strip"><span>Placeholders:</span>${placeholderHtml}</div>
+    <textarea id="tpl-file-content" spellcheck="false" placeholder="File content">${escapeHtml(file.content || '')}</textarea>`;
+  document.getElementById('tpl-file-content').addEventListener('input', ev => {
+    file.content = ev.target.value;
+    const livePlaceholders = placeholdersInContent(file.content);
+    document.getElementById('tpl-placeholder-strip').innerHTML = '<span>Placeholders:</span>' + (
+      livePlaceholders.length
+        ? livePlaceholders.map(name => `<span class="badge">{{${escapeHtml(name)}}}</span>`).join('')
+        : '<span class="hint">none</span>'
+    );
+  });
+  document.getElementById('tpl-file-executable').addEventListener('change', ev => {
+    file.executable = ev.target.checked;
+  });
+  document.getElementById('tpl-file-remove').onclick = () => removeSelectedTemplateFile(file.path);
+}
+function placeholdersInContent(content) {
+  const names = new Set();
+  String(content || '').replace(/{{\s*([A-Za-z0-9_-]+)\s*}}/g, (_match, name) => {
+    names.add(name);
+    return _match;
+  });
+  return Array.from(names).sort((a, b) => a.localeCompare(b));
+}
+function addTemplateFile() {
+  if (!TEMPLATE_WORKING) return;
+  const path = prompt('File path', 'src/main.rs');
+  const cleanPath = String(path || '').trim();
+  if (!cleanPath) return;
+  if (!isSafeTemplateFilePath(cleanPath)) {
+    showToast('File path must stay inside the scaffold target.', 'err');
+    return;
+  }
+  if (TEMPLATE_WORKING.files.some(file => file.path === cleanPath)) {
+    showToast('A file with that path already exists.', 'err');
+    return;
+  }
+  TEMPLATE_WORKING.files.push({ path: cleanPath, content: '', executable: false });
+  TEMPLATE_SELECTED_FILE_PATH = cleanPath;
+  renderTemplateFiles();
+}
+function removeSelectedTemplateFile(path) {
+  if (!TEMPLATE_WORKING) return;
+  if (!confirm(`Remove file "${path}"?`)) return;
+  TEMPLATE_WORKING.files = TEMPLATE_WORKING.files.filter(file => file.path !== path);
+  TEMPLATE_SELECTED_FILE_PATH = TEMPLATE_WORKING.files[0]?.path || '';
+  renderTemplateFiles();
 }
 function collectTemplateFromEditor() {
   const name = document.getElementById('tpl-name').value.trim();
-  if (!isSafeTemplateSlug(name)) throw new Error('Name must use letters, numbers, hyphens, or underscores.');
-  const variables = Array.from(document.querySelectorAll('#tpl-vars-body tr')).map(row => ({
-    name: row.querySelector('[data-var-name]').value.trim(),
-    default: row.querySelector('[data-var-default]').value || undefined,
-    description: row.querySelector('[data-var-description]').value || undefined,
-    required: row.querySelector('[data-var-required]').checked,
-  })).filter(v => v.name);
-  const files = Array.from(document.querySelectorAll('#tpl-files-list .tpl-file-item')).map(item => ({
-    path: item.querySelector('[data-file-path]').value.trim(),
-    content: item.querySelector('[data-file-content]').value,
-    executable: item.querySelector('[data-file-executable]').checked,
+  if (!isSafeTemplateSlug(name)) throw new Error('Name must use lowercase letters, numbers, hyphens, or underscores.');
+  const { variables, errors } = collectVariableRows(true);
+  if (errors.length) throw new Error(errors[0]);
+  const files = (TEMPLATE_WORKING?.files || []).map(file => ({
+    path: String(file.path || '').trim(),
+    content: file.content || '',
+    executable: Boolean(file.executable),
   }));
   for (const file of files) {
     if (!isSafeTemplateFilePath(file.path)) throw new Error(`File path must stay inside the scaffold target: ${file.path || '(empty)'}`);
   }
+  if (!files.length) throw new Error('Add at least one file.');
   return {
     name,
     description: document.getElementById('tpl-description').value.trim(),
@@ -5562,7 +5765,7 @@ function validateTemplateSlugUi() {
   const name = document.getElementById('tpl-name').value.trim();
   const status = document.getElementById('tpl-slug-status');
   if (!name) {
-    status.textContent = 'Use letters, numbers, hyphens, or underscores.';
+    status.textContent = 'Use lowercase letters, numbers, hyphens, or underscores.';
     return false;
   }
   const ok = isSafeTemplateSlug(name);
@@ -5572,12 +5775,24 @@ function validateTemplateSlugUi() {
 async function duplicateTemplate(name) {
   try {
     const t = await fetchTemplate(name);
-    t.name = `custom-${t.name}`;
-    t.category = categoryEditorValue(t.category);
-    openTemplateEditor(t, { isNew: true, originalName: '' });
+    t.name = uniqueDuplicateName(t.name);
+    t.category = categoryEditorValue(t.category, t);
+    openTemplateEditor(t, { isNew: true, originalName: '', sourceName: name });
   } catch (e) {
     showToast(`Duplicate failed: ${e.message || e}`, 'err');
   }
+}
+function uniqueDuplicateName(name) {
+  const base = `custom-${String(name || 'template').toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`.replace(/-+$/g, '');
+  const names = new Set(LOADED_TEMPLATES.map(t => t.name));
+  if (!names.has(base)) return base;
+  let index = TEMPLATE_DUPLICATE_START_INDEX;
+  let next = `${base}-${index}`;
+  while (names.has(next)) {
+    index += 1;
+    next = `${base}-${index}`;
+  }
+  return next;
 }
 async function editTemplate(name) {
   try {
@@ -5586,8 +5801,8 @@ async function editTemplate(name) {
       showToast('Built-in templates are read-only. Duplicate as custom first.', 'err');
       return;
     }
-    t.category = categoryEditorValue(t.category);
-    openTemplateEditor(t, { isNew: false, originalName: t.name });
+    t.category = categoryEditorValue(t.category, t);
+    openTemplateEditor(t, { isNew: false, originalName: t.name, sourceName: '' });
   } catch (e) {
     showToast(`Edit failed: ${e.message || e}`, 'err');
   }
@@ -5602,31 +5817,27 @@ async function deleteTemplate(name) {
   }
   showToast(`Deleted ${name}`, 'ok');
   if (TEMPLATE_EDITOR_STATE.originalName === name) {
-    document.getElementById('tpl-editor-card').hidden = true;
-    TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '' };
+    closeTemplateEditor();
   }
   await loadTemplates();
 }
 document.getElementById('tpl-new-btn').onclick = () => openTemplateEditor(emptyTemplate(), { isNew: true, originalName: '' });
 document.getElementById('tpl-refresh-btn').onclick = loadTemplates;
 document.getElementById('tpl-var-add').onclick = () => {
-  document.getElementById('tpl-vars-body').insertAdjacentHTML('beforeend', templateVariableRow({ required: true }));
-  renderTemplateVariables(Array.from(document.querySelectorAll('#tpl-vars-body tr')).map(row => ({
-    name: row.querySelector('[data-var-name]').value,
-    default: row.querySelector('[data-var-default]').value,
-    description: row.querySelector('[data-var-description]').value,
-    required: row.querySelector('[data-var-required]').checked,
-  })));
+  const { variables } = collectVariableRows(false);
+  variables.push({ name: '', default: '', description: '', required: true });
+  renderTemplateVariables(variables);
+  validateTemplateVariablesUi(false);
 };
-document.getElementById('tpl-file-add').onclick = () => {
-  document.getElementById('tpl-files-list').insertAdjacentHTML('beforeend', templateFileItem({ path: '', content: '', executable: false }, Date.now()));
-  bindTemplateFileButtons();
-};
+document.getElementById('tpl-file-add').onclick = addTemplateFile;
 document.getElementById('tpl-name').addEventListener('input', validateTemplateSlugUi);
 document.getElementById('tpl-delete').onclick = () => {
   const name = TEMPLATE_EDITOR_STATE.originalName || document.getElementById('tpl-name').value.trim();
   if (name) deleteTemplate(name);
 };
+document.getElementById('tpl-cancel').onclick = closeTemplateEditor;
+document.getElementById('tpl-preview-close').onclick = () => document.getElementById('tpl-preview-modal').hidden = true;
+document.getElementById('tpl-preview-modal').onclick = (ev) => { if (ev.target.id === 'tpl-preview-modal') document.getElementById('tpl-preview-modal').hidden = true; };
 document.getElementById('tpl-preview').onclick = async () => {
   const out = document.getElementById('tpl-editor-result');
   let template;
@@ -5642,16 +5853,56 @@ document.getElementById('tpl-preview').onclick = async () => {
   const r = await fetch('/api/templates/scaffold/preview', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ template: template.name, target: `./preview-${template.name}`, variables, overwrite: false }),
+    body: JSON.stringify({ template: template.name, target: `${TEMPLATE_PREVIEW_TARGET_PREFIX}${template.name}`, variables, overwrite: false, manifest: template }),
   });
   if (!r.ok) {
     out.innerHTML = `<span style="color:var(--err);">${r.status}: ${escapeHtml(await r.text())}</span>`;
     return;
   }
   const d = await r.json();
-  const rows = d.files.map(f => `<tr><td><code>${escapeHtml(String(f.path))}</code></td><td>${f.bytes}</td><td>${f.executable ? 'yes' : 'no'}</td></tr>`).join('');
-  out.innerHTML = `<div>${escapeHtml(String(d.root))} · ${d.files.length} files</div><table style="margin-top:0.4rem;"><thead><tr><th>Path</th><th>Bytes</th><th>Executable</th></tr></thead><tbody>${rows}</tbody></table>`;
+  renderTemplatePreview(d);
+  out.innerHTML = `<span class="badge ok">Preview ready</span> ${d.files.length} files`;
 };
+function renderTemplatePreview(preview) {
+  document.getElementById('tpl-preview-title').textContent = `Preview ${document.getElementById('tpl-name').value.trim() || 'template'}`;
+  document.getElementById('tpl-preview-meta').textContent = `${String(preview.root || '')} · ${(preview.files || []).length} files`;
+  const paths = (preview.files || []).map(file => ({
+    path: previewRelativePath(preview.root, file.path),
+    content: `${file.bytes} bytes${file.executable ? ' · executable' : ''}`,
+  }));
+  document.getElementById('tpl-preview-tree').innerHTML = renderPreviewTree(paths);
+  document.getElementById('tpl-preview-modal').hidden = false;
+}
+function previewRelativePath(root, path) {
+  const rootText = String(root || '').replace(/\/+$/g, '');
+  const pathText = String(path || '');
+  return rootText && pathText.startsWith(`${rootText}/`) ? pathText.slice(rootText.length + 1) : pathText;
+}
+function renderPreviewTree(files) {
+  if (!files.length) return '<div class="empty">No files in preview.</div>';
+  const root = { dirs: new Map(), files: [] };
+  files.slice().sort((a, b) => a.path.localeCompare(b.path)).forEach(file => {
+    const parts = file.path.split('/').filter(Boolean);
+    let node = root;
+    parts.slice(0, -1).forEach(part => {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    });
+    node.files.push({ name: parts[parts.length - 1] || file.path, meta: file.content });
+  });
+  return renderPreviewTreeNode(root);
+}
+function renderPreviewTreeNode(node, depth = 0) {
+  const pad = (TEMPLATE_TREE_BASE_PAD_REM + (depth * TEMPLATE_TREE_INDENT_REM)).toFixed(2);
+  const dirs = Array.from(node.dirs.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([name, child]) =>
+    `<div class="tpl-tree-row dir" style="padding-left:${pad}rem;"><span>▾</span><span class="tree-label">${escapeHtml(name)}</span></div>` +
+    renderPreviewTreeNode(child, depth + 1)
+  );
+  const files = node.files.sort((a, b) => a.name.localeCompare(b.name)).map(file =>
+    `<div class="tpl-tree-row" style="padding-left:${pad}rem;"><span>□</span><span class="tree-label">${escapeHtml(file.name)}</span><span class="hint">${escapeHtml(file.meta)}</span></div>`
+  );
+  return dirs.concat(files).join('');
+}
 document.getElementById('tpl-editor-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const out = document.getElementById('tpl-editor-result');
@@ -5677,7 +5928,8 @@ document.getElementById('tpl-editor-form').onsubmit = async (ev) => {
   const d = await r.json();
   out.innerHTML = `<span class="badge ok">Saved</span> <code>${escapeHtml(d.name || template.name)}</code>`;
   showToast(`Saved ${template.name}`, 'ok');
-  TEMPLATE_EDITOR_STATE = { isNew: false, originalName: template.name };
+  TEMPLATE_EDITOR_STATE = { isNew: false, originalName: template.name, sourceName: '' };
+  TEMPLATE_WORKING = normalizeTemplateForEditor(template);
   document.getElementById('tpl-name').readOnly = true;
   document.getElementById('tpl-delete').hidden = false;
   await loadTemplates();

@@ -372,6 +372,8 @@ async fn main() -> Result<()> {
         .route("/api/overview", get(optimizer_overview))
         .route("/api/optimizer/overview", get(optimizer_overview))
         .route("/api/gain", get(gain))
+        .route("/api/detect", get(detect_tools_api))
+        .route("/api/detect/toggle", post(toggle_detected_tool))
         .route(
             "/api/optimizer/level",
             get(get_optimizer_level).post(post_optimizer_level),
@@ -848,21 +850,44 @@ async fn post_optimizer_level(Json(body): Json<SetLevelRequest>) -> impl IntoRes
     .into_response()
 }
 
-fn metadata_saved_chars(raw: &str, expected_source: &str) -> Option<i64> {
+fn metadata_savings(raw: &str, expected_source: &str) -> Option<(i64, i64)> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = value.as_object()?;
     if obj.get("source")?.as_str()? != expected_source {
         return None;
     }
-    let saved = obj.get("saved_chars")?;
-    if let Some(n) = saved.as_i64() {
+    let original_chars = json_i64(obj.get("compressed_from_chars")?)?.max(0);
+    let saved_chars = obj
+        .get("saved_chars")
+        .and_then(json_i64)
+        .or_else(|| {
+            let to_chars = obj.get("compressed_to_chars").and_then(json_i64)?;
+            Some((original_chars - to_chars).max(0))
+        })?
+        .max(0);
+    Some((saved_chars, original_chars))
+}
+
+fn json_i64(value: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = value.as_i64() {
         return Some(n);
     }
-    saved.as_str()?.parse::<i64>().ok()
+    value.as_str()?.parse::<i64>().ok()
 }
 
 fn estimate_saved_tokens(saved_chars: i64) -> i64 {
     saved_chars / 4
+}
+
+fn saved_pct(saved_chars: i64, original_chars: i64) -> Option<f64> {
+    if original_chars <= 0 {
+        return None;
+    }
+    Some(saved_chars.max(0) as f64 / original_chars as f64 * 100.0)
+}
+
+fn saved_pct_or_zero(saved_chars: i64, original_chars: i64) -> f64 {
+    saved_pct(saved_chars, original_chars).unwrap_or(0.0)
 }
 
 fn proxy_stats_path() -> PathBuf {
@@ -890,6 +915,8 @@ struct SavingsProject {
     count: i64,
     saved_chars: i64,
     saved_tokens: i64,
+    original_chars: i64,
+    saved_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -900,6 +927,8 @@ struct SavingsSource {
     count: i64,
     saved_chars: i64,
     saved_tokens: i64,
+    original_chars: i64,
+    saved_pct: Option<f64>,
     source: String,
     by_project: Vec<SavingsProject>,
 }
@@ -909,6 +938,8 @@ struct ProjectSourceRollup {
     count: i64,
     saved_chars: i64,
     saved_tokens: i64,
+    original_chars: i64,
+    saved_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -916,6 +947,8 @@ struct ProjectRollup {
     project: String,
     saved_chars: i64,
     saved_tokens: i64,
+    original_chars: i64,
+    saved_pct: Option<f64>,
     by_source: BTreeMap<String, ProjectSourceRollup>,
 }
 
@@ -934,6 +967,7 @@ fn savings_source(
     });
     let count = by_project.iter().map(|p| p.count).sum();
     let saved_chars = by_project.iter().map(|p| p.saved_chars).sum();
+    let original_chars = by_project.iter().map(|p| p.original_chars).sum();
     SavingsSource {
         name: name.to_string(),
         label: label.to_string(),
@@ -941,6 +975,8 @@ fn savings_source(
         count,
         saved_chars,
         saved_tokens: estimate_saved_tokens(saved_chars),
+        original_chars,
+        saved_pct: saved_pct(saved_chars, original_chars),
         source: source.to_string(),
         by_project,
     }
@@ -956,21 +992,27 @@ fn projects_rollup(sources: &[SavingsSource]) -> Vec<ProjectRollup> {
                     project: item.project.clone(),
                     saved_chars: 0,
                     saved_tokens: 0,
+                    original_chars: 0,
+                    saved_pct: None,
                     by_source: BTreeMap::new(),
                 });
             entry.saved_chars += item.saved_chars;
+            entry.original_chars += item.original_chars;
             entry.by_source.insert(
                 source.name.clone(),
                 ProjectSourceRollup {
                     count: item.count,
                     saved_chars: item.saved_chars,
                     saved_tokens: item.saved_tokens,
+                    original_chars: item.original_chars,
+                    saved_pct: item.saved_pct,
                 },
             );
         }
     }
     for project in projects.values_mut() {
         project.saved_tokens = estimate_saved_tokens(project.saved_chars);
+        project.saved_pct = saved_pct(project.saved_chars, project.original_chars);
     }
     let mut projects: Vec<ProjectRollup> = projects.into_values().collect();
     projects.sort_by(|a, b| {
@@ -989,7 +1031,8 @@ fn memory_savings_by_project(
 ) -> (bool, Vec<SavingsProject>) {
     let mut stmt = match conn.prepare(
         "SELECT project, COUNT(*) AS row_count, \
-                COALESCE(SUM(LENGTH(body_full) - LENGTH(body)), 0) AS saved_chars \
+                COALESCE(SUM(LENGTH(body_full) - LENGTH(body)), 0) AS saved_chars, \
+                COALESCE(SUM(LENGTH(body_full)), 0) AS original_chars \
          FROM memories \
          WHERE body_full IS NOT NULL AND (?1 IS NULL OR project = ?1) \
          GROUP BY project",
@@ -1003,12 +1046,15 @@ fn memory_savings_by_project(
     let rows = match stmt.query_map(rusqlite::params![project], |row| {
         let project = normalize_project(row.get::<_, Option<String>>(0)?);
         let count = row.get::<_, i64>(1)?;
-        let saved_chars = row.get::<_, i64>(2)?;
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let original_chars = nonnegative_i64(row.get::<_, i64>(3)?);
         Ok(SavingsProject {
             project,
             count,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
+            original_chars,
+            saved_pct: saved_pct(saved_chars, original_chars),
         })
     }) {
         Ok(rows) => rows,
@@ -1054,14 +1100,17 @@ fn output_savings_by_project(
             return (false, Vec::new());
         }
     };
-    let mut grouped: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     for row in rows {
         match row {
             Ok((project, raw)) => {
-                if let Some(saved_chars) = metadata_saved_chars(&raw, "compress") {
-                    let entry = grouped.entry(normalize_project(project)).or_insert((0, 0));
+                if let Some((saved_chars, original_chars)) = metadata_savings(&raw, "compress") {
+                    let entry = grouped
+                        .entry(normalize_project(project))
+                        .or_insert((0, 0, 0));
                     entry.0 += 1;
                     entry.1 += saved_chars;
+                    entry.2 += original_chars;
                 }
             }
             Err(e) => {
@@ -1072,11 +1121,17 @@ fn output_savings_by_project(
     }
     let projects = grouped
         .into_iter()
-        .map(|(project, (count, saved_chars))| SavingsProject {
-            project,
-            count,
-            saved_chars,
-            saved_tokens: estimate_saved_tokens(saved_chars),
+        .map(|(project, (count, saved_chars, original_chars))| {
+            let saved_chars = nonnegative_i64(saved_chars);
+            let original_chars = nonnegative_i64(original_chars);
+            SavingsProject {
+                project,
+                count,
+                saved_chars,
+                saved_tokens: estimate_saved_tokens(saved_chars),
+                original_chars,
+                saved_pct: saved_pct(saved_chars, original_chars),
+            }
         })
         .collect();
     (true, projects)
@@ -1105,7 +1160,8 @@ fn command_savings_by_project(
         }
     };
     let mut stmt = match conn.prepare(
-        "SELECT project, COUNT(*) AS run_count, COALESCE(SUM(saved_chars), 0) AS saved_chars \
+        "SELECT project, COUNT(*) AS run_count, COALESCE(SUM(saved_chars), 0) AS saved_chars, \
+                COALESCE(SUM(input_chars), 0) AS original_chars \
          FROM proxy_runs \
          WHERE (?1 IS NULL OR project = ?1) \
          GROUP BY project",
@@ -1119,12 +1175,15 @@ fn command_savings_by_project(
     let rows = match stmt.query_map(rusqlite::params![project], |row| {
         let project = normalize_project(row.get::<_, Option<String>>(0)?);
         let count = row.get::<_, i64>(1)?;
-        let saved_chars = row.get::<_, i64>(2)?;
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let original_chars = nonnegative_i64(row.get::<_, i64>(3)?);
         Ok(SavingsProject {
             project,
             count,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
+            original_chars,
+            saved_pct: saved_pct(saved_chars, original_chars),
         })
     }) {
         Ok(rows) => rows,
@@ -1176,8 +1235,10 @@ fn nonnegative_i64(value: i64) -> i64 {
 struct GainCommand {
     command: String,
     runs: i64,
+    input_chars: i64,
     saved_chars: i64,
     saved_tokens: i64,
+    saved_pct: f64,
     saved_pct_avg: f64,
 }
 
@@ -1185,8 +1246,10 @@ struct GainCommand {
 struct GainProject {
     project: String,
     runs: i64,
+    input_chars: i64,
     saved_chars: i64,
     saved_tokens: i64,
+    saved_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1234,11 +1297,17 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
         }
     };
 
-    let (total_runs, total_saved_chars) = match conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(saved_chars), 0) \
+    let (total_runs, total_input_chars, total_saved_chars) = match conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
          FROM proxy_runs WHERE (?1 IS NULL OR project = ?1)",
         rusqlite::params![project],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
     ) {
         Ok(row) => row,
         Err(e) => {
@@ -1252,6 +1321,7 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
     };
 
     let total_runs = nonnegative_i64(total_runs);
+    let total_input_chars = nonnegative_i64(total_input_chars);
     let total_saved_chars = nonnegative_i64(total_saved_chars);
     let display_count = dynamic_gain_count(total_runs);
     let display_count_i64 = usize_to_i64(display_count);
@@ -1295,8 +1365,11 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
         "scope": project.unwrap_or("all"),
         "path": db_path.display().to_string(),
         "total_runs": total_runs,
+        "input_chars": total_input_chars,
+        "total_input_chars": total_input_chars,
         "total_saved_chars": total_saved_chars,
         "total_saved_tokens": estimate_saved_tokens(total_saved_chars),
+        "saved_pct": saved_pct_or_zero(total_saved_chars, total_input_chars),
         "token_estimate": "chars/4",
         "display_count": display_count,
         "top_commands": top_commands,
@@ -1311,7 +1384,7 @@ fn load_gain_top_commands(
     limit: i64,
 ) -> rusqlite::Result<Vec<GainCommand>> {
     let mut stmt = conn.prepare(
-        "SELECT original_cmd, COUNT(*), COALESCE(SUM(saved_chars), 0), COALESCE(AVG(saved_pct), 0.0) \
+        "SELECT original_cmd, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
          FROM proxy_runs \
          WHERE (?1 IS NULL OR project = ?1) \
          GROUP BY original_cmd \
@@ -1319,13 +1392,17 @@ fn load_gain_top_commands(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let input_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let pct = saved_pct_or_zero(saved_chars, input_chars);
         Ok(GainCommand {
             command: row.get(0)?,
             runs: nonnegative_i64(row.get::<_, i64>(1)?),
+            input_chars,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
-            saved_pct_avg: row.get(3)?,
+            saved_pct: pct,
+            saved_pct_avg: pct,
         })
     })?;
     rows.collect()
@@ -1336,19 +1413,22 @@ fn load_gain_projects(
     project: Option<&str>,
 ) -> rusqlite::Result<Vec<GainProject>> {
     let mut stmt = conn.prepare(
-        "SELECT project, COUNT(*), COALESCE(SUM(saved_chars), 0) \
+        "SELECT project, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
          FROM proxy_runs \
          WHERE (?1 IS NULL OR project = ?1) \
          GROUP BY project \
          ORDER BY COALESCE(SUM(saved_chars), 0) DESC, COUNT(*) DESC, project ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![project], |row| {
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let input_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(3)?);
         Ok(GainProject {
             project: normalize_project(row.get::<_, Option<String>>(0)?),
             runs: nonnegative_i64(row.get::<_, i64>(1)?),
+            input_chars,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
+            saved_pct: saved_pct_or_zero(saved_chars, input_chars),
         })
     })?;
     rows.collect()
@@ -1367,17 +1447,18 @@ fn load_gain_recent(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
+        let input_chars = nonnegative_i64(row.get::<_, i64>(4)?);
         let saved_chars = nonnegative_i64(row.get::<_, i64>(6)?);
         Ok(GainRun {
             ts: row.get(0)?,
             project: normalize_project(row.get::<_, Option<String>>(1)?),
             original_cmd: row.get(2)?,
             mode: row.get(3)?,
-            input_chars: nonnegative_i64(row.get::<_, i64>(4)?),
+            input_chars,
             output_chars: nonnegative_i64(row.get::<_, i64>(5)?),
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
-            saved_pct: row.get(7)?,
+            saved_pct: saved_pct_or_zero(saved_chars, input_chars),
             exec_ms: nonnegative_i64(row.get::<_, i64>(8)?),
         })
     })?;
@@ -1452,6 +1533,7 @@ async fn optimizer_overview(
         ),
     ];
     let total_saved_chars: i64 = sources.iter().map(|source| source.saved_chars).sum();
+    let total_original_chars: i64 = sources.iter().map(|source| source.original_chars).sum();
     let total_saved_tokens = estimate_saved_tokens(total_saved_chars);
     let projects = projects_rollup(&sources);
 
@@ -1459,6 +1541,8 @@ async fn optimizer_overview(
         "scope": project.unwrap_or("all"),
         "total_saved_chars": total_saved_chars,
         "total_saved_tokens": total_saved_tokens,
+        "total_original_chars": total_original_chars,
+        "total_saved_pct": saved_pct(total_saved_chars, total_original_chars),
         "token_estimate": "chars/4",
         "sources": sources,
         "projects": projects,
@@ -3855,6 +3939,132 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
         security: cfg.security,
         path,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Environment / orchestration detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct DetectedToolResponse {
+    #[serde(flatten)]
+    tool: rtrt_core::DetectedTool,
+    has_api_key: bool,
+}
+
+async fn detect_tools_api() -> Json<Vec<DetectedToolResponse>> {
+    Json(
+        detected_tools_with_config_overrides()
+            .into_iter()
+            .map(|tool| {
+                let has_api_key = provider_api_key_present(&tool);
+                DetectedToolResponse { tool, has_api_key }
+            })
+            .collect(),
+    )
+}
+
+fn provider_api_key_present(tool: &rtrt_core::DetectedTool) -> bool {
+    matches!(tool.kind, rtrt_core::ToolKind::ProviderApi) && tool.installed && tool.path.is_none()
+}
+
+fn detected_tools_with_config_overrides() -> Vec<rtrt_core::DetectedTool> {
+    let mut tools = rtrt_core::detect_tools();
+    let Ok(cfg) = rtrt_core::Config::load() else {
+        return tools;
+    };
+
+    for tool in &mut tools {
+        let override_value = match tool.kind {
+            rtrt_core::ToolKind::ProviderApi => cfg.providers.enabled_override(&tool.name),
+            rtrt_core::ToolKind::CodingAgent
+            | rtrt_core::ToolKind::LocalRuntime
+            | rtrt_core::ToolKind::McpServer => cfg.agents.enabled_override(&tool.name),
+        };
+        if let Some(enabled) = override_value {
+            tool.enabled = enabled;
+        }
+    }
+    tools
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectToggleRequest {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DetectToggleResponse {
+    ok: bool,
+    name: String,
+    enabled: bool,
+    section: String,
+    path: String,
+}
+
+async fn toggle_detected_tool(
+    Json(req): Json<DetectToggleRequest>,
+) -> std::result::Result<Json<DetectToggleResponse>, (StatusCode, String)> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".to_string()));
+    }
+
+    let detected = rtrt_core::detect_tools()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .ok_or((StatusCode::NOT_FOUND, format!("tool not detected: {name}")))?;
+
+    let mut cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let section = match detected.kind {
+        rtrt_core::ToolKind::ProviderApi => {
+            cfg.set_provider_enabled(name, req.enabled);
+            "providers"
+        }
+        rtrt_core::ToolKind::CodingAgent
+        | rtrt_core::ToolKind::LocalRuntime
+        | rtrt_core::ToolKind::McpServer => {
+            cfg.set_agent_enabled(name, req.enabled);
+            "agents"
+        }
+    };
+
+    let path = write_config_file(&cfg)?;
+    Ok(Json(DetectToggleResponse {
+        ok: true,
+        name: name.to_string(),
+        enabled: req.enabled,
+        section: section.to_string(),
+        path,
+    }))
+}
+
+fn write_config_file(cfg: &rtrt_core::Config) -> std::result::Result<String, (StatusCode, String)> {
+    let path = rtrt_core::Config::default_path().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cannot determine config path".into(),
+    ))?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create dir {}: {e}", parent.display()),
+            )
+        })?;
+    }
+
+    let toml_str = toml::to_string_pretty(cfg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(&path, toml_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------

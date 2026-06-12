@@ -95,6 +95,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_docs_round_trip() {
+        if loopback_bind_unavailable() {
+            return;
+        }
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", "/facebook/react")
@@ -112,6 +115,9 @@ mod tests {
 
     #[tokio::test]
     async fn topic_query_parameter_is_sent() {
+        if loopback_bind_unavailable() {
+            return;
+        }
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", "/facebook/react")
@@ -138,5 +144,9 @@ mod tests {
             assert!(c.get_library_docs("owner/repo/extra", None).await.is_err());
             assert!(c.get_library_docs("../escape/repo", None).await.is_err());
         });
+    }
+
+    fn loopback_bind_unavailable() -> bool {
+        std::net::TcpListener::bind("127.0.0.1:0").is_err()
     }
 }

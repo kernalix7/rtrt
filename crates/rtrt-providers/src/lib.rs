@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod invoke;
 pub mod openai;
 pub mod openai_compatible;
+pub mod router;
 pub mod stream;
 pub mod usage;
 
@@ -27,7 +28,8 @@ pub use gateway::{
 pub use invoke::{DEFAULT_TIMEOUT_SECS, InvokeOptions, InvokeOutcome, Mode, invoke_agent};
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
-pub use usage::Usage;
+pub use router::{Prefer, RouteAlternative, RouteDecision, RouteRequest, select_route};
+pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

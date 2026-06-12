@@ -16,13 +16,15 @@ use rtrt_compress::{
     AsyncCompressor, Compressor, Language as TsLanguage, LlmCompressor, SignatureExtractor,
 };
 use rtrt_core::{
-    CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel, ToolKind,
+    Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
+    ToolKind,
 };
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_TIMEOUT_SECS, InvokeOptions, Mode as InvokeMode, OpenAICompatibleProvider,
-    OpenAIProvider, Provider, Role, invoke_agent,
+    OpenAIProvider, Prefer, Provider, Role, RouteDecision, RouteRequest, UsageSnapshot,
+    invoke_agent, select_route,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -173,6 +175,33 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value = "text")]
         format: CallFormatArg,
+        /// Prompt text. Multiple words are joined with spaces.
+        #[arg(num_args = 1.., allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+    /// Pick and optionally invoke the cheapest useful route for a prompt.
+    Route {
+        /// Needed capability.
+        #[arg(long, value_enum)]
+        capability: Option<RouteCapabilityArg>,
+        /// Routing preference.
+        #[arg(long, value_enum, default_value = "cheapest")]
+        prefer: RoutePreferArg,
+        /// Explicit target override.
+        #[arg(long)]
+        target: Option<String>,
+        /// Model id for targets that need or allow a model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Invocation mode.
+        #[arg(long, value_enum, default_value = "auto")]
+        mode: CallModeArg,
+        /// Print the decision, ranked alternatives, and usage/headroom considered.
+        #[arg(long)]
+        explain: bool,
+        /// Print only the decision and do not invoke the target.
+        #[arg(long)]
+        dry_run: bool,
         /// Prompt text. Multiple words are joined with spaces.
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -747,6 +776,44 @@ impl From<CallModeArg> for InvokeMode {
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RouteCapabilityArg {
+    Code,
+    Reasoning,
+    Vision,
+    Embed,
+    Cheap,
+}
+
+impl From<RouteCapabilityArg> for Capability {
+    fn from(capability: RouteCapabilityArg) -> Self {
+        match capability {
+            RouteCapabilityArg::Code => Capability::Code,
+            RouteCapabilityArg::Reasoning => Capability::Reasoning,
+            RouteCapabilityArg::Vision => Capability::Vision,
+            RouteCapabilityArg::Embed => Capability::Embed,
+            RouteCapabilityArg::Cheap => Capability::CheapBulk,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RoutePreferArg {
+    Cheapest,
+    Quality,
+    Local,
+}
+
+impl From<RoutePreferArg> for Prefer {
+    fn from(prefer: RoutePreferArg) -> Self {
+        match prefer {
+            RoutePreferArg::Cheapest => Prefer::Cheapest,
+            RoutePreferArg::Quality => Prefer::Quality,
+            RoutePreferArg::Local => Prefer::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum DetectFormatArg {
     Table,
     Json,
@@ -1176,6 +1243,28 @@ async fn main() -> Result<()> {
                 CallFormatArg::Text => print!("{}", outcome.output),
                 CallFormatArg::Json => println!("{}", serde_json::to_string_pretty(&outcome)?),
             }
+        }
+        Cmd::Route {
+            capability,
+            prefer,
+            target,
+            model,
+            mode,
+            explain,
+            dry_run,
+            prompt,
+        } => {
+            run_route(RouteCliOptions {
+                capability,
+                prefer,
+                target,
+                model,
+                mode,
+                explain,
+                dry_run,
+                prompt,
+            })
+            .await?;
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
@@ -2503,6 +2592,14 @@ fn cost_class_label(cost: CostClass) -> &'static str {
     }
 }
 
+fn invoke_mode_label(mode: InvokeMode) -> &'static str {
+    match mode {
+        InvokeMode::Cli => "cli",
+        InvokeMode::Api => "api",
+        InvokeMode::Auto => "auto",
+    }
+}
+
 fn bool_label(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -2540,6 +2637,112 @@ fn run_hook(cwd: &std::path::Path, hook: &str) -> Result<()> {
         bail!("hook `{hook}` exited with {status}");
     }
     Ok(())
+}
+
+struct RouteCliOptions {
+    capability: Option<RouteCapabilityArg>,
+    prefer: RoutePreferArg,
+    target: Option<String>,
+    model: Option<String>,
+    mode: CallModeArg,
+    explain: bool,
+    dry_run: bool,
+    prompt: Vec<String>,
+}
+
+async fn run_route(opts: RouteCliOptions) -> Result<()> {
+    let prompt = opts.prompt.join(" ");
+    if prompt.trim().is_empty() {
+        bail!("rtrt route: prompt is empty");
+    }
+    let mode = InvokeMode::from(opts.mode);
+    let req = RouteRequest {
+        capability: opts.capability.map(Capability::from),
+        prefer: Prefer::from(opts.prefer),
+        target: opts.target,
+        model: opts.model,
+        mode: (mode != InvokeMode::Auto).then_some(mode),
+    };
+    let tools = rtrt_core::detect_tools();
+    let usage = UsageSnapshot::load_best_effort();
+    let decision = select_route(&req, &tools, &usage)?;
+
+    if opts.explain || opts.dry_run {
+        print_route_decision(&decision, opts.explain, &usage);
+    }
+    if opts.dry_run {
+        return Ok(());
+    }
+
+    let outcome = invoke_agent(
+        &decision.target,
+        &prompt,
+        InvokeOptions {
+            mode: Some(decision.mode),
+            model: decision.model.clone(),
+            timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        },
+    )
+    .await
+    .with_context(|| format!("rtrt route {}", decision.target))?;
+    print!("{}", outcome.output);
+    Ok(())
+}
+
+fn print_route_decision(decision: &RouteDecision, explain: bool, usage: &UsageSnapshot) {
+    println!("target: {}", decision.target);
+    println!("mode: {}", invoke_mode_label(decision.mode));
+    println!("model: {}", decision.model.as_deref().unwrap_or("-"));
+    println!("cost: {}", cost_class_label(decision.cost_class));
+    println!("reason: {}", decision.reason);
+    if !explain {
+        return;
+    }
+    println!("alternatives:");
+    if decision.alternatives.is_empty() {
+        println!("  (none)");
+    } else {
+        for alt in &decision.alternatives {
+            println!(
+                "  {} mode={} model={} cost={} headroom={} reason={}",
+                alt.target,
+                invoke_mode_label(alt.mode),
+                alt.model.as_deref().unwrap_or("-"),
+                cost_class_label(alt.cost_class),
+                alt.headroom,
+                alt.reason
+            );
+        }
+    }
+    println!("usage:");
+    if usage.usage_by_target.is_empty() {
+        println!("  tokens: unknown");
+    } else {
+        for (target, tokens) in &usage.usage_by_target {
+            println!("  {target}: used_tokens={tokens}");
+        }
+    }
+    if usage.limits_by_target.is_empty() {
+        println!("  limits: unknown");
+    } else {
+        for (target, limit) in &usage.limits_by_target {
+            let used = usage.usage_by_target.get(target).copied().unwrap_or(0);
+            println!(
+                "  {target}: limit={limit} remaining={}",
+                limit.saturating_sub(used)
+            );
+        }
+    }
+    if let Some(proxy) = usage.proxy_runs {
+        println!(
+            "  proxy: runs={} input_chars={} output_chars={}",
+            proxy.runs, proxy.input_chars, proxy.output_chars
+        );
+    }
+    println!("sources:");
+    for source in &usage.sources {
+        println!("  {source}");
+    }
 }
 
 async fn run_provider(cmd: ProviderCmd) -> Result<()> {

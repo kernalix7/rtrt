@@ -245,6 +245,12 @@
   .toggle-row { display: flex; align-items: center; gap: 0.6rem; }
   .toggle-row label { font-size: 0.85em; cursor: pointer; }
   .compress-now-result { margin-top: 0.5rem; font-size: 0.88em; }
+  .segment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.45rem; }
+  .segment-toggle { display: flex; align-items: center; gap: 0.45rem; padding: 0.45rem 0.55rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+  .segment-toggle input { margin: 0; }
+  .statusline-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr); gap: 1rem; align-items: start; }
+  .statusline-preview { background: #0b0e14; color: #e6edf3; border-color: #232a35; min-height: 108px; margin: 0; }
+  .placeholder-hint { color: var(--muted); font-size: 0.78em; }
 
   /* Template category cards */
   .tpl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
@@ -430,6 +436,7 @@
     main { padding: 1rem; }
     .row { grid-template-columns: 1fr; }
     .route-form-grid, .route-alt-row { grid-template-columns: 1fr; }
+    .statusline-grid { grid-template-columns: 1fr; }
     .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
@@ -509,6 +516,7 @@
       <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
       <a class="nav" data-page="prompts"><span class="icon">¶</span><span class="nav-copy"><span class="nav-label">Prompts</span><span class="nav-sub">version registry</span></span></a>
       <a class="nav" data-page="security"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">Security</span><span class="nav-sub">profiles and scans</span></span></a>
+      <a class="nav" data-page="statusline"><span class="icon">▤</span><span class="nav-copy"><span class="nav-label">Statusline</span><span class="nav-sub">rich prompt line</span></span></a>
       <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Settings</span><span class="nav-sub">capture defaults</span></span></a>
     </details>
   </aside>
@@ -1218,6 +1226,58 @@
         </div>
     </section>
 
+    <!-- Statusline -->
+    <section id="page-statusline" class="page" hidden>
+      <div class="section-head">
+        <h1>Statusline Customizer</h1>
+        <div class="lede">Configure the rich CLI statusline format.</div>
+      </div>
+      <div class="statusline-grid">
+        <div class="card">
+          <div class="head"><h2>Segments and Format</h2><span class="hint">~/.rtrt/config.toml</span></div>
+          <form id="statusline-form">
+            <div class="settings-section">
+              <h3>Segments</h3>
+              <div id="statusline-segments" class="segment-grid"></div>
+            </div>
+            <div class="settings-section">
+              <h3>Format</h3>
+              <label class="field-label" for="statusline-format">
+                <span>Line 1 format</span>
+                <input id="statusline-format" placeholder="{project} [{branch}] {wip} {sess} {ctx} {cache} {model}">
+                <small class="placeholder-hint"></small>
+              </label>
+              <label class="field-label" for="statusline-line2-format" style="margin-top:0.6rem;">
+                <span>Line 2 format</span>
+                <input id="statusline-line2-format" placeholder="{usage}">
+                <small class="placeholder-hint"></small>
+              </label>
+              <label class="field-label" for="statusline-line3-format" style="margin-top:0.6rem;">
+                <span>Line 3 format</span>
+                <input id="statusline-line3-format" placeholder="{codex} | {savings}">
+                <small class="placeholder-hint"></small>
+              </label>
+            </div>
+            <div class="settings-section">
+              <h3>Checks</h3>
+              <label class="field-label" for="statusline-timeout">
+                <span>Codex check timeout (ms)</span>
+                <input id="statusline-timeout" type="number" min="50" step="50" value="200">
+              </label>
+            </div>
+            <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
+              <button type="submit" class="primary">Save</button>
+              <span id="statusline-save-result" class="out-meta"></span>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <div class="head"><h2>Live Preview</h2><span class="hint">statusline --rich</span></div>
+          <pre id="statusline-preview" class="statusline-preview">Loading...</pre>
+        </div>
+      </div>
+    </section>
+
     <!-- 설정 -->
     <section id="page-settings" class="page" hidden>
       <div class="section-head">
@@ -1517,6 +1577,8 @@ let SECURITY_PROFILES_CACHE = [];
 let GLOBAL_DEFAULT_PROFILE = 'ai-default';
 const GLOBAL_PROJECT_VALUE = '__global__';
 const GLOBAL_SCOPE_MESSAGE = '전역 모드입니다 — 개별 프로젝트를 선택하세요';
+const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'model', 'usage', 'codex', 'savings'];
+const STATUSLINE_TOKENS_HINT = STATUSLINE_SEGMENTS.map(segment => `{${segment}}`).join(', ');
 
 function currentProject() {
   return document.getElementById('project-selector').value;
@@ -2240,6 +2302,7 @@ const PALETTE_ITEMS = [
   { label: 'System · Setup', hint: 'mcp setup', run: () => navigate('connect') },
   { label: 'System · Diagnose', hint: 'diagnose', run: () => navigate('diagnose') },
   { label: 'System · Security', hint: 'security', run: () => navigate('security') },
+  { label: 'System · Statusline', hint: 'rich statusline', run: () => navigate('statusline') },
   { label: 'System · Settings', hint: 'config / auto-compress', run: () => navigate('settings') },
   { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
   { label: 'Output Optimizer · sample', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
@@ -2339,6 +2402,9 @@ function navigate(page, opts = {}) {
   if (page === 'security') {
     loadSecurityProfiles();
     refreshSecurityScope();
+  }
+  if (page === 'statusline') {
+    loadStatuslinePage();
   }
   if (page === 'compress') {
     loadOptimizerLevel();
@@ -5217,6 +5283,87 @@ function populateEmbModelSelect(selected) {
   ).join('');
   sel.value = selected || '';
 }
+
+function renderStatuslineSegments(enabled = STATUSLINE_SEGMENTS) {
+  const selected = new Set(enabled);
+  const wrap = document.getElementById('statusline-segments');
+  wrap.innerHTML = STATUSLINE_SEGMENTS.map(segment => `
+    <label class="segment-toggle" for="statusline-segment-${segment}">
+      <input id="statusline-segment-${segment}" type="checkbox" value="${segment}" ${selected.has(segment) ? 'checked' : ''}>
+      <span>${segment}</span>
+    </label>
+  `).join('');
+  document.querySelectorAll('.placeholder-hint').forEach(el => {
+    el.textContent = `Available tokens: ${STATUSLINE_TOKENS_HINT}`;
+  });
+}
+
+function readStatuslineForm() {
+  return {
+    enabled_segments: [...document.querySelectorAll('#statusline-segments input[type="checkbox"]:checked')].map(input => input.value),
+    format: document.getElementById('statusline-format').value,
+    line2_format: document.getElementById('statusline-line2-format').value,
+    line3_format: document.getElementById('statusline-line3-format').value,
+    codex_check_timeout_ms: Number(document.getElementById('statusline-timeout').value || 200),
+  };
+}
+
+async function loadStatuslineConfig() {
+  const result = document.getElementById('statusline-save-result');
+  try {
+    const r = await fetch('/api/statusline/config');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    renderStatuslineSegments(d.enabled_segments || STATUSLINE_SEGMENTS);
+    document.getElementById('statusline-format').value = d.format || '';
+    document.getElementById('statusline-line2-format').value = d.line2_format || '';
+    document.getElementById('statusline-line3-format').value = d.line3_format || '';
+    document.getElementById('statusline-timeout').value = d.codex_check_timeout_ms ?? 200;
+    result.textContent = '';
+  } catch (err) {
+    renderStatuslineSegments();
+    result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+  }
+}
+
+async function loadStatuslinePreview() {
+  const pre = document.getElementById('statusline-preview');
+  pre.textContent = 'Loading...';
+  try {
+    const r = await fetch('/api/statusline/preview');
+    const d = await r.json();
+    const lines = Array.isArray(d.lines) ? d.lines : [];
+    pre.textContent = lines.length ? lines.join('\n') : '(no preview output)';
+  } catch (err) {
+    pre.textContent = err.message || String(err);
+  }
+}
+
+async function loadStatuslinePage() {
+  renderStatuslineSegments();
+  await Promise.all([loadStatuslineConfig(), loadStatuslinePreview()]);
+}
+
+document.getElementById('statusline-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const result = document.getElementById('statusline-save-result');
+  result.textContent = 'Saving...';
+  try {
+    const r = await fetch('/api/statusline/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readStatuslineForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    result.innerHTML = '<span class="badge ok">Saved</span>';
+    pushActivity('Statusline config saved');
+    showToast('Statusline config saved', 'ok');
+    await loadStatuslinePreview();
+  } catch (err) {
+    result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+  }
+};
 
 // Settings page — config form.
 async function loadConfig() {

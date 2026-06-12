@@ -27,6 +27,8 @@
 //! - `/api/proxy`         — `POST` rtrt-proxy filters (command / errors_only / ultra_compact).
 //! - `/api/diagnose`      — `POST` aider-style failure triage (errors_only + gateway chat).
 //! - `/api/route`         — `GET` dry-run orchestration route selection.
+//! - `/api/statusline/config` — `GET` / `POST` statusline rich-format config.
+//! - `/api/statusline/preview` — `GET` rendered `rtrt statusline --rich` preview.
 //!
 //! All `/api/*` routes are gated by a bearer-token middleware when the
 //! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
@@ -36,6 +38,7 @@ mod transcripts;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -58,6 +61,7 @@ use rtrt_providers::{
 use rtrt_security::{Profile, ScanReport};
 use rtrt_templates::{Prompt, PromptRegistry};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -407,6 +411,11 @@ async fn main() -> Result<()> {
         .route("/api/stream", get(sse_stream))
         .route("/api/tokens/summary", get(tokens_summary))
         .route("/api/config", get(get_config).post(post_config))
+        .route(
+            "/api/statusline/config",
+            get(get_statusline_config).post(post_statusline_config),
+        )
+        .route("/api/statusline/preview", get(statusline_preview))
         .route("/api/models", get(get_models))
         .route("/api/memory/compress", post(memory_compress))
         .route("/api/memory/stats", get(memory_stats))
@@ -3942,6 +3951,277 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
         security: cfg.security,
         path,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/statusline/config + GET /api/statusline/preview
+// ---------------------------------------------------------------------------
+
+const STATUSLINE_SEGMENTS: &[&str] = &[
+    "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
+];
+const STATUSLINE_DEFAULT_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
+const STATUSLINE_DEFAULT_LINE2_FORMAT: &str = "{usage}";
+const STATUSLINE_DEFAULT_LINE3_FORMAT: &str = "{codex} | {savings}";
+const STATUSLINE_DEFAULT_CODEX_TIMEOUT_MS: u64 = 200;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StatuslineConfig {
+    #[serde(default = "default_statusline_segments")]
+    enabled_segments: Vec<String>,
+    #[serde(default = "default_statusline_format")]
+    format: String,
+    #[serde(default = "default_statusline_line2_format")]
+    line2_format: String,
+    #[serde(default = "default_statusline_line3_format")]
+    line3_format: String,
+    #[serde(default = "default_statusline_codex_timeout_ms")]
+    codex_check_timeout_ms: u64,
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self {
+            enabled_segments: default_statusline_segments(),
+            format: default_statusline_format(),
+            line2_format: default_statusline_line2_format(),
+            line3_format: default_statusline_line3_format(),
+            codex_check_timeout_ms: default_statusline_codex_timeout_ms(),
+        }
+    }
+}
+
+fn default_statusline_segments() -> Vec<String> {
+    STATUSLINE_SEGMENTS
+        .iter()
+        .map(|segment| segment.to_string())
+        .collect()
+}
+
+fn default_statusline_format() -> String {
+    STATUSLINE_DEFAULT_FORMAT.to_string()
+}
+
+fn default_statusline_line2_format() -> String {
+    STATUSLINE_DEFAULT_LINE2_FORMAT.to_string()
+}
+
+fn default_statusline_line3_format() -> String {
+    STATUSLINE_DEFAULT_LINE3_FORMAT.to_string()
+}
+
+fn default_statusline_codex_timeout_ms() -> u64 {
+    STATUSLINE_DEFAULT_CODEX_TIMEOUT_MS
+}
+
+#[derive(Debug, Serialize)]
+struct StatuslineOk {
+    ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StatuslinePreview {
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiError {
+    error: String,
+}
+
+type DashboardJsonResult<T> = std::result::Result<Json<T>, (StatusCode, Json<ApiError>)>;
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            error: message.into(),
+        }),
+    )
+}
+
+async fn get_statusline_config() -> DashboardJsonResult<StatuslineConfig> {
+    let path = statusline_config_path()?;
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => {
+            let root = parse_config_toml(&content, &path)?;
+            let Some(statusline) = root.get("statusline") else {
+                return Ok(Json(StatuslineConfig::default()));
+            };
+            let cfg = statusline.clone().try_into().map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("parse [statusline] in {}: {e}", path.display()),
+                )
+            })?;
+            Ok(Json(cfg))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(StatuslineConfig::default())),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read {}: {e}", path.display()),
+        )),
+    }
+}
+
+async fn post_statusline_config(
+    Json(req): Json<StatuslineConfig>,
+) -> DashboardJsonResult<StatuslineOk> {
+    validate_statusline_segments(&req.enabled_segments)?;
+
+    let path = statusline_config_path()?;
+    let mut root = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => parse_config_toml(&content, &path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::Table::new())
+        }
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read {}: {e}", path.display()),
+            ));
+        }
+    };
+    if !root.is_table() {
+        root = toml::Value::Table(toml::Table::new());
+    }
+    let root_table = root.as_table_mut().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config root is not a TOML table",
+        )
+    })?;
+    let statusline_value = toml::Value::try_from(req).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize statusline config: {e}"),
+        )
+    })?;
+    root_table.insert("statusline".to_string(), statusline_value);
+
+    let output = toml::to_string_pretty(&root).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize {}: {e}", path.display()),
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create dir {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    tokio::fs::write(&path, output).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write {}: {e}", path.display()),
+        )
+    })?;
+
+    Ok(Json(StatuslineOk { ok: true }))
+}
+
+async fn statusline_preview() -> Json<StatuslinePreview> {
+    let fallback = || {
+        Json(StatuslinePreview {
+            lines: vec![
+                "(rtrt binary not found or timed out — save config and ensure rtrt is installed)"
+                    .to_string(),
+            ],
+        })
+    };
+    match run_statusline_preview("rtrt").await {
+        Some(lines) => Json(StatuslinePreview { lines }),
+        None => {
+            let Some(home) = dirs::home_dir() else {
+                return fallback();
+            };
+            let cargo_bin = home.join(".cargo").join("bin").join("rtrt");
+            match run_statusline_preview(cargo_bin).await {
+                Some(lines) => Json(StatuslinePreview { lines }),
+                None => fallback(),
+            }
+        }
+    }
+}
+
+fn statusline_config_path() -> std::result::Result<PathBuf, (StatusCode, Json<ApiError>)> {
+    rtrt_core::Config::default_path().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot determine config path",
+        )
+    })
+}
+
+fn parse_config_toml(
+    content: &str,
+    path: &std::path::Path,
+) -> std::result::Result<toml::Value, (StatusCode, Json<ApiError>)> {
+    content.parse::<toml::Value>().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("parse {}: {e}", path.display()),
+        )
+    })
+}
+
+fn validate_statusline_segments(
+    segments: &[String],
+) -> std::result::Result<(), (StatusCode, Json<ApiError>)> {
+    for segment in segments {
+        if !STATUSLINE_SEGMENTS.contains(&segment.as_str()) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown statusline segment: {segment}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn run_statusline_preview<P>(binary: P) -> Option<Vec<String>>
+where
+    P: AsRef<std::ffi::OsStr>,
+{
+    let sample = serde_json::json!({
+        "model": { "display_name": "Opus 4.8" },
+        "cwd": "/home/kernalix7/Desktop/00_Personal_Project/00G_rtrt",
+        "transcript": [],
+    });
+    let sample = serde_json::to_vec(&sample).ok()?;
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .arg("statusline")
+        .arg("--rich")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(&sample).await.is_err() || stdin.shutdown().await.is_err() {
+            return None;
+        }
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .take(3)
+        .collect::<Vec<_>>();
+    Some(lines)
 }
 
 // ---------------------------------------------------------------------------

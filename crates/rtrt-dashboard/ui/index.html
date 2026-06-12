@@ -260,6 +260,26 @@
   .tpl-card h3 { margin: 0.4rem 0 0.4rem; font-size: 1.35rem; }
   .tpl-card .desc { color: var(--muted); font-size: 0.92em; line-height: 1.5; }
   .tpl-card .go { color: var(--accent); font-weight: 600; margin-top: 0.85rem; display: inline-block; }
+  .tpl-editor-layout { display: grid; grid-template-columns: minmax(260px, 0.75fr) minmax(0, 1.25fr); gap: 1rem; align-items: start; }
+  .tpl-toolbar { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; }
+  .tpl-list { display: grid; gap: 0.55rem; }
+  .tpl-list-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem; display: grid; gap: 0.5rem; }
+  .tpl-list-item.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+  .tpl-list-item .tpl-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.5rem; }
+  .tpl-list-item .tpl-name { font-weight: 700; overflow-wrap: anywhere; }
+  .tpl-list-item .tpl-desc { color: var(--muted); font-size: 0.88em; overflow-wrap: anywhere; }
+  .tpl-list-item .tpl-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+  .tpl-list-item .tpl-actions button { padding: 0.3rem 0.5rem; font-size: 0.82em; }
+  .tpl-form-grid { display: grid; gap: 0.75rem; }
+  .tpl-table input { width: 100%; }
+  .tpl-var-required { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
+  .tpl-file-list { display: grid; gap: 0.65rem; }
+  .tpl-file-item { border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem; background: var(--bg); display: grid; gap: 0.55rem; }
+  .tpl-file-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.45rem; align-items: center; }
+  .tpl-file-item textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, monospace; }
+  .tpl-editor-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .tpl-editor-actions .spacer { flex: 1; }
+  .tpl-slug-status { min-height: 1.2em; color: var(--muted); font-size: 0.82em; }
 
   /* Modal */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
@@ -447,6 +467,8 @@
     .row { grid-template-columns: 1fr; }
     .route-form-grid, .route-alt-row { grid-template-columns: 1fr; }
     .statusline-grid { grid-template-columns: 1fr; }
+    .tpl-editor-layout { grid-template-columns: 1fr; }
+    .tpl-file-head { grid-template-columns: 1fr; }
     .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
@@ -1208,9 +1230,62 @@
     <section id="page-templates" class="page" hidden>
       <div class="section-head">
         <h1>Templates</h1>
-        <div class="lede">Create projects from built-in scaffolds.</div>
+        <div class="lede">Create, duplicate, and manage custom project scaffolds.</div>
       </div>
-      <div id="tpl-grid" class="tpl-grid"></div>
+      <div class="tpl-editor-layout">
+        <div class="card">
+          <div class="head">
+            <h2>Template Library</h2>
+            <div class="tpl-toolbar">
+              <button id="tpl-new-btn" class="primary" type="button">New</button>
+              <button id="tpl-refresh-btn" class="ghost" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="tpl-list" class="tpl-list"></div>
+        </div>
+        <div id="tpl-editor-card" class="card" hidden>
+          <div class="head">
+            <h2 id="tpl-editor-title">New Template</h2>
+            <span id="tpl-editor-mode" class="badge">custom</span>
+          </div>
+          <form id="tpl-editor-form" class="tpl-form-grid">
+            <input id="tpl-original-name" type="hidden">
+            <div class="row">
+              <label class="field-label"><span>Name</span><input id="tpl-name" placeholder="custom-rust-cli" required pattern="[A-Za-z0-9_-]+"></label>
+              <label class="field-label"><span>Category</span><select id="tpl-category">
+                <option value="rust-cli">rust-cli</option>
+                <option value="rust-lib">rust-lib</option>
+                <option value="rust-axum">rust-axum</option>
+                <option value="node-typescript">node-typescript</option>
+                <option value="python-uv">python-uv</option>
+                <option value="go-cli">go-cli</option>
+                <option value="custom">custom</option>
+              </select></label>
+            </div>
+            <div id="tpl-slug-status" class="tpl-slug-status"></div>
+            <label class="field-label"><span>Description</span><input id="tpl-description" placeholder="Short scaffold description"></label>
+            <div>
+              <div class="head"><h2>Variables</h2><button id="tpl-var-add" class="ghost" type="button">Add variable</button></div>
+              <table class="tpl-table">
+                <thead><tr><th>Name</th><th>Default</th><th>Description</th><th>Required</th><th></th></tr></thead>
+                <tbody id="tpl-vars-body"></tbody>
+              </table>
+            </div>
+            <div>
+              <div class="head"><h2>Files</h2><button id="tpl-file-add" class="ghost" type="button">Add file</button></div>
+              <div class="hint">Use {{variable_name}} placeholders — substituted at scaffold time</div>
+              <div id="tpl-files-list" class="tpl-file-list"></div>
+            </div>
+            <div class="tpl-editor-actions">
+              <button id="tpl-save" class="primary" type="submit">Save</button>
+              <button id="tpl-preview" class="ghost" type="button">Preview</button>
+              <span class="spacer"></span>
+              <button id="tpl-delete" class="danger-confirm" type="button" hidden>Delete</button>
+            </div>
+          </form>
+          <div id="tpl-editor-result" class="out-meta"></div>
+        </div>
+      </div>
       <div id="scaffold-modal" class="modal-backdrop" hidden>
         <div class="modal">
           <div class="modal-head">
@@ -5312,34 +5387,305 @@ document.getElementById('repomap-form').onsubmit = async (ev) => {
 };
 
 // Templates
-const CAT_LABEL = { development: '개발', design: '디자인', planning: '설계' };
+const CAT_LABEL = {
+  development: '개발',
+  design: '디자인',
+  planning: '설계',
+  'rust-cli': 'rust-cli',
+  'rust-lib': 'rust-lib',
+  'rust-axum': 'rust-axum',
+  'node-typescript': 'node-typescript',
+  'python-uv': 'python-uv',
+  'go-cli': 'go-cli',
+  custom: 'custom',
+};
 let LOADED_TEMPLATES = [];
-const CAT_NUM = { development: '01', design: '02', planning: '03' };
+let TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '' };
+const TEMPLATE_SLUG_RE = /^[A-Za-z0-9_-]+$/;
+const TEMPLATE_CATEGORY_VALUES = ['rust-cli', 'rust-lib', 'rust-axum', 'node-typescript', 'python-uv', 'go-cli', 'custom'];
+
+function templateSource(t) {
+  return String(t.source || '').toLowerCase().replace(/_/g, '');
+}
+function isBuiltinTemplate(t) {
+  return templateSource(t) === 'builtin';
+}
+function categoryLabel(cat) {
+  return CAT_LABEL[cat] || cat || 'custom';
+}
+function categoryEditorValue(cat) {
+  return TEMPLATE_CATEGORY_VALUES.includes(cat) ? cat : 'custom';
+}
+function isSafeTemplateSlug(name) {
+  return TEMPLATE_SLUG_RE.test(name || '');
+}
+function isSafeTemplateFilePath(path) {
+  if (!path || path.startsWith('/') || path.includes('\\')) return false;
+  return path.split('/').every(part => part && part !== '.' && part !== '..');
+}
 async function loadTemplates() {
   const tpls = await fetch('/api/templates').then(r => r.ok ? r.json() : []).catch(() => []);
   LOADED_TEMPLATES = tpls;
-  const grid = document.getElementById('tpl-grid');
-  if (!grid) return;
-  const order = ['development', 'design', 'planning'];
-  const byCat = {};
-  for (const t of tpls) { (byCat[t.category || 'development'] ||= []).push(t); }
-  grid.innerHTML = order.map(cat => {
-    const list = byCat[cat] || [];
-    if (!list.length) return '';
-    const t = list[0];
-    return `<div class="tpl-card" data-pick="${t.name}">
-      <div class="num">${CAT_NUM[cat]} · ${CAT_LABEL[cat].toUpperCase()}</div>
-      <h3>${CAT_LABEL[cat]}</h3>
-      <div class="desc">${t.description}</div>
-      <div class="go">시작 →</div>
+  renderTemplateList();
+}
+function renderTemplateList() {
+  const list = document.getElementById('tpl-list');
+  if (!list) return;
+  const sorted = LOADED_TEMPLATES.slice().sort((a, b) => {
+    const sourceRank = Number(isBuiltinTemplate(b)) - Number(isBuiltinTemplate(a));
+    return sourceRank || String(a.name).localeCompare(String(b.name));
+  });
+  if (!sorted.length) {
+    list.innerHTML = '<div class="empty">No templates found.</div>';
+    return;
+  }
+  const active = TEMPLATE_EDITOR_STATE.originalName || document.getElementById('tpl-name')?.value || '';
+  list.innerHTML = sorted.map(t => {
+    const builtin = isBuiltinTemplate(t);
+    const activeClass = active === t.name ? ' active' : '';
+    const badge = builtin ? '<span class="badge warn">read-only</span>' : '<span class="badge ok">custom</span>';
+    const editButtons = builtin
+      ? `<button type="button" class="ghost" data-tpl-duplicate="${escapeAttr(t.name)}">Duplicate as custom</button>`
+      : `<button type="button" class="ghost" data-tpl-edit="${escapeAttr(t.name)}">Edit</button><button type="button" class="ghost" data-tpl-delete="${escapeAttr(t.name)}">Delete</button>`;
+    return `<div class="tpl-list-item${activeClass}">
+      <div class="tpl-top">
+        <div><div class="tpl-name">${escapeHtml(t.name)}</div><div class="tpl-desc">${escapeHtml(t.description || '')}</div></div>
+        ${badge}
+      </div>
+      <div class="hint">${escapeHtml(categoryLabel(t.category))} · ${(t.variables || []).length} variables</div>
+      <div class="tpl-actions">
+        <button type="button" class="ghost" data-tpl-scaffold="${escapeAttr(t.name)}">Scaffold</button>
+        ${editButtons}
+      </div>
     </div>`;
   }).join('');
-  grid.querySelectorAll('.tpl-card').forEach(card => card.onclick = () => openScaffoldModal(card.dataset.pick));
+  list.querySelectorAll('[data-tpl-scaffold]').forEach(btn => btn.onclick = () => openScaffoldModal(btn.dataset.tplScaffold));
+  list.querySelectorAll('[data-tpl-duplicate]').forEach(btn => btn.onclick = () => duplicateTemplate(btn.dataset.tplDuplicate));
+  list.querySelectorAll('[data-tpl-edit]').forEach(btn => btn.onclick = () => editTemplate(btn.dataset.tplEdit));
+  list.querySelectorAll('[data-tpl-delete]').forEach(btn => btn.onclick = () => deleteTemplate(btn.dataset.tplDelete));
 }
+async function fetchTemplate(name) {
+  const r = await fetch(`/api/templates/${encodeURIComponent(name)}`);
+  if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+  return r.json();
+}
+function emptyTemplate() {
+  return {
+    name: '',
+    description: '',
+    category: 'rust-cli',
+    variables: [{ name: 'project_name', description: '', default: '', required: true }],
+    files: [{ path: 'README.md', content: '# {{project_name}}\n', executable: false }],
+  };
+}
+function openTemplateEditor(template, state) {
+  TEMPLATE_EDITOR_STATE = state;
+  document.getElementById('tpl-editor-card').hidden = false;
+  document.getElementById('tpl-editor-title').textContent = state.isNew ? 'New Template' : `Edit ${template.name}`;
+  document.getElementById('tpl-editor-mode').textContent = state.isNew ? 'new custom' : 'custom';
+  document.getElementById('tpl-original-name').value = state.originalName || '';
+  const nameInput = document.getElementById('tpl-name');
+  nameInput.value = template.name || '';
+  nameInput.readOnly = !state.isNew;
+  document.getElementById('tpl-description').value = template.description || '';
+  document.getElementById('tpl-category').value = categoryEditorValue(template.category);
+  document.getElementById('tpl-delete').hidden = state.isNew;
+  document.getElementById('tpl-editor-result').textContent = '';
+  renderTemplateVariables(template.variables || []);
+  renderTemplateFiles(template.files || []);
+  validateTemplateSlugUi();
+  renderTemplateList();
+  setTimeout(() => (state.isNew ? nameInput : document.getElementById('tpl-description')).focus(), 0);
+}
+function renderTemplateVariables(vars) {
+  const body = document.getElementById('tpl-vars-body');
+  body.innerHTML = vars.map(v => templateVariableRow(v)).join('');
+  body.querySelectorAll('[data-var-remove]').forEach(btn => btn.onclick = () => {
+    btn.closest('tr').remove();
+  });
+}
+function templateVariableRow(v = {}) {
+  return `<tr>
+    <td><input data-var-name value="${escapeAttr(v.name || '')}" placeholder="project_name"></td>
+    <td><input data-var-default value="${escapeAttr(v.default || '')}" placeholder="demo"></td>
+    <td><input data-var-description value="${escapeAttr(v.description || '')}" placeholder="Shown in scaffold form"></td>
+    <td><label class="tpl-var-required"><input data-var-required type="checkbox" ${v.required !== false ? 'checked' : ''}> Required</label></td>
+    <td><button class="ghost" type="button" data-var-remove>Remove</button></td>
+  </tr>`;
+}
+function renderTemplateFiles(files) {
+  const list = document.getElementById('tpl-files-list');
+  list.innerHTML = files.map((file, idx) => templateFileItem(file, idx)).join('');
+  bindTemplateFileButtons();
+}
+function templateFileItem(file = {}, idx = 0) {
+  return `<div class="tpl-file-item" data-file-index="${idx}">
+    <div class="tpl-file-head">
+      <input data-file-path value="${escapeAttr(file.path || '')}" placeholder="src/main.rs">
+      <label class="tpl-var-required"><input data-file-executable type="checkbox" ${file.executable ? 'checked' : ''}> Executable</label>
+      <button class="ghost" type="button" data-file-remove>Remove</button>
+    </div>
+    <textarea data-file-content spellcheck="false" placeholder="File content">${escapeHtml(file.content || '')}</textarea>
+  </div>`;
+}
+function bindTemplateFileButtons() {
+  document.querySelectorAll('#tpl-files-list [data-file-remove]').forEach(btn => btn.onclick = () => {
+    btn.closest('.tpl-file-item').remove();
+  });
+}
+function collectTemplateFromEditor() {
+  const name = document.getElementById('tpl-name').value.trim();
+  if (!isSafeTemplateSlug(name)) throw new Error('Name must use letters, numbers, hyphens, or underscores.');
+  const variables = Array.from(document.querySelectorAll('#tpl-vars-body tr')).map(row => ({
+    name: row.querySelector('[data-var-name]').value.trim(),
+    default: row.querySelector('[data-var-default]').value || undefined,
+    description: row.querySelector('[data-var-description]').value || undefined,
+    required: row.querySelector('[data-var-required]').checked,
+  })).filter(v => v.name);
+  const files = Array.from(document.querySelectorAll('#tpl-files-list .tpl-file-item')).map(item => ({
+    path: item.querySelector('[data-file-path]').value.trim(),
+    content: item.querySelector('[data-file-content]').value,
+    executable: item.querySelector('[data-file-executable]').checked,
+  }));
+  for (const file of files) {
+    if (!isSafeTemplateFilePath(file.path)) throw new Error(`File path must stay inside the scaffold target: ${file.path || '(empty)'}`);
+  }
+  return {
+    name,
+    description: document.getElementById('tpl-description').value.trim(),
+    category: document.getElementById('tpl-category').value,
+    variables,
+    files,
+  };
+}
+function validateTemplateSlugUi() {
+  const name = document.getElementById('tpl-name').value.trim();
+  const status = document.getElementById('tpl-slug-status');
+  if (!name) {
+    status.textContent = 'Use letters, numbers, hyphens, or underscores.';
+    return false;
+  }
+  const ok = isSafeTemplateSlug(name);
+  status.innerHTML = ok ? '<span class="badge ok">valid slug</span>' : '<span class="badge err">invalid slug</span>';
+  return ok;
+}
+async function duplicateTemplate(name) {
+  try {
+    const t = await fetchTemplate(name);
+    t.name = `custom-${t.name}`;
+    t.category = categoryEditorValue(t.category);
+    openTemplateEditor(t, { isNew: true, originalName: '' });
+  } catch (e) {
+    showToast(`Duplicate failed: ${e.message || e}`, 'err');
+  }
+}
+async function editTemplate(name) {
+  try {
+    const t = await fetchTemplate(name);
+    if (isBuiltinTemplate(t)) {
+      showToast('Built-in templates are read-only. Duplicate as custom first.', 'err');
+      return;
+    }
+    t.category = categoryEditorValue(t.category);
+    openTemplateEditor(t, { isNew: false, originalName: t.name });
+  } catch (e) {
+    showToast(`Edit failed: ${e.message || e}`, 'err');
+  }
+}
+async function deleteTemplate(name) {
+  const ok = confirm(`Delete custom template "${name}"?`);
+  if (!ok) return;
+  const r = await fetch(`/api/templates/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  if (!r.ok) {
+    showToast(`Delete failed ${r.status}: ${await r.text()}`, 'err');
+    return;
+  }
+  showToast(`Deleted ${name}`, 'ok');
+  if (TEMPLATE_EDITOR_STATE.originalName === name) {
+    document.getElementById('tpl-editor-card').hidden = true;
+    TEMPLATE_EDITOR_STATE = { isNew: true, originalName: '' };
+  }
+  await loadTemplates();
+}
+document.getElementById('tpl-new-btn').onclick = () => openTemplateEditor(emptyTemplate(), { isNew: true, originalName: '' });
+document.getElementById('tpl-refresh-btn').onclick = loadTemplates;
+document.getElementById('tpl-var-add').onclick = () => {
+  document.getElementById('tpl-vars-body').insertAdjacentHTML('beforeend', templateVariableRow({ required: true }));
+  renderTemplateVariables(Array.from(document.querySelectorAll('#tpl-vars-body tr')).map(row => ({
+    name: row.querySelector('[data-var-name]').value,
+    default: row.querySelector('[data-var-default]').value,
+    description: row.querySelector('[data-var-description]').value,
+    required: row.querySelector('[data-var-required]').checked,
+  })));
+};
+document.getElementById('tpl-file-add').onclick = () => {
+  document.getElementById('tpl-files-list').insertAdjacentHTML('beforeend', templateFileItem({ path: '', content: '', executable: false }, Date.now()));
+  bindTemplateFileButtons();
+};
+document.getElementById('tpl-name').addEventListener('input', validateTemplateSlugUi);
+document.getElementById('tpl-delete').onclick = () => {
+  const name = TEMPLATE_EDITOR_STATE.originalName || document.getElementById('tpl-name').value.trim();
+  if (name) deleteTemplate(name);
+};
+document.getElementById('tpl-preview').onclick = async () => {
+  const out = document.getElementById('tpl-editor-result');
+  let template;
+  try {
+    template = collectTemplateFromEditor();
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    return;
+  }
+  const variables = {};
+  for (const v of template.variables) variables[v.name] = v.default || '';
+  out.textContent = 'Previewing…';
+  const r = await fetch('/api/templates/scaffold/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ template: template.name, target: `./preview-${template.name}`, variables, overwrite: false }),
+  });
+  if (!r.ok) {
+    out.innerHTML = `<span style="color:var(--err);">${r.status}: ${escapeHtml(await r.text())}</span>`;
+    return;
+  }
+  const d = await r.json();
+  const rows = d.files.map(f => `<tr><td><code>${escapeHtml(String(f.path))}</code></td><td>${f.bytes}</td><td>${f.executable ? 'yes' : 'no'}</td></tr>`).join('');
+  out.innerHTML = `<div>${escapeHtml(String(d.root))} · ${d.files.length} files</div><table style="margin-top:0.4rem;"><thead><tr><th>Path</th><th>Bytes</th><th>Executable</th></tr></thead><tbody>${rows}</tbody></table>`;
+};
+document.getElementById('tpl-editor-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const out = document.getElementById('tpl-editor-result');
+  let template;
+  try {
+    template = collectTemplateFromEditor();
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    return;
+  }
+  const method = TEMPLATE_EDITOR_STATE.isNew ? 'POST' : 'PUT';
+  const url = TEMPLATE_EDITOR_STATE.isNew ? '/api/templates' : `/api/templates/${encodeURIComponent(TEMPLATE_EDITOR_STATE.originalName)}`;
+  out.textContent = 'Saving…';
+  const r = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(template),
+  });
+  if (!r.ok) {
+    out.innerHTML = `<span style="color:var(--err);">${r.status}: ${escapeHtml(await r.text())}</span>`;
+    return;
+  }
+  const d = await r.json();
+  out.innerHTML = `<span class="badge ok">Saved</span> <code>${escapeHtml(d.name || template.name)}</code>`;
+  showToast(`Saved ${template.name}`, 'ok');
+  TEMPLATE_EDITOR_STATE = { isNew: false, originalName: template.name };
+  document.getElementById('tpl-name').readOnly = true;
+  document.getElementById('tpl-delete').hidden = false;
+  await loadTemplates();
+};
 function openScaffoldModal(name) {
   const tpl = LOADED_TEMPLATES.find(t => t.name === name);
   if (!tpl) return;
-  document.getElementById('scaffold-title').textContent = `새 ${CAT_LABEL[tpl.category]} 프로젝트`;
+  document.getElementById('scaffold-title').textContent = `새 ${categoryLabel(tpl.category)} 프로젝트`;
   document.getElementById('scaffold-template').value = name;
   document.getElementById('scaffold-target').value = '';
   document.getElementById('scaffold-overwrite').checked = false;
@@ -5358,8 +5704,8 @@ function renderScaffoldVars() {
   if (!tpl) { wrap.innerHTML = ''; return; }
   wrap.innerHTML = `<table style="margin-top:0.5rem;"><tbody>` +
     tpl.variables.map(v =>
-      `<tr><td style="width:30%;"><code>${v.name}</code>${v.required ? ' *' : ''}</td>` +
-      `<td><input data-var="${v.name}" placeholder="${v.description || ''}" value="${v.default || ''}" style="width:100%;"></td></tr>`
+      `<tr><td style="width:30%;"><code>${escapeHtml(v.name)}</code>${v.required ? ' *' : ''}</td>` +
+      `<td><input data-var="${escapeAttr(v.name)}" placeholder="${escapeAttr(v.description || '')}" value="${escapeAttr(v.default || '')}" style="width:100%;"></td></tr>`
     ).join('') + `</tbody></table>`;
 }
 function buildScaffoldBody() {
@@ -5380,8 +5726,8 @@ document.getElementById('scaffold-preview').onclick = async () => {
   const r = await fetch('/api/templates/scaffold/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
   if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  const rows = d.files.map(f => `<tr><td><code>${f.path}</code></td><td>${f.bytes}</td></tr>`).join('');
-  out.innerHTML = `<div>${d.root} 아래 ${d.files.length} 파일 생성 예정</div><table style="margin-top:0.4rem;"><thead><tr><th>경로</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const rows = d.files.map(f => `<tr><td><code>${escapeHtml(String(f.path))}</code></td><td>${f.bytes}</td></tr>`).join('');
+  out.innerHTML = `<div>${escapeHtml(String(d.root))} 아래 ${d.files.length} 파일 생성 예정</div><table style="margin-top:0.4rem;"><thead><tr><th>경로</th><th>bytes</th></tr></thead><tbody>${rows}</tbody></table>`;
 };
 document.getElementById('scaffold-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -5390,8 +5736,8 @@ document.getElementById('scaffold-form').onsubmit = async (ev) => {
   const r = await fetch('/api/templates/scaffold', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(buildScaffoldBody())});
   if (!r.ok) { out.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`; return; }
   const d = await r.json();
-  out.innerHTML = `<span class="badge ok">✓ ${d.files_written} 파일</span> <code>${d.root}</code>` +
-    (d.post_hooks.length ? `<br>후처리: ${d.post_hooks.map(h => `<code>${h}</code>`).join(', ')}` : '');
+  out.innerHTML = `<span class="badge ok">✓ ${d.files_written} 파일</span> <code>${escapeHtml(String(d.root))}</code>` +
+    (d.post_hooks.length ? `<br>후처리: ${d.post_hooks.map(h => `<code>${escapeHtml(h)}</code>`).join(', ')}` : '');
   pushActivity(`scaffold · ${d.files_written} 파일`);
 };
 

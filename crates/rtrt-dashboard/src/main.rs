@@ -385,8 +385,13 @@ async fn main() -> Result<()> {
             "/api/optimizer/level",
             get(get_optimizer_level).post(post_optimizer_level),
         )
-        .route("/api/templates", get(list_templates))
-        .route("/api/templates/{name}", get(get_template))
+        .route("/api/templates", get(list_templates).post(create_template))
+        .route(
+            "/api/templates/{name}",
+            get(get_template)
+                .put(update_template)
+                .delete(delete_template),
+        )
         .route("/api/templates/scaffold", post(scaffold))
         .route("/api/templates/scaffold/preview", post(scaffold_preview))
         .route("/api/chat", post(chat))
@@ -1834,6 +1839,71 @@ async fn get_template(
         .ok_or((StatusCode::NOT_FOUND, format!("template not found: {name}")))
 }
 
+async fn create_template(
+    Json(req): Json<TemplateUpsertRequest>,
+) -> std::result::Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    if is_builtin_template(&req.name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("built-in template is read-only: {}", req.name),
+        ));
+    }
+    let template = req.into_template();
+    let path =
+        rtrt_templates::custom::save_custom(&template).map_err(template_write_error_status)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true, "name": template.name, "path": path })),
+    ))
+}
+
+async fn update_template(
+    AxPath(name): AxPath<String>,
+    Json(req): Json<TemplateUpsertRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if req.name != name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "template body name must match route name".to_string(),
+        ));
+    }
+    if is_builtin_template(&name) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("built-in template is read-only: {name}"),
+        ));
+    }
+    let template = req.into_template();
+    let path =
+        rtrt_templates::custom::save_custom(&template).map_err(template_write_error_status)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "name": template.name, "path": path }),
+    ))
+}
+
+async fn delete_template(
+    AxPath(name): AxPath<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_safe_template_slug(&name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "template name must be a non-empty slug using letters, numbers, hyphens, or underscores"
+                .to_string(),
+        ));
+    }
+    if is_builtin_template(&name) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("built-in template is read-only: {name}"),
+        ));
+    }
+    if !rtrt_templates::custom::is_custom(&name) {
+        return Err((StatusCode::NOT_FOUND, format!("template not found: {name}")));
+    }
+    rtrt_templates::custom::delete_custom(&name).map_err(template_write_error_status)?;
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
 async fn security_profiles() -> Json<Vec<String>> {
     Json(rtrt_security::list_profiles())
 }
@@ -2040,6 +2110,58 @@ impl From<rtrt_templates::Template> for TemplateSummary {
             category: t.category,
             variables: t.variables,
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TemplateUpsertRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    category: rtrt_templates::TemplateCategory,
+    #[serde(default)]
+    variables: Vec<rtrt_templates::TemplateVariable>,
+    #[serde(default)]
+    files: Vec<rtrt_templates::TemplateFile>,
+    #[serde(default)]
+    post_hooks: Vec<String>,
+}
+
+impl TemplateUpsertRequest {
+    fn into_template(self) -> rtrt_templates::Template {
+        rtrt_templates::Template {
+            name: self.name,
+            description: self.description,
+            source: rtrt_templates::TemplateSource::Custom,
+            category: self.category,
+            variables: self.variables,
+            files: self.files,
+            post_hooks: self.post_hooks,
+        }
+    }
+}
+
+fn is_builtin_template(name: &str) -> bool {
+    rtrt_templates::builtin::ALL
+        .iter()
+        .any(|template| template.name == name)
+}
+
+fn is_safe_template_slug(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn template_write_error_status(err: rtrt_core::Error) -> (StatusCode, String) {
+    match err {
+        rtrt_core::Error::Config(message) => (StatusCode::BAD_REQUEST, message),
+        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
 

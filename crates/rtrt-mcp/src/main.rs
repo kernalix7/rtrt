@@ -28,7 +28,10 @@ use rmcp::{
 use rtrt_compress::Compressor;
 use rtrt_core::CompressionLevel;
 use rtrt_memory::MemoryStore;
-use rtrt_providers::{ChatMessage, ChatRequest, Gateway, Role};
+use rtrt_providers::{
+    ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvokeOptions, Mode as InvokeMode,
+    Role, invoke_agent,
+};
 use rtrt_templates::PromptRegistry;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -303,6 +306,16 @@ struct ProviderChatArgs {
 struct ProviderChatMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentCallArgs {
+    target: String,
+    prompt: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -867,6 +880,39 @@ impl RtrtMcp {
     }
 
     #[tool(
+        description = "Invoke a detected local agent or provider through RTRT's cross-tool bridge. mode: cli, api, or auto."
+    )]
+    async fn agent_call(
+        &self,
+        Parameters(args): Parameters<AgentCallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = match args.mode.as_deref() {
+            Some(value) => Some(
+                InvokeMode::parse_label(value)
+                    .map_err(|e| McpError::invalid_params(format!("agent_call mode: {e}"), None))?,
+            ),
+            None => Some(InvokeMode::Auto),
+        };
+        let outcome = invoke_agent(
+            &args.target,
+            &args.prompt,
+            InvokeOptions {
+                mode,
+                model: args.model,
+                timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            },
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_call: {e}"), None))?;
+        let body = serde_json::to_string(&outcome)
+            .map_err(|e| McpError::internal_error(format!("agent_call serialize: {e}"), None))?;
+        self.state
+            .auto_capture("agent_call", None, &outcome.output)
+            .await;
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
         description = "Scan a directory for security & license issues in AI-generated code using a named profile (CIS / NIST SSDF / OWASP Top 10 / ASVS / ai-default / ai-strict). Returns a ScanReport: findings with severity, file:line, fix hint, and the standards each rule maps to (CWE/OWASP/NIST/...), plus per-severity counts."
     )]
     async fn security_scan(
@@ -980,7 +1026,7 @@ impl ServerHandler for RtrtMcp {
                  proxy (command output filters). \
                  Code tools: repo_map (tree-sitter signatures). \
                  Project tools: templates_list / templates_scaffold. \
-                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible). \
+                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible) / agent_call (detected CLI/API agent bridge). \
                  Security tools: security_scan (profile-driven secrets / license / dependency / pattern / AI-artifact scan; profiles map to CWE/OWASP/NIST/CIS/SLSA/EU-AI-Act). \
                  Prompts: every entry in the local PromptRegistry (~/.rtrt/prompts) is exposed via prompts/list + prompts/get with handlebars argument substitution. \
                  Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block.",

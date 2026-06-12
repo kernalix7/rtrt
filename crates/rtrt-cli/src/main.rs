@@ -21,7 +21,8 @@ use rtrt_core::{
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
-    OpenAICompatibleProvider, OpenAIProvider, Provider, Role,
+    DEFAULT_TIMEOUT_SECS, InvokeOptions, Mode as InvokeMode, OpenAICompatibleProvider,
+    OpenAIProvider, Provider, Role, invoke_agent,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -155,6 +156,26 @@ enum Cmd {
     Provider {
         #[command(subcommand)]
         cmd: ProviderCmd,
+    },
+    /// Invoke a detected local agent or provider through the cross-tool bridge.
+    Call {
+        /// Target from `rtrt detect`, e.g. claude, codex, ollama, openai.
+        target: String,
+        /// Invocation mode.
+        #[arg(long, value_enum, default_value = "auto")]
+        mode: CallModeArg,
+        /// Model id used by API calls and templates with `{model}`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Timeout in seconds.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
+        timeout: u64,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: CallFormatArg,
+        /// Prompt text. Multiple words are joined with spaces.
+        #[arg(num_args = 1.., allow_hyphen_values = true)]
+        prompt: Vec<String>,
     },
     /// Persistent memory operations (SQLite-backed).
     Memory {
@@ -703,6 +724,29 @@ enum ReportFormatArg {
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CallFormatArg {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CallModeArg {
+    Cli,
+    Api,
+    Auto,
+}
+
+impl From<CallModeArg> for InvokeMode {
+    fn from(mode: CallModeArg) -> Self {
+        match mode {
+            CallModeArg::Cli => InvokeMode::Cli,
+            CallModeArg::Api => InvokeMode::Api,
+            CallModeArg::Auto => InvokeMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum DetectFormatArg {
     Table,
     Json,
@@ -1103,6 +1147,34 @@ async fn main() -> Result<()> {
                     println!("$ {hook}");
                     run_hook(&plan.root, hook)?;
                 }
+            }
+        }
+        Cmd::Call {
+            target,
+            mode,
+            model,
+            timeout,
+            format,
+            prompt,
+        } => {
+            let prompt = prompt.join(" ");
+            if prompt.trim().is_empty() {
+                bail!("rtrt call: prompt is empty");
+            }
+            let outcome = invoke_agent(
+                &target,
+                &prompt,
+                InvokeOptions {
+                    mode: Some(mode.into()),
+                    model,
+                    timeout: std::time::Duration::from_secs(timeout),
+                },
+            )
+            .await
+            .with_context(|| format!("rtrt call {target}"))?;
+            match format {
+                CallFormatArg::Text => print!("{}", outcome.output),
+                CallFormatArg::Json => println!("{}", serde_json::to_string_pretty(&outcome)?),
             }
         }
         Cmd::Provider { cmd } => run_provider(cmd).await?,

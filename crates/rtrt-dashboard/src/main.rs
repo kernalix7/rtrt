@@ -1842,13 +1842,14 @@ async fn get_template(
 async fn create_template(
     Json(req): Json<TemplateUpsertRequest>,
 ) -> std::result::Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    validate_template_name(&req.name)?;
     if is_builtin_template(&req.name) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("built-in template is read-only: {}", req.name),
         ));
     }
-    let template = req.into_template();
+    let template = req.try_into_template()?;
     let path =
         rtrt_templates::custom::save_custom(&template).map_err(template_write_error_status)?;
     Ok((
@@ -1861,6 +1862,8 @@ async fn update_template(
     AxPath(name): AxPath<String>,
     Json(req): Json<TemplateUpsertRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    validate_template_name(&name)?;
+    validate_template_name(&req.name)?;
     if req.name != name {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1873,7 +1876,7 @@ async fn update_template(
             format!("built-in template is read-only: {name}"),
         ));
     }
-    let template = req.into_template();
+    let template = req.try_into_template()?;
     let path =
         rtrt_templates::custom::save_custom(&template).map_err(template_write_error_status)?;
     Ok(Json(
@@ -1884,13 +1887,7 @@ async fn update_template(
 async fn delete_template(
     AxPath(name): AxPath<String>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !is_safe_template_slug(&name) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "template name must be a non-empty slug using letters, numbers, hyphens, or underscores"
-                .to_string(),
-        ));
-    }
+    validate_template_name(&name)?;
     if is_builtin_template(&name) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -2118,8 +2115,8 @@ struct TemplateUpsertRequest {
     name: String,
     #[serde(default)]
     description: String,
-    #[serde(default)]
-    category: rtrt_templates::TemplateCategory,
+    #[serde(default = "default_template_category")]
+    category: String,
     #[serde(default)]
     variables: Vec<rtrt_templates::TemplateVariable>,
     #[serde(default)]
@@ -2129,16 +2126,44 @@ struct TemplateUpsertRequest {
 }
 
 impl TemplateUpsertRequest {
-    fn into_template(self) -> rtrt_templates::Template {
-        rtrt_templates::Template {
+    fn try_into_template(
+        self,
+    ) -> std::result::Result<rtrt_templates::Template, (StatusCode, String)> {
+        let template = rtrt_templates::Template {
             name: self.name,
             description: self.description,
             source: rtrt_templates::TemplateSource::Custom,
-            category: self.category,
+            category: parse_template_category(&self.category)?,
             variables: self.variables,
             files: self.files,
             post_hooks: self.post_hooks,
+        };
+        validate_template_manifest(&template)?;
+        Ok(template)
+    }
+}
+
+fn default_template_category() -> String {
+    rtrt_templates::TemplateCategory::Development
+        .as_str()
+        .to_string()
+}
+
+fn parse_template_category(
+    raw: &str,
+) -> std::result::Result<rtrt_templates::TemplateCategory, (StatusCode, String)> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "development" | "scaffold" | "project" | "project-template" | "project-templates"
+        | "rust-cli" | "rust-lib" | "rust-axum" | "node-typescript" | "python-uv" | "go-cli"
+        | "custom" => Ok(rtrt_templates::TemplateCategory::Development),
+        "design" => Ok(rtrt_templates::TemplateCategory::Design),
+        "planning" | "doc-chain" | "document-chain" | "document-chains" => {
+            Ok(rtrt_templates::TemplateCategory::Planning)
         }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown template category: {raw}"),
+        )),
     }
 }
 
@@ -2148,6 +2173,18 @@ fn is_builtin_template(name: &str) -> bool {
         .any(|template| template.name == name)
 }
 
+fn validate_template_name(name: &str) -> std::result::Result<(), (StatusCode, String)> {
+    if is_safe_template_slug(name) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "template name must be a non-empty lowercase slug using letters, numbers, hyphens, or underscores"
+                .to_string(),
+        ))
+    }
+}
+
 fn is_safe_template_slug(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('.')
@@ -2155,7 +2192,45 @@ fn is_safe_template_slug(name: &str) -> bool {
         && !name.contains('\\')
         && name
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+}
+
+fn validate_template_manifest(
+    template: &rtrt_templates::Template,
+) -> std::result::Result<(), (StatusCode, String)> {
+    validate_template_name(&template.name)?;
+    for variable in &template.variables {
+        if variable.name.is_empty() || variable.name.chars().any(char::is_whitespace) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "template variable name must be non-empty and contain no spaces: {}",
+                    variable.name
+                ),
+            ));
+        }
+    }
+    for file in &template.files {
+        if !is_safe_template_file_path(&file.path) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "template file path must be relative and stay inside the scaffold target: {}",
+                    file.path
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_template_file_path(path: &str) -> bool {
+    let path_ref = std::path::Path::new(path);
+    !path.is_empty()
+        && !path.contains('\\')
+        && path_ref
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn template_write_error_status(err: rtrt_core::Error) -> (StatusCode, String) {
@@ -2173,6 +2248,8 @@ struct ScaffoldRequest {
     variables: BTreeMap<String, String>,
     #[serde(default)]
     overwrite: bool,
+    #[serde(default)]
+    manifest: Option<TemplateUpsertRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2199,10 +2276,14 @@ struct ScaffoldPreviewFile {
 async fn scaffold_preview(
     Json(req): Json<ScaffoldRequest>,
 ) -> std::result::Result<Json<ScaffoldPreviewResponse>, (StatusCode, String)> {
-    let tmpl = rtrt_templates::find(&req.template).ok_or((
-        StatusCode::NOT_FOUND,
-        format!("template not found: {}", req.template),
-    ))?;
+    let tmpl = if let Some(manifest) = req.manifest {
+        manifest.try_into_template()?
+    } else {
+        rtrt_templates::find(&req.template).ok_or((
+            StatusCode::NOT_FOUND,
+            format!("template not found: {}", req.template),
+        ))?
+    };
     let plan = rtrt_templates::render::plan(&tmpl, &req.target, req.variables)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let files = plan

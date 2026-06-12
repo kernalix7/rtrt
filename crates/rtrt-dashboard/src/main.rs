@@ -5,6 +5,7 @@
 //! - `/healthz`        — liveness probe.
 //! - `/api/stats`      — compression / proxy savings JSON.
 //! - `/api/overview`   — aggregate persisted optimizer savings.
+//! - `/api/gain`       — persisted `rtrt proxy-run` savings analytics.
 //! - `/api/templates`  — list built-in + custom templates.
 //! - `/api/templates/{name}` — full manifest for one template.
 //! - `/api/templates/scaffold` — `POST` scaffold a project.
@@ -370,6 +371,7 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/overview", get(optimizer_overview))
         .route("/api/optimizer/overview", get(optimizer_overview))
+        .route("/api/gain", get(gain))
         .route(
             "/api/optimizer/level",
             get(get_optimizer_level).post(post_optimizer_level),
@@ -864,7 +866,9 @@ fn estimate_saved_tokens(saved_chars: i64) -> i64 {
 }
 
 fn proxy_stats_path() -> PathBuf {
-    dirs::home_dir()
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".rtrt")
         .join("proxy-stats.sqlite")
@@ -1140,6 +1144,244 @@ fn command_savings_by_project(
         }
     }
     (true, projects)
+}
+
+const GAIN_MIN_ROWS: usize = 5;
+const GAIN_MAX_ROWS: usize = 50;
+
+fn integer_sqrt_ceil(n: u64) -> u64 {
+    let mut root = 0u64;
+    while root.saturating_mul(root) < n {
+        root = root.saturating_add(1);
+    }
+    root
+}
+
+fn dynamic_gain_count(total_runs: i64) -> usize {
+    let total = u64::try_from(total_runs.max(1)).unwrap_or(1);
+    usize::try_from(integer_sqrt_ceil(total))
+        .unwrap_or(GAIN_MAX_ROWS)
+        .clamp(GAIN_MIN_ROWS, GAIN_MAX_ROWS)
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn nonnegative_i64(value: i64) -> i64 {
+    value.max(0)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GainCommand {
+    command: String,
+    runs: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+    saved_pct_avg: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GainProject {
+    project: String,
+    runs: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GainRun {
+    ts: String,
+    project: String,
+    original_cmd: String,
+    mode: String,
+    input_chars: i64,
+    output_chars: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+    saved_pct: f64,
+    exec_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GainQuery {
+    project: Option<String>,
+}
+
+async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<serde_json::Value> {
+    let project = q.project.as_deref().filter(|p| !p.trim().is_empty());
+    let db_path = proxy_stats_path();
+    if !db_path.exists() {
+        return Json(serde_json::json!({
+            "available": false,
+            "reason": "database_missing",
+            "path": db_path.display().to_string(),
+        }));
+    }
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "database_unavailable",
+                "error": e.to_string(),
+                "path": db_path.display().to_string(),
+            }));
+        }
+    };
+
+    let (total_runs, total_saved_chars) = match conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(saved_chars), 0) \
+         FROM proxy_runs WHERE (?1 IS NULL OR project = ?1)",
+        rusqlite::params![project],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    ) {
+        Ok(row) => row,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "table_unavailable",
+                "error": e.to_string(),
+                "path": db_path.display().to_string(),
+            }));
+        }
+    };
+
+    let total_runs = nonnegative_i64(total_runs);
+    let total_saved_chars = nonnegative_i64(total_saved_chars);
+    let display_count = dynamic_gain_count(total_runs);
+    let display_count_i64 = usize_to_i64(display_count);
+
+    let top_commands = match load_gain_top_commands(&conn, project, display_count_i64) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "top_commands_unavailable",
+                "error": e.to_string(),
+                "path": db_path.display().to_string(),
+            }));
+        }
+    };
+    let per_project = match load_gain_projects(&conn, project) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "projects_unavailable",
+                "error": e.to_string(),
+                "path": db_path.display().to_string(),
+            }));
+        }
+    };
+    let recent_history = match load_gain_recent(&conn, project, display_count_i64) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "history_unavailable",
+                "error": e.to_string(),
+                "path": db_path.display().to_string(),
+            }));
+        }
+    };
+
+    Json(serde_json::json!({
+        "available": true,
+        "scope": project.unwrap_or("all"),
+        "path": db_path.display().to_string(),
+        "total_runs": total_runs,
+        "total_saved_chars": total_saved_chars,
+        "total_saved_tokens": estimate_saved_tokens(total_saved_chars),
+        "token_estimate": "chars/4",
+        "display_count": display_count,
+        "top_commands": top_commands,
+        "per_project": per_project,
+        "recent_history": recent_history,
+    }))
+}
+
+fn load_gain_top_commands(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    limit: i64,
+) -> rusqlite::Result<Vec<GainCommand>> {
+    let mut stmt = conn.prepare(
+        "SELECT original_cmd, COUNT(*), COALESCE(SUM(saved_chars), 0), COALESCE(AVG(saved_pct), 0.0) \
+         FROM proxy_runs \
+         WHERE (?1 IS NULL OR project = ?1) \
+         GROUP BY original_cmd \
+         ORDER BY COALESCE(SUM(saved_chars), 0) DESC, COUNT(*) DESC, original_cmd ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        Ok(GainCommand {
+            command: row.get(0)?,
+            runs: nonnegative_i64(row.get::<_, i64>(1)?),
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+            saved_pct_avg: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_gain_projects(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+) -> rusqlite::Result<Vec<GainProject>> {
+    let mut stmt = conn.prepare(
+        "SELECT project, COUNT(*), COALESCE(SUM(saved_chars), 0) \
+         FROM proxy_runs \
+         WHERE (?1 IS NULL OR project = ?1) \
+         GROUP BY project \
+         ORDER BY COALESCE(SUM(saved_chars), 0) DESC, COUNT(*) DESC, project ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project], |row| {
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+        Ok(GainProject {
+            project: normalize_project(row.get::<_, Option<String>>(0)?),
+            runs: nonnegative_i64(row.get::<_, i64>(1)?),
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+        })
+    })?;
+    rows.collect()
+}
+
+fn load_gain_recent(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    limit: i64,
+) -> rusqlite::Result<Vec<GainRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts, project, original_cmd, mode, input_chars, output_chars, saved_chars, saved_pct, exec_ms \
+         FROM proxy_runs \
+         WHERE (?1 IS NULL OR project = ?1) \
+         ORDER BY id DESC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(6)?);
+        Ok(GainRun {
+            ts: row.get(0)?,
+            project: normalize_project(row.get::<_, Option<String>>(1)?),
+            original_cmd: row.get(2)?,
+            mode: row.get(3)?,
+            input_chars: nonnegative_i64(row.get::<_, i64>(4)?),
+            output_chars: nonnegative_i64(row.get::<_, i64>(5)?),
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+            saved_pct: row.get(7)?,
+            exec_ms: nonnegative_i64(row.get::<_, i64>(8)?),
+        })
+    })?;
+    rows.collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2333,7 +2575,7 @@ async fn memory_graph_overview(
         _ => "auto",
     };
     // 세밀도(granularity): bubble target. Explicit value (clamped) wins; otherwise
-    // default to a clean, airy count — agentmemory stays uncluttered by distilling
+    // default to a clean, airy count — Memory stays uncluttered by distilling
     // to few-but-meaningful nodes, so scale gently with project size (~sqrt(n))
     // and clamp low: a 20k project lands ~140 bubbles, a small project ~60.
     let target = match target_pref {

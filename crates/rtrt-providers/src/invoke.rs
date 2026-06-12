@@ -16,6 +16,8 @@ const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const API_MAX_TOKENS: u32 = 1024;
 const PROMPT_PLACEHOLDER: &str = "{prompt}";
 const MODEL_PLACEHOLDER: &str = "{model}";
+const ASCII_SPINNER_CHARS: &[char] = &['|', '/', '-', '\\'];
+const BRAILLE_SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 #[derive(Debug, Clone)]
 pub struct InvokeOptions {
@@ -261,7 +263,98 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
     let mut output = String::new();
     output.push_str(&String::from_utf8_lossy(&stdout));
     output.push_str(&String::from_utf8_lossy(&stderr));
+    let output = sanitize_cli_output(&output);
     Ok((output, status.code()))
+}
+
+fn sanitize_cli_output(input: &str) -> String {
+    let without_ansi = strip_ansi_escape_sequences(input);
+    let mut output = String::new();
+    let mut frame = String::new();
+    let mut previous_was_cr = false;
+    for ch in without_ansi.chars() {
+        match ch {
+            '\r' => {
+                push_non_spinner_frame(&mut output, &frame, true);
+                frame.clear();
+                previous_was_cr = true;
+            }
+            '\n' => {
+                if previous_was_cr {
+                    previous_was_cr = false;
+                    continue;
+                }
+                push_non_spinner_frame(&mut output, &frame, false);
+                output.push('\n');
+                frame.clear();
+            }
+            _ => {
+                previous_was_cr = false;
+                frame.push(ch);
+            }
+        }
+    }
+    push_non_spinner_frame(&mut output, &frame, false);
+    output.trim().to_string()
+}
+
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            output.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                let _ = chars.next();
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let _ = chars.next();
+                let mut saw_escape = false;
+                for next in chars.by_ref() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if saw_escape && next == '\\' {
+                        break;
+                    }
+                    saw_escape = next == '\x1b';
+                }
+            }
+            Some('\u{40}'..='\u{5f}') => {
+                let _ = chars.next();
+            }
+            Some(_) | None => {}
+        }
+    }
+    output
+}
+
+fn push_non_spinner_frame(output: &mut String, frame: &str, add_line_break: bool) {
+    if is_spinner_only_frame(frame) {
+        return;
+    }
+    output.push_str(frame);
+    if add_line_break {
+        output.push('\n');
+    }
+}
+
+fn is_spinner_only_frame(frame: &str) -> bool {
+    let trimmed = frame.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|ch| {
+            ch.is_whitespace()
+                || ASCII_SPINNER_CHARS.contains(&ch)
+                || BRAILLE_SPINNER_CHARS.contains(&ch)
+        })
 }
 
 fn read_pipe<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
@@ -331,6 +424,13 @@ mod tests {
             CostClass::ApiMetered,
         );
         assert_eq!(auto_mode_for(&api_tool), Mode::Api);
+    }
+
+    #[test]
+    fn sanitize_cli_output_removes_spinner_frames_and_ansi() {
+        let raw = "\x1b[?25l\r\x1b[?2026h⠙\r\x1b[K⠹\r\x1b[32mClean answer\x1b[0m\n";
+
+        assert_eq!(sanitize_cli_output(raw), "Clean answer");
     }
 
     fn tool_for_mode(

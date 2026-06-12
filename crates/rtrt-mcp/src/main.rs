@@ -26,11 +26,11 @@ use rmcp::{
     },
 };
 use rtrt_compress::Compressor;
-use rtrt_core::CompressionLevel;
+use rtrt_core::{Capability, CompressionLevel};
 use rtrt_memory::MemoryStore;
 use rtrt_providers::{
     ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvokeOptions, Mode as InvokeMode,
-    Role, invoke_agent,
+    Prefer, Role, RouteRequest, UsageSnapshot, invoke_agent, select_route,
 };
 use rtrt_templates::PromptRegistry;
 use serde::Deserialize;
@@ -316,6 +316,51 @@ struct AgentCallArgs {
     mode: Option<String>,
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentRouteArgs {
+    prompt: String,
+    #[serde(default)]
+    prefer: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    dry_run: Option<bool>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn parse_agent_route_prefer(value: Option<&str>) -> Result<Prefer, McpError> {
+    let Some(value) = value else {
+        return Ok(Prefer::Cheapest);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cheapest" => Ok(Prefer::Cheapest),
+        "local" => Ok(Prefer::Local),
+        "quality" => Ok(Prefer::Quality),
+        other => Err(McpError::invalid_params(
+            format!("agent_route prefer: unknown prefer '{other}'"),
+            None,
+        )),
+    }
+}
+
+fn parse_agent_route_capability(value: Option<&str>) -> Result<Option<Capability>, McpError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "code" => Ok(Some(Capability::Code)),
+        "reasoning" => Ok(Some(Capability::Reasoning)),
+        "vision" => Ok(Some(Capability::Vision)),
+        "embed" => Ok(Some(Capability::Embed)),
+        "cheap" => Ok(Some(Capability::CheapBulk)),
+        other => Err(McpError::invalid_params(
+            format!("agent_route capability: unknown capability '{other}'"),
+            None,
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -910,6 +955,58 @@ impl RtrtMcp {
             .auto_capture("agent_call", None, &outcome.output)
             .await;
         Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        description = "Select the best detected agent route by preference and capability, optionally invoking the selected target."
+    )]
+    async fn agent_route(
+        &self,
+        Parameters(args): Parameters<AgentRouteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let req = RouteRequest {
+            capability: parse_agent_route_capability(args.capability.as_deref())?,
+            prefer: parse_agent_route_prefer(args.prefer.as_deref())?,
+            target: None,
+            model: args.model,
+            mode: None,
+        };
+        let tools = rtrt_core::detect::detect_tools();
+        let usage = UsageSnapshot::load_best_effort();
+        let decision = select_route(&req, &tools, &usage)
+            .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
+        let target = decision.target.clone();
+        let mut body = serde_json::json!({
+            "target": target,
+            "cost_class": decision.cost_class,
+            "reason": decision.reason.clone(),
+            "alternatives": decision.alternatives.clone(),
+        });
+        if args.dry_run.unwrap_or(true) {
+            return Ok(CallToolResult::success(vec![Content::text(
+                body.to_string(),
+            )]));
+        }
+        let outcome = invoke_agent(
+            &decision.target,
+            &args.prompt,
+            InvokeOptions {
+                mode: Some(decision.mode),
+                model: decision.model,
+                timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            },
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
+        body["output"] = serde_json::Value::String(rtrt_compress::redact_secrets(&outcome.output));
+        body["exit_code"] = serde_json::json!(outcome.exit_code);
+        body["ms"] = serde_json::json!(outcome.ms);
+        self.state
+            .auto_capture("agent_route", None, &outcome.output)
+            .await;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
     }
 
     #[tool(

@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
     pub projects: Vec<ProjectEntry>,
 }
 
@@ -358,6 +360,42 @@ impl ProvidersConfig {
     }
 }
 
+/// Optional daily usage ceilings by provider or target name.
+///
+/// Example `~/.rtrt/config.toml`:
+///
+/// ```toml
+/// [limits.openai]
+/// daily_tokens = 1_000_000
+/// daily_requests = 2_000
+///
+/// [limits.ollama]
+/// daily_tokens = 250_000
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(flatten)]
+    pub targets: BTreeMap<String, TargetLimit>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetLimit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_requests: Option<u64>,
+}
+
+impl LimitsConfig {
+    pub fn target(&self, name: &str) -> Option<&TargetLimit> {
+        self.targets.get(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -525,6 +563,28 @@ mod tests {
         assert_eq!(c.agents.enabled_override("codex"), None);
         assert_eq!(c.providers.active.as_deref(), Some("openai"));
         assert_eq!(c.providers.enabled_override("openrouter"), Some(false));
+    }
+
+    #[test]
+    fn limits_load_as_target_tables() {
+        let c = Config::from_toml_str(
+            r#"
+            [limits.openai]
+            daily_tokens = 1_000_000
+            daily_requests = 2_000
+
+            [limits.ollama]
+            daily_tokens = 250_000
+            "#,
+        )
+        .unwrap();
+
+        let openai = c.limits.target("openai").unwrap();
+        assert_eq!(openai.daily_tokens, Some(1_000_000));
+        assert_eq!(openai.daily_requests, Some(2_000));
+        let ollama = c.limits.target("ollama").unwrap();
+        assert_eq!(ollama.daily_tokens, Some(250_000));
+        assert_eq!(ollama.daily_requests, None);
     }
 
     #[test]

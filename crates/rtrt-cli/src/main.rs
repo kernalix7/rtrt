@@ -154,6 +154,24 @@ enum Cmd {
         #[arg(long)]
         no_hooks: bool,
     },
+    /// Render a template into an existing repository.
+    Init {
+        /// Template name (defaults to standardization).
+        #[arg(long)]
+        template: Option<String>,
+        /// Existing repository directory (defaults to cwd).
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+        /// Overwrite files that already exist.
+        #[arg(long)]
+        force: bool,
+        /// Print the file actions without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Variables: `--var key=value` (repeatable). Overrides detected values.
+        #[arg(long = "var", value_parser = parse_var)]
+        vars: Vec<(String, String)>,
+    },
     /// Talk to a chat provider.
     Provider {
         #[command(subcommand)]
@@ -860,6 +878,9 @@ const DETECT_MODES_WIDTH: usize = 9;
 const DETECT_COST_WIDTH: usize = 17;
 const DETECT_ENABLED_WIDTH: usize = 7;
 const DETECT_DETAIL_WIDTH: usize = 72;
+const DEFAULT_INIT_TEMPLATE: &str = "standardization";
+#[cfg(unix)]
+const UNIX_EXECUTE_BITS: u32 = 0o111;
 const DETECT_KIND_ORDER: &[ToolKind] = &[
     ToolKind::CodingAgent,
     ToolKind::LocalRuntime,
@@ -883,6 +904,328 @@ fn parse_var(s: &str) -> std::result::Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got `{s}`"))?;
     Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+fn run_init(
+    template: Option<String>,
+    path: Option<PathBuf>,
+    force: bool,
+    dry_run: bool,
+    vars: Vec<(String, String)>,
+) -> Result<()> {
+    let target = match path {
+        Some(path) => path,
+        None => std::env::current_dir().context("resolve current directory")?,
+    };
+    let target = std::fs::canonicalize(&target)
+        .with_context(|| format!("target path does not exist: {}", target.display()))?;
+    if !target.is_dir() {
+        bail!("target path is not a directory: {}", target.display());
+    }
+
+    let template_name = template.unwrap_or_else(|| DEFAULT_INIT_TEMPLATE.to_string());
+    let tmpl = rtrt_templates::find(&template_name)
+        .with_context(|| format!("unknown template: {template_name}"))?;
+    validate_init_template_paths(&tmpl)?;
+
+    let mut map = detect_init_vars(&target);
+    for (key, value) in vars {
+        map.insert(key, value);
+    }
+
+    let plan = rtrt_templates::render::plan(&tmpl, &target, map)?;
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+
+    println!("init template {} -> {}", tmpl.name, plan.root.display());
+    for file in &plan.files {
+        let rel = safe_rendered_relative_path(&plan.root, &file.path)?;
+        let rel_display = rel.display();
+        let exists = file.path.exists();
+        if exists && !force {
+            skipped += 1;
+            if dry_run {
+                println!("would skip {rel_display}");
+            } else {
+                println!("skipped {rel_display}");
+            }
+            continue;
+        }
+
+        written += 1;
+        if dry_run {
+            let action = if exists {
+                "would overwrite"
+            } else {
+                "would write"
+            };
+            println!("{action} {rel_display}");
+            continue;
+        }
+
+        if let Some(parent) = file.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create directory: {}", parent.display()))?;
+        }
+        std::fs::write(&file.path, &file.content)
+            .with_context(|| format!("write file: {}", file.path.display()))?;
+        set_executable_if_requested(&file.path, file.executable)?;
+
+        let action = if exists { "overwrote" } else { "wrote" };
+        println!("{action} {rel_display}");
+    }
+
+    let verb = if dry_run { "would write" } else { "written" };
+    println!("init complete: {written} {verb}, {skipped} skipped");
+    Ok(())
+}
+
+fn detect_init_vars(target: &Path) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    let fingerprint = detect_manifest_fingerprint(target);
+    let project_name = fingerprint
+        .project_name
+        .unwrap_or_else(|| rtrt_core::project_for_cwd(target));
+
+    vars.insert("project_name".into(), project_name);
+    if let Some(language) = fingerprint.language {
+        vars.insert("language".into(), language);
+    }
+    if let Some(framework) = fingerprint.framework {
+        vars.insert("framework".into(), framework);
+    }
+    vars
+}
+
+#[derive(Default)]
+struct ManifestFingerprint {
+    project_name: Option<String>,
+    language: Option<String>,
+    framework: Option<String>,
+}
+
+fn detect_manifest_fingerprint(root: &Path) -> ManifestFingerprint {
+    if root.join("Cargo.toml").exists() {
+        return ManifestFingerprint {
+            project_name: cargo_package_name(&root.join("Cargo.toml")),
+            language: Some("Rust".into()),
+            framework: Some("cargo".into()),
+        };
+    }
+
+    if root.join("package.json").exists() {
+        return ManifestFingerprint {
+            project_name: package_json_name(&root.join("package.json")),
+            language: Some("Node/TypeScript".into()),
+            framework: Some(node_package_manager(root).into()),
+        };
+    }
+
+    if root.join("pyproject.toml").exists() || root.join("requirements.txt").exists() {
+        return ManifestFingerprint {
+            project_name: python_project_name(root),
+            language: Some("Python".into()),
+            framework: Some(python_package_manager(root).into()),
+        };
+    }
+
+    if root.join("go.mod").exists() {
+        return ManifestFingerprint {
+            project_name: go_module_name(&root.join("go.mod")),
+            language: Some("Go".into()),
+            framework: Some("go".into()),
+        };
+    }
+
+    if root.join("pom.xml").exists() {
+        return ManifestFingerprint {
+            project_name: pom_artifact_name(&root.join("pom.xml")),
+            language: Some("Java".into()),
+            framework: Some("maven".into()),
+        };
+    }
+
+    if root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() {
+        return ManifestFingerprint {
+            project_name: gradle_project_name(root),
+            language: Some("Java".into()),
+            framework: Some("gradle".into()),
+        };
+    }
+
+    ManifestFingerprint::default()
+}
+
+fn cargo_package_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_package = false;
+    for raw in content.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
+                return parse_toml_string(value);
+            }
+        }
+    }
+    None
+}
+
+fn package_json_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(last_package_segment)
+        .filter(|name| !name.is_empty())
+}
+
+fn python_project_name(root: &Path) -> Option<String> {
+    let path = root.join("pyproject.toml");
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_project = false;
+    for raw in content.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_project = line == "[project]" || line == "[tool.poetry]";
+            continue;
+        }
+        if in_project {
+            if let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
+                return parse_toml_string(value);
+            }
+        }
+    }
+    None
+}
+
+fn go_module_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content.lines().find_map(|line| {
+        let module = line.trim().strip_prefix("module")?.trim();
+        if module.is_empty() {
+            None
+        } else {
+            Some(last_package_segment(module))
+        }
+    })
+}
+
+fn pom_artifact_name(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let start = content.find("<artifactId>")? + "<artifactId>".len();
+    let rest = &content[start..];
+    let end = rest.find("</artifactId>")?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn gradle_project_name(root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("settings.gradle"))
+        .or_else(|_| std::fs::read_to_string(root.join("settings.gradle.kts")))
+        .ok()?;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if let Some(value) = line.strip_prefix("rootProject.name").and_then(|rest| {
+            rest.split_once('=')
+                .map(|(_, value)| value.trim().trim_matches('"').trim_matches('\''))
+        }) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn toml_value_after_eq(rest: &str) -> Option<&str> {
+    let rest = rest.trim_start();
+    rest.strip_prefix('=').map(str::trim)
+}
+
+fn last_package_segment(raw: &str) -> String {
+    raw.rsplit(['/', ':'])
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
+}
+
+fn node_package_manager(root: &Path) -> &'static str {
+    if root.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if root.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm"
+    }
+}
+
+fn python_package_manager(root: &Path) -> &'static str {
+    if root.join("uv.lock").exists() {
+        "uv"
+    } else {
+        "pip"
+    }
+}
+
+fn validate_init_template_paths(template: &rtrt_templates::Template) -> Result<()> {
+    for file in &template.files {
+        validate_relative_template_path(&file.path)?;
+    }
+    Ok(())
+}
+
+fn validate_relative_template_path(path: &str) -> Result<()> {
+    if path.starts_with('/') || path.contains("..") {
+        bail!("unsafe template file path: {path}");
+    }
+
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => bail!("unsafe template file path: {path}"),
+        }
+    }
+    Ok(())
+}
+
+fn safe_rendered_relative_path(root: &Path, path: &Path) -> Result<PathBuf> {
+    let rel = path.strip_prefix(root).with_context(|| {
+        format!(
+            "rendered template path escapes target directory: {}",
+            path.display()
+        )
+    })?;
+    validate_relative_template_path(&rel.to_string_lossy())?;
+    Ok(rel.to_path_buf())
+}
+
+fn set_executable_if_requested(path: &Path, executable: bool) -> Result<()> {
+    if !executable {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(path)
+            .with_context(|| format!("read permissions: {}", path.display()))?
+            .permissions();
+        perm.set_mode(perm.mode() | UNIX_EXECUTE_BITS);
+        std::fs::set_permissions(path, perm)
+            .with_context(|| format!("set executable bit: {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn run_proxy_run(command: Vec<String>, raw: bool, errors_only: bool, ultra_compact: bool) -> ! {
@@ -1223,6 +1566,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Init {
+            template,
+            path,
+            force,
+            dry_run,
+            vars,
+        } => run_init(template, path, force, dry_run, vars)?,
         Cmd::Call {
             target,
             mode,

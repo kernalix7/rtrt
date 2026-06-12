@@ -29,7 +29,8 @@ fn common_vars() -> Vec<TemplateVariable> {
     ]
 }
 
-pub static ALL: Lazy<Vec<Template>> = Lazy::new(|| vec![dev(), design(), plan()]);
+pub static ALL: Lazy<Vec<Template>> =
+    Lazy::new(|| vec![dev(), design(), plan(), standardization()]);
 
 fn dev() -> Template {
     Template {
@@ -118,6 +119,85 @@ fn plan() -> Template {
             TemplateFile {
                 path: "ROADMAP.md".into(),
                 content: PLAN_ROADMAP.into(),
+                executable: false,
+            },
+        ],
+        post_hooks: vec![],
+    }
+}
+
+fn standardization_vars() -> Vec<TemplateVariable> {
+    vec![
+        TemplateVariable {
+            name: "project_name".into(),
+            description: Some("Project name".into()),
+            default: None,
+            required: true,
+        },
+        TemplateVariable {
+            name: "license".into(),
+            description: Some("Project license".into()),
+            default: Some("MIT".into()),
+            required: false,
+        },
+        TemplateVariable {
+            name: "language".into(),
+            description: Some("Primary implementation language".into()),
+            default: Some("Rust".into()),
+            required: false,
+        },
+        TemplateVariable {
+            name: "framework".into(),
+            description: Some("Primary framework or package manager".into()),
+            default: Some("".into()),
+            required: false,
+        },
+        TemplateVariable {
+            name: "target_platform".into(),
+            description: Some("Supported runtime platforms".into()),
+            default: Some("Linux / macOS / Windows".into()),
+            required: false,
+        },
+        TemplateVariable {
+            name: "deployment".into(),
+            description: Some("Deployment or CI surface".into()),
+            default: Some("GitHub Actions".into()),
+            required: false,
+        },
+    ]
+}
+
+fn standardization() -> Template {
+    Template {
+        name: "standardization".into(),
+        description: "Project standardization contract and agent definitions".into(),
+        source: TemplateSource::BuiltIn,
+        category: TemplateCategory::Planning,
+        variables: standardization_vars(),
+        files: vec![
+            TemplateFile {
+                path: "CLAUDE.md".into(),
+                content: STANDARDIZATION_CLAUDE.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".claude/agents/explorer.md".into(),
+                content: STANDARDIZATION_EXPLORER.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".claude/agents/code-reviewer.md".into(),
+                content: STANDARDIZATION_CODE_REVIEWER.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".claude/agents/log-analyzer.md".into(),
+                content: STANDARDIZATION_LOG_ANALYZER.into(),
+                executable: false,
+            },
+            TemplateFile {
+                path: ".claude/agents/tech-lead.md".into(),
+                content: STANDARDIZATION_TECH_LEAD.into(),
                 executable: false,
             },
         ],
@@ -321,4 +401,119 @@ const PLAN_ROADMAP: &str = r#"# {{project_name}} — Roadmap
 ## 리스크
 
 -
+"#;
+
+const STANDARDIZATION_CLAUDE: &str = r#"# {{project_name}}
+
+## 1. Project Identity
+
+- **Name**: {{project_name}}
+- **License**: {{license}}
+- **Language**: {{language}}
+- **Framework**: {{framework}}
+- **Target Platform**: {{target_platform}}
+- **Deployment**: {{deployment}}
+
+## 2. Core Design Goals
+
+1. Keep {{project_name}} focused on a small, well-defined user problem.
+2. Make {{project_name}} easy to build, test, review, and release from a clean checkout.
+3. Preserve clear ownership boundaries so changes remain understandable and reversible.
+
+## 3. Project Structure
+
+```
+{{project_name}}/
+├── README.md
+├── src/
+│   └── main.*
+├── tests/
+└── docs/
+```
+
+## 4. Coding Conventions
+
+### General
+
+- Follow the community style guide for {{language}}.
+- Keep functions small and single-purpose.
+- Prefer explicit errors over panics in production paths.
+- Comments explain intent, tradeoffs, and surprising constraints.
+
+### Formatting / Linting
+
+- Run the standard formatter before review.
+- Keep lints clean before merging.
+- Treat warnings as work to resolve, not background noise.
+
+## 5. Build & Verification
+
+```bash
+cargo build
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
+```
+
+## 6. Dependencies Policy
+
+- Add dependencies only when they remove meaningful local complexity.
+- Vet new dependencies for license compatibility, maintenance activity, security history, and transitive impact.
+- Prefer stable, widely used packages over niche packages for core paths.
+- Pin versions through the lockfile and keep dependency changes scoped.
+
+## 7. Git Workflow
+
+- **Branch naming**: `feature/<short-name>`, `fix/<short-name>`, `chore/<short-name>`.
+- **Commit convention**: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`.
+- **Merge strategy**: squash merge reviewed changes to the main branch.
+
+## 11. Agent Teams
+
+| Agent | Owned Paths | Domain | Model |
+|-------|-------------|--------|-------|
+| tech-lead | All | orchestration, planning, integration | claude-opus-4-5 |
+| explorer | All | read-only code discovery and symbol mapping | claude-opus-4-5 |
+| code-reviewer | All | diff review, conventions, security, tests | claude-sonnet-4-5 |
+| log-analyzer | logs, traces, CI output | failure diagnosis and root cause analysis | claude-sonnet-4-5 |
+"#;
+
+const STANDARDIZATION_EXPLORER: &str = r#"---
+name: explorer
+description: Read-only code locator that finds relevant files and symbols without changing the repository.
+tools: Read, Glob, Grep, LS
+model: claude-opus-4-5
+---
+
+You are a read-only code locator. Find and surface the files, symbols, tests, configuration, and ownership boundaries relevant to the task. Do not edit files. Return concise findings with paths and line references where possible.
+"#;
+
+const STANDARDIZATION_CODE_REVIEWER: &str = r#"---
+name: code-reviewer
+description: Reviews diffs against this repository's CLAUDE.md conventions and flags risks.
+tools: Read, Glob, Grep
+model: claude-sonnet-4-5
+---
+
+Review diffs against this repository's CLAUDE.md conventions. Prioritize correctness, security, maintainability, style gaps, and missing tests. Lead with actionable findings tied to files and lines. Do not edit files.
+"#;
+
+const STANDARDIZATION_LOG_ANALYZER: &str = r#"---
+name: log-analyzer
+description: Parses logs and stack traces to identify the root cause and affected code.
+tools: Read, Bash
+model: claude-sonnet-4-5
+---
+
+Parse logs, stack traces, and command output to identify the most likely root cause. Surface file and line references when available, explain the failure path concisely, and recommend the smallest useful next check.
+"#;
+
+const STANDARDIZATION_TECH_LEAD: &str = r#"---
+name: tech-lead
+description: Orchestrates cross-cutting work, assigns sub-agents, integrates results, and enforces conventions.
+tools: Read, Bash, Glob, Grep, Edit, Write
+model: claude-opus-4-5
+---
+
+Break down cross-cutting tasks, assign focused sub-agent work, integrate results, and enforce this repository's conventions. Keep changes scoped, resolve conflicts deliberately, and make verification explicit before handoff.
 "#;

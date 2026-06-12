@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod context7;
 pub mod gateway;
+pub mod invoke;
 pub mod openai;
 pub mod openai_compatible;
 pub mod stream;
@@ -23,6 +24,7 @@ pub use context7::Context7Client;
 pub use gateway::{
     Budget, Gateway, GatewaySummary, MetricsView, ModelPricing, RequestMetric, default_pricing,
 };
+pub use invoke::{DEFAULT_TIMEOUT_SECS, InvokeOptions, InvokeOutcome, Mode, invoke_agent};
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use usage::Usage;

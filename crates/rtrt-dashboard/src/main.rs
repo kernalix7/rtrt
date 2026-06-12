@@ -862,22 +862,26 @@ async fn post_optimizer_level(Json(body): Json<SetLevelRequest>) -> impl IntoRes
     .into_response()
 }
 
-fn metadata_savings(raw: &str, expected_source: &str) -> Option<(i64, i64)> {
+fn metadata_savings(raw: &str, expected_source: &str) -> Option<(i64, i64, i64)> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = value.as_object()?;
     if obj.get("source")?.as_str()? != expected_source {
         return None;
     }
     let original_chars = json_i64(obj.get("compressed_from_chars")?)?.max(0);
-    let saved_chars = obj
-        .get("saved_chars")
-        .and_then(json_i64)
-        .or_else(|| {
-            let to_chars = obj.get("compressed_to_chars").and_then(json_i64)?;
-            Some((original_chars - to_chars).max(0))
-        })?
-        .max(0);
-    Some((saved_chars, original_chars))
+    let compressed_to_chars = obj.get("compressed_to_chars").and_then(json_i64);
+    // The stored `saved_chars` field is unreliable (observed 0 for a real
+    // 309->117 compression, and 81 for a 68-char input). Always derive the
+    // delta from compressed_from/to when `to` is present; only fall back to the
+    // stored field when `to` is missing.
+    let (saved_chars, with_rtrt_chars) = match compressed_to_chars {
+        Some(to_chars) => ((original_chars - to_chars).max(0), to_chars.max(0)),
+        None => {
+            let stored = obj.get("saved_chars").and_then(json_i64)?.max(0);
+            (stored, original_chars.saturating_sub(stored).max(0))
+        }
+    };
+    Some((saved_chars, original_chars, with_rtrt_chars))
 }
 
 fn json_i64(value: &serde_json::Value) -> Option<i64> {
@@ -921,14 +925,77 @@ fn normalize_project(project: Option<String>) -> String {
     }
 }
 
+const SECS_PER_HOUR: i64 = 60 * 60;
+const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DashboardWindow {
+    label: &'static str,
+    since_unix: Option<i64>,
+    proxy_modifier: Option<&'static str>,
+}
+
+impl DashboardWindow {
+    fn parse(raw: Option<&str>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match raw.unwrap_or("all").trim().to_ascii_lowercase().as_str() {
+            "1h" => Self {
+                label: "1h",
+                since_unix: Some(now.saturating_sub(SECS_PER_HOUR)),
+                proxy_modifier: Some("-1 hours"),
+            },
+            "6h" => Self {
+                label: "6h",
+                since_unix: Some(now.saturating_sub(SECS_PER_HOUR * 6)),
+                proxy_modifier: Some("-6 hours"),
+            },
+            "24h" => Self {
+                label: "24h",
+                since_unix: Some(now.saturating_sub(SECS_PER_DAY)),
+                proxy_modifier: Some("-24 hours"),
+            },
+            "7d" => Self {
+                label: "7d",
+                since_unix: Some(now.saturating_sub(SECS_PER_DAY * 7)),
+                proxy_modifier: Some("-7 days"),
+            },
+            "30d" => Self {
+                label: "30d",
+                since_unix: Some(now.saturating_sub(SECS_PER_DAY * 30)),
+                proxy_modifier: Some("-30 days"),
+            },
+            _ => Self {
+                label: "all",
+                since_unix: None,
+                proxy_modifier: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SavingsCoverage {
+    reduced: i64,
+    total: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SavingsProject {
     project: String,
     count: i64,
+    reduced_count: i64,
     saved_chars: i64,
     saved_tokens: i64,
     original_chars: i64,
+    with_rtrt_chars: i64,
     saved_pct: Option<f64>,
+    effective_pct: Option<f64>,
+    coverage: SavingsCoverage,
+    #[serde(skip)]
+    effective_pct_sum: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -940,7 +1007,10 @@ struct SavingsSource {
     saved_chars: i64,
     saved_tokens: i64,
     original_chars: i64,
+    with_rtrt_chars: i64,
     saved_pct: Option<f64>,
+    effective_pct: Option<f64>,
+    coverage: SavingsCoverage,
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
@@ -954,10 +1024,14 @@ struct SavingsSource {
 #[derive(Debug, Clone, Serialize)]
 struct ProjectSourceRollup {
     count: i64,
+    reduced_count: i64,
     saved_chars: i64,
     saved_tokens: i64,
     original_chars: i64,
+    with_rtrt_chars: i64,
     saved_pct: Option<f64>,
+    effective_pct: Option<f64>,
+    coverage: SavingsCoverage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -966,6 +1040,7 @@ struct ProjectRollup {
     saved_chars: i64,
     saved_tokens: i64,
     original_chars: i64,
+    with_rtrt_chars: i64,
     saved_pct: Option<f64>,
     by_source: BTreeMap<String, ProjectSourceRollup>,
 }
@@ -984,17 +1059,26 @@ fn savings_source(
             .then_with(|| a.project.cmp(&b.project))
     });
     let count = by_project.iter().map(|p| p.count).sum();
+    let reduced_count = by_project.iter().map(|p| p.reduced_count).sum();
     let saved_chars = by_project.iter().map(|p| p.saved_chars).sum();
     let original_chars = by_project.iter().map(|p| p.original_chars).sum();
+    let with_rtrt_chars = by_project.iter().map(|p| p.with_rtrt_chars).sum();
+    let effective_pct_sum: f64 = by_project.iter().map(|p| p.effective_pct_sum).sum();
     SavingsSource {
         name: name.to_string(),
         label: label.to_string(),
-        available,
+        available: available && count > 0,
         count,
         saved_chars,
         saved_tokens: estimate_saved_tokens(saved_chars),
         original_chars,
+        with_rtrt_chars,
         saved_pct: saved_pct(saved_chars, original_chars),
+        effective_pct: (reduced_count > 0).then_some(effective_pct_sum / reduced_count as f64),
+        coverage: SavingsCoverage {
+            reduced: reduced_count,
+            total: count,
+        },
         source: source.to_string(),
         level: None,
         active: None,
@@ -1024,19 +1108,25 @@ fn projects_rollup(sources: &[SavingsSource]) -> Vec<ProjectRollup> {
                     saved_chars: 0,
                     saved_tokens: 0,
                     original_chars: 0,
+                    with_rtrt_chars: 0,
                     saved_pct: None,
                     by_source: BTreeMap::new(),
                 });
             entry.saved_chars += item.saved_chars;
             entry.original_chars += item.original_chars;
+            entry.with_rtrt_chars += item.with_rtrt_chars;
             entry.by_source.insert(
                 source.name.clone(),
                 ProjectSourceRollup {
                     count: item.count,
+                    reduced_count: item.reduced_count,
                     saved_chars: item.saved_chars,
                     saved_tokens: item.saved_tokens,
                     original_chars: item.original_chars,
+                    with_rtrt_chars: item.with_rtrt_chars,
                     saved_pct: item.saved_pct,
+                    effective_pct: item.effective_pct,
+                    coverage: item.coverage.clone(),
                 },
             );
         }
@@ -1058,14 +1148,18 @@ fn projects_rollup(sources: &[SavingsSource]) -> Vec<ProjectRollup> {
 fn memory_savings_by_project(
     conn: &rusqlite::Connection,
     project: Option<&str>,
+    window: DashboardWindow,
     notes: &mut Vec<String>,
 ) -> (bool, Vec<SavingsProject>) {
     let mut stmt = match conn.prepare(
         "SELECT project, COUNT(*) AS row_count, \
-                COALESCE(SUM(LENGTH(body_full) - LENGTH(body)), 0) AS saved_chars, \
-                COALESCE(SUM(LENGTH(body_full)), 0) AS original_chars \
+                COALESCE(SUM(CASE WHEN body_full IS NOT NULL AND LENGTH(body_full) > LENGTH(body) THEN 1 ELSE 0 END), 0) AS reduced_count, \
+                COALESCE(SUM(CASE WHEN body_full IS NOT NULL AND LENGTH(body_full) > LENGTH(body) THEN LENGTH(body_full) - LENGTH(body) ELSE 0 END), 0) AS saved_chars, \
+                COALESCE(SUM(CASE WHEN body_full IS NOT NULL THEN LENGTH(body_full) ELSE LENGTH(body) END), 0) AS original_chars, \
+                COALESCE(SUM(LENGTH(body)), 0) AS with_rtrt_chars, \
+                COALESCE(SUM(CASE WHEN body_full IS NOT NULL AND LENGTH(body_full) > LENGTH(body) AND LENGTH(body_full) > 0 THEN ((LENGTH(body_full) - LENGTH(body)) * 100.0 / LENGTH(body_full)) ELSE 0 END), 0.0) AS effective_pct_sum \
          FROM memories \
-         WHERE body_full IS NOT NULL AND (?1 IS NULL OR project = ?1) \
+         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR created_at >= ?2) \
          GROUP BY project",
     ) {
         Ok(stmt) => stmt,
@@ -1074,18 +1168,29 @@ fn memory_savings_by_project(
             return (false, Vec::new());
         }
     };
-    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+    let rows = match stmt.query_map(rusqlite::params![project, window.since_unix], |row| {
         let project = normalize_project(row.get::<_, Option<String>>(0)?);
         let count = row.get::<_, i64>(1)?;
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
-        let original_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let reduced_count = nonnegative_i64(row.get::<_, i64>(2)?);
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let original_chars = nonnegative_i64(row.get::<_, i64>(4)?);
+        let with_rtrt_chars = nonnegative_i64(row.get::<_, i64>(5)?);
+        let effective_pct_sum = row.get::<_, f64>(6)?.max(0.0);
         Ok(SavingsProject {
             project,
             count,
+            reduced_count,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
             original_chars,
+            with_rtrt_chars,
             saved_pct: saved_pct(saved_chars, original_chars),
+            effective_pct: (reduced_count > 0).then_some(effective_pct_sum / reduced_count as f64),
+            coverage: SavingsCoverage {
+                reduced: reduced_count,
+                total: count,
+            },
+            effective_pct_sum,
         })
     }) {
         Ok(rows) => rows,
@@ -1110,11 +1215,12 @@ fn memory_savings_by_project(
 fn output_savings_by_project(
     conn: &rusqlite::Connection,
     project: Option<&str>,
+    window: DashboardWindow,
     notes: &mut Vec<String>,
 ) -> (bool, Vec<SavingsProject>) {
     let mut stmt = match conn.prepare(
         "SELECT project, metadata FROM memories \
-         WHERE metadata IS NOT NULL AND (?1 IS NULL OR project = ?1)",
+         WHERE metadata IS NOT NULL AND (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR created_at >= ?2)",
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -1122,7 +1228,7 @@ fn output_savings_by_project(
             return (false, Vec::new());
         }
     };
-    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+    let rows = match stmt.query_map(rusqlite::params![project, window.since_unix], |row| {
         Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
     }) {
         Ok(rows) => rows,
@@ -1131,17 +1237,24 @@ fn output_savings_by_project(
             return (false, Vec::new());
         }
     };
-    let mut grouped: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, (i64, i64, i64, i64, i64, f64)> = BTreeMap::new();
     for row in rows {
         match row {
             Ok((project, raw)) => {
-                if let Some((saved_chars, original_chars)) = metadata_savings(&raw, "compress") {
+                if let Some((saved_chars, original_chars, with_rtrt_chars)) =
+                    metadata_savings(&raw, "compress")
+                {
                     let entry = grouped
                         .entry(normalize_project(project))
-                        .or_insert((0, 0, 0));
+                        .or_insert((0, 0, 0, 0, 0, 0.0));
                     entry.0 += 1;
                     entry.1 += saved_chars;
                     entry.2 += original_chars;
+                    entry.3 += with_rtrt_chars;
+                    if saved_chars > 0 && original_chars > 0 {
+                        entry.4 += 1;
+                        entry.5 += saved_chars as f64 / original_chars as f64 * 100.0;
+                    }
                 }
             }
             Err(e) => {
@@ -1152,18 +1265,41 @@ fn output_savings_by_project(
     }
     let projects = grouped
         .into_iter()
-        .map(|(project, (count, saved_chars, original_chars))| {
-            let saved_chars = nonnegative_i64(saved_chars);
-            let original_chars = nonnegative_i64(original_chars);
-            SavingsProject {
+        .map(
+            |(
                 project,
-                count,
-                saved_chars,
-                saved_tokens: estimate_saved_tokens(saved_chars),
-                original_chars,
-                saved_pct: saved_pct(saved_chars, original_chars),
-            }
-        })
+                (
+                    count,
+                    saved_chars,
+                    original_chars,
+                    with_rtrt_chars,
+                    reduced_count,
+                    effective_pct_sum,
+                ),
+            )| {
+                let saved_chars = nonnegative_i64(saved_chars);
+                let original_chars = nonnegative_i64(original_chars);
+                let with_rtrt_chars = nonnegative_i64(with_rtrt_chars);
+                let reduced_count = nonnegative_i64(reduced_count);
+                SavingsProject {
+                    project,
+                    count,
+                    reduced_count,
+                    saved_chars,
+                    saved_tokens: estimate_saved_tokens(saved_chars),
+                    original_chars,
+                    with_rtrt_chars,
+                    saved_pct: saved_pct(saved_chars, original_chars),
+                    effective_pct: (reduced_count > 0)
+                        .then_some(effective_pct_sum / reduced_count as f64),
+                    coverage: SavingsCoverage {
+                        reduced: reduced_count,
+                        total: count,
+                    },
+                    effective_pct_sum,
+                }
+            },
+        )
         .collect();
     (true, projects)
 }
@@ -1171,6 +1307,7 @@ fn output_savings_by_project(
 fn command_savings_by_project(
     db_path: &std::path::Path,
     project: Option<&str>,
+    window: DashboardWindow,
     notes: &mut Vec<String>,
 ) -> (bool, Vec<SavingsProject>) {
     if !db_path.exists() {
@@ -1192,9 +1329,12 @@ fn command_savings_by_project(
     };
     let mut stmt = match conn.prepare(
         "SELECT project, COUNT(*) AS run_count, COALESCE(SUM(saved_chars), 0) AS saved_chars, \
-                COALESCE(SUM(input_chars), 0) AS original_chars \
+                COALESCE(SUM(input_chars), 0) AS original_chars, \
+                COALESCE(SUM(output_chars), 0) AS with_rtrt_chars, \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 THEN 1 ELSE 0 END), 0) AS reduced_count, \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 AND input_chars > 0 THEN saved_chars * 100.0 / input_chars ELSE 0 END), 0.0) AS effective_pct_sum \
          FROM proxy_runs \
-         WHERE (?1 IS NULL OR project = ?1) \
+         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2)) \
          GROUP BY project",
     ) {
         Ok(stmt) => stmt,
@@ -1203,18 +1343,29 @@ fn command_savings_by_project(
             return (false, Vec::new());
         }
     };
-    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+    let rows = match stmt.query_map(rusqlite::params![project, window.proxy_modifier], |row| {
         let project = normalize_project(row.get::<_, Option<String>>(0)?);
         let count = row.get::<_, i64>(1)?;
         let saved_chars = nonnegative_i64(row.get::<_, i64>(2)?);
         let original_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let with_rtrt_chars = nonnegative_i64(row.get::<_, i64>(4)?);
+        let reduced_count = nonnegative_i64(row.get::<_, i64>(5)?);
+        let effective_pct_sum = row.get::<_, f64>(6)?.max(0.0);
         Ok(SavingsProject {
             project,
             count,
+            reduced_count,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
             original_chars,
+            with_rtrt_chars,
             saved_pct: saved_pct(saved_chars, original_chars),
+            effective_pct: (reduced_count > 0).then_some(effective_pct_sum / reduced_count as f64),
+            coverage: SavingsCoverage {
+                reduced: reduced_count,
+                total: count,
+            },
+            effective_pct_sum,
         })
     }) {
         Ok(rows) => rows,
@@ -1266,21 +1417,28 @@ fn nonnegative_i64(value: i64) -> i64 {
 struct GainCommand {
     command: String,
     runs: i64,
+    reduced_runs: i64,
     input_chars: i64,
+    output_chars: i64,
     saved_chars: i64,
     saved_tokens: i64,
     saved_pct: f64,
-    saved_pct_avg: f64,
+    effective_pct: Option<f64>,
+    coverage: SavingsCoverage,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct GainProject {
     project: String,
     runs: i64,
+    reduced_runs: i64,
     input_chars: i64,
+    output_chars: i64,
     saved_chars: i64,
     saved_tokens: i64,
     saved_pct: f64,
+    effective_pct: Option<f64>,
+    coverage: SavingsCoverage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1300,10 +1458,12 @@ struct GainRun {
 #[derive(Debug, Deserialize)]
 struct GainQuery {
     project: Option<String>,
+    window: Option<String>,
 }
 
 async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<serde_json::Value> {
     let project = q.project.as_deref().filter(|p| !p.trim().is_empty());
+    let window = DashboardWindow::parse(q.window.as_deref());
     let db_path = proxy_stats_path();
     if !db_path.exists() {
         return Json(serde_json::json!({
@@ -1328,15 +1488,21 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
         }
     };
 
-    let (total_runs, total_input_chars, total_saved_chars) = match conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
-         FROM proxy_runs WHERE (?1 IS NULL OR project = ?1)",
-        rusqlite::params![project],
+    let (total_runs, total_input_chars, total_output_chars, total_saved_chars, reduced_runs, effective_pct_sum) = match conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(output_chars), 0), \
+                COALESCE(SUM(saved_chars), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 AND input_chars > 0 THEN saved_chars * 100.0 / input_chars ELSE 0 END), 0.0) \
+         FROM proxy_runs WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2))",
+        rusqlite::params![project, window.proxy_modifier],
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, f64>(5)?,
             ))
         },
     ) {
@@ -1353,11 +1519,25 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
 
     let total_runs = nonnegative_i64(total_runs);
     let total_input_chars = nonnegative_i64(total_input_chars);
+    let total_output_chars = nonnegative_i64(total_output_chars);
     let total_saved_chars = nonnegative_i64(total_saved_chars);
+    let reduced_runs = nonnegative_i64(reduced_runs);
+    if total_runs == 0 {
+        return Json(serde_json::json!({
+            "available": false,
+            "reason": "no_data_in_window",
+            "scope": project.unwrap_or("all"),
+            "window": window.label,
+            "path": db_path.display().to_string(),
+            "top_commands": [],
+            "per_project": [],
+            "recent_history": [],
+        }));
+    }
     let display_count = dynamic_gain_count(total_runs);
     let display_count_i64 = usize_to_i64(display_count);
 
-    let top_commands = match load_gain_top_commands(&conn, project, display_count_i64) {
+    let top_commands = match load_gain_top_commands(&conn, project, window, display_count_i64) {
         Ok(rows) => rows,
         Err(e) => {
             return Json(serde_json::json!({
@@ -1368,7 +1548,7 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
             }));
         }
     };
-    let per_project = match load_gain_projects(&conn, project) {
+    let per_project = match load_gain_projects(&conn, project, window) {
         Ok(rows) => rows,
         Err(e) => {
             return Json(serde_json::json!({
@@ -1379,7 +1559,7 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
             }));
         }
     };
-    let recent_history = match load_gain_recent(&conn, project, display_count_i64) {
+    let recent_history = match load_gain_recent(&conn, project, window, display_count_i64) {
         Ok(rows) => rows,
         Err(e) => {
             return Json(serde_json::json!({
@@ -1394,13 +1574,19 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
     Json(serde_json::json!({
         "available": true,
         "scope": project.unwrap_or("all"),
+        "window": window.label,
         "path": db_path.display().to_string(),
         "total_runs": total_runs,
+        "reduced_runs": reduced_runs,
         "input_chars": total_input_chars,
         "total_input_chars": total_input_chars,
+        "output_chars": total_output_chars,
+        "total_output_chars": total_output_chars,
         "total_saved_chars": total_saved_chars,
         "total_saved_tokens": estimate_saved_tokens(total_saved_chars),
         "saved_pct": saved_pct_or_zero(total_saved_chars, total_input_chars),
+        "effective_pct": (reduced_runs > 0).then_some(effective_pct_sum / reduced_runs as f64),
+        "coverage": SavingsCoverage { reduced: reduced_runs, total: total_runs },
         "token_estimate": "chars/4",
         "display_count": display_count,
         "top_commands": top_commands,
@@ -1412,54 +1598,87 @@ async fn gain(axum::extract::Query(q): axum::extract::Query<GainQuery>) -> Json<
 fn load_gain_top_commands(
     conn: &rusqlite::Connection,
     project: Option<&str>,
+    window: DashboardWindow,
     limit: i64,
 ) -> rusqlite::Result<Vec<GainCommand>> {
     let mut stmt = conn.prepare(
-        "SELECT original_cmd, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
+        "SELECT original_cmd, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(output_chars), 0), \
+                COALESCE(SUM(saved_chars), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 AND input_chars > 0 THEN saved_chars * 100.0 / input_chars ELSE 0 END), 0.0) \
          FROM proxy_runs \
-         WHERE (?1 IS NULL OR project = ?1) \
+         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2)) \
          GROUP BY original_cmd \
          ORDER BY COALESCE(SUM(saved_chars), 0) DESC, COUNT(*) DESC, original_cmd ASC \
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
-        let input_chars = nonnegative_i64(row.get::<_, i64>(2)?);
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(3)?);
-        let pct = saved_pct_or_zero(saved_chars, input_chars);
-        Ok(GainCommand {
-            command: row.get(0)?,
-            runs: nonnegative_i64(row.get::<_, i64>(1)?),
-            input_chars,
-            saved_chars,
-            saved_tokens: estimate_saved_tokens(saved_chars),
-            saved_pct: pct,
-            saved_pct_avg: pct,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![project, window.proxy_modifier, limit],
+        |row| {
+            let input_chars = nonnegative_i64(row.get::<_, i64>(2)?);
+            let output_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+            let saved_chars = nonnegative_i64(row.get::<_, i64>(4)?);
+            let reduced_runs = nonnegative_i64(row.get::<_, i64>(5)?);
+            let effective_pct_sum = row.get::<_, f64>(6)?.max(0.0);
+            let pct = saved_pct_or_zero(saved_chars, input_chars);
+            let runs = nonnegative_i64(row.get::<_, i64>(1)?);
+            Ok(GainCommand {
+                command: row.get(0)?,
+                runs,
+                reduced_runs,
+                input_chars,
+                output_chars,
+                saved_chars,
+                saved_tokens: estimate_saved_tokens(saved_chars),
+                saved_pct: pct,
+                effective_pct: (reduced_runs > 0)
+                    .then_some(effective_pct_sum / reduced_runs as f64),
+                coverage: SavingsCoverage {
+                    reduced: reduced_runs,
+                    total: runs,
+                },
+            })
+        },
+    )?;
     rows.collect()
 }
 
 fn load_gain_projects(
     conn: &rusqlite::Connection,
     project: Option<&str>,
+    window: DashboardWindow,
 ) -> rusqlite::Result<Vec<GainProject>> {
     let mut stmt = conn.prepare(
-        "SELECT project, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(saved_chars), 0) \
+        "SELECT project, COUNT(*), COALESCE(SUM(input_chars), 0), COALESCE(SUM(output_chars), 0), \
+                COALESCE(SUM(saved_chars), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN saved_chars > 0 AND input_chars > 0 THEN saved_chars * 100.0 / input_chars ELSE 0 END), 0.0) \
          FROM proxy_runs \
-         WHERE (?1 IS NULL OR project = ?1) \
+         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2)) \
          GROUP BY project \
          ORDER BY COALESCE(SUM(saved_chars), 0) DESC, COUNT(*) DESC, project ASC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![project], |row| {
+    let rows = stmt.query_map(rusqlite::params![project, window.proxy_modifier], |row| {
         let input_chars = nonnegative_i64(row.get::<_, i64>(2)?);
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let output_chars = nonnegative_i64(row.get::<_, i64>(3)?);
+        let saved_chars = nonnegative_i64(row.get::<_, i64>(4)?);
+        let reduced_runs = nonnegative_i64(row.get::<_, i64>(5)?);
+        let effective_pct_sum = row.get::<_, f64>(6)?.max(0.0);
+        let runs = nonnegative_i64(row.get::<_, i64>(1)?);
         Ok(GainProject {
             project: normalize_project(row.get::<_, Option<String>>(0)?),
-            runs: nonnegative_i64(row.get::<_, i64>(1)?),
+            runs,
+            reduced_runs,
             input_chars,
+            output_chars,
             saved_chars,
             saved_tokens: estimate_saved_tokens(saved_chars),
             saved_pct: saved_pct_or_zero(saved_chars, input_chars),
+            effective_pct: (reduced_runs > 0).then_some(effective_pct_sum / reduced_runs as f64),
+            coverage: SavingsCoverage {
+                reduced: reduced_runs,
+                total: runs,
+            },
         })
     })?;
     rows.collect()
@@ -1468,37 +1687,42 @@ fn load_gain_projects(
 fn load_gain_recent(
     conn: &rusqlite::Connection,
     project: Option<&str>,
+    window: DashboardWindow,
     limit: i64,
 ) -> rusqlite::Result<Vec<GainRun>> {
     let mut stmt = conn.prepare(
         "SELECT ts, project, original_cmd, mode, input_chars, output_chars, saved_chars, saved_pct, exec_ms \
          FROM proxy_runs \
-         WHERE (?1 IS NULL OR project = ?1) \
+         WHERE (?1 IS NULL OR project = ?1) AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2)) \
          ORDER BY id DESC \
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = stmt.query_map(rusqlite::params![project, limit], |row| {
-        let input_chars = nonnegative_i64(row.get::<_, i64>(4)?);
-        let saved_chars = nonnegative_i64(row.get::<_, i64>(6)?);
-        Ok(GainRun {
-            ts: row.get(0)?,
-            project: normalize_project(row.get::<_, Option<String>>(1)?),
-            original_cmd: row.get(2)?,
-            mode: row.get(3)?,
-            input_chars,
-            output_chars: nonnegative_i64(row.get::<_, i64>(5)?),
-            saved_chars,
-            saved_tokens: estimate_saved_tokens(saved_chars),
-            saved_pct: saved_pct_or_zero(saved_chars, input_chars),
-            exec_ms: nonnegative_i64(row.get::<_, i64>(8)?),
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![project, window.proxy_modifier, limit],
+        |row| {
+            let input_chars = nonnegative_i64(row.get::<_, i64>(4)?);
+            let saved_chars = nonnegative_i64(row.get::<_, i64>(6)?);
+            Ok(GainRun {
+                ts: row.get(0)?,
+                project: normalize_project(row.get::<_, Option<String>>(1)?),
+                original_cmd: row.get(2)?,
+                mode: row.get(3)?,
+                input_chars,
+                output_chars: nonnegative_i64(row.get::<_, i64>(5)?),
+                saved_chars,
+                saved_tokens: estimate_saved_tokens(saved_chars),
+                saved_pct: saved_pct_or_zero(saved_chars, input_chars),
+                exec_ms: nonnegative_i64(row.get::<_, i64>(8)?),
+            })
+        },
+    )?;
     rows.collect()
 }
 
 #[derive(Debug, Deserialize)]
 struct OverviewQuery {
     project: Option<String>,
+    window: Option<String>,
 }
 
 async fn optimizer_overview(
@@ -1506,6 +1730,7 @@ async fn optimizer_overview(
     axum::extract::Query(q): axum::extract::Query<OverviewQuery>,
 ) -> Json<serde_json::Value> {
     let project = q.project.as_deref().filter(|p| !p.is_empty());
+    let window = DashboardWindow::parse(q.window.as_deref());
     let mut notes = Vec::new();
 
     let (memory_available, memory_by_project, output_available, output_by_project) =
@@ -1519,9 +1744,9 @@ async fn optimizer_overview(
             match rusqlite::Connection::open(&state.memory_path) {
                 Ok(conn) => {
                     let (memory_available, memory_by_project) =
-                        memory_savings_by_project(&conn, project, &mut notes);
+                        memory_savings_by_project(&conn, project, window, &mut notes);
                     let (output_available, output_by_project) =
-                        output_savings_by_project(&conn, project, &mut notes);
+                        output_savings_by_project(&conn, project, window, &mut notes);
                     (
                         memory_available,
                         memory_by_project,
@@ -1538,7 +1763,7 @@ async fn optimizer_overview(
 
     let proxy_path = proxy_stats_path();
     let (command_available, command_by_project) =
-        command_savings_by_project(&proxy_path, project, &mut notes);
+        command_savings_by_project(&proxy_path, project, window, &mut notes);
 
     let output_level = read_output_style_level().as_str().to_string();
     let mut output_source = savings_source(
@@ -1571,14 +1796,19 @@ async fn optimizer_overview(
     ];
     let total_saved_chars: i64 = sources.iter().map(|source| source.saved_chars).sum();
     let total_original_chars: i64 = sources.iter().map(|source| source.original_chars).sum();
+    let total_with_rtrt_chars: i64 = sources.iter().map(|source| source.with_rtrt_chars).sum();
     let total_saved_tokens = estimate_saved_tokens(total_saved_chars);
     let projects = projects_rollup(&sources);
+    let available = sources.iter().any(|source| source.available);
 
     Json(serde_json::json!({
+        "available": available,
         "scope": project.unwrap_or("all"),
+        "window": window.label,
         "total_saved_chars": total_saved_chars,
         "total_saved_tokens": total_saved_tokens,
         "total_original_chars": total_original_chars,
+        "total_with_rtrt_chars": total_with_rtrt_chars,
         "total_saved_pct": saved_pct(total_saved_chars, total_original_chars),
         "token_estimate": "chars/4",
         "sources": sources,

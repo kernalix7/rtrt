@@ -388,6 +388,14 @@
   .project-row-bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; }
   .project-row-bar span { display: block; height: 100%; border-radius: inherit; background: var(--ok); transition: width .35s ease; }
   .overview-live { white-space: nowrap; }
+  .command-feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+  .command-gain-bar { min-width: 150px; display: grid; gap: 0.25rem; }
+  .command-gain-bar .bar { height: 7px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .command-gain-bar .bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease; }
+  .command-chip-grid { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .command-chip-grid .badge { background: var(--bg); }
+  .command-note { display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.75rem 0.85rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted); }
+  .command-note strong { color: var(--fg); }
 
   /* Mobile */
   @media (max-width: 720px) {
@@ -462,8 +470,10 @@
     </div>
     <div class="nav-group">
       <div class="group">Command Optimizer</div>
-      <a class="nav" data-page="compress" data-focus="proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">git / cargo filters</span></span></a>
-      <a class="nav" data-page="repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
+      <a class="nav" data-page="command" data-sub="command-gain"><span class="icon">↗</span><span class="nav-copy"><span class="nav-label">Gain</span><span class="nav-sub">proxy-run analytics</span></span></a>
+      <a class="nav" data-page="command" data-sub="command-coverage"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Coverage</span><span class="nav-sub">34 command filters</span></span></a>
+      <a class="nav" data-page="command" data-sub="command-proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">stdin filter demo</span></span></a>
+      <a class="nav" data-page="command" data-sub="command-repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
     </div>
     <div class="nav-group">
       <div class="group">System</div>
@@ -904,32 +914,137 @@
       </div>
     </section>
 
-    <!-- Command Optimizer: proxy -->
-    <section id="page-proxy" class="page" hidden>
-      <div class="card">
-        <div class="head"><h2>Command Output Proxy</h2><span class="hint">git / cargo output filters</span></div>
-        <form id="proxy-form">
-          <input id="proxy-command" placeholder="명령 (예: git status)">
-          <textarea id="proxy-raw" rows="6" placeholder="원본 stdout / stderr" required></textarea>
-          <div style="display:flex;gap:0.5rem;align-items:center;">
-            <button class="primary" type="submit">필터링</button>
-            <a data-sample="proxy" style="cursor:pointer;">예시 채우기</a>
+    <!-- Command Optimizer -->
+    <section id="page-command" class="page" hidden>
+      <div class="section-head">
+        <h1>Command Optimizer</h1>
+        <div class="lede"><code>rtrt proxy-run</code> and the transparent Bash hook reduce command output before it reaches agents.</div>
+      </div>
+      <nav class="subtabs" id="command-subtabs">
+        <a class="active" data-sub="command-gain">Gain</a>
+        <a data-sub="command-coverage">Coverage</a>
+        <a data-sub="command-proxy">Proxy</a>
+        <a data-sub="command-repomap">Repo Map</a>
+      </nav>
+
+      <div id="sub-command-gain" class="subpage">
+        <div class="card savings-hero">
+          <div class="head">
+            <h2>Total Command Tokens Saved</h2>
+            <span id="command-gain-live" class="badge ok overview-live">live</span>
           </div>
-          <details><summary class="muted-summary">고급 옵션</summary>
-            <div class="adv">
-              <div class="row">
-                <select id="proxy-mode">
-                  <option value="command">command 자동</option>
-                  <option value="errors_only">errors_only</option>
-                  <option value="ultra_compact">ultra_compact</option>
-                </select>
-                <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only 컨텍스트">
-              </div>
+          <div class="savings-total countup" id="gain-total-tokens" data-target="0">0</div>
+          <div class="savings-meta">
+            <span id="gain-token-note">(estimate, chars/4)</span>
+            <span><span id="gain-total-chars" class="countup" data-target="0">0</span> chars</span>
+            <span><span id="gain-total-runs" class="countup" data-target="0">0</span> runs</span>
+          </div>
+        </div>
+        <div class="command-feature-grid">
+          <div class="optimizer-mini-card">
+            <div class="top"><span class="name">proxy-run</span><span class="badge ok">active</span></div>
+            <div class="tokens">rtrt proxy-run</div>
+            <div class="meta"><span>filters stdout/stderr</span><span>persistent gain stats</span></div>
+          </div>
+          <div class="optimizer-mini-card">
+            <div class="top"><span class="name">Transparent Hook</span><span class="badge">PreToolUse Bash</span></div>
+            <div class="tokens">auto-route</div>
+            <div class="meta"><span><code>rtrt hook proxy-rewrite</code></span><span>via <code>rtrt setup</code></span></div>
+          </div>
+          <div class="optimizer-mini-card">
+            <div class="top"><span class="name">Analytics Store</span><span class="badge">SQLite</span></div>
+            <div class="tokens">gain</div>
+            <div class="meta"><span><code>~/.rtrt/proxy-stats.sqlite</code></span><span id="gain-display-count">dynamic rows</span></div>
+          </div>
+        </div>
+        <div id="gain-unavailable" class="card" hidden>
+          <div class="head"><h2>Gain Analytics</h2><span class="hint">Waiting for proxy-run data</span></div>
+          <div class="empty" id="gain-unavailable-text">No Command Optimizer database yet.</div>
+        </div>
+        <div id="gain-body">
+          <div class="card">
+            <div class="head"><h2>Top Commands</h2><span class="hint">Sorted by saved characters.</span></div>
+            <table id="gain-top-tbl">
+              <thead><tr><th>Command</th><th>Runs</th><th>Saved</th><th>Avg %</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="head"><h2>Per-Project Breakdown</h2><span class="hint">From persisted proxy runs.</span></div>
+            <table id="gain-project-tbl">
+              <thead><tr><th>Project</th><th>Runs</th><th>Saved chars</th><th>Saved tokens</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="head"><h2>Recent Runs</h2><a id="gain-refresh">Refresh</a></div>
+            <table id="gain-history-tbl">
+              <thead><tr><th>Time</th><th>Project</th><th>Command</th><th>Mode</th><th>Saved</th><th>Exec</th></tr></thead>
+              <tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div id="sub-command-coverage" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>Covered Commands</h2><span class="hint">34 command filters</span></div>
+          <div class="command-note" style="margin-bottom:0.85rem;">
+            <span class="badge ok">hook</span>
+            <span><strong>Transparent PreToolUse Bash routing</strong> uses <code>rtrt hook proxy-rewrite</code>, installed by <code>rtrt setup</code>, to auto-route covered commands through <code>rtrt proxy-run</code>. Commands with pipes, <code>&amp;&amp;</code>, or redirects are skipped.</span>
+          </div>
+          <div id="command-coverage-list" class="command-chip-grid"></div>
+        </div>
+      </div>
+
+      <div id="sub-command-proxy" class="subpage" hidden>
+        <div class="card">
+          <div class="head"><h2>Manual Proxy</h2><span class="hint">stdin filter demo</span></div>
+          <form id="proxy-form">
+            <input id="proxy-command" placeholder="명령 (예: git status)">
+            <textarea id="proxy-raw" rows="6" placeholder="원본 stdout / stderr" required></textarea>
+            <div style="display:flex;gap:0.5rem;align-items:center;">
+              <button class="primary" type="submit">필터링</button>
+              <a data-sample="proxy" style="cursor:pointer;">예시 채우기</a>
             </div>
-          </details>
-        </form>
-        <div id="proxy-summary" class="out-meta"></div>
-        <pre id="proxy-output" hidden></pre>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <select id="proxy-mode">
+                    <option value="command">command 자동</option>
+                    <option value="errors_only">errors_only</option>
+                    <option value="ultra_compact">ultra_compact</option>
+                  </select>
+                  <input id="proxy-context" type="number" min="0" max="20" value="3" title="errors_only 컨텍스트">
+                </div>
+              </div>
+            </details>
+          </form>
+          <div id="proxy-summary" class="out-meta"></div>
+          <pre id="proxy-output" hidden></pre>
+        </div>
+      </div>
+
+      <div id="sub-command-repomap" class="subpage" hidden>
+        <div id="repomap-scope-empty" class="scope-empty" hidden>프로젝트를 선택하거나 추가하세요</div>
+        <div class="card">
+          <div class="head"><h2>Repo Map</h2><span class="hint">Rust / Python / TypeScript signatures</span></div>
+          <div id="repomap-project-meta" class="out-meta scope-status"></div>
+          <form id="repomap-form">
+            <input id="repomap-root" type="hidden">
+            <button class="primary" type="submit">맵 생성</button>
+            <details><summary class="muted-summary">고급 옵션</summary>
+              <div class="adv">
+                <div class="row">
+                  <input id="repomap-ext" placeholder="확장자 (비우면 자동)">
+                  <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
+                </div>
+              </div>
+            </details>
+          </form>
+          <div id="repomap-summary" class="out-meta"></div>
+          <pre id="repomap-output" style="max-height:420px;overflow:auto;" hidden></pre>
+        </div>
       </div>
     </section>
 
@@ -954,29 +1069,6 @@
           </form>
           <div id="diagnose-meta" class="out-meta"></div>
           <pre id="diagnose-output" hidden></pre>
-        </div>
-    </section>
-
-    <!-- 코드 맵 -->
-    <section id="page-repomap" class="page" hidden>
-        <div id="repomap-scope-empty" class="scope-empty" hidden>프로젝트를 선택하거나 추가하세요</div>
-        <div class="card">
-          <div class="head"><h2>코드 시그니처 맵</h2><span class="hint">Rust / Python / TypeScript 자동</span></div>
-          <div id="repomap-project-meta" class="out-meta scope-status"></div>
-          <form id="repomap-form">
-            <input id="repomap-root" type="hidden">
-            <button class="primary" type="submit">맵 생성</button>
-            <details><summary class="muted-summary">고급 옵션</summary>
-              <div class="adv">
-                <div class="row">
-                  <input id="repomap-ext" placeholder="확장자 (비우면 자동)">
-                  <input id="repomap-max" type="number" min="1024" step="1024" value="524288" title="파일당 최대 바이트">
-                </div>
-              </div>
-            </details>
-          </form>
-          <div id="repomap-summary" class="out-meta"></div>
-          <pre id="repomap-output" style="max-height:420px;overflow:auto;" hidden></pre>
         </div>
     </section>
 
@@ -1585,6 +1677,12 @@ wireSubtabs('security-subtabs', (sub) => {
   if (sub === 'securityprofiles') loadSecurityProfileSettings();
   if (sub === 'securityscan') refreshSecurityScope();
 });
+wireSubtabs('command-subtabs', (sub) => {
+  if (sub === 'command-gain') startGainPolling();
+  else stopGainPolling();
+  if (sub === 'command-coverage') renderCommandCoverage();
+  if (sub === 'command-repomap') refreshRepomapScope();
+});
 
 // Memory: project drill-in from the global selector
 function relativeTime(ts) {
@@ -2007,7 +2105,7 @@ const SAMPLES = {
     pushActivity('압축 예시 채움');
   },
   proxy() {
-    navigate('compress', { focus: 'proxy' });
+    navigate('command', { sub: 'command-proxy' });
     document.getElementById('proxy-command').value = 'cargo build';
     const ta = document.getElementById('proxy-raw');
     ta.value = '   Compiling rtrt-core v0.1.0\n   Compiling rtrt-compress v0.1.0\n   Compiling rtrt-memory v0.1.0\nerror[E0599]: no method named `foo` found for struct `Bar`\n   --> crates/rtrt-memory/src/lib.rs:204:18\n    |\n204 |         store.foo();\n    |               ^^^ method not found\n   Compiling rtrt-providers v0.1.0\nwarning: unused variable `x`\n   --> src/lib.rs:42:9\nerror: could not compile `rtrt-memory` due to previous error';
@@ -2037,8 +2135,10 @@ const PALETTE_ITEMS = [
   { label: 'Output Optimizer · Compress Full', hint: 'rules / full', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'full' }); document.getElementById('compress-input').focus(); } },
   { label: 'Output Optimizer · Compress Ultra', hint: 'rules / ultra', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'ultra' }); document.getElementById('compress-input').focus(); } },
   { label: 'Output Optimizer · compress_ml', hint: 'ml / compress', run: () => { navigate('compress', { compressEngine: 'ml' }); document.getElementById('compress-input').focus(); } },
-  { label: 'Command Optimizer · Proxy', hint: 'git / cargo filters', run: () => navigate('compress', { focus: 'proxy' }) },
-  { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('repomap') },
+  { label: 'Command Optimizer · Gain', hint: 'proxy-run analytics', run: () => navigate('command', { sub: 'command-gain' }) },
+  { label: 'Command Optimizer · Coverage', hint: '34 command filters', run: () => navigate('command', { sub: 'command-coverage' }) },
+  { label: 'Command Optimizer · Proxy', hint: 'stdin filter demo', run: () => navigate('command', { sub: 'command-proxy' }) },
+  { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('command', { sub: 'command-repomap' }) },
   { label: 'System · Providers', hint: 'providers / local models', run: () => navigate('llm') },
   { label: 'System · Prompts', hint: 'prompts', run: () => navigate('prompts') },
   { label: 'System · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
@@ -2048,14 +2148,14 @@ const PALETTE_ITEMS = [
   { label: 'System · Settings', hint: 'config / auto-compress', run: () => navigate('settings') },
   { label: '테마 토글', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
   { label: 'Output Optimizer · sample', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
-  { label: 'Command Optimizer · sample', hint: 'sample · proxy', run: () => { navigate('compress', { focus: 'proxy' }); SAMPLES.proxy(); } },
+  { label: 'Command Optimizer · sample', hint: 'sample · proxy', run: () => { navigate('command', { sub: 'command-proxy' }); SAMPLES.proxy(); } },
   { label: 'System · sample diagnose', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
 ];
 function refreshMemoryScope() {
   openProject(currentProject());
 }
 function refreshRepomapScope() {
-  const ok = setScopeState('repomap-scope-empty', '#page-repomap .card', true);
+  const ok = setScopeState('repomap-scope-empty', '#sub-command-repomap .card', true);
   const path = projectPath();
   document.getElementById('repomap-project-meta').textContent = ok ? `${currentProject()} · ${path}` : '';
   document.getElementById('repomap-root').value = ok ? path : '';
@@ -2069,7 +2169,11 @@ function refreshProjectScopePage() {
   const page = activePage();
   if (page === 'memory') refreshMemoryScope();
   if (page === 'security') refreshSecurityScope();
-  if (page === 'repomap') refreshRepomapScope();
+  if (page === 'command') {
+    const activeSub = document.querySelector('#command-subtabs a.active');
+    if (activeSub && activeSub.dataset.sub === 'command-repomap') refreshRepomapScope();
+    if (activeSub && activeSub.dataset.sub === 'command-gain') loadGain();
+  }
   if (page === 'diagnose') refreshDiagnoseScope();
 }
 function setCompressEngine(engine, level) {
@@ -2106,12 +2210,18 @@ function navigate(page, opts = {}) {
   if (target) target.hidden = false;
   if (page === 'overview') startOverviewPolling();
   else stopOverviewPolling();
+  if (page !== 'command') stopGainPolling();
   if (page === 'memory') {
     refreshMemoryScope();
     if (opts.sub) subClick('memory-subtabs', opts.sub);
   }
-  if (page === 'repomap') {
-    refreshRepomapScope();
+  if (page === 'command') {
+    if (opts.sub) subClick('command-subtabs', opts.sub);
+    const activeSub = document.querySelector('#command-subtabs a.active');
+    const sub = activeSub ? activeSub.dataset.sub : 'command-gain';
+    if (sub === 'command-gain') startGainPolling();
+    if (sub === 'command-coverage') renderCommandCoverage();
+    if (sub === 'command-repomap') refreshRepomapScope();
   }
   if (page === 'diagnose') {
     refreshDiagnoseScope();
@@ -2478,6 +2588,157 @@ function stopOverviewPolling() {
   }
 }
 
+const GAIN_REFRESH_MS = 5000;
+const COMMAND_COVERED_FILTERS = [
+  'git status', 'git diff', 'git show', 'git branch', 'git stash', 'git log',
+  'cargo nextest', 'cargo check', 'cargo clippy', 'cargo build', 'cargo test',
+  'ls -la', 'ls -al', 'ls', 'grep -rn', 'grep', 'rg', 'find', 'cat', 'read',
+  'curl', 'wget', 'gh', 'docker', 'kubectl', 'pytest', 'go test',
+  'npm', 'npx', 'pnpm', 'pip', 'tsc', 'eslint', 'prettier',
+];
+let gainPollTimer = null;
+let gainAgeTimer = null;
+let gainLastUpdatedAt = 0;
+let gainLoading = false;
+
+function commandGainVisible() {
+  return activePage() === 'command' && !document.getElementById('sub-command-gain').hidden;
+}
+
+function updateGainLiveIndicator() {
+  const el = document.getElementById('command-gain-live');
+  if (!el) return;
+  if (!gainLastUpdatedAt) {
+    el.textContent = 'live';
+    return;
+  }
+  const age = Math.max(0, Math.floor((Date.now() - gainLastUpdatedAt) / 1000));
+  el.textContent = `live · updated ${age}s ago`;
+}
+
+function renderCommandCoverage() {
+  const list = document.getElementById('command-coverage-list');
+  if (!list || list.dataset.rendered === '1') return;
+  list.innerHTML = COMMAND_COVERED_FILTERS.map(cmd => `<span class="badge">${escapeHtml(cmd)}</span>`).join('');
+  list.dataset.rendered = '1';
+}
+
+function gainUrl() {
+  const params = new URLSearchParams();
+  if (currentProject() && !isGlobalScope()) params.set('project', currentProject());
+  return `/api/gain${params.toString() ? '?' + params.toString() : ''}`;
+}
+
+function renderGainUnavailable(d) {
+  document.getElementById('gain-unavailable').hidden = false;
+  document.getElementById('gain-body').hidden = true;
+  document.getElementById('gain-unavailable-text').textContent =
+    d && d.reason ? `${d.reason}${d.path ? ` · ${d.path}` : ''}` : 'No Command Optimizer database yet.';
+  animateCount(document.getElementById('gain-total-tokens'), 0);
+  animateCount(document.getElementById('gain-total-chars'), 0);
+  animateCount(document.getElementById('gain-total-runs'), 0);
+  document.getElementById('gain-display-count').textContent = 'waiting for data';
+}
+
+function renderGainTopCommands(rows) {
+  const tbody = document.querySelector('#gain-top-tbl tbody');
+  const maxSaved = Math.max(1, ...rows.map(r => numberValue(r.saved_chars)));
+  tbody.innerHTML = rows.map(r => {
+    const chars = numberValue(r.saved_chars);
+    const width = Math.max(0, Math.min(100, (chars / maxSaved) * 100));
+    return `<tr>
+      <td class="project-name-cell"><code>${escapeHtml(r.command || '')}</code></td>
+      <td class="tokens-cell">${numberValue(r.runs).toLocaleString()}</td>
+      <td class="command-gain-bar">
+        <span class="tokens-cell">${numberValue(r.saved_tokens).toLocaleString()} tokens</span>
+        <span class="hint">${chars.toLocaleString()} chars</span>
+        <span class="bar"><span style="width:${width.toFixed(1)}%;"></span></span>
+      </td>
+      <td><span class="badge save">−${Number(r.saved_pct_avg || 0).toFixed(1)}%</span></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4" class="empty">No command savings yet.</td></tr>';
+}
+
+function renderGainProjects(rows) {
+  const tbody = document.querySelector('#gain-project-tbl tbody');
+  tbody.innerHTML = rows.map(r => `<tr>
+    <td class="project-name-cell">${escapeHtml(r.project || '(unknown)')}</td>
+    <td class="tokens-cell">${numberValue(r.runs).toLocaleString()}</td>
+    <td class="tokens-cell">${numberValue(r.saved_chars).toLocaleString()}</td>
+    <td class="tokens-cell">${numberValue(r.saved_tokens).toLocaleString()}</td>
+  </tr>`).join('') || '<tr><td colspan="4" class="empty">No project breakdown yet.</td></tr>';
+}
+
+function renderGainHistory(rows) {
+  const tbody = document.querySelector('#gain-history-tbl tbody');
+  tbody.innerHTML = rows.map(r => `<tr>
+    <td class="tokens-cell">${escapeHtml(r.ts || '—')}</td>
+    <td class="project-name-cell">${escapeHtml(r.project || '(unknown)')}</td>
+    <td class="project-name-cell"><code>${escapeHtml(r.original_cmd || '')}</code></td>
+    <td><span class="badge">${escapeHtml(r.mode || 'command')}</span></td>
+    <td class="tokens-cell">${numberValue(r.saved_tokens).toLocaleString()} tokens<div class="hint">${numberValue(r.saved_chars).toLocaleString()} chars · −${Number(r.saved_pct || 0).toFixed(1)}%</div></td>
+    <td class="tokens-cell">${numberValue(r.exec_ms).toLocaleString()} ms</td>
+  </tr>`).join('') || '<tr><td colspan="6" class="empty">No recent proxy runs yet.</td></tr>';
+}
+
+async function loadGain() {
+  if (gainLoading) return;
+  gainLoading = true;
+  let d = null;
+  try {
+    const r = await fetch(gainUrl());
+    d = r.ok ? await r.json() : { available: false, reason: `HTTP ${r.status}` };
+  } catch (e) {
+    d = { available: false, reason: e.message || String(e) };
+  } finally {
+    gainLoading = false;
+  }
+
+  gainLastUpdatedAt = Date.now();
+  updateGainLiveIndicator();
+  if (!d || d.available === false) {
+    renderGainUnavailable(d);
+    return;
+  }
+  document.getElementById('gain-unavailable').hidden = true;
+  document.getElementById('gain-body').hidden = false;
+  animateCount(document.getElementById('gain-total-tokens'), numberValue(d.total_saved_tokens));
+  animateCount(document.getElementById('gain-total-chars'), numberValue(d.total_saved_chars));
+  animateCount(document.getElementById('gain-total-runs'), numberValue(d.total_runs));
+  setUpdating(document.getElementById('gain-total-tokens'));
+  document.getElementById('gain-token-note').textContent = `(${d.token_estimate || 'chars/4'} estimate)`;
+  document.getElementById('gain-display-count').textContent = `${numberValue(d.display_count).toLocaleString()} rows shown`;
+  renderGainTopCommands(Array.isArray(d.top_commands) ? d.top_commands : []);
+  renderGainProjects(Array.isArray(d.per_project) ? d.per_project : []);
+  renderGainHistory(Array.isArray(d.recent_history) ? d.recent_history : []);
+}
+
+function startGainPolling() {
+  if (!commandGainVisible()) return;
+  if (!gainPollTimer) {
+    loadGain();
+    gainPollTimer = setInterval(() => {
+      if (commandGainVisible()) loadGain();
+      else stopGainPolling();
+    }, GAIN_REFRESH_MS);
+  }
+  if (!gainAgeTimer) {
+    gainAgeTimer = setInterval(updateGainLiveIndicator, 1000);
+  }
+}
+
+function stopGainPolling() {
+  if (gainPollTimer) {
+    clearInterval(gainPollTimer);
+    gainPollTimer = null;
+  }
+  if (gainAgeTimer) {
+    clearInterval(gainAgeTimer);
+    gainAgeTimer = null;
+  }
+}
+
+document.getElementById('gain-refresh').onclick = () => { loadGain(); pushActivity('Command gain refreshed'); };
 document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('Overview refreshed'); };
 
 // Recall mode toggle (bm25 / hybrid).
@@ -3021,7 +3282,7 @@ function memmapCatchAllId(clusters) {
 }
 
 // Small, purposeful palette keyed to MEANING (source), not a per-id hash —
-// agentmemory-style gold/blue/green. Main = blue, subagent = gold, mixed = green,
+// Memory map gold/blue/green. Main = blue, subagent = gold, mixed = green,
 // catch-all/misc = neutral grey. This is what makes the map read as clean +
 // structured instead of an 18-colour rainbow.
 const MEMMAP_PALETTE = {
@@ -3068,7 +3329,7 @@ function memmapCyStyle() {
         'min-zoomed-font-size': 8,
       },
     },
-    // SHAPES carry meaning (agentmemory-style): cluster/group bubbles are ellipse
+    // SHAPES carry meaning: cluster/group bubbles are ellipse
     // hubs; leaf member nodes are round-rectangles ("things" hanging off a hub).
     { selector: 'node[kindType = "cluster"]', style: { 'shape': 'ellipse' } },
     { selector: 'node[kindType = "member"]', style: { 'shape': 'round-rectangle' } },
@@ -3106,7 +3367,7 @@ function memmapCyStyle() {
       style: { 'opacity': 0.12, 'text-opacity': 0.06 },
     },
     {
-      selector: 'node.hit',          // search match highlight (red ring, agentmemory)
+      selector: 'node.hit',          // search match highlight (red ring)
       style: { 'border-width': 3, 'border-color': '#CC0000' },
     },
     {
@@ -3191,9 +3452,9 @@ function memmapEnsureCy() {
       if (/^\d+$/.test(num)) openDetailModal(Number(num));
     }
   });
-  // Hover a node: light up its connecting edges + show the agentmemory-style card.
+  // Hover a node: light up its connecting edges + show the Memory card.
   // In brain mode, fade the non-neighbours and reveal the hovered node + its
-  // neighbours' labels (agentmemory focus behaviour).
+  // neighbours' labels (Memory map focus behaviour).
   memmapCy.on('mouseover', 'node', (ev) => {
     ev.target.connectedEdges().addClass('hl');
     if (memmapViewMode === 'brain' && !brainConcept) {
@@ -3210,7 +3471,7 @@ function memmapEnsureCy() {
     }
     memmapHideTooltip();
   });
-  // Track the cursor so the card follows it (offset +12px, like agentmemory).
+  // Track the cursor so the card follows it.
   memmapCy.on('mousemove', 'node', (ev) => memmapMoveTooltip(ev));
   // Any pan/zoom/tap-on-background dismisses the card so it never sticks.
   memmapCy.on('pan zoom', () => memmapHideTooltip());
@@ -3218,7 +3479,7 @@ function memmapEnsureCy() {
   return memmapCy;
 }
 
-// Hover card (agentmemory style): "<name> · <TYPE> · N connections". TYPE is
+// Hover card: "<name> · <TYPE> · N connections". TYPE is
 // derived from kindType + misc (클러스터 / 메모리 / 미분류); connection count is the
 // live cy node degree. The card is a DOM div positioned over the .memmap-cy-wrap.
 function memmapTooltipMeta(node) {
@@ -3732,7 +3993,7 @@ function brainNodeDiameter(degree) {
   return Math.round(r * 2);
 }
 
-// Deterministic palette colour per concept (clean agentmemory gold/blue/green,
+// Deterministic palette colour per concept (clean Memory map gold/blue/green,
 // never an 18-colour rainbow). Hash the token so the same concept keeps its hue.
 const BRAIN_CONCEPT_PALETTE = [
   MEMMAP_PALETTE.main, MEMMAP_PALETTE.subagent, MEMMAP_PALETTE.mixed,

@@ -18,7 +18,7 @@ pub use prompts::{Prompt, PromptRegistry};
 use std::collections::BTreeMap;
 
 use rtrt_core::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Template {
@@ -46,7 +46,7 @@ pub enum TemplateSource {
 
 /// Project kind. Keeps the surface organised around what the user is trying
 /// to start, not which programming language fronts the scaffold.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TemplateCategory {
     /// Code projects (CLI / lib / service across any language).
@@ -56,6 +56,24 @@ pub enum TemplateCategory {
     Design,
     /// Specs, decision records, roadmaps, agent definitions.
     Planning,
+}
+
+impl<'de> Deserialize<'de> for TemplateCategory {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "development" | "rust-cli" | "rust-lib" | "rust-axum" | "node-typescript"
+            | "python-uv" | "go-cli" | "custom" => Ok(Self::Development),
+            "design" => Ok(Self::Design),
+            "planning" => Ok(Self::Planning),
+            _ => Err(de::Error::custom(format!(
+                "unknown template category: {raw}"
+            ))),
+        }
+    }
 }
 
 impl TemplateCategory {

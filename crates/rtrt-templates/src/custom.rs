@@ -1,16 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rtrt_core::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Template, TemplateCategory, TemplateFile, TemplateSource, TemplateVariable};
 
-#[derive(Debug, Deserialize)]
+const MANIFEST_FILE: &str = "manifest.toml";
+
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestToml {
     name: String,
     description: String,
     #[serde(default)]
-    category: Option<TemplateCategory>,
+    category: TemplateCategory,
     #[serde(default)]
     variables: Vec<TemplateVariable>,
     #[serde(default)]
@@ -18,7 +20,7 @@ struct ManifestToml {
     files: Vec<ManifestFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ManifestFile {
     path: String,
     #[serde(default)]
@@ -54,7 +56,7 @@ pub fn scan_dir(root: &Path) -> Result<Vec<Template>> {
             continue;
         }
         let dir = entry.path();
-        let manifest = dir.join("manifest.toml");
+        let manifest = dir.join(MANIFEST_FILE);
         if !manifest.exists() {
             continue;
         }
@@ -64,16 +66,20 @@ pub fn scan_dir(root: &Path) -> Result<Vec<Template>> {
 }
 
 pub fn load_one(dir: &Path) -> Result<Template> {
-    let manifest_path = dir.join("manifest.toml");
+    let manifest_path = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&manifest_path).map_err(Error::Io)?;
     let parsed: ManifestToml = toml::from_str(&raw)
         .map_err(|e| Error::Config(format!("{}: {e}", manifest_path.display())))?;
 
     let mut files = Vec::with_capacity(parsed.files.len());
     for f in parsed.files {
+        validate_file_path(&f.path)?;
         let content = match (f.content, f.source) {
             (Some(c), None) => c,
-            (None, Some(rel)) => std::fs::read_to_string(dir.join(rel)).map_err(Error::Io)?,
+            (None, Some(rel)) => {
+                validate_file_path(&rel)?;
+                std::fs::read_to_string(dir.join(rel)).map_err(Error::Io)?
+            }
             (Some(_), Some(_)) => {
                 return Err(Error::Config(format!(
                     "{}: file '{}' has both content and source",
@@ -100,9 +106,104 @@ pub fn load_one(dir: &Path) -> Result<Template> {
         name: parsed.name,
         description: parsed.description,
         source: TemplateSource::Custom,
-        category: parsed.category.unwrap_or_default(),
+        category: parsed.category,
         variables: parsed.variables,
         files,
         post_hooks: parsed.post_hooks,
     })
+}
+
+pub fn save_custom(template: &Template) -> Result<PathBuf> {
+    validate_name(&template.name)?;
+    for file in &template.files {
+        validate_file_path(&file.path)?;
+    }
+
+    let root = default_dir()
+        .ok_or_else(|| Error::Config("cannot determine custom template directory".to_string()))?;
+    let dir = root.join(&template.name);
+    ensure_strict_child(&root, &dir)?;
+
+    std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest = ManifestToml {
+        name: template.name.clone(),
+        description: template.description.clone(),
+        category: template.category,
+        variables: template.variables.clone(),
+        post_hooks: template.post_hooks.clone(),
+        files: template
+            .files
+            .iter()
+            .map(|file| ManifestFile {
+                path: file.path.clone(),
+                executable: file.executable,
+                content: Some(file.content.clone()),
+                source: None,
+            })
+            .collect(),
+    };
+    let encoded = toml::to_string_pretty(&manifest).map_err(|e| Error::Config(e.to_string()))?;
+    std::fs::write(&manifest_path, encoded).map_err(Error::Io)?;
+    Ok(manifest_path)
+}
+
+pub fn delete_custom(name: &str) -> Result<()> {
+    validate_name(name)?;
+    let root = default_dir()
+        .ok_or_else(|| Error::Config("cannot determine custom template directory".to_string()))?;
+    let dir = root.join(name);
+    ensure_strict_child(&root, &dir)?;
+    std::fs::remove_dir_all(&dir).map_err(Error::Io)
+}
+
+pub fn is_custom(name: &str) -> bool {
+    validate_name(name)
+        .ok()
+        .and_then(|()| default_dir())
+        .map(|root| root.join(name).join(MANIFEST_FILE).is_file())
+        .unwrap_or(false)
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('.')
+        || name.contains(std::path::MAIN_SEPARATOR)
+        || name.contains('/')
+        || name.contains('\\')
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(Error::Config(
+            "template name must be a non-empty slug using letters, numbers, hyphens, or underscores"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_path(path: &str) -> Result<()> {
+    let path_ref = Path::new(path);
+    if path.is_empty()
+        || path.contains('\\')
+        || path_ref
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(Error::Config(format!(
+            "template file path must be relative and stay inside the scaffold target: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_strict_child(root: &Path, child: &Path) -> Result<()> {
+    if child.parent() != Some(root) || child == root {
+        return Err(Error::Config(format!(
+            "template path must stay under {}",
+            root.display()
+        )));
+    }
+    Ok(())
 }

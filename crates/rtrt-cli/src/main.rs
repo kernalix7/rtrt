@@ -3310,9 +3310,14 @@ struct TranscriptTokenUsage {
 }
 
 const DEFAULT_STATUSLINE_ENABLED_SEGMENTS: &[&str] = &[
+    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "codex", "savings",
+];
+const LEGACY_STATUSLINE_ENABLED_SEGMENTS: &[&str] = &[
     "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
 ];
-const DEFAULT_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
+const DEFAULT_STATUSLINE_FORMAT: &str =
+    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}";
+const LEGACY_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
 const DEFAULT_STATUSLINE_LINE2_FORMAT: &str = "{usage}";
 const DEFAULT_STATUSLINE_LINE3_FORMAT: &str = "{codex} | {savings}";
 const DEFAULT_CODEX_CHECK_TIMEOUT_MS: u64 = 200;
@@ -3418,6 +3423,8 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     if let Some(model) = input.model_display_name.or(input.model_id) {
         segments.insert("model".to_string(), model);
     }
+    let opt_level = rtrt_core::read_output_style_level();
+    segments.insert("opt".to_string(), format!("opt:{}", opt_level.as_str()));
     if let Some(usage) = usage_window_segment() {
         segments.insert("usage".to_string(), usage);
     }
@@ -3505,7 +3512,26 @@ fn load_statusline_config() -> StatuslineConfig {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return StatuslineConfig::default();
     };
-    parse_statusline_config(&raw).unwrap_or_default()
+    parse_statusline_config(&raw)
+        .map(upgrade_legacy_statusline_config)
+        .unwrap_or_default()
+}
+
+fn upgrade_legacy_statusline_config(mut cfg: StatuslineConfig) -> StatuslineConfig {
+    let legacy_segments = LEGACY_STATUSLINE_ENABLED_SEGMENTS
+        .iter()
+        .map(|item| (*item).to_string())
+        .collect::<Vec<_>>();
+    if cfg.enabled_segments == legacy_segments {
+        cfg.enabled_segments = DEFAULT_STATUSLINE_ENABLED_SEGMENTS
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect();
+    }
+    if cfg.format == LEGACY_STATUSLINE_FORMAT {
+        cfg.format = DEFAULT_STATUSLINE_FORMAT.to_string();
+    }
+    cfg
 }
 
 fn parse_statusline_config(raw: &str) -> Option<StatuslineConfig> {
@@ -4592,6 +4618,7 @@ mod statusline_tests {
             ("sess", "sess:1"),
             ("ctx", "ctx:74%(740k/1.0M)"),
             ("cache", "cache:97%"),
+            ("opt", "opt:full"),
             ("model", "Opus 4.8"),
             ("usage", "5h:8% ↻52m | wk:28% ↻5d17h"),
             ("codex", "🤖cdx:ready"),
@@ -4600,7 +4627,7 @@ mod statusline_tests {
 
         assert_eq!(
             render_statusline(&cfg, &segments),
-            "00G_rtrt [feature/orchestrator-polish] wip:1 sess:1 ctx:74%(740k/1.0M) cache:97% Opus 4.8\n5h:8% ↻52m | wk:28% ↻5d17h\n🤖cdx:ready | 💯Σ:0"
+            "00G_rtrt [feature/orchestrator-polish] wip:1 sess:1 ctx:74%(740k/1.0M) cache:97% opt:full Opus 4.8\n5h:8% ↻52m | wk:28% ↻5d17h\n🤖cdx:ready | 💯Σ:0"
         );
     }
 
@@ -4619,6 +4646,7 @@ mod statusline_tests {
             ("wip", "wip:1"),
             ("sess", "sess:1"),
             ("ctx", "ctx:74%(740k/1.0M)"),
+            ("opt", "opt:full"),
             ("model", "Opus 4.8"),
             ("codex", "🤖cdx:ready"),
             ("savings", "💯Σ:0"),
@@ -4632,6 +4660,7 @@ mod statusline_tests {
         assert!(!rendered.contains("wip:1"));
         assert!(!rendered.contains("sess:1"));
         assert!(!rendered.contains("ctx:"));
+        assert!(!rendered.contains("opt:"));
         assert!(!rendered.contains("🤖cdx"));
     }
 

@@ -390,6 +390,8 @@
   .optimizer-mini-card .name { font-weight: 700; }
   .optimizer-mini-card .tokens { font-size: 1.55rem; line-height: 1.1; font-weight: 750; font-variant-numeric: tabular-nums; transition: opacity .18s ease, transform .18s ease; }
   .optimizer-mini-card .meta { color: var(--muted); font-size: 0.82em; display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+  .optimizer-level-primary { font-size: 1.05rem; line-height: 1.2; font-weight: 750; transition: opacity .18s ease, transform .18s ease; }
+  .optimizer-rule-summary { color: var(--muted); font-size: 0.82em; line-height: 1.35; margin: -0.25rem 0 0.75rem; }
   .share-bar { height: 7px; border-radius: 999px; background: var(--border); overflow: hidden; }
   .share-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease; }
   .project-name-cell { max-width: 280px; overflow-wrap: anywhere; }
@@ -949,6 +951,7 @@
           </div>
           <span id="optimizer-level-status" class="badge optimizer-level-status inactive">Terse mode: off</span>
         </div>
+        <div id="optimizer-rule-summary" class="optimizer-rule-summary">rule compressor: 0.0% on 0 calls (deterministic compress only — terse-mode savings are not measurable)</div>
         <form id="compress-form">
           <textarea id="compress-input" rows="6" placeholder="줄일 텍스트" required></textarea>
           <div style="display:flex;gap:0.5rem;align-items:center;">
@@ -1244,7 +1247,7 @@
               <h3>Format</h3>
               <label class="field-label" for="statusline-format">
                 <span>Line 1 format</span>
-                <input id="statusline-format" placeholder="{project} [{branch}] {wip} {sess} {ctx} {cache} {model}">
+                <input id="statusline-format" placeholder="{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}">
                 <small class="placeholder-hint"></small>
               </label>
               <label class="field-label" for="statusline-line2-format" style="margin-top:0.6rem;">
@@ -1577,8 +1580,9 @@ let SECURITY_PROFILES_CACHE = [];
 let GLOBAL_DEFAULT_PROFILE = 'ai-default';
 const GLOBAL_PROJECT_VALUE = '__global__';
 const GLOBAL_SCOPE_MESSAGE = '전역 모드입니다 — 개별 프로젝트를 선택하세요';
-const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'model', 'usage', 'codex', 'savings'];
+const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'opt', 'model', 'usage', 'codex', 'savings'];
 const STATUSLINE_TOKENS_HINT = STATUSLINE_SEGMENTS.map(segment => `{${segment}}`).join(', ');
+const OUTPUT_OPTIMIZER_MEASUREMENT_NOTE = 'Deterministic compress only — terse-mode injection savings are not measurable';
 
 function currentProject() {
   return document.getElementById('project-selector').value;
@@ -2591,6 +2595,38 @@ function orderedSources(payload) {
   });
 }
 
+function normalizedOptimizerLevel(level) {
+  const value = String(level || 'off').trim().toLowerCase();
+  return ['lite', 'full', 'ultra'].includes(value) ? value : 'off';
+}
+
+function isOptimizerActive(level, active) {
+  if (typeof active === 'boolean') return active;
+  return normalizedOptimizerLevel(level) !== 'off';
+}
+
+function lowerFirst(value) {
+  return value ? value.charAt(0).toLowerCase() + value.slice(1) : value;
+}
+
+function optimizerMeasurementNote(source = {}) {
+  return lowerFirst(source.measurement_note || OUTPUT_OPTIMIZER_MEASUREMENT_NOTE);
+}
+
+function optimizerRuleSummary(source = {}) {
+  const pct = source.saved_pct == null ? 0 : pctValue(source.saved_pct);
+  const count = numberValue(source.count);
+  return `rule compressor: ${fmtPct(pct)} on ${count.toLocaleString()} calls (${optimizerMeasurementNote(source)})`;
+}
+
+function optimizerLevelBadge(level, active) {
+  const normalized = normalizedOptimizerLevel(level);
+  const enabled = isOptimizerActive(normalized, active);
+  const label = enabled ? `Terse mode: ${normalized.toUpperCase()} (active)` : 'OFF';
+  const cls = enabled ? 'badge ok' : 'badge optimizer-level-status inactive';
+  return `<span class="${cls}">${escapeHtml(label)}</span>`;
+}
+
 function renderOverviewSources(payload) {
   const wrap = document.getElementById('optimizer-source-cards');
   if (!wrap) return;
@@ -2606,6 +2642,15 @@ function renderOverviewSources(payload) {
     const badge = source.available === false
       ? '<span class="badge warn">unavailable</span>'
       : '<span class="badge ok">available</span>';
+    if (source.name === 'output_optimizer') {
+      return `<div class="optimizer-mini-card">
+        <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
+        <div class="optimizer-level-primary metric-value">${optimizerLevelBadge(source.level, source.active)}</div>
+        <div class="meta"><span>${optimizerRuleSummary(source)}</span></div>
+        <div class="meta"><span>${tokens.toLocaleString()} tokens</span><span>${chars.toLocaleString()} / ${originalChars.toLocaleString()} chars</span></div>
+        <div class="share-bar" title="${share.toFixed(1)}% of total"><span style="width:${Math.max(0, Math.min(100, share)).toFixed(1)}%;"></span></div>
+      </div>`;
+    }
     return `<div class="optimizer-mini-card">
       <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
       <div class="tokens metric-value">${fmtPct(pct)} saved</div>
@@ -4962,26 +5007,50 @@ document.getElementById('compress-mode').addEventListener('change', function () 
 });
 
 function renderOptimizerLevel(level, active) {
-  const normalized = ['off', 'lite', 'full', 'ultra'].includes(level) ? level : 'off';
+  const normalized = normalizedOptimizerLevel(level);
+  const enabled = isOptimizerActive(normalized, active);
   document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.level === normalized);
     btn.disabled = false;
   });
   const status = document.getElementById('optimizer-level-status');
   if (status) {
-    status.classList.toggle('ok', !!active);
-    status.classList.toggle('inactive', !active);
-    status.textContent = active ? `Terse mode: ${normalized.toUpperCase()}` : 'Terse mode: off';
+    status.classList.toggle('ok', enabled);
+    status.classList.toggle('inactive', !enabled);
+    status.textContent = enabled ? `Terse mode: ${normalized.toUpperCase()} (active)` : 'OFF';
   }
+}
+
+function renderOptimizerRuleSummary(source) {
+  const el = document.getElementById('optimizer-rule-summary');
+  if (!el) return;
+  el.textContent = optimizerRuleSummary(source || {});
+}
+
+async function loadOptimizerRuleSummary() {
+  const params = new URLSearchParams();
+  if (currentProject() && !isGlobalScope()) params.set('project', currentProject());
+  const url = `/api/overview${params.toString() ? '?' + params.toString() : ''}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const d = await r.json();
+    const source = Array.isArray(d.sources)
+      ? d.sources.find(s => s.name === 'output_optimizer')
+      : null;
+    renderOptimizerRuleSummary(source);
+  } catch (_) { /* keep current UI state */ }
 }
 
 async function loadOptimizerLevel() {
   try {
     const r = await fetch('/api/optimizer/level');
-    if (!r.ok) return;
-    const d = await r.json();
-    renderOptimizerLevel(d.level || 'off', !!d.active);
+    if (r.ok) {
+      const d = await r.json();
+      renderOptimizerLevel(d.level || 'off', !!d.active);
+    }
   } catch (_) { /* keep current UI state */ }
+  await loadOptimizerRuleSummary();
 }
 
 async function setOptimizerLevel(level) {
@@ -5002,6 +5071,7 @@ async function setOptimizerLevel(level) {
     }
     const d = await r.json();
     renderOptimizerLevel(d.level || level, !!d.active);
+    await loadOptimizerRuleSummary();
     pushActivity(`terse mode · ${d.level || level}`);
   } catch (e) {
     showToast(`레벨 저장 오류: ${e.message || e}`, 'err');

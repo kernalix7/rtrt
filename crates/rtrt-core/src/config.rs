@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,8 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub agents: AgentsConfig,
     #[serde(default)]
     pub capture: CaptureConfig,
     #[serde(default)]
@@ -323,9 +325,29 @@ fn default_dashboard_addr() -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentsConfig {
+    #[serde(flatten)]
+    pub enabled: BTreeMap<String, bool>,
+}
+
+impl AgentsConfig {
+    pub fn enabled_override(&self, name: &str) -> Option<bool> {
+        self.enabled.get(name).copied()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub active: Option<String>,
+    #[serde(flatten)]
+    pub enabled: BTreeMap<String, bool>,
+}
+
+impl ProvidersConfig {
+    pub fn enabled_override(&self, name: &str) -> Option<bool> {
+        self.enabled.get(name).copied()
+    }
 }
 
 fn default_true() -> bool {
@@ -458,6 +480,27 @@ mod tests {
     #[test]
     fn malformed_toml_errors() {
         assert!(Config::from_toml_str("[auto_compress\nmodel =").is_err());
+    }
+
+    #[test]
+    fn agent_and_provider_detect_overrides_load() {
+        let c = Config::from_toml_str(
+            r#"
+            [agents]
+            claude = true
+            aider = false
+
+            [providers]
+            active = "openai"
+            openrouter = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.agents.enabled_override("claude"), Some(true));
+        assert_eq!(c.agents.enabled_override("aider"), Some(false));
+        assert_eq!(c.agents.enabled_override("codex"), None);
+        assert_eq!(c.providers.active.as_deref(), Some("openai"));
+        assert_eq!(c.providers.enabled_override("openrouter"), Some(false));
     }
 
     #[test]

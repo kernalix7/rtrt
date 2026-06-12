@@ -15,7 +15,9 @@ mod setup;
 use rtrt_compress::{
     AsyncCompressor, Compressor, Language as TsLanguage, LlmCompressor, SignatureExtractor,
 };
-use rtrt_core::{CompressionLevel, OutputStyleLevel};
+use rtrt_core::{
+    CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel, ToolKind,
+};
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
@@ -342,6 +344,21 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: ReportFormatArg,
+    },
+    /// Detect local AI agents, runtimes, provider APIs, and MCP servers.
+    Detect {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: DetectFormatArg,
+        /// Restrict results to one tool kind.
+        #[arg(long, value_enum)]
+        kind: Option<DetectKindArg>,
+        /// Show only installed/configured entries.
+        #[arg(long)]
+        installed_only: bool,
+        /// Show only enabled entries.
+        #[arg(long)]
+        enabled_only: bool,
     },
     /// Show RTRT version + crate manifest.
     Info,
@@ -685,6 +702,31 @@ enum ReportFormatArg {
     Table,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DetectFormatArg {
+    Table,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DetectKindArg {
+    CodingAgent,
+    LocalRuntime,
+    ProviderApi,
+    McpServer,
+}
+
+impl From<DetectKindArg> for ToolKind {
+    fn from(kind: DetectKindArg) -> Self {
+        match kind {
+            DetectKindArg::CodingAgent => ToolKind::CodingAgent,
+            DetectKindArg::LocalRuntime => ToolKind::LocalRuntime,
+            DetectKindArg::ProviderApi => ToolKind::ProviderApi,
+            DetectKindArg::McpServer => ToolKind::McpServer,
+        }
+    }
+}
+
 const PROXY_RUN_ERROR_CONTEXT_LINES: usize = 1;
 const EXEC_FAILURE_EXIT_CODE: i32 = 1;
 const STDERR_TO_STDOUT_REDIRECT: &str = " 2>&1";
@@ -693,6 +735,19 @@ const LEGACY_PROXY_PREFIX: &str = concat!("r", "t", "k", " ");
 const SHELL_COMPLEX_MARKERS: &[&str] = &["|", "&&", "||", ";", "$(", "`", ">", "<", "\n"];
 const KNOWN_SHRINKABLE_COMMANDS: &[&str] =
     &["git", "cargo", "docker", "kubectl", "npm", "yarn", "pnpm"];
+const DETECT_NAME_WIDTH: usize = 16;
+const DETECT_INSTALLED_WIDTH: usize = 9;
+const DETECT_VERSION_WIDTH: usize = 18;
+const DETECT_MODES_WIDTH: usize = 9;
+const DETECT_COST_WIDTH: usize = 17;
+const DETECT_ENABLED_WIDTH: usize = 7;
+const DETECT_DETAIL_WIDTH: usize = 72;
+const DETECT_KIND_ORDER: &[ToolKind] = &[
+    ToolKind::CodingAgent,
+    ToolKind::LocalRuntime,
+    ToolKind::ProviderApi,
+    ToolKind::McpServer,
+];
 
 impl From<FormatArg> for rtrt_compress::OutputFormat {
     fn from(f: FormatArg) -> Self {
@@ -1376,6 +1431,12 @@ async fn main() -> Result<()> {
             since,
             format,
         } => run_discover(project, all, since, format)?,
+        Cmd::Detect {
+            format,
+            kind,
+            installed_only,
+            enabled_only,
+        } => run_detect(format, kind, installed_only, enabled_only)?,
         Cmd::Signatures { lang } => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
@@ -1409,6 +1470,16 @@ enabled = true            # RTRT_AUTO_CAPTURE
 redact = true             # RTRT_AUTO_REDACT — run redact_secrets before saving
 dedup_window_sec = 300    # RTRT_AUTO_DEDUP_WINDOW_SEC
 # project = "myproject"   # RTRT_DEFAULT_PROJECT (default: cwd basename)
+
+[agents]
+# `rtrt detect` opt-in/out. Absent key = enabled when installed.
+# claude = true
+# aider = false
+
+[providers]
+# Provider API opt-in/out. Never put API key values here; use environment vars.
+# active = "openai"
+# openrouter = false
 
 [auto_compress]
 # LLM compression of old memory rows (SessionEnd hook + dashboard daemon).
@@ -2254,6 +2325,134 @@ fn run_config(cmd: ConfigCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_detect(
+    format: DetectFormatArg,
+    kind: Option<DetectKindArg>,
+    installed_only: bool,
+    enabled_only: bool,
+) -> Result<()> {
+    let selected_kind = kind.map(ToolKind::from);
+    let mut tools = rtrt_core::detect_tools();
+    tools.retain(|tool| {
+        selected_kind.is_none_or(|kind| tool.kind == kind)
+            && (!installed_only || tool.installed)
+            && (!enabled_only || tool.enabled)
+    });
+
+    match format {
+        DetectFormatArg::Json => {
+            println!("{}", serde_json::to_string_pretty(&tools)?);
+        }
+        DetectFormatArg::Table => print_detect_table(&tools),
+    }
+    Ok(())
+}
+
+fn print_detect_table(tools: &[DetectedTool]) {
+    let mut printed_group = false;
+    for kind in DETECT_KIND_ORDER {
+        let group = tools
+            .iter()
+            .filter(|tool| tool.kind == *kind)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        if printed_group {
+            println!();
+        }
+        println!("{}", detect_kind_label(*kind));
+        println!(
+            "{:<name_w$} | {:<installed_w$} | {:<version_w$} | {:<modes_w$} | {:<cost_w$} | {:<enabled_w$} | invocation/models",
+            "name",
+            "installed",
+            "version",
+            "modes",
+            "cost",
+            "enabled",
+            name_w = DETECT_NAME_WIDTH,
+            installed_w = DETECT_INSTALLED_WIDTH,
+            version_w = DETECT_VERSION_WIDTH,
+            modes_w = DETECT_MODES_WIDTH,
+            cost_w = DETECT_COST_WIDTH,
+            enabled_w = DETECT_ENABLED_WIDTH,
+        );
+        for tool in group {
+            println!(
+                "{:<name_w$} | {:<installed_w$} | {:<version_w$} | {:<modes_w$} | {:<cost_w$} | {:<enabled_w$} | {}",
+                tool.name,
+                bool_label(tool.installed),
+                compact_cell(tool.version.as_deref().unwrap_or("-"), DETECT_VERSION_WIDTH),
+                invocation_modes_label(&tool.invocation_modes),
+                cost_class_label(tool.cost_class),
+                bool_label(tool.enabled),
+                compact_cell(&detect_detail(tool), DETECT_DETAIL_WIDTH),
+                name_w = DETECT_NAME_WIDTH,
+                installed_w = DETECT_INSTALLED_WIDTH,
+                version_w = DETECT_VERSION_WIDTH,
+                modes_w = DETECT_MODES_WIDTH,
+                cost_w = DETECT_COST_WIDTH,
+                enabled_w = DETECT_ENABLED_WIDTH,
+            );
+        }
+        printed_group = true;
+    }
+}
+
+fn detect_kind_label(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::CodingAgent => "coding-agent",
+        ToolKind::LocalRuntime => "local-runtime",
+        ToolKind::ProviderApi => "provider-api",
+        ToolKind::McpServer => "mcp-server",
+    }
+}
+
+fn invocation_modes_label(modes: &[InvocationMode]) -> String {
+    modes
+        .iter()
+        .map(|mode| match mode {
+            InvocationMode::Cli => "cli",
+            InvocationMode::Api => "api",
+            InvocationMode::Mcp => "mcp",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn cost_class_label(cost: CostClass) -> &'static str {
+    match cost {
+        CostClass::LocalFree => "local-free",
+        CostClass::SubscriptionFlat => "subscription-flat",
+        CostClass::ApiMetered => "api-metered",
+        CostClass::Unknown => "unknown",
+    }
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn detect_detail(tool: &DetectedTool) -> String {
+    if !tool.models.is_empty() {
+        return format!("models: {}", tool.models.join(","));
+    }
+    tool.cli_invocation
+        .clone()
+        .or_else(|| tool.path.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn compact_cell(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}...")
+    } else {
+        compact
+    }
 }
 
 fn run_hook(cwd: &std::path::Path, hook: &str) -> Result<()> {

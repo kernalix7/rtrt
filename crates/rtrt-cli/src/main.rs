@@ -1,8 +1,8 @@
 //! rtrt (Retort) — top-level CLI for the Rust toolkit that distills AI agent context.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -270,8 +270,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HookCmd,
     },
-    /// Print the Output Optimizer statusline badge.
-    Statusline,
+    /// Print the Output Optimizer statusline badge or rich Claude Code line.
+    Statusline {
+        /// Force rich mode even when stdin is a TTY.
+        #[arg(long)]
+        rich: bool,
+        /// Override the first rich statusline template.
+        #[arg(long)]
+        format: Option<String>,
+    },
     /// Wire RTRT into a popular coding agent's MCP config. `--plugin`
     /// (Claude only) also merges hook entries into
     /// `~/.claude/settings.json` so every PreToolUse / PostToolUse /
@@ -1458,7 +1465,7 @@ async fn main() -> Result<()> {
                 HookCmd::Style => run_hook_style(),
                 HookCmd::StyleInject => run_hook_style_inject(),
                 HookCmd::Statusline => {
-                    print_statusline();
+                    print_statusline_badge();
                     Ok(())
                 }
                 HookCmd::ProxyRewrite => run_hook_proxy_rewrite(),
@@ -1468,8 +1475,8 @@ async fn main() -> Result<()> {
                 eprintln!("rtrt hook: {e}");
             }
         }
-        Cmd::Statusline => {
-            print_statusline();
+        Cmd::Statusline { rich, format } => {
+            print_statusline(StatuslineOptions { rich, format });
         }
         Cmd::Setup {
             agent,
@@ -3263,11 +3270,723 @@ fn style_session_block(level: OutputStyleLevel) -> String {
     setup::style_session_block(level)
 }
 
-fn print_statusline() {
+struct StatuslineOptions {
+    rich: bool,
+    format: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StatuslineConfig {
+    enabled_segments: Vec<String>,
+    format: String,
+    line2_format: String,
+    line3_format: String,
+    codex_check_timeout_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClaudeStatusInput {
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    transcript_path: Option<PathBuf>,
+    model_id: Option<String>,
+    model_display_name: Option<String>,
+    cache_pct: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct GitStatusInfo {
+    project: String,
+    branch: String,
+    wip_count: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TranscriptTokenUsage {
+    used_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    input_tokens: u64,
+}
+
+const DEFAULT_STATUSLINE_ENABLED_SEGMENTS: &[&str] = &[
+    "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
+];
+const DEFAULT_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
+const DEFAULT_STATUSLINE_LINE2_FORMAT: &str = "{usage}";
+const DEFAULT_STATUSLINE_LINE3_FORMAT: &str = "{codex} | {savings}";
+const DEFAULT_CODEX_CHECK_TIMEOUT_MS: u64 = 200;
+/// Claude Code refreshes this often, so transcript parsing only considers the
+/// newest JSONL records. This keeps statusline latency bounded on long sessions.
+const TRANSCRIPT_RECENT_LINE_CAP: usize = 4_000;
+/// Best-effort "today" session count uses a rolling day when local calendar
+/// data is unavailable from std alone.
+const SESSION_TODAY_WINDOW_SECS: u64 = 24 * 60 * 60;
+const CODEX_STATUS_CACHE_TTL_SECS: u64 = 30;
+
+/// Context-window lookup used by `rtrt statusline`.
+///
+/// Entries are model-id prefixes because Claude Code can pass date-suffixed or
+/// vendor-suffixed ids. Unknown models intentionally omit the ctx segment.
+const STATUSLINE_CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
+    ("gpt-5", 400_000),
+    ("gpt-4.1", 1_000_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+];
+
+fn print_statusline_badge() {
     let level = rtrt_core::read_output_style_level();
     if level.is_active() {
         print!("[OPT:{}]", level.as_str().to_ascii_uppercase());
     }
+}
+
+fn print_statusline(opts: StatuslineOptions) {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    if !opts.rich && stdin_is_tty {
+        print_statusline_badge();
+        return;
+    }
+
+    let mut raw = String::new();
+    if !stdin_is_tty {
+        let _ = std::io::stdin().read_to_string(&mut raw);
+    }
+    match build_statusline_output(&raw, opts.format) {
+        Some(output) if !output.trim().is_empty() => println!("{output}"),
+        _ => print_statusline_badge(),
+    }
+}
+
+fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> Option<String> {
+    let mut cfg = load_statusline_config();
+    if let Some(format) = format_override {
+        cfg.format = format;
+    }
+    let input = parse_claude_status_input(raw_stdin);
+    let cwd = input
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let git = load_git_status(&cwd);
+    let transcript_usage = input
+        .transcript_path
+        .as_deref()
+        .and_then(load_recent_transcript_usage);
+    let mut segments = BTreeMap::new();
+
+    if let Some(git) = git {
+        segments.insert("project".to_string(), git.project);
+        segments.insert("branch".to_string(), git.branch);
+        segments.insert("wip".to_string(), format!("wip:{}", git.wip_count));
+    }
+    segments.insert(
+        "sess".to_string(),
+        format!(
+            "sess:{}",
+            session_count_today(
+                input.session_id.as_deref(),
+                input.transcript_path.as_deref()
+            )
+        ),
+    );
+    if let (Some(model), Some(usage)) = (input.model_id.as_deref(), transcript_usage) {
+        if let Some(window) = context_window_for_model(model) {
+            if usage.used_tokens > 0 {
+                let pct = percentage_rounded(usage.used_tokens, window);
+                segments.insert(
+                    "ctx".to_string(),
+                    format!(
+                        "ctx:{}%({}/{})",
+                        pct,
+                        compact_count(usage.used_tokens),
+                        compact_count(window)
+                    ),
+                );
+            }
+        }
+        if let Some(pct) = input.cache_pct.or_else(|| transcript_cache_pct(usage)) {
+            segments.insert("cache".to_string(), format!("cache:{pct}%"));
+        }
+    }
+    if let Some(model) = input.model_display_name.or(input.model_id) {
+        segments.insert("model".to_string(), model);
+    }
+    if let Some(usage) = usage_window_segment() {
+        segments.insert("usage".to_string(), usage);
+    }
+    segments.insert(
+        "codex".to_string(),
+        format!("🤖cdx:{}", codex_status(cfg.codex_check_timeout_ms)),
+    );
+    segments.insert(
+        "savings".to_string(),
+        format!("💯Σ:{}", total_savings_tokens()),
+    );
+
+    Some(render_statusline(&cfg, &segments))
+}
+
+fn render_statusline(cfg: &StatuslineConfig, segments: &BTreeMap<String, String>) -> String {
+    let enabled = cfg
+        .enabled_segments
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    [&cfg.format, &cfg.line2_format, &cfg.line3_format]
+        .into_iter()
+        .filter_map(|template| {
+            let line = render_statusline_template(template, segments, &enabled);
+            (!line.is_empty()).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_statusline_template(
+    template: &str,
+    segments: &BTreeMap<String, String>,
+    enabled: &std::collections::BTreeSet<&str>,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let key = &after[..end];
+        if enabled.contains(key) {
+            if let Some(value) = segments.get(key) {
+                out.push_str(value);
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    clean_statusline_line(&out)
+}
+
+fn clean_statusline_line(line: &str) -> String {
+    let mut out = line.replace("[]", "").replace("()", "");
+    loop {
+        let next = out
+            .replace("  ", " ")
+            .replace(" | | ", " | ")
+            .replace("| |", "|")
+            .replace("[ ]", "")
+            .replace("( )", "");
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    out.trim()
+        .trim_matches('|')
+        .trim()
+        .trim_end_matches('[')
+        .trim()
+        .to_string()
+}
+
+fn load_statusline_config() -> StatuslineConfig {
+    let Some(path) = home_dir().map(|home| home.join(".rtrt").join("config.toml")) else {
+        return StatuslineConfig::default();
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return StatuslineConfig::default();
+    };
+    parse_statusline_config(&raw).unwrap_or_default()
+}
+
+fn parse_statusline_config(raw: &str) -> Option<StatuslineConfig> {
+    let mut cfg = StatuslineConfig::default();
+    let mut in_statusline = false;
+    for raw_line in raw.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_statusline = line == "[statusline]";
+            continue;
+        }
+        if !in_statusline {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "enabled_segments" => {
+                if let Some(items) = parse_toml_string_array(value) {
+                    cfg.enabled_segments = items;
+                }
+            }
+            "format" => {
+                if let Some(value) = parse_toml_string(value) {
+                    cfg.format = value;
+                }
+            }
+            "line2_format" => {
+                if let Some(value) = parse_toml_string(value) {
+                    cfg.line2_format = value;
+                }
+            }
+            "line3_format" => {
+                if let Some(value) = parse_toml_string(value) {
+                    cfg.line3_format = value;
+                }
+            }
+            "codex_check_timeout_ms" => {
+                if let Ok(value) = value.parse::<u64>() {
+                    cfg.codex_check_timeout_ms = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(cfg)
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !(value.starts_with('"') && value.ends_with('"')) {
+        return None;
+    }
+    let inner = &value[1..value.len().saturating_sub(1)];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
+    let value = value.trim();
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return None;
+    }
+    let inner = &value[1..value.len().saturating_sub(1)];
+    let mut items = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        let end = quoted_value_end(rest)?;
+        items.push(parse_toml_string(&rest[..=end])?);
+        rest = rest[end + 1..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if !rest.starts_with(',') {
+            return None;
+        }
+        rest = rest[1..].trim_start();
+    }
+    Some(items)
+}
+
+fn quoted_value_end(value: &str) -> Option<usize> {
+    if !value.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (idx, ch) in value.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self {
+            enabled_segments: DEFAULT_STATUSLINE_ENABLED_SEGMENTS
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
+            format: DEFAULT_STATUSLINE_FORMAT.to_string(),
+            line2_format: DEFAULT_STATUSLINE_LINE2_FORMAT.to_string(),
+            line3_format: DEFAULT_STATUSLINE_LINE3_FORMAT.to_string(),
+            codex_check_timeout_ms: DEFAULT_CODEX_CHECK_TIMEOUT_MS,
+        }
+    }
+}
+
+fn parse_claude_status_input(raw: &str) -> ClaudeStatusInput {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+        return ClaudeStatusInput::default();
+    };
+    let workspace = value.get("workspace").unwrap_or(&serde_json::Value::Null);
+    let cwd = json_string(&value, "cwd")
+        .or_else(|| json_string(workspace, "current_dir"))
+        .or_else(|| json_string(workspace, "project_dir"))
+        .map(PathBuf::from);
+    let model = value.get("model").unwrap_or(&serde_json::Value::Null);
+    ClaudeStatusInput {
+        session_id: json_string(&value, "session_id"),
+        cwd,
+        transcript_path: json_string(&value, "transcript_path").map(PathBuf::from),
+        model_id: json_string(model, "id"),
+        model_display_name: json_string(model, "display_name"),
+        cache_pct: value.get("cost").and_then(cache_pct_from_value),
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn load_git_status(cwd: &Path) -> Option<GitStatusInfo> {
+    let root = run_command_timeout(
+        "git",
+        &[
+            "-C",
+            cwd.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--show-toplevel",
+        ],
+        std::time::Duration::from_millis(120),
+    )?;
+    let root_path = PathBuf::from(root.trim());
+    let project = root_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())?
+        .to_string();
+    let branch = run_command_timeout(
+        "git",
+        &[
+            "-C",
+            cwd.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ],
+        std::time::Duration::from_millis(120),
+    )?
+    .trim()
+    .to_string();
+    if branch.is_empty() {
+        return None;
+    }
+    let status = run_command_timeout(
+        "git",
+        &["-C", cwd.to_string_lossy().as_ref(), "status", "--short"],
+        std::time::Duration::from_millis(160),
+    )
+    .unwrap_or_default();
+    Some(GitStatusInfo {
+        project,
+        branch,
+        wip_count: status
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+    })
+}
+
+fn run_command_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut child = std::process::Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                if status.success() {
+                    return String::from_utf8(output.stdout).ok();
+                }
+                return None;
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn load_recent_transcript_usage(path: &Path) -> Option<TranscriptTokenUsage> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut recent = std::collections::VecDeque::with_capacity(TRANSCRIPT_RECENT_LINE_CAP);
+    for line in reader.lines().map_while(Result::ok) {
+        if recent.len() == TRANSCRIPT_RECENT_LINE_CAP {
+            recent.pop_front();
+        }
+        recent.push_back(line);
+    }
+    let mut usage = TranscriptTokenUsage::default();
+    for line in recent {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            collect_token_usage(&value, &mut usage);
+        }
+    }
+    (usage.used_tokens > 0).then_some(usage)
+}
+
+fn collect_token_usage(value: &serde_json::Value, usage: &mut TranscriptTokenUsage) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(raw_usage) = map.get("usage") {
+                add_usage_object(raw_usage, usage);
+            }
+            for (key, value) in map {
+                if key != "usage" {
+                    collect_token_usage(value, usage);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_token_usage(item, usage);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn add_usage_object(value: &serde_json::Value, usage: &mut TranscriptTokenUsage) {
+    let input = token_field(value, "input_tokens").or_else(|| token_field(value, "prompt_tokens"));
+    let output =
+        token_field(value, "output_tokens").or_else(|| token_field(value, "completion_tokens"));
+    let cache_read = token_field(value, "cache_read_input_tokens")
+        .or_else(|| token_field(value, "cached_tokens"));
+    let cache_write = token_field(value, "cache_creation_input_tokens");
+    let specific_total = input
+        .unwrap_or(0)
+        .saturating_add(output.unwrap_or(0))
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_write.unwrap_or(0));
+    let total = if specific_total > 0 {
+        specific_total
+    } else {
+        token_field(value, "total_tokens").unwrap_or(0)
+    };
+    usage.used_tokens = usage.used_tokens.saturating_add(total);
+    usage.input_tokens = usage.input_tokens.saturating_add(input.unwrap_or(0));
+    usage.cache_read_tokens = usage
+        .cache_read_tokens
+        .saturating_add(cache_read.unwrap_or(0));
+    usage.cache_write_tokens = usage
+        .cache_write_tokens
+        .saturating_add(cache_write.unwrap_or(0));
+}
+
+fn token_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn context_window_for_model(model_id: &str) -> Option<u64> {
+    STATUSLINE_CONTEXT_WINDOWS
+        .iter()
+        .find_map(|(prefix, window)| model_id.starts_with(prefix).then_some(*window))
+}
+
+fn percentage_rounded(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator
+        .saturating_mul(100)
+        .saturating_add(denominator / 2)
+        / denominator
+}
+
+fn compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+fn cache_pct_from_value(value: &serde_json::Value) -> Option<u64> {
+    if let Some(pct) = token_field(value, "cache_pct") {
+        return Some(pct.min(100));
+    }
+    if let Some(pct) = value
+        .get("cache_hit_rate")
+        .and_then(serde_json::Value::as_f64)
+    {
+        return f64_to_percentage(pct);
+    }
+    let usage = {
+        let mut usage = TranscriptTokenUsage::default();
+        add_usage_object(value, &mut usage);
+        usage
+    };
+    transcript_cache_pct(usage)
+}
+
+fn transcript_cache_pct(usage: TranscriptTokenUsage) -> Option<u64> {
+    let denom = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens);
+    (usage.cache_read_tokens > 0 && denom > 0)
+        .then(|| percentage_rounded(usage.cache_read_tokens, denom))
+}
+
+fn f64_to_percentage(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let pct = if value <= 1.0 { value * 100.0 } else { value };
+    Some(pct.round().clamp(0.0, 100.0) as u64)
+}
+
+fn session_count_today(session_id: Option<&str>, transcript_path: Option<&Path>) -> usize {
+    let Some(path) = transcript_path else {
+        return usize::from(session_id.is_some()).max(1);
+    };
+    let Some(parent) = path.parent() else {
+        return usize::from(session_id.is_some()).max(1);
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return usize::from(session_id.is_some()).max(1);
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(elapsed) = modified.elapsed() else {
+            continue;
+        };
+        if elapsed.as_secs() <= SESSION_TODAY_WINDOW_SECS {
+            count = count.saturating_add(1);
+        }
+    }
+    count.max(usize::from(session_id.is_some())).max(1)
+}
+
+fn usage_window_segment() -> Option<String> {
+    Some("5h:n/a ↻n/a | wk:n/a ↻n/a".to_string())
+}
+
+fn codex_status(timeout_ms: u64) -> &'static str {
+    if let Some(cached) = read_codex_status_cache() {
+        return cached;
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    let status = if run_command_timeout("codex", &["--version"], timeout).is_some() {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    write_codex_status_cache(status);
+    status
+}
+
+fn read_codex_status_cache() -> Option<&'static str> {
+    let path = codex_status_cache_path();
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    if modified.elapsed().ok()?.as_secs() > CODEX_STATUS_CACHE_TTL_SECS {
+        return None;
+    }
+    match std::fs::read_to_string(path).ok()?.trim() {
+        "ready" => Some("ready"),
+        "unavailable" => Some("unavailable"),
+        _ => None,
+    }
+}
+
+fn write_codex_status_cache(status: &str) {
+    let _ = std::fs::write(codex_status_cache_path(), status);
+}
+
+fn codex_status_cache_path() -> PathBuf {
+    std::env::temp_dir().join("rtrt-codex-status.cache")
+}
+
+fn total_savings_tokens() -> u64 {
+    let path = proxy_stats::default_path();
+    if !path.exists() {
+        return 0;
+    }
+    proxy_stats::load_summary(None, None, false)
+        .ok()
+        .map(|summary| estimated_tokens(summary.saved_chars))
+        .unwrap_or(0)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Best-effort HYBRID recall for the auto-recall hook.
@@ -3849,5 +4568,93 @@ fn detect_provider(model: &str) -> ProviderArg {
         ProviderArg::Openai
     } else {
         ProviderArg::OpenaiCompat
+    }
+}
+
+#[cfg(test)]
+mod statusline_tests {
+    use super::*;
+
+    fn segment_map(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+        items
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn renders_statusline_templates_with_injected_segments() {
+        let cfg = StatuslineConfig::default();
+        let segments = segment_map(&[
+            ("project", "00G_rtrt"),
+            ("branch", "feature/orchestrator-polish"),
+            ("wip", "wip:1"),
+            ("sess", "sess:1"),
+            ("ctx", "ctx:74%(740k/1.0M)"),
+            ("cache", "cache:97%"),
+            ("model", "Opus 4.8"),
+            ("usage", "5h:8% ↻52m | wk:28% ↻5d17h"),
+            ("codex", "🤖cdx:ready"),
+            ("savings", "💯Σ:0"),
+        ]);
+
+        assert_eq!(
+            render_statusline(&cfg, &segments),
+            "00G_rtrt [feature/orchestrator-polish] wip:1 sess:1 ctx:74%(740k/1.0M) cache:97% Opus 4.8\n5h:8% ↻52m | wk:28% ↻5d17h\n🤖cdx:ready | 💯Σ:0"
+        );
+    }
+
+    #[test]
+    fn disabled_segments_are_absent_from_output() {
+        let cfg = StatuslineConfig {
+            enabled_segments: vec!["project".into(), "model".into(), "savings".into()],
+            format: DEFAULT_STATUSLINE_FORMAT.to_string(),
+            line2_format: DEFAULT_STATUSLINE_LINE2_FORMAT.to_string(),
+            line3_format: DEFAULT_STATUSLINE_LINE3_FORMAT.to_string(),
+            codex_check_timeout_ms: DEFAULT_CODEX_CHECK_TIMEOUT_MS,
+        };
+        let segments = segment_map(&[
+            ("project", "00G_rtrt"),
+            ("branch", "feature/orchestrator-polish"),
+            ("wip", "wip:1"),
+            ("sess", "sess:1"),
+            ("ctx", "ctx:74%(740k/1.0M)"),
+            ("model", "Opus 4.8"),
+            ("codex", "🤖cdx:ready"),
+            ("savings", "💯Σ:0"),
+        ]);
+        let rendered = render_statusline(&cfg, &segments);
+
+        assert!(rendered.contains("00G_rtrt"));
+        assert!(rendered.contains("Opus 4.8"));
+        assert!(rendered.contains("💯Σ:0"));
+        assert!(!rendered.contains("feature/orchestrator-polish"));
+        assert!(!rendered.contains("wip:1"));
+        assert!(!rendered.contains("sess:1"));
+        assert!(!rendered.contains("ctx:"));
+        assert!(!rendered.contains("🤖cdx"));
+    }
+
+    #[test]
+    fn parses_inline_statusline_toml_table() {
+        let raw = r#"
+            [other]
+            format = "ignored"
+
+            [statusline]
+            enabled_segments = ["project", "branch", "model"]
+            format = "{project}:{branch}"
+            line2_format = "{model}"
+            line3_format = ""
+            codex_check_timeout_ms = 75
+        "#;
+
+        let cfg = parse_statusline_config(raw).expect("statusline config");
+
+        assert_eq!(cfg.enabled_segments, ["project", "branch", "model"]);
+        assert_eq!(cfg.format, "{project}:{branch}");
+        assert_eq!(cfg.line2_format, "{model}");
+        assert_eq!(cfg.line3_format, "");
+        assert_eq!(cfg.codex_check_timeout_ms, 75);
     }
 }

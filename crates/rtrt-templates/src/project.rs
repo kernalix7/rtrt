@@ -530,16 +530,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expected_sections_cover_full_contract_range() {
+    fn expected_sections_are_the_project_contract_set() {
+        // The standardization contract carries only the project-contract
+        // sections. 8/9/10 (and 12/13) are reserved for rtrt-owned tooling and
+        // are deliberately absent, so "11. Agent Teams" keeps its number with a
+        // gap — the template must never invade rtrt's feature territory.
         let root = std::env::temp_dir();
         let sections = expected_sections(&root).expect("sections");
         let numbers = sections
             .iter()
             .map(|(number, _title)| *number)
             .collect::<Vec<_>>();
-        assert_eq!(
-            numbers,
-            (FIRST_MANAGED_SECTION..=LAST_MANAGED_SECTION).collect::<Vec<_>>()
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5, 6, 7, 11]);
+        assert!(
+            numbers
+                .iter()
+                .all(|n| (FIRST_MANAGED_SECTION..=LAST_MANAGED_SECTION).contains(n))
         );
     }
 

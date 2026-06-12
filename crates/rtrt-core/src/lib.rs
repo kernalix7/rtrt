@@ -11,11 +11,12 @@ pub mod plugin;
 pub mod project;
 pub mod token;
 
-pub use config::{Config, ProjectEntry};
+pub use config::{Config, ProjectConfig, ProjectEntry};
 pub use detect::{Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools};
 pub use error::{Error, Result};
 pub use output_style::{
-    OutputStyleLevel, output_style_path, read_output_style_level, write_output_style_level,
+    OutputStyleLevel, output_style_path, read_output_style_level, read_output_style_level_for,
+    write_output_style_level, write_output_style_level_for,
 };
 pub use plugin::{Plugin, PluginKind, PluginMetadata};
 pub use project::{project_for_cwd, project_for_cwd_str};

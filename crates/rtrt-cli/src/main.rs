@@ -944,7 +944,16 @@ const DETECT_COST_WIDTH: usize = 17;
 const DETECT_ENABLED_WIDTH: usize = 7;
 const DETECT_DETAIL_WIDTH: usize = 72;
 const DEFAULT_INIT_TEMPLATE: &str = "standardization";
-const MIGRATE_GITIGNORE_ENTRIES: &[&str] = &[".rtrt/", ".claude/settings.local.json"];
+// Ignore only the per-project runtime artifacts under `.rtrt/`; keep
+// `.rtrt/config.toml` (the per-project customization override) tracked so it
+// travels with the repo for the whole team.
+const MIGRATE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".rtrt/*.sqlite",
+    ".rtrt/*.sqlite-journal",
+    ".rtrt/*.sqlite-wal",
+    ".rtrt/*.sqlite-shm",
+    ".claude/settings.local.json",
+];
 const PROJECT_STATE_WIDTH: usize = 4;
 const PROJECT_CHECK_WIDTH: usize = 18;
 const PROJECT_STATUSLINE_NEEDLE: &str = "statusline --rich";
@@ -4477,22 +4486,51 @@ fn run_hook_proxy_rewrite() -> Result<()> {
     Ok(())
 }
 
+/// Walk up from `start` to the enclosing repo root (first ancestor with a
+/// `.git` or `.rtrt`), falling back to `start` itself. Used to resolve which
+/// `<repo>/.rtrt/config.toml` a hook or status line should read its
+/// per-project customization from.
+fn repo_root_from_cwd(start: &std::path::Path) -> PathBuf {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() || dir.join(".rtrt").exists() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent();
+    }
+    start.to_path_buf()
+}
+
+/// Resolve the repo root from a hook payload's `cwd` field, if present.
+fn hook_repo_root(raw: &str) -> Option<PathBuf> {
+    extract_json_str(raw, "cwd").map(|cwd| repo_root_from_cwd(std::path::Path::new(&cwd)))
+}
+
 fn run_hook_style() -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
+    let repo = hook_repo_root(&raw);
     let prompt = extract_json_str(&raw, "prompt").unwrap_or_else(|| raw.trim().to_string());
     if let Some(level) = parse_output_switch(&prompt) {
-        rtrt_core::write_output_style_level(level)?;
-        let reason = if level.is_active() {
-            format!("Output Optimizer terse mode set to {}.", level.as_str())
+        rtrt_core::write_output_style_level_for(repo.as_deref(), level)?;
+        let scope = if repo.is_some() {
+            "this project"
         } else {
-            "Output Optimizer terse mode off.".to_string()
+            "globally"
+        };
+        let reason = if level.is_active() {
+            format!(
+                "Output Optimizer terse mode set to {} for {scope}.",
+                level.as_str()
+            )
+        } else {
+            format!("Output Optimizer terse mode off for {scope}.")
         };
         print_hook_block(&reason);
         return Ok(());
     }
 
-    let level = rtrt_core::read_output_style_level();
+    let level = rtrt_core::read_output_style_level_for(repo.as_deref());
     if level.is_active() {
         print_hook_context(&style_reinforcement(level));
     }
@@ -4500,7 +4538,10 @@ fn run_hook_style() -> Result<()> {
 }
 
 fn run_hook_style_inject() -> Result<()> {
-    let level = rtrt_core::read_output_style_level();
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok();
+    let repo = hook_repo_root(&raw);
+    let level = rtrt_core::read_output_style_level_for(repo.as_deref());
     if level.is_active() {
         println!("{}", style_session_block(level));
     }
@@ -4704,7 +4745,7 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     if let Some(model) = input.model_display_name.or(input.model_id) {
         segments.insert("model".to_string(), model);
     }
-    let opt_level = rtrt_core::read_output_style_level();
+    let opt_level = rtrt_core::read_output_style_level_for(Some(&repo_root_from_cwd(&cwd)));
     segments.insert("opt".to_string(), format!("opt:{}", opt_level.as_str()));
     if let Some(usage) = usage_window_segment() {
         segments.insert("usage".to_string(), usage);

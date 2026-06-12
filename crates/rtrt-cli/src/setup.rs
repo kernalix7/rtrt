@@ -197,6 +197,32 @@ model: sonnet
 Terse, technically exact. Reply in the user's language. Output format is strictly: path:line: <severity>: <problem>. <fix>. Severity values: error | warn | note. No praise. No scope creep. No summaries. Stop when findings are exhausted.
 "#,
     },
+    AgentSpec {
+        name: "log-analyzer",
+        description: "rtrt read-only log triage. Parses logs, stack traces, and build output into root cause plus next step.",
+        body: r#"---
+name: log-analyzer
+description: rtrt read-only log triage. Parses logs, stack traces, and build output into root cause plus next step.
+tools: Read, Grep
+model: inherit
+---
+
+Read logs, stack traces, and build output. Identify the most likely root cause, cite exact file paths or line references when present, and give the smallest useful next step. Do not edit files or run commands. Reply in the user's language. Keep it compact.
+"#,
+    },
+    AgentSpec {
+        name: "tech-lead",
+        description: "rtrt team orchestration lead. Breaks down cross-cutting work, delegates focused agents, and integrates results.",
+        body: r#"---
+name: tech-lead
+description: rtrt team orchestration lead. Breaks down cross-cutting work, delegates focused agents, and integrates results.
+tools: Read, Grep, Glob
+model: inherit
+---
+
+Plan cross-cutting work, decide when TeamCreate delegation is useful, assign focused read/edit/review tasks, and integrate results into a concise handoff. Keep ownership and verification explicit. Do not make broad edits directly; delegate or return the smallest actionable plan. Reply in the user's language.
+"#,
+    },
 ];
 
 pub fn style_reinforcement(level: OutputStyleLevel) -> String {
@@ -728,13 +754,20 @@ fn install_claude_skills_agents(apply: bool) -> Result<()> {
         }
         std::fs::write(&path, skill.body).with_context(|| format!("write {}", path.display()))?;
     }
+    let mut agents_written = 0usize;
+    let mut agents_skipped = 0usize;
     for agent in CLAUDE_AGENTS {
         let path = claude_agent_path(&agents_root, agent);
+        if path.exists() {
+            agents_skipped += 1;
+            continue;
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
         std::fs::write(&path, agent.body).with_context(|| format!("write {}", path.display()))?;
+        agents_written += 1;
     }
     println!(
         "wrote {} rtrt Output Optimizer skill files under {}",
@@ -742,8 +775,7 @@ fn install_claude_skills_agents(apply: bool) -> Result<()> {
         skills_root.display()
     );
     println!(
-        "wrote {} rtrt Output Optimizer agent files under {}",
-        CLAUDE_AGENTS.len(),
+        "wrote {agents_written} rtrt Output Optimizer agent files under {} ({agents_skipped} existing)",
         agents_root.display()
     );
     Ok(())

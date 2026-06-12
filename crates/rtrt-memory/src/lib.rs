@@ -3897,7 +3897,7 @@ impl MemoryStore {
         // canvas. `rows_for_ids` does not order, so cap on the newest ids
         // (largest id first) to drill into the most recent members.
         if rows.len() > MEMBER_RENDER_CAP {
-            rows.sort_by(|a, b| b.0.id.cmp(&a.0.id));
+            rows.sort_by_key(|r| std::cmp::Reverse(r.0.id));
             rows.truncate(MEMBER_RENDER_CAP);
         }
         let nodes: Vec<MemNode> = rows.iter().map(|(node, _)| node.clone()).collect();
@@ -4568,7 +4568,7 @@ impl MemoryStore {
             // without this they'd produce a spurious self-pair and over-weight the
             // node. Sort-by-index then dedup is deterministic and cheap (≤ a few
             // dozen tokens per body).
-            sel.sort_by(|a, b| a.0.cmp(&b.0));
+            sel.sort_by_key(|p| p.0);
             sel.dedup_by_key(|p| p.0);
             if sel.len() < 2 {
                 continue;

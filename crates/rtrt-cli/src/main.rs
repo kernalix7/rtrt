@@ -2152,6 +2152,11 @@ fn set_executable_if_requested(path: &Path, executable: bool) -> Result<()> {
             .with_context(|| format!("set executable bit: {}", path.display()))?;
     }
 
+    // The executable bit is a no-op on non-unix targets; `path` is only read
+    // inside the `cfg(unix)` block above.
+    #[cfg(not(unix))]
+    let _ = path;
+
     Ok(())
 }
 

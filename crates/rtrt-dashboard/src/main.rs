@@ -26,6 +26,7 @@
 //! - `/api/compress`      — `POST` run the rule, ML, or LLM compressor against arbitrary text.
 //! - `/api/proxy`         — `POST` rtrt-proxy filters (command / errors_only / ultra_compact).
 //! - `/api/diagnose`      — `POST` aider-style failure triage (errors_only + gateway chat).
+//! - `/api/route`         — `GET` dry-run orchestration route selection.
 //!
 //! All `/api/*` routes are gated by a bearer-token middleware when the
 //! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
@@ -51,7 +52,8 @@ use rtrt_memory::{
     Summariser,
 };
 use rtrt_providers::{
-    ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Provider, RequestMetric, Role,
+    ChatMessage, ChatRequest, ChatResponse, Gateway, MetricsView, Prefer, Provider, RequestMetric,
+    Role, RouteAlternative, RouteRequest, UsageSnapshot, select_route,
 };
 use rtrt_security::{Profile, ScanReport};
 use rtrt_templates::{Prompt, PromptRegistry};
@@ -373,6 +375,7 @@ async fn main() -> Result<()> {
         .route("/api/optimizer/overview", get(optimizer_overview))
         .route("/api/gain", get(gain))
         .route("/api/detect", get(detect_tools_api))
+        .route("/api/route", get(route_api))
         .route("/api/detect/toggle", post(toggle_detected_tool))
         .route(
             "/api/optimizer/level",
@@ -3962,6 +3965,168 @@ async fn detect_tools_api() -> Json<Vec<DetectedToolResponse>> {
             })
             .collect(),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteQuery {
+    prompt: String,
+    #[serde(default)]
+    prefer: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteChosen {
+    target: String,
+    mode: rtrt_providers::Mode,
+    model: Option<String>,
+    cost_class: rtrt_core::CostClass,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteUsageHeadroom {
+    sources: Vec<String>,
+    by_target: BTreeMap<String, RouteTargetHeadroom>,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteTargetHeadroom {
+    used: Option<u64>,
+    limit: Option<u64>,
+    remaining: Option<u64>,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteApiResponse {
+    chosen: RouteChosen,
+    alternatives: Vec<RouteAlternative>,
+    usage_headroom: RouteUsageHeadroom,
+}
+
+async fn route_api(
+    axum::extract::Query(q): axum::extract::Query<RouteQuery>,
+) -> axum::response::Response {
+    if q.prompt.trim().is_empty() {
+        return route_error(StatusCode::BAD_REQUEST, "prompt is required");
+    }
+
+    let prefer = match parse_route_prefer(q.prefer.as_deref()) {
+        Ok(prefer) => prefer,
+        Err(message) => return route_error(StatusCode::BAD_REQUEST, &message),
+    };
+    let capability = match parse_route_capability(q.capability.as_deref()) {
+        Ok(capability) => capability,
+        Err(message) => return route_error(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let request = RouteRequest {
+        capability,
+        prefer,
+        target: None,
+        model: None,
+        mode: None,
+    };
+    let tools = detected_tools_with_config_overrides();
+    let usage = UsageSnapshot::load_best_effort();
+    let decision = match select_route(&request, &tools, &usage) {
+        Ok(decision) => decision,
+        Err(e) => return route_error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let usage_headroom = route_usage_headroom(&usage, &tools);
+    let response = RouteApiResponse {
+        chosen: RouteChosen {
+            target: decision.target,
+            mode: decision.mode,
+            model: decision.model,
+            cost_class: decision.cost_class,
+            reason: decision.reason,
+        },
+        alternatives: decision.alternatives,
+        usage_headroom,
+    };
+    Json(response).into_response()
+}
+
+fn route_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+        })),
+    )
+        .into_response()
+}
+
+fn parse_route_prefer(value: Option<&str>) -> std::result::Result<Prefer, String> {
+    match value
+        .unwrap_or("cheapest")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "cheapest" => Ok(Prefer::Cheapest),
+        "local" => Ok(Prefer::Local),
+        "quality" => Ok(Prefer::Quality),
+        other => Err(format!(
+            "unknown prefer '{other}' (expected cheapest, local, or quality)"
+        )),
+    }
+}
+
+fn parse_route_capability(
+    value: Option<&str>,
+) -> std::result::Result<Option<rtrt_core::Capability>, String> {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "chat" | "general" => Ok(None),
+        "code" => Ok(Some(rtrt_core::Capability::Code)),
+        "reasoning" => Ok(Some(rtrt_core::Capability::Reasoning)),
+        "vision" => Ok(Some(rtrt_core::Capability::Vision)),
+        "embed" | "embedding" => Ok(Some(rtrt_core::Capability::Embed)),
+        "agentic" => Ok(Some(rtrt_core::Capability::Agentic)),
+        "summarize" | "summary" | "cheap-bulk" | "cheap_bulk" => {
+            Ok(Some(rtrt_core::Capability::CheapBulk))
+        }
+        other => Err(format!(
+            "unknown capability '{other}' (expected code, reasoning, chat, summarize, vision, embed, or agentic)"
+        )),
+    }
+}
+
+fn route_usage_headroom(
+    usage: &UsageSnapshot,
+    tools: &[rtrt_core::DetectedTool],
+) -> RouteUsageHeadroom {
+    let mut by_target = BTreeMap::new();
+    for tool in tools.iter().filter(|tool| tool.installed && tool.enabled) {
+        let headroom = usage.headroom(&tool.name);
+        let view = match headroom {
+            Some(quota) => RouteTargetHeadroom {
+                used: Some(quota.used),
+                limit: Some(quota.limit),
+                remaining: Some(quota.remaining),
+                label: format!("{}/{} tokens remaining", quota.remaining, quota.limit),
+            },
+            None => RouteTargetHeadroom {
+                used: None,
+                limit: None,
+                remaining: None,
+                label: "unknown".to_string(),
+            },
+        };
+        by_target.insert(tool.name.clone(), view);
+    }
+    RouteUsageHeadroom {
+        sources: usage.sources.clone(),
+        by_target,
+    }
 }
 
 fn provider_api_key_present(tool: &rtrt_core::DetectedTool) -> bool {

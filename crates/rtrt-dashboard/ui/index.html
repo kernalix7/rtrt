@@ -34,13 +34,17 @@
 
   /* Layout: sidebar + main */
   .layout { display: grid; grid-template-columns: 250px 1fr; min-height: calc(100vh - 53px - 32px); }
-  aside { background: var(--surface); border-right: 1px solid var(--border); padding: 1rem 0.5rem; }
-  aside .nav-group { margin-bottom: 0.55rem; }
-  aside .group { color: var(--muted); font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.7rem 0.75rem 0.25rem; }
+  aside { background: var(--surface); border-right: 1px solid var(--border); padding: 0.75rem 0.5rem; }
+  aside .nav-group { margin-bottom: 0.35rem; }
+  aside .group { color: var(--muted); font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.5rem 0.75rem 0.2rem; }
+  aside details.nav-group > summary.group { cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; }
+  aside details.nav-group > summary.group::-webkit-details-marker { display: none; }
+  aside details.nav-group > summary.group::after { content: '⌄'; font-size: 0.85em; color: var(--muted); transition: transform .12s ease; }
+  aside details.nav-group:not([open]) > summary.group::after { transform: rotate(-90deg); }
   aside .nav-subtitle { color: var(--muted); font-size: 0.74rem; padding: 0 0.75rem 0.3rem; }
-  aside a.nav { display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.5rem 0.75rem; border-radius: 8px; color: var(--fg); margin: 0.08rem 0; }
+  aside a.nav { display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.42rem 0.75rem; border-radius: 8px; color: var(--fg); margin: 0.05rem 0; }
   aside a.nav:hover { background: var(--bg); }
-  aside a.nav.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  aside a.nav.active { background: var(--accent-soft); color: var(--accent); font-weight: 700; box-shadow: inset 3px 0 0 var(--accent); }
   aside a.nav .icon { width: 18px; text-align: center; line-height: 1.35; flex-shrink: 0; }
   aside a.nav .nav-copy { min-width: 0; display: flex; flex-direction: column; line-height: 1.25; }
   aside a.nav .nav-label { font-size: 0.92rem; }
@@ -407,6 +411,17 @@
   .env-toggle { min-width: 88px; padding: 0.35rem 0.55rem; font-size: 0.84em; }
   .env-toggle.enabled { color: var(--ok); border-color: var(--ok); }
   .env-toggle.disabled { color: var(--muted); }
+  .route-form-grid { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(130px, 0.25fr) minmax(150px, 0.28fr) auto; gap: 0.55rem; align-items: end; }
+  .route-chosen-card { background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 8px; padding: 1rem; display: grid; gap: 0.55rem; margin-bottom: 0.75rem; }
+  .route-chosen-top { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+  .route-target-name { font-size: 1.35rem; font-weight: 800; line-height: 1.1; }
+  .route-meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.5rem; }
+  .route-meta-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.55rem 0.65rem; }
+  .route-meta-box .label { color: var(--muted); font-size: 0.76em; text-transform: uppercase; letter-spacing: 0.05em; }
+  .route-meta-box .value { font-weight: 700; overflow-wrap: anywhere; }
+  .route-alt-list { display: grid; gap: 0.45rem; }
+  .route-alt-row { display: grid; grid-template-columns: minmax(110px, 0.8fr) minmax(90px, 0.6fr) minmax(100px, 0.7fr) 1fr; gap: 0.55rem; align-items: start; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.65rem 0.75rem; }
+  .route-headroom-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.5rem; }
 
   /* Mobile */
   @media (max-width: 720px) {
@@ -414,6 +429,7 @@
     aside { display: none; }
     main { padding: 1rem; }
     .row { grid-template-columns: 1fr; }
+    .route-form-grid, .route-alt-row { grid-template-columns: 1fr; }
     .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
@@ -458,45 +474,43 @@
       </div>
     </div>
     <div class="nav-group">
-      <div class="group">Overview</div>
-      <a class="nav active" data-page="overview"><span class="icon">⌂</span><span class="nav-copy"><span class="nav-label">Token Savings</span><span class="nav-sub">all optimizers</span></span></a>
+      <a class="nav active" data-page="overview"><span class="icon">⌂</span><span class="nav-copy"><span class="nav-label">Overview</span><span class="nav-sub">token savings</span></span></a>
     </div>
-    <div class="nav-group">
-      <div class="group">Memory</div>
-      <div class="nav-subtitle">persistent memory &amp; recall</div>
+    <details class="nav-group" open>
+      <summary class="group">Memory</summary>
       <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Recall</span><span class="nav-sub">search and hybrid recall</span></span></a>
       <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
       <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">captured activity</span></span></a>
       <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
       <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Brain Map</span><span class="nav-sub">concept graph</span></span></a>
       <a class="nav" data-page="memory" data-sub="memgovern"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Profile</span><span class="nav-sub">governance and backup</span></span></a>
-    </div>
-    <div class="nav-group">
-      <div class="group">Output Optimizer</div>
-      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="lite"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Lite</span><span class="nav-sub">rule compression</span></span></a>
-      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="full"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Full</span><span class="nav-sub">rule compression</span></span></a>
-      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="ultra"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress Ultra</span><span class="nav-sub">rule compression</span></span></a>
-      <a class="nav" data-page="compress" data-compress-engine="ml"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">compress_ml</span><span class="nav-sub">ML heuristic</span></span></a>
-      <a class="nav" data-page="settings"><span class="icon">◉</span><span class="nav-copy"><span class="nav-label">Output Style Status</span><span class="nav-sub">auto-compress settings</span></span></a>
-    </div>
-    <div class="nav-group">
-      <div class="group">Command Optimizer</div>
+    </details>
+    <details class="nav-group" open>
+      <summary class="group">Output Optimizer</summary>
+      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="full"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress</span><span class="nav-sub">text reduction</span></span></a>
+      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="lite"><span class="icon">◉</span><span class="nav-copy"><span class="nav-label">Style</span><span class="nav-sub">terse output</span></span></a>
+    </details>
+    <details class="nav-group" open>
+      <summary class="group">Command Optimizer</summary>
       <a class="nav" data-page="command" data-sub="command-gain"><span class="icon">↗</span><span class="nav-copy"><span class="nav-label">Gain</span><span class="nav-sub">proxy-run analytics</span></span></a>
       <a class="nav" data-page="command" data-sub="command-coverage"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Coverage</span><span class="nav-sub">34 command filters</span></span></a>
       <a class="nav" data-page="command" data-sub="command-proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">stdin filter demo</span></span></a>
       <a class="nav" data-page="command" data-sub="command-repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
-    </div>
-    <div class="nav-group">
-      <div class="group">System</div>
-      <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">tools and routing</span></span></a>
+    </details>
+    <details class="nav-group" open>
+      <summary class="group">Orchestration</summary>
+      <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
+      <a class="nav" data-page="route"><span class="icon">⇄</span><span class="nav-copy"><span class="nav-label">Route</span><span class="nav-sub">dry-run selection</span></span></a>
+    </details>
+    <details class="nav-group" open>
+      <summary class="group">System</summary>
       <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">local models</span></span></a>
       <a class="nav" data-page="templates"><span class="icon">□</span><span class="nav-copy"><span class="nav-label">Templates</span><span class="nav-sub">project scaffolds</span></span></a>
       <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
-      <a class="nav" data-page="connect"><span class="icon">⛓</span><span class="nav-copy"><span class="nav-label">Setup</span><span class="nav-sub">MCP snippets</span></span></a>
       <a class="nav" data-page="prompts"><span class="icon">¶</span><span class="nav-copy"><span class="nav-label">Prompts</span><span class="nav-sub">version registry</span></span></a>
       <a class="nav" data-page="security"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">Security</span><span class="nav-sub">profiles and scans</span></span></a>
       <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Settings</span><span class="nav-sub">capture defaults</span></span></a>
-    </div>
+    </details>
   </aside>
 
   <main>
@@ -568,6 +582,55 @@
           </table>
         </div>
         <div id="environment-notes" class="out-meta"></div>
+      </div>
+    </section>
+
+    <section id="page-route" class="page" hidden>
+      <div class="section-head">
+        <h1>Route</h1>
+        <div class="lede">Dry-run orchestration routing across detected targets.</div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Route Preview</h2><span class="hint">No provider call is made.</span></div>
+        <form id="route-form" class="route-form-grid">
+          <div class="ctrl-field">
+            <label for="route-prompt">Task prompt</label>
+            <input id="route-prompt" placeholder="refactor parser module" required>
+          </div>
+          <div class="ctrl-field">
+            <label for="route-prefer">Prefer</label>
+            <select id="route-prefer">
+              <option value="cheapest">cheapest</option>
+              <option value="local">local</option>
+              <option value="quality">quality</option>
+            </select>
+          </div>
+          <div class="ctrl-field">
+            <label for="route-capability">Capability</label>
+            <select id="route-capability">
+              <option value="code">code</option>
+              <option value="reasoning">reasoning</option>
+              <option value="chat">chat</option>
+              <option value="summarize">summarize</option>
+            </select>
+          </div>
+          <button id="route-submit" class="primary" type="submit">Preview</button>
+        </form>
+        <div id="route-status" class="out-meta"></div>
+      </div>
+      <div id="route-results" hidden>
+        <div class="card">
+          <div class="head"><h2>Chosen Target</h2><span class="hint">Selected by router dry-run</span></div>
+          <div id="route-chosen"></div>
+        </div>
+        <div class="card">
+          <div class="head"><h2>Alternatives</h2><span class="hint">Ranked fallback targets</span></div>
+          <div id="route-alternatives" class="route-alt-list"></div>
+        </div>
+        <div class="card">
+          <div class="head"><h2>Usage Headroom</h2><span id="route-headroom-sources" class="hint"></span></div>
+          <div id="route-headroom" class="route-headroom-grid"></div>
+        </div>
       </div>
     </section>
 
@@ -2169,7 +2232,8 @@ const PALETTE_ITEMS = [
   { label: 'Command Optimizer · Coverage', hint: '34 command filters', run: () => navigate('command', { sub: 'command-coverage' }) },
   { label: 'Command Optimizer · Proxy', hint: 'stdin filter demo', run: () => navigate('command', { sub: 'command-proxy' }) },
   { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('command', { sub: 'command-repomap' }) },
-  { label: 'System · Environment', hint: 'tools and routing', run: () => navigate('environment') },
+  { label: 'Orchestration · Environment', hint: 'tools and routing', run: () => navigate('environment') },
+  { label: 'Orchestration · Route', hint: 'dry-run routing', run: () => navigate('route') },
   { label: 'System · Providers', hint: 'providers / local models', run: () => navigate('llm') },
   { label: 'System · Prompts', hint: 'prompts', run: () => navigate('prompts') },
   { label: 'System · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
@@ -2912,6 +2976,94 @@ async function toggleEnvironmentTool(name, enabled) {
 document.getElementById('gain-refresh').onclick = () => { loadGain(); pushActivity('Command gain refreshed'); };
 document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('Overview refreshed'); };
 document.getElementById('environment-refresh').onclick = () => { loadEnvironment(); pushActivity('Environment refreshed'); };
+
+function routeValue(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  return String(value);
+}
+
+function routeCostBadge(costClass) {
+  const label = routeValue(costClass);
+  const cls = label === 'LocalFree' || label === 'SubscriptionFlat' ? 'ok' : (label === 'ApiMetered' ? 'warn' : '');
+  return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
+}
+
+function renderRouteResult(data) {
+  const chosen = data.chosen || {};
+  const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
+  const usage = data.usage_headroom || {};
+  const byTarget = usage.by_target || {};
+  document.getElementById('route-results').hidden = false;
+  document.getElementById('route-chosen').innerHTML = `
+    <div class="route-chosen-card">
+      <div class="route-chosen-top">
+        <div class="route-target-name">${escapeHtml(routeValue(chosen.target))}</div>
+        ${routeCostBadge(chosen.cost_class)}
+      </div>
+      <div class="route-meta-grid">
+        <div class="route-meta-box"><div class="label">mode</div><div class="value">${escapeHtml(routeValue(chosen.mode))}</div></div>
+        <div class="route-meta-box"><div class="label">model</div><div class="value">${escapeHtml(routeValue(chosen.model))}</div></div>
+        <div class="route-meta-box"><div class="label">reason</div><div class="value">${escapeHtml(routeValue(chosen.reason))}</div></div>
+      </div>
+    </div>`;
+  document.getElementById('route-alternatives').innerHTML = alternatives.length
+    ? alternatives.map((alt, idx) => `
+      <div class="route-alt-row">
+        <div><span class="badge">#${idx + 1}</span> <strong>${escapeHtml(routeValue(alt.target))}</strong></div>
+        <div>${routeCostBadge(alt.cost_class)}</div>
+        <div><code>${escapeHtml(routeValue(alt.mode))}</code>${alt.model ? `<div class="hint">${escapeHtml(alt.model)}</div>` : ''}</div>
+        <div>${escapeHtml(routeValue(alt.reason))}<div class="hint">${escapeHtml(routeValue(alt.headroom))}</div></div>
+      </div>`).join('')
+    : '<div class="empty">No alternatives returned for this request.</div>';
+  const headroomRows = Object.entries(byTarget);
+  document.getElementById('route-headroom').innerHTML = headroomRows.length
+    ? headroomRows.map(([target, info]) => `
+      <div class="route-meta-box">
+        <div class="label">${escapeHtml(target)}</div>
+        <div class="value">${escapeHtml(routeValue(info.label))}</div>
+        <div class="hint">used ${escapeHtml(routeValue(info.used))} · limit ${escapeHtml(routeValue(info.limit))} · remaining ${escapeHtml(routeValue(info.remaining))}</div>
+      </div>`).join('')
+    : '<div class="empty">No usage limits found.</div>';
+  const sources = Array.isArray(usage.sources) ? usage.sources : [];
+  document.getElementById('route-headroom-sources').textContent = sources.length
+    ? `${sources.length.toLocaleString()} usage sources`
+    : 'No usage sources';
+}
+
+document.getElementById('route-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const prompt = document.getElementById('route-prompt').value.trim();
+  const prefer = document.getElementById('route-prefer').value;
+  const capability = document.getElementById('route-capability').value;
+  const status = document.getElementById('route-status');
+  const btn = document.getElementById('route-submit');
+  const params = new URLSearchParams({ prompt, prefer, capability });
+  btn.disabled = true;
+  status.textContent = 'Routing…';
+  try {
+    const r = await fetch(`/api/route?${params.toString()}`);
+    const text = await r.text();
+    let data = {};
+    if (text) {
+      try { data = JSON.parse(text); } catch (_) { data = { error: text }; }
+    }
+    if (!r.ok) {
+      const msg = data.error || `HTTP ${r.status}`;
+      status.innerHTML = `<span style="color:var(--err);">${escapeHtml(msg)}</span>`;
+      document.getElementById('route-results').hidden = true;
+      showToast(`Route preview failed: ${msg}`, 'err');
+      return;
+    }
+    renderRouteResult(data);
+    status.innerHTML = '<span class="badge ok">dry-run complete</span>';
+    pushActivity(`route · ${data.chosen && data.chosen.target ? data.chosen.target : 'selected'}`);
+  } catch (e) {
+    status.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    document.getElementById('route-results').hidden = true;
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 // Recall mode toggle (bm25 / hybrid).
 (function wireRecallModeToggle() {

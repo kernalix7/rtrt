@@ -368,12 +368,34 @@
   .badge.sev-low { color: #65a30d; border-color: #65a30d; }
   .badge.sev-info { color: #6b7280; border-color: #6b7280; }
 
+  /* Overview savings */
+  .savings-hero { display: grid; gap: 0.65rem; }
+  .savings-hero .head { margin-bottom: 0; }
+  .savings-total { font-size: clamp(2.2rem, 6vw, 4.5rem); line-height: 1; font-weight: 800; font-variant-numeric: tabular-nums; background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; transition: opacity .18s ease, transform .18s ease; }
+  .savings-total.updating, .metric-value.updating { opacity: .72; transform: translateY(-1px); }
+  .savings-meta { display: flex; align-items: center; gap: 0.65rem; flex-wrap: wrap; color: var(--muted); }
+  .savings-source-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.75rem; }
+  .optimizer-mini-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.85rem 0.95rem; display: grid; gap: 0.55rem; }
+  .optimizer-mini-card .top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+  .optimizer-mini-card .name { font-weight: 700; }
+  .optimizer-mini-card .tokens { font-size: 1.55rem; line-height: 1.1; font-weight: 750; font-variant-numeric: tabular-nums; transition: opacity .18s ease, transform .18s ease; }
+  .optimizer-mini-card .meta { color: var(--muted); font-size: 0.82em; display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+  .share-bar { height: 7px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .share-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease; }
+  .project-name-cell { max-width: 280px; overflow-wrap: anywhere; }
+  .tokens-cell { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .project-total-cell { display: grid; gap: 0.25rem; min-width: 130px; }
+  .project-row-bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .project-row-bar span { display: block; height: 100%; border-radius: inherit; background: var(--ok); transition: width .35s ease; }
+  .overview-live { white-space: nowrap; }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
     aside { display: none; }
     main { padding: 1rem; }
     .row { grid-template-columns: 1fr; }
+    .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
 </style>
@@ -460,23 +482,39 @@
     <section id="page-overview" class="page">
       <div class="section-head">
         <h1>Token Savings Overview</h1>
-        <div class="lede">Combined savings from memory, output, and command optimizers.</div>
+        <div class="lede">Combined savings from Memory, Output Optimizer, and Command Optimizer.</div>
       </div>
-      <div class="card">
-        <div class="kpis">
-          <div class="kpi accent"><div class="label">Known tokens saved</div><div class="value countup" id="kpi-saved" data-target="0">0</div><div class="sub" id="kpi-saved-sub">no token counter yet</div></div>
-          <div class="kpi"><div class="label">Saved characters</div><div class="value countup" id="kpi-saved-chars" data-target="0">0</div><div class="sub">exact persisted total</div></div>
-          <div class="kpi"><div class="label">호출 수</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">게이트웨이 누적</div></div>
-          <div class="kpi"><div class="label">평균 지연</div><div class="value" id="kpi-latency">— ms</div><div class="sub">최근 50건</div></div>
+      <div class="card savings-hero">
+        <div class="head">
+          <h2>Total Tokens Saved</h2>
+          <span id="overview-live" class="badge ok overview-live">live</span>
+        </div>
+        <div class="savings-total countup" id="kpi-saved" data-target="0">0</div>
+        <div class="savings-meta">
+          <span id="kpi-saved-sub">(estimate, chars/4)</span>
+          <span><span id="kpi-saved-chars" class="countup" data-target="0">0</span> total chars</span>
         </div>
       </div>
       <div class="card">
-        <div class="head"><h2>Optimizer Savings</h2><span class="hint">Exact characters saved; token counters shown only when persisted</span></div>
-        <table id="optimizer-savings-tbl"><thead><tr><th>Optimizer</th><th>Saved chars</th><th>Estimated tokens</th><th>Source</th></tr></thead><tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody></table>
+        <div class="head"><h2>Optimizer Savings</h2><span class="hint">Tokens are estimated from characters.</span></div>
+        <div id="optimizer-source-cards" class="savings-source-grid">
+          <div class="empty">Loading…</div>
+        </div>
         <div id="optimizer-notes" class="out-meta"></div>
       </div>
       <div class="card">
+        <div class="head"><h2>Per-Project Savings</h2><span class="hint" id="project-savings-hint">Sorted by total tokens.</span></div>
+        <table id="project-savings-tbl">
+          <thead><tr><th>Project</th><th>Memory</th><th>Output Optimizer</th><th>Command Optimizer</th><th>Total tokens</th></tr></thead>
+          <tbody><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card">
         <div class="head"><h2>응답 추이</h2><span class="hint">최근 요청 50건</span></div>
+        <div class="kpis" style="margin-bottom:0.75rem;">
+          <div class="kpi"><div class="label">호출 수</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">게이트웨이 누적</div></div>
+          <div class="kpi"><div class="label">평균 지연</div><div class="value" id="kpi-latency">— ms</div><div class="sub">최근 50건</div></div>
+        </div>
         <div class="row">
           <div><div class="hint">지연 (ms)</div><svg id="chart-latency" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
           <div><div class="hint">토큰 (in + out)</div><svg id="chart-tokens" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
@@ -1481,6 +1519,7 @@ document.getElementById('project-selector').onchange = () => {
     return;
   }
   refreshProjectScopePage();
+  if (activePage() === 'overview') loadOverview();
 };
 document.getElementById('project-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -2065,6 +2104,8 @@ function navigate(page, opts = {}) {
   if (link) link.classList.add('active');
   const target = document.getElementById('page-' + page);
   if (target) target.hidden = false;
+  if (page === 'overview') startOverviewPolling();
+  else stopOverviewPolling();
   if (page === 'memory') {
     refreshMemoryScope();
     if (opts.sub) subClick('memory-subtabs', opts.sub);
@@ -2213,15 +2254,148 @@ function spark(svgId, values, color) {
     `<text x="${w-pad}" y="11" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
 }
 
+const OVERVIEW_SOURCE_ORDER = ['memory', 'output_optimizer', 'command_optimizer'];
+const OVERVIEW_SOURCE_LABELS = {
+  memory: 'Memory',
+  output_optimizer: 'Output Optimizer',
+  command_optimizer: 'Command Optimizer',
+};
+let overviewPollTimer = null;
+let overviewAgeTimer = null;
+let overviewLastUpdatedAt = 0;
+let overviewLoading = false;
+
+function numberValue(v) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function setUpdating(el) {
+  if (!el) return;
+  el.classList.add('updating');
+  setTimeout(() => el.classList.remove('updating'), 220);
+}
+
+function updateOverviewLiveIndicator() {
+  const el = document.getElementById('overview-live');
+  if (!el) return;
+  if (!overviewLastUpdatedAt) {
+    el.textContent = 'live';
+    return;
+  }
+  const age = Math.max(0, Math.floor((Date.now() - overviewLastUpdatedAt) / 1000));
+  el.textContent = `live · updated ${age}s ago`;
+}
+
+function orderedSources(payload) {
+  const sources = payload && Array.isArray(payload.sources) ? payload.sources : [];
+  const byName = new Map(sources.map(s => [s.name, s]));
+  return OVERVIEW_SOURCE_ORDER.map(name => byName.get(name) || {
+    name,
+    label: OVERVIEW_SOURCE_LABELS[name],
+    available: false,
+    count: 0,
+    saved_chars: 0,
+    saved_tokens: 0,
+    by_project: [],
+  });
+}
+
+function renderOverviewSources(payload) {
+  const wrap = document.getElementById('optimizer-source-cards');
+  if (!wrap) return;
+  const sources = orderedSources(payload);
+  const totalTokens = Math.max(0, numberValue(payload && payload.total_saved_tokens));
+  wrap.innerHTML = sources.map(source => {
+    const tokens = numberValue(source.saved_tokens);
+    const chars = numberValue(source.saved_chars);
+    const count = numberValue(source.count);
+    const share = totalTokens > 0 ? Math.max(0, tokens) / totalTokens * 100 : 0;
+    const badge = source.available === false
+      ? '<span class="badge warn">unavailable</span>'
+      : '<span class="badge ok">available</span>';
+    return `<div class="optimizer-mini-card">
+      <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
+      <div class="tokens metric-value">${tokens.toLocaleString()}</div>
+      <div class="meta"><span>${count.toLocaleString()} rows/runs</span><span>${chars.toLocaleString()} chars</span></div>
+      <div class="share-bar" title="${share.toFixed(1)}% of total"><span style="width:${Math.max(0, Math.min(100, share)).toFixed(1)}%;"></span></div>
+    </div>`;
+  }).join('');
+  wrap.querySelectorAll('.metric-value').forEach(setUpdating);
+}
+
+function projectDisplayCutoff(total, sourceCount) {
+  if (total <= 0) return 0;
+  const root = Math.ceil(Math.sqrt(total));
+  const sourceFloor = Math.max(1, sourceCount);
+  const lower = sourceFloor * 2;
+  const upper = Math.max(lower, sourceFloor * sourceFloor * sourceFloor);
+  if (total <= upper) return total;
+  return Math.min(total, Math.max(lower, Math.min(upper, root)));
+}
+
+function sourceRollup(project, sourceName) {
+  return project && project.by_source && project.by_source[sourceName]
+    ? project.by_source[sourceName]
+    : { count: 0, saved_chars: 0, saved_tokens: 0 };
+}
+
+function optimizerCell(project, sourceName) {
+  const item = sourceRollup(project, sourceName);
+  const tokens = numberValue(item.saved_tokens);
+  const chars = numberValue(item.saved_chars);
+  return `<td class="tokens-cell">${tokens.toLocaleString()}<div class="hint">${chars.toLocaleString()} chars</div></td>`;
+}
+
+function renderProjectSavings(payload) {
+  const body = document.querySelector('#project-savings-tbl tbody');
+  const hint = document.getElementById('project-savings-hint');
+  if (!body) return;
+  const projects = payload && Array.isArray(payload.projects) ? payload.projects : [];
+  if (!projects.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">No persisted savings yet.</td></tr>';
+    if (hint) hint.textContent = 'Sorted by total tokens.';
+    return;
+  }
+  const cutoff = projectDisplayCutoff(projects.length, OVERVIEW_SOURCE_ORDER.length);
+  const visible = projects.slice(0, cutoff);
+  const maxTokens = Math.max(1, ...visible.map(p => Math.max(0, numberValue(p.saved_tokens))));
+  body.innerHTML = visible.map(project => {
+    const totalTokens = numberValue(project.saved_tokens);
+    const width = Math.max(0, totalTokens) / maxTokens * 100;
+    return `<tr>
+      <td class="project-name-cell">${escapeHtml(project.project || '(unknown)')}</td>
+      ${optimizerCell(project, 'memory')}
+      ${optimizerCell(project, 'output_optimizer')}
+      ${optimizerCell(project, 'command_optimizer')}
+      <td class="project-total-cell"><span class="tokens-cell">${totalTokens.toLocaleString()}</span><div class="project-row-bar"><span style="width:${Math.max(0, Math.min(100, width)).toFixed(1)}%;"></span></div></td>
+    </tr>`;
+  }).join('');
+  if (hint) {
+    hint.textContent = cutoff < projects.length
+      ? `Showing ${cutoff.toLocaleString()} of ${projects.length.toLocaleString()}, sorted by total tokens.`
+      : `Showing all ${projects.length.toLocaleString()} projects, sorted by total tokens.`;
+  }
+}
+
 async function loadOverview() {
+  if (overviewLoading) return;
+  overviewLoading = true;
   const overviewParams = new URLSearchParams();
   if (currentProject() && !isGlobalScope()) overviewParams.set('project', currentProject());
   const overviewUrl = `/api/overview${overviewParams.toString() ? '?' + overviewParams.toString() : ''}`;
-  const [mRes, bRes, oRes] = await Promise.all([
-    fetch('/api/metrics').then(r => r.ok ? r.json() : ({summary:{}, recent:[]})).catch(() => ({summary:{}, recent:[]})),
-    fetch('/api/budget').then(r => r.ok ? r.json() : null).catch(() => null),
-    fetch(overviewUrl).then(r => r.ok ? r.json() : null).catch(() => null),
-  ]);
+  let mRes = {summary:{}, recent:[]};
+  let bRes = null;
+  let oRes = null;
+  try {
+    [mRes, bRes, oRes] = await Promise.all([
+      fetch('/api/metrics').then(r => r.ok ? r.json() : ({summary:{}, recent:[]})).catch(() => ({summary:{}, recent:[]})),
+      fetch('/api/budget').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch(overviewUrl).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+  } finally {
+    overviewLoading = false;
+  }
   const s = mRes.summary || {};
   const calls = s.calls || 0;
   const savedChars = oRes ? Number(oRes.total_saved_chars || 0) : 0;
@@ -2230,25 +2404,20 @@ async function loadOverview() {
   animateCount(document.getElementById('kpi-saved'), savedTokens);
   animateCount(document.getElementById('kpi-saved-chars'), savedChars);
   animateCount(document.getElementById('kpi-calls'), calls);
-  document.getElementById('kpi-saved-sub').textContent = oRes && oRes.total_saved_tokens != null ? 'exact persisted total' : 'no token counter yet';
+  setUpdating(document.getElementById('kpi-saved'));
+  document.getElementById('kpi-saved-sub').textContent = '(estimate, chars/4)';
   document.getElementById('kpi-latency').textContent = `${avgLatency} ms`;
   document.getElementById('kpi-spent').textContent = bRes ? fmtUsd(bRes.spent_usd) : '—';
   document.getElementById('kpi-spent-sub').textContent = bRes && bRes.cap_usd ? `한도 ${fmtUsd(bRes.cap_usd)}` : '한도 미설정';
 
-  const optBody = document.querySelector('#optimizer-savings-tbl tbody');
-  if (optBody) {
-    const sources = oRes && Array.isArray(oRes.sources) ? oRes.sources : [];
-    optBody.innerHTML = sources.map(c => {
-      const chars = c.saved_chars == null ? '—' : Number(c.saved_chars || 0).toLocaleString();
-      const tokens = c.saved_tokens == null ? '—' : Number(c.saved_tokens || 0).toLocaleString();
-      const status = c.available === false ? '<span class="badge warn">no counter</span> ' : '<span class="badge ok">available</span> ';
-      return `<tr><td>${escapeHtml(c.label || c.name || 'Optimizer')}</td><td>${chars}</td><td>${tokens}</td><td>${status}${escapeHtml(c.source || '')}</td></tr>`;
-    }).join('') || '<tr><td colspan="4" class="empty">No persisted savings yet.</td></tr>';
-  }
+  renderOverviewSources(oRes);
+  renderProjectSavings(oRes);
   const notes = document.getElementById('optimizer-notes');
   if (notes) {
-    notes.textContent = oRes && oRes.note ? oRes.note : 'Aggregate endpoint unavailable.';
+    notes.textContent = oRes && oRes.note ? oRes.note : 'All available counters loaded.';
   }
+  overviewLastUpdatedAt = Date.now();
+  updateOverviewLiveIndicator();
 
   setPill('pill-gateway', calls > 0, calls > 0 ? '게이트웨이 활성' : '게이트웨이 대기');
   setPill('pill-memory', null, '메모리');
@@ -2284,7 +2453,32 @@ async function loadOverview() {
   }
   document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">아직 호출 없음. <code>rtrt provider chat</code> 또는 MCP로 시작하세요.</td></tr>';
 }
-document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('개요 새로고침'); };
+function startOverviewPolling() {
+  if (activePage() !== 'overview') return;
+  if (!overviewPollTimer) {
+    loadOverview();
+    overviewPollTimer = setInterval(() => {
+      if (activePage() === 'overview') loadOverview();
+      else stopOverviewPolling();
+    }, 5000);
+  }
+  if (!overviewAgeTimer) {
+    overviewAgeTimer = setInterval(updateOverviewLiveIndicator, 1000);
+  }
+}
+
+function stopOverviewPolling() {
+  if (overviewPollTimer) {
+    clearInterval(overviewPollTimer);
+    overviewPollTimer = null;
+  }
+  if (overviewAgeTimer) {
+    clearInterval(overviewAgeTimer);
+    overviewAgeTimer = null;
+  }
+}
+
+document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('Overview refreshed'); };
 
 // Recall mode toggle (bm25 / hybrid).
 (function wireRecallModeToggle() {
@@ -4567,14 +4761,16 @@ document.getElementById('setup-form').onsubmit = async (ev) => {
 // the EventSource handshake fails (older browsers, proxies stripping SSE).
 function subscribeStream() {
   if (typeof EventSource === 'undefined') {
-    setInterval(loadOverview, 5000);
+    startOverviewPolling();
     return;
   }
   let es;
   let pollTimer = null;
   const startPolling = () => {
     if (pollTimer) return;
-    pollTimer = setInterval(loadOverview, 5000);
+    pollTimer = setInterval(() => {
+      if (activePage() === 'overview') loadOverview();
+    }, 5000);
   };
   const stopPolling = () => {
     if (!pollTimer) return;
@@ -4592,7 +4788,7 @@ function subscribeStream() {
         const d = JSON.parse(ev.data);
         if (d.type === 'memory.save') {
           pushActivity(`memory.save · ${d.kind || '?'} · ${d.project || '?'} (#${d.id})`);
-          loadOverview();
+          if (activePage() === 'overview') loadOverview();
         } else if (d.type === 'memory.delete') {
           pushActivity(`memory.delete · #${d.id}`);
           // Reload history if the deleted item belongs to the open project.
@@ -5299,7 +5495,7 @@ document.getElementById('llm-ps-refresh').onclick = () => loadLlmPs();
 // Init
 document.getElementById('env-bind').textContent = window.location.host;
 loadProjects();
-loadOverview();
+startOverviewPolling();
 loadTemplates();
 loadPrompts();
 loadModels();  // populates model <select>s throughout the UI

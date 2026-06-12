@@ -172,6 +172,11 @@ enum Cmd {
         #[arg(long = "var", value_parser = parse_var)]
         vars: Vec<(String, String)>,
     },
+    /// Inspect and repair the project-standardization lifecycle contract.
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Talk to a chat provider.
     Provider {
         #[command(subcommand)]
@@ -455,6 +460,31 @@ enum ConfigCmd {
     },
     /// Print the resolved config path and whether it exists.
     Path,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCmd {
+    /// Report project contract, agents, hooks, status line, and memory reachability.
+    Status {
+        /// Repository root to inspect. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+    /// Run status plus deeper lifecycle consistency checks.
+    Health {
+        /// Repository root to inspect. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+    /// Append missing managed sections and install missing project agents.
+    Repair {
+        /// Repository root to repair. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+        /// Preview the repair actions without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -879,6 +909,10 @@ const DETECT_COST_WIDTH: usize = 17;
 const DETECT_ENABLED_WIDTH: usize = 7;
 const DETECT_DETAIL_WIDTH: usize = 72;
 const DEFAULT_INIT_TEMPLATE: &str = "standardization";
+const PROJECT_STATE_WIDTH: usize = 4;
+const PROJECT_CHECK_WIDTH: usize = 18;
+const PROJECT_STATUSLINE_NEEDLE: &str = "statusline --rich";
+const PROJECT_HOOK_NEEDLE: &str = "rtrt hook";
 #[cfg(unix)]
 const UNIX_EXECUTE_BITS: u32 = 0o111;
 const DETECT_KIND_ORDER: &[ToolKind] = &[
@@ -978,6 +1012,475 @@ fn run_init(
     let verb = if dry_run { "would write" } else { "written" };
     println!("init complete: {written} {verb}, {skipped} skipped");
     Ok(())
+}
+
+fn run_project(cmd: ProjectCmd) -> Result<()> {
+    match cmd {
+        ProjectCmd::Status { path } => {
+            let root = resolve_project_path(path)?;
+            print_project_report(&root, false)
+        }
+        ProjectCmd::Health { path } => {
+            let root = resolve_project_path(path)?;
+            print_project_report(&root, true)
+        }
+        ProjectCmd::Repair { path, dry_run } => {
+            let root = resolve_project_path(path)?;
+            run_project_repair(&root, dry_run)
+        }
+    }
+}
+
+fn resolve_project_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    let raw = match path {
+        Some(path) => path,
+        None => std::env::current_dir().context("resolve current directory")?,
+    };
+    rtrt_templates::project::validate_project_path(&raw).map_err(anyhow::Error::from)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCheckState {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl ProjectCheckState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+struct ProjectCheckRow {
+    state: ProjectCheckState,
+    check: &'static str,
+    detail: String,
+}
+
+fn print_project_report(root: &Path, health: bool) -> Result<()> {
+    let inspection = rtrt_templates::project::inspect_project(root)?;
+    let settings = claude_settings_status(health);
+    let memory = memory_reachable_status(health);
+    let mut rows = Vec::new();
+    rows.push(ProjectCheckRow {
+        state: ProjectCheckState::Pass,
+        check: "root",
+        detail: inspection.root.display().to_string(),
+    });
+    rows.push(ProjectCheckRow {
+        state: if inspection.contract_present {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Warn
+        },
+        check: "CLAUDE.md",
+        detail: if inspection.contract_present {
+            "present".into()
+        } else {
+            "missing".into()
+        },
+    });
+    rows.push(sections_check_row(&inspection, health));
+    rows.push(agents_check_row(&inspection, health));
+    rows.push(ProjectCheckRow {
+        state: if inspection.present_agents.is_empty() {
+            ProjectCheckState::Warn
+        } else {
+            ProjectCheckState::Pass
+        },
+        check: "agent files",
+        detail: if inspection.present_agents.is_empty() {
+            "none present".into()
+        } else {
+            inspection.present_agents.join(", ")
+        },
+    });
+    rows.push(ProjectCheckRow {
+        state: settings.hooks_state,
+        check: "hooks",
+        detail: settings.hooks_detail,
+    });
+    rows.push(ProjectCheckRow {
+        state: settings.statusline_state,
+        check: "statusLine",
+        detail: settings.statusline_detail,
+    });
+    rows.push(ProjectCheckRow {
+        state: memory.0,
+        check: "memory DB",
+        detail: memory.1,
+    });
+
+    if health {
+        rows.push(stale_sections_check_row(&inspection));
+        rows.push(extra_sections_check_row(&inspection));
+        rows.push(duplicate_sections_check_row(&inspection));
+        rows.push(ProjectCheckRow {
+            state: if root.join(".git").exists() {
+                ProjectCheckState::Pass
+            } else {
+                ProjectCheckState::Fail
+            },
+            check: "git repo",
+            detail: if root.join(".git").exists() {
+                "detected".into()
+            } else {
+                "missing .git".into()
+            },
+        });
+    }
+
+    print_project_rows(&rows);
+    if health {
+        let pass = rows
+            .iter()
+            .filter(|row| row.state == ProjectCheckState::Pass)
+            .count();
+        let warn = rows
+            .iter()
+            .filter(|row| row.state == ProjectCheckState::Warn)
+            .count();
+        let fail = rows
+            .iter()
+            .filter(|row| row.state == ProjectCheckState::Fail)
+            .count();
+        println!("summary: PASS={pass} WARN={warn} FAIL={fail}");
+    }
+    Ok(())
+}
+
+fn sections_check_row(
+    inspection: &rtrt_templates::project::ProjectInspection,
+    health: bool,
+) -> ProjectCheckRow {
+    let missing = inspection
+        .sections
+        .iter()
+        .filter(|section| !section.present)
+        .map(|section| section.number.to_string())
+        .collect::<Vec<_>>();
+    let present = inspection.sections.len().saturating_sub(missing.len());
+    let state = if missing.is_empty() {
+        ProjectCheckState::Pass
+    } else if health {
+        ProjectCheckState::Fail
+    } else {
+        ProjectCheckState::Warn
+    };
+    ProjectCheckRow {
+        state,
+        check: "sections",
+        detail: if missing.is_empty() {
+            format!("present {present}/{}", inspection.sections.len())
+        } else {
+            format!(
+                "present {present}/{}; missing {}",
+                inspection.sections.len(),
+                missing.join(",")
+            )
+        },
+    }
+}
+
+fn agents_check_row(
+    inspection: &rtrt_templates::project::ProjectInspection,
+    health: bool,
+) -> ProjectCheckRow {
+    let missing = inspection
+        .managed_agents
+        .iter()
+        .filter(|agent| !agent.present)
+        .map(|agent| agent.name.clone())
+        .collect::<Vec<_>>();
+    let present = inspection
+        .managed_agents
+        .len()
+        .saturating_sub(missing.len());
+    let state = if missing.is_empty() {
+        ProjectCheckState::Pass
+    } else if health {
+        ProjectCheckState::Fail
+    } else {
+        ProjectCheckState::Warn
+    };
+    ProjectCheckRow {
+        state,
+        check: "managed agents",
+        detail: if missing.is_empty() {
+            format!("present {present}/{}", inspection.managed_agents.len())
+        } else {
+            format!(
+                "present {present}/{}; missing {}",
+                inspection.managed_agents.len(),
+                missing.join(",")
+            )
+        },
+    }
+}
+
+fn stale_sections_check_row(
+    inspection: &rtrt_templates::project::ProjectInspection,
+) -> ProjectCheckRow {
+    let stale = inspection
+        .sections
+        .iter()
+        .filter(|section| section.stale)
+        .map(|section| section.number.to_string())
+        .collect::<Vec<_>>();
+    ProjectCheckRow {
+        state: if stale.is_empty() {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Warn
+        },
+        check: "stale sections",
+        detail: if stale.is_empty() {
+            "none".into()
+        } else {
+            stale.join(",")
+        },
+    }
+}
+
+fn extra_sections_check_row(
+    inspection: &rtrt_templates::project::ProjectInspection,
+) -> ProjectCheckRow {
+    let extra = inspection
+        .extra_sections
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>();
+    ProjectCheckRow {
+        state: if extra.is_empty() {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Warn
+        },
+        check: "extra sections",
+        detail: if extra.is_empty() {
+            "none".into()
+        } else {
+            extra.join(",")
+        },
+    }
+}
+
+fn duplicate_sections_check_row(
+    inspection: &rtrt_templates::project::ProjectInspection,
+) -> ProjectCheckRow {
+    let duplicate = inspection
+        .duplicate_sections
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>();
+    ProjectCheckRow {
+        state: if duplicate.is_empty() {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Fail
+        },
+        check: "duplicate sections",
+        detail: if duplicate.is_empty() {
+            "none".into()
+        } else {
+            duplicate.join(",")
+        },
+    }
+}
+
+fn print_project_rows(rows: &[ProjectCheckRow]) {
+    println!(
+        "{:<state_width$}  {:<check_width$}  detail",
+        "state",
+        "check",
+        state_width = PROJECT_STATE_WIDTH,
+        check_width = PROJECT_CHECK_WIDTH
+    );
+    for row in rows {
+        println!(
+            "{:<state_width$}  {:<check_width$}  {}",
+            row.state.as_str(),
+            row.check,
+            row.detail,
+            state_width = PROJECT_STATE_WIDTH,
+            check_width = PROJECT_CHECK_WIDTH
+        );
+    }
+}
+
+fn run_project_repair(root: &Path, dry_run: bool) -> Result<()> {
+    let plan = rtrt_templates::project::plan_repair(root)?;
+    if dry_run {
+        println!("[dry-run] root: {}", plan.root.display());
+        if plan.actions.is_empty() {
+            println!("[dry-run] no managed repair actions");
+            return Ok(());
+        }
+        for action in &plan.actions {
+            print_repair_action(action, true);
+        }
+        return Ok(());
+    }
+    rtrt_templates::project::apply_repair(&plan)?;
+    if plan.actions.is_empty() {
+        println!("project repair: no managed repair actions");
+        return Ok(());
+    }
+    for action in &plan.actions {
+        print_repair_action(action, false);
+    }
+    Ok(())
+}
+
+fn print_repair_action(action: &rtrt_templates::project::RepairAction, dry_run: bool) {
+    let prefix = if dry_run {
+        "[dry-run] would"
+    } else {
+        "repaired:"
+    };
+    match action {
+        rtrt_templates::project::RepairAction::CreateContract { path } => {
+            println!("{prefix} create {}", path.display());
+        }
+        rtrt_templates::project::RepairAction::AppendSection { number, title } => {
+            println!("{prefix} append ## {number}. {title}");
+        }
+        rtrt_templates::project::RepairAction::InstallAgent { path } => {
+            println!("{prefix} install {}", path.display());
+        }
+    }
+}
+
+struct ClaudeSettingsStatus {
+    hooks_state: ProjectCheckState,
+    hooks_detail: String,
+    statusline_state: ProjectCheckState,
+    statusline_detail: String,
+}
+
+fn claude_settings_status(health: bool) -> ClaudeSettingsStatus {
+    let missing = ClaudeSettingsStatus {
+        hooks_state: ProjectCheckState::Warn,
+        hooks_detail: "settings file missing".into(),
+        statusline_state: ProjectCheckState::Warn,
+        statusline_detail: "settings file missing".into(),
+    };
+    let Some(settings_path) = home_dir().map(|home| home.join(".claude/settings.json")) else {
+        return ClaudeSettingsStatus {
+            hooks_detail: "home directory unavailable".into(),
+            statusline_detail: "home directory unavailable".into(),
+            ..missing
+        };
+    };
+    if !settings_path.exists() {
+        return missing;
+    }
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            let state = if health {
+                ProjectCheckState::Fail
+            } else {
+                ProjectCheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("read failed: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("read failed: {err}"),
+            };
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let state = if health {
+                ProjectCheckState::Fail
+            } else {
+                ProjectCheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("invalid JSON: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("invalid JSON: {err}"),
+            };
+        }
+    };
+    let hooks_present = parsed
+        .get("hooks")
+        .is_some_and(|hooks| json_contains_text(hooks, PROJECT_HOOK_NEEDLE));
+    let statusline_present = parsed
+        .get("statusLine")
+        .is_some_and(|statusline| json_contains_text(statusline, PROJECT_STATUSLINE_NEEDLE));
+    ClaudeSettingsStatus {
+        hooks_state: if hooks_present {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Warn
+        },
+        hooks_detail: if hooks_present {
+            "rtrt hook entries found".into()
+        } else {
+            "rtrt hook entries missing".into()
+        },
+        statusline_state: if statusline_present {
+            ProjectCheckState::Pass
+        } else {
+            ProjectCheckState::Warn
+        },
+        statusline_detail: if statusline_present {
+            "rtrt rich statusLine found".into()
+        } else {
+            "rtrt rich statusLine missing".into()
+        },
+    }
+}
+
+fn json_contains_text(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains(needle),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| json_contains_text(item, needle))
+        }
+        serde_json::Value::Object(map) => map.values().any(|item| json_contains_text(item, needle)),
+        _ => false,
+    }
+}
+
+fn memory_reachable_status(health: bool) -> (ProjectCheckState, String) {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_memory_path);
+    if !path.exists() {
+        return (
+            ProjectCheckState::Warn,
+            format!("missing {}", path.display()),
+        );
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match rusqlite::Connection::open_with_flags(&path, flags)
+        .and_then(|conn| conn.query_row("SELECT 1", [], |_row| Ok(())))
+    {
+        Ok(()) => (
+            ProjectCheckState::Pass,
+            format!("reachable {}", path.display()),
+        ),
+        Err(err) => (
+            if health {
+                ProjectCheckState::Fail
+            } else {
+                ProjectCheckState::Warn
+            },
+            format!("unreachable {}: {err}", path.display()),
+        ),
+    }
 }
 
 fn detect_init_vars(target: &Path) -> BTreeMap<String, String> {
@@ -1573,6 +2076,7 @@ async fn main() -> Result<()> {
             dry_run,
             vars,
         } => run_init(template, path, force, dry_run, vars)?,
+        Cmd::Project { cmd } => run_project(cmd)?,
         Cmd::Call {
             target,
             mode,

@@ -8,6 +8,7 @@ pub mod builtin;
 #[cfg(feature = "chains")]
 pub mod chains;
 pub mod custom;
+pub mod project;
 pub mod prompts;
 pub mod render;
 

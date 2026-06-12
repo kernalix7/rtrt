@@ -35,7 +35,7 @@ pub static ALL: Lazy<Vec<Template>> =
 fn dev() -> Template {
     Template {
         name: "dev".into(),
-        description: "개발 — 코드 프로젝트 스타터 (README + LICENSE + .gitignore + src/)".into(),
+        description: "Document chain — generates a development starter doc set".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Development,
         variables: common_vars(),
@@ -68,7 +68,7 @@ fn dev() -> Template {
 fn design() -> Template {
     Template {
         name: "design".into(),
-        description: "디자인 — 브랜드 보이스 + 토큰 + 와이어프레임 스크린 폴더".into(),
+        description: "Document chain — generates a design kit doc set".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Design,
         variables: common_vars(),
@@ -101,7 +101,7 @@ fn design() -> Template {
 fn plan() -> Template {
     Template {
         name: "plan".into(),
-        description: "설계 — PRD + ADR 템플릿 + 로드맵 (필요한 만큼만 채우세요)".into(),
+        description: "Document chain — generates a planning doc set".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Planning,
         variables: common_vars(),
@@ -170,7 +170,7 @@ fn standardization_vars() -> Vec<TemplateVariable> {
 fn standardization() -> Template {
     Template {
         name: "standardization".into(),
-        description: "Project standardization contract and agent definitions".into(),
+        description: "Project contract — CLAUDE.md + agents".into(),
         source: TemplateSource::BuiltIn,
         category: TemplateCategory::Planning,
         variables: standardization_vars(),
@@ -467,6 +467,24 @@ cargo fmt --check
 - **Branch naming**: `feature/<short-name>`, `fix/<short-name>`, `chore/<short-name>`.
 - **Commit convention**: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`.
 - **Merge strategy**: squash merge reviewed changes to the main branch.
+
+## 8. AI Config Storage
+
+- Keep repository-specific agent instructions in this file.
+- Keep global agent configuration outside the repository.
+- Do not commit local secrets, credentials, or machine-specific paths.
+
+## 9. Work Status
+
+- Track active work in the issue, task, or pull request that owns the change.
+- Keep status updates factual: completed work, current blocker, next step.
+- Call out verification gaps before handoff.
+
+## 10. Memory
+
+- Preserve durable project decisions in committed docs.
+- Keep transient notes in local memory or scratch files outside version control.
+- Promote repeated context into this contract when it becomes a standing rule.
 
 ## 11. Agent Teams
 

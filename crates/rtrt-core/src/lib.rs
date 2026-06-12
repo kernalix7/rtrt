@@ -4,6 +4,7 @@
 //! [`Plugin`], [`Config`].
 
 pub mod config;
+pub mod detect;
 pub mod error;
 pub mod output_style;
 pub mod plugin;
@@ -11,6 +12,7 @@ pub mod project;
 pub mod token;
 
 pub use config::{Config, ProjectEntry};
+pub use detect::{Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools};
 pub use error::{Error, Result};
 pub use output_style::{
     OutputStyleLevel, output_style_path, read_output_style_level, write_output_style_level,

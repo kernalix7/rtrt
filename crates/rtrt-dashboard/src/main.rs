@@ -854,28 +854,292 @@ fn metadata_saved_chars(raw: &str, expected_source: &str) -> Option<i64> {
     }
     let saved = obj.get("saved_chars")?;
     if let Some(n) = saved.as_i64() {
-        return Some(n.max(0));
+        return Some(n);
     }
-    saved.as_str()?.parse::<i64>().ok().map(|n| n.max(0))
+    saved.as_str()?.parse::<i64>().ok()
 }
 
-fn savings_component(
+fn estimate_saved_tokens(saved_chars: i64) -> i64 {
+    saved_chars / 4
+}
+
+fn proxy_stats_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rtrt")
+        .join("proxy-stats.sqlite")
+}
+
+fn normalize_project(project: Option<String>) -> String {
+    let project = project.unwrap_or_default();
+    let project = project.trim();
+    if project.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        project.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SavingsProject {
+    project: String,
+    count: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SavingsSource {
+    name: String,
+    label: String,
+    available: bool,
+    count: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+    source: String,
+    by_project: Vec<SavingsProject>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectSourceRollup {
+    count: i64,
+    saved_chars: i64,
+    saved_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProjectRollup {
+    project: String,
+    saved_chars: i64,
+    saved_tokens: i64,
+    by_source: BTreeMap<String, ProjectSourceRollup>,
+}
+
+fn savings_source(
     name: &str,
     label: &str,
-    saved_chars: i64,
-    count: i64,
     source: &str,
     available: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "label": label,
-        "saved_chars": saved_chars.max(0),
-        "saved_tokens": serde_json::Value::Null,
-        "count": count.max(0),
-        "source": source,
-        "available": available,
-    })
+    mut by_project: Vec<SavingsProject>,
+) -> SavingsSource {
+    by_project.sort_by(|a, b| {
+        b.saved_tokens
+            .cmp(&a.saved_tokens)
+            .then_with(|| b.saved_chars.cmp(&a.saved_chars))
+            .then_with(|| a.project.cmp(&b.project))
+    });
+    let count = by_project.iter().map(|p| p.count).sum();
+    let saved_chars = by_project.iter().map(|p| p.saved_chars).sum();
+    SavingsSource {
+        name: name.to_string(),
+        label: label.to_string(),
+        available,
+        count,
+        saved_chars,
+        saved_tokens: estimate_saved_tokens(saved_chars),
+        source: source.to_string(),
+        by_project,
+    }
+}
+
+fn projects_rollup(sources: &[SavingsSource]) -> Vec<ProjectRollup> {
+    let mut projects: BTreeMap<String, ProjectRollup> = BTreeMap::new();
+    for source in sources {
+        for item in &source.by_project {
+            let entry = projects
+                .entry(item.project.clone())
+                .or_insert_with(|| ProjectRollup {
+                    project: item.project.clone(),
+                    saved_chars: 0,
+                    saved_tokens: 0,
+                    by_source: BTreeMap::new(),
+                });
+            entry.saved_chars += item.saved_chars;
+            entry.by_source.insert(
+                source.name.clone(),
+                ProjectSourceRollup {
+                    count: item.count,
+                    saved_chars: item.saved_chars,
+                    saved_tokens: item.saved_tokens,
+                },
+            );
+        }
+    }
+    for project in projects.values_mut() {
+        project.saved_tokens = estimate_saved_tokens(project.saved_chars);
+    }
+    let mut projects: Vec<ProjectRollup> = projects.into_values().collect();
+    projects.sort_by(|a, b| {
+        b.saved_tokens
+            .cmp(&a.saved_tokens)
+            .then_with(|| b.saved_chars.cmp(&a.saved_chars))
+            .then_with(|| a.project.cmp(&b.project))
+    });
+    projects
+}
+
+fn memory_savings_by_project(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    notes: &mut Vec<String>,
+) -> (bool, Vec<SavingsProject>) {
+    let mut stmt = match conn.prepare(
+        "SELECT project, COUNT(*) AS row_count, \
+                COALESCE(SUM(LENGTH(body_full) - LENGTH(body)), 0) AS saved_chars \
+         FROM memories \
+         WHERE body_full IS NOT NULL AND (?1 IS NULL OR project = ?1) \
+         GROUP BY project",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            notes.push(format!("Memory savings query unavailable: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+        let project = normalize_project(row.get::<_, Option<String>>(0)?);
+        let count = row.get::<_, i64>(1)?;
+        let saved_chars = row.get::<_, i64>(2)?;
+        Ok(SavingsProject {
+            project,
+            count,
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            notes.push(format!("Memory savings query failed: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let mut projects = Vec::new();
+    for row in rows {
+        match row {
+            Ok(project) => projects.push(project),
+            Err(e) => {
+                notes.push(format!("Memory savings row skipped: {e}."));
+                return (false, projects);
+            }
+        }
+    }
+    (true, projects)
+}
+
+fn output_savings_by_project(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    notes: &mut Vec<String>,
+) -> (bool, Vec<SavingsProject>) {
+    let mut stmt = match conn.prepare(
+        "SELECT project, metadata FROM memories \
+         WHERE metadata IS NOT NULL AND (?1 IS NULL OR project = ?1)",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            notes.push(format!("Output Optimizer query unavailable: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            notes.push(format!("Output Optimizer query failed: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let mut grouped: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for row in rows {
+        match row {
+            Ok((project, raw)) => {
+                if let Some(saved_chars) = metadata_saved_chars(&raw, "compress") {
+                    let entry = grouped.entry(normalize_project(project)).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += saved_chars;
+                }
+            }
+            Err(e) => {
+                notes.push(format!("Output Optimizer row skipped: {e}."));
+                return (false, Vec::new());
+            }
+        }
+    }
+    let projects = grouped
+        .into_iter()
+        .map(|(project, (count, saved_chars))| SavingsProject {
+            project,
+            count,
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+        })
+        .collect();
+    (true, projects)
+}
+
+fn command_savings_by_project(
+    db_path: &std::path::Path,
+    project: Option<&str>,
+    notes: &mut Vec<String>,
+) -> (bool, Vec<SavingsProject>) {
+    if !db_path.exists() {
+        notes.push(format!(
+            "Command Optimizer database not found at {}.",
+            db_path.display()
+        ));
+        return (false, Vec::new());
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => {
+            notes.push(format!("Command Optimizer database unavailable: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT project, COUNT(*) AS run_count, COALESCE(SUM(saved_chars), 0) AS saved_chars \
+         FROM proxy_runs \
+         WHERE (?1 IS NULL OR project = ?1) \
+         GROUP BY project",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            notes.push(format!("Command Optimizer stats unavailable: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let rows = match stmt.query_map(rusqlite::params![project], |row| {
+        let project = normalize_project(row.get::<_, Option<String>>(0)?);
+        let count = row.get::<_, i64>(1)?;
+        let saved_chars = row.get::<_, i64>(2)?;
+        Ok(SavingsProject {
+            project,
+            count,
+            saved_chars,
+            saved_tokens: estimate_saved_tokens(saved_chars),
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            notes.push(format!("Command Optimizer stats query failed: {e}."));
+            return (false, Vec::new());
+        }
+    };
+    let mut projects = Vec::new();
+    for row in rows {
+        match row {
+            Ok(project) => projects.push(project),
+            Err(e) => {
+                notes.push(format!("Command Optimizer stats row skipped: {e}."));
+                return (false, projects);
+            }
+        }
+    }
+    (true, projects)
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,140 +1152,74 @@ async fn optimizer_overview(
     axum::extract::Query(q): axum::extract::Query<OverviewQuery>,
 ) -> Json<serde_json::Value> {
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    let mut notes = vec![
-        "Token savings counters are not persisted yet; exact saved-character totals are shown."
-            .to_string(),
-    ];
+    let mut notes = Vec::new();
 
-    let mut memory_saved = 0_i64;
-    let mut memory_count = 0_i64;
-    let mut output_saved = 0_i64;
-    let mut output_count = 0_i64;
-    let mut command_saved = 0_i64;
-    let mut command_count = 0_i64;
-    let mut db_available = true;
-
-    if !state.memory_path.exists() {
-        db_available = false;
-        notes.push(format!(
-            "Memory database not found at {}.",
-            state.memory_path.display()
-        ));
-    } else {
-        match rusqlite::Connection::open(&state.memory_path) {
-            Ok(conn) => {
-                match conn.prepare(
-                    "SELECT LENGTH(body), LENGTH(body_full) FROM memories \
-                     WHERE body_full IS NOT NULL \
-                       AND (?1 IS NULL OR project = ?1) \
-                       AND COALESCE(json_extract(metadata, '$.source'), '') NOT IN ('compress', 'proxy')",
-                ) {
-                    Ok(mut stmt) => {
-                        match stmt
-                            .query_map([project], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
-                        {
-                            Ok(rows) => {
-                                for (body_len, full_len) in rows.flatten() {
-                                    if full_len > 0 {
-                                        memory_count += 1;
-                                        memory_saved += (full_len - body_len).max(0);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                db_available = false;
-                                notes.push(format!("Memory compression query unavailable: {e}."));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        db_available = false;
-                        notes.push(format!("Memory compression query unavailable: {e}."));
-                    }
+    let (memory_available, memory_by_project, output_available, output_by_project) =
+        if !state.memory_path.exists() {
+            notes.push(format!(
+                "Memory database not found at {}.",
+                state.memory_path.display()
+            ));
+            (false, Vec::new(), false, Vec::new())
+        } else {
+            match rusqlite::Connection::open(&state.memory_path) {
+                Ok(conn) => {
+                    let (memory_available, memory_by_project) =
+                        memory_savings_by_project(&conn, project, &mut notes);
+                    let (output_available, output_by_project) =
+                        output_savings_by_project(&conn, project, &mut notes);
+                    (
+                        memory_available,
+                        memory_by_project,
+                        output_available,
+                        output_by_project,
+                    )
                 }
-
-                match conn.prepare(
-                    "SELECT metadata FROM memories \
-                     WHERE metadata IS NOT NULL AND (?1 IS NULL OR project = ?1)",
-                ) {
-                    Ok(mut stmt) => {
-                        match stmt.query_map([project], |row| row.get::<_, String>(0)) {
-                            Ok(rows) => {
-                                for raw in rows.flatten() {
-                                    if let Some(saved) = metadata_saved_chars(&raw, "compress") {
-                                        output_saved += saved;
-                                        output_count += 1;
-                                    }
-                                    if let Some(saved) = metadata_saved_chars(&raw, "proxy") {
-                                        command_saved += saved;
-                                        command_count += 1;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                db_available = false;
-                                notes.push(format!("Optimizer metadata query unavailable: {e}."));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        db_available = false;
-                        notes.push(format!("Optimizer metadata query unavailable: {e}."));
-                    }
+                Err(e) => {
+                    notes.push(format!("Memory database unavailable: {e}."));
+                    (false, Vec::new(), false, Vec::new())
                 }
             }
-            Err(e) => {
-                db_available = false;
-                notes.push(format!("Memory database unavailable: {e}."));
-            }
-        }
-    }
+        };
 
-    let recall_component = savings_component(
-        "memory_recall",
-        "Memory Recall",
-        0,
-        0,
-        "recall retrieval does not persist savings counters",
-        false,
-    );
-    let memory_component = savings_component(
-        "memory_compression",
-        "Memory Compression",
-        memory_saved,
-        memory_count,
-        "memories.body_full - memories.body",
-        db_available,
-    );
-    let output_component = savings_component(
-        "output_optimizer",
-        "Output Optimizer",
-        output_saved,
-        output_count,
-        "metadata.source=compress saved_chars",
-        db_available,
-    );
-    let command_component = savings_component(
-        "command_optimizer",
-        "Command Optimizer",
-        command_saved,
-        command_count,
-        "metadata.source=proxy saved_chars",
-        db_available,
-    );
+    let proxy_path = proxy_stats_path();
+    let (command_available, command_by_project) =
+        command_savings_by_project(&proxy_path, project, &mut notes);
 
-    let total_saved_chars = memory_saved + output_saved + command_saved;
     let sources = vec![
-        recall_component,
-        memory_component,
-        output_component,
-        command_component,
+        savings_source(
+            "memory",
+            "Memory",
+            "SUM(length(body_full) - length(body)) from memories",
+            memory_available,
+            memory_by_project,
+        ),
+        savings_source(
+            "output_optimizer",
+            "Output Optimizer",
+            "memories metadata source=compress saved_chars",
+            output_available,
+            output_by_project,
+        ),
+        savings_source(
+            "command_optimizer",
+            "Command Optimizer",
+            "~/.rtrt/proxy-stats.sqlite proxy_runs saved_chars",
+            command_available,
+            command_by_project,
+        ),
     ];
+    let total_saved_chars: i64 = sources.iter().map(|source| source.saved_chars).sum();
+    let total_saved_tokens = estimate_saved_tokens(total_saved_chars);
+    let projects = projects_rollup(&sources);
+
     Json(serde_json::json!({
         "scope": project.unwrap_or("all"),
-        "total_saved_chars": total_saved_chars.max(0),
-        "total_saved_tokens": serde_json::Value::Null,
+        "total_saved_chars": total_saved_chars,
+        "total_saved_tokens": total_saved_tokens,
+        "token_estimate": "chars/4",
         "sources": sources,
+        "projects": projects,
         "note": notes.join(" "),
     }))
 }

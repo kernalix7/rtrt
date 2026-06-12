@@ -387,6 +387,10 @@
   .project-total-cell { display: grid; gap: 0.25rem; min-width: 130px; }
   .project-row-bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; }
   .project-row-bar span { display: block; height: 100%; border-radius: inherit; background: var(--ok); transition: width .35s ease; }
+  .percent-cell { min-width: 110px; font-variant-numeric: tabular-nums; }
+  .percent-inline { display: grid; gap: 0.22rem; }
+  .percent-bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .percent-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease; }
   .overview-live { white-space: nowrap; }
   .command-feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
   .command-gain-bar { min-width: 150px; display: grid; gap: 0.25rem; }
@@ -396,6 +400,13 @@
   .command-chip-grid .badge { background: var(--bg); }
   .command-note { display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.75rem 0.85rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted); }
   .command-note strong { color: var(--fg); }
+  .env-table-wrap { overflow-x: auto; }
+  .env-group-row td { background: var(--bg); color: var(--muted); font-size: 0.78em; letter-spacing: 0.07em; text-transform: uppercase; }
+  .env-models { max-width: 220px; }
+  .env-template { max-width: 260px; overflow-wrap: anywhere; }
+  .env-toggle { min-width: 88px; padding: 0.35rem 0.55rem; font-size: 0.84em; }
+  .env-toggle.enabled { color: var(--ok); border-color: var(--ok); }
+  .env-toggle.disabled { color: var(--muted); }
 
   /* Mobile */
   @media (max-width: 720px) {
@@ -477,6 +488,7 @@
     </div>
     <div class="nav-group">
       <div class="group">System</div>
+      <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">tools and routing</span></span></a>
       <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">local models</span></span></a>
       <a class="nav" data-page="templates"><span class="icon">□</span><span class="nav-copy"><span class="nav-label">Templates</span><span class="nav-sub">project scaffolds</span></span></a>
       <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
@@ -496,12 +508,12 @@
       </div>
       <div class="card savings-hero">
         <div class="head">
-          <h2>Total Tokens Saved</h2>
+          <h2>Total Saved</h2>
           <span id="overview-live" class="badge ok overview-live">live</span>
         </div>
-        <div class="savings-total countup" id="kpi-saved" data-target="0">0</div>
+        <div class="savings-total" id="kpi-saved">0% saved</div>
         <div class="savings-meta">
-          <span id="kpi-saved-sub">(estimate, chars/4)</span>
+          <span><span id="kpi-saved-tokens" class="countup" data-target="0">0</span> tokens <span id="kpi-saved-sub">(estimate, chars/4)</span></span>
           <span><span id="kpi-saved-chars" class="countup" data-target="0">0</span> total chars</span>
         </div>
       </div>
@@ -515,8 +527,8 @@
       <div class="card">
         <div class="head"><h2>Per-Project Savings</h2><span class="hint" id="project-savings-hint">Sorted by total tokens.</span></div>
         <table id="project-savings-tbl">
-          <thead><tr><th>Project</th><th>Memory</th><th>Output Optimizer</th><th>Command Optimizer</th><th>Total tokens</th></tr></thead>
-          <tbody><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+          <thead><tr><th>Project</th><th>Memory</th><th>Output Optimizer</th><th>Command Optimizer</th><th>%</th><th>Total tokens</th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
       <div class="card">
@@ -539,6 +551,23 @@
         <div class="kpis">
           <div class="kpi"><div class="label">사용 비용</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">한도 미설정</div></div>
         </div>
+      </div>
+    </section>
+
+    <section id="page-environment" class="page" hidden>
+      <div class="section-head">
+        <h1>Environment</h1>
+        <div class="lede">Detected coding tools, local runtimes, provider APIs, and MCP servers.</div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Detected Tools</h2><a id="environment-refresh">Refresh</a></div>
+        <div class="env-table-wrap">
+          <table id="environment-tbl">
+            <thead><tr><th>Name</th><th>Installed</th><th>Version</th><th>Modes</th><th>Cost class</th><th>Models</th><th>Invocation template</th><th>Enabled</th></tr></thead>
+            <tbody><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div id="environment-notes" class="out-meta"></div>
       </div>
     </section>
 
@@ -938,6 +967,7 @@
             <span id="gain-token-note">(estimate, chars/4)</span>
             <span><span id="gain-total-chars" class="countup" data-target="0">0</span> chars</span>
             <span><span id="gain-total-runs" class="countup" data-target="0">0</span> runs</span>
+            <span><span id="gain-saved-pct">0.0%</span> saved</span>
           </div>
         </div>
         <div class="command-feature-grid">
@@ -965,15 +995,15 @@
           <div class="card">
             <div class="head"><h2>Top Commands</h2><span class="hint">Sorted by saved characters.</span></div>
             <table id="gain-top-tbl">
-              <thead><tr><th>Command</th><th>Runs</th><th>Saved</th><th>Avg %</th></tr></thead>
+              <thead><tr><th>Command</th><th>Runs</th><th>Saved</th><th>%</th></tr></thead>
               <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
             </table>
           </div>
           <div class="card">
             <div class="head"><h2>Per-Project Breakdown</h2><span class="hint">From persisted proxy runs.</span></div>
             <table id="gain-project-tbl">
-              <thead><tr><th>Project</th><th>Runs</th><th>Saved chars</th><th>Saved tokens</th></tr></thead>
-              <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+              <thead><tr><th>Project</th><th>Runs</th><th>%</th><th>Saved chars</th><th>Saved tokens</th></tr></thead>
+              <tbody><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
             </table>
           </div>
           <div class="card">
@@ -2139,6 +2169,7 @@ const PALETTE_ITEMS = [
   { label: 'Command Optimizer · Coverage', hint: '34 command filters', run: () => navigate('command', { sub: 'command-coverage' }) },
   { label: 'Command Optimizer · Proxy', hint: 'stdin filter demo', run: () => navigate('command', { sub: 'command-proxy' }) },
   { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('command', { sub: 'command-repomap' }) },
+  { label: 'System · Environment', hint: 'tools and routing', run: () => navigate('environment') },
   { label: 'System · Providers', hint: 'providers / local models', run: () => navigate('llm') },
   { label: 'System · Prompts', hint: 'prompts', run: () => navigate('prompts') },
   { label: 'System · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
@@ -2211,6 +2242,9 @@ function navigate(page, opts = {}) {
   if (page === 'overview') startOverviewPolling();
   else stopOverviewPolling();
   if (page !== 'command') stopGainPolling();
+  if (page === 'environment') {
+    loadEnvironment();
+  }
   if (page === 'memory') {
     refreshMemoryScope();
     if (opts.sub) subClick('memory-subtabs', opts.sub);
@@ -2380,6 +2414,20 @@ function numberValue(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function pctValue(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtPct(v) {
+  return `${pctValue(v).toFixed(1)}%`;
+}
+
+function percentInline(pct, maxPct) {
+  const width = maxPct > 0 ? Math.max(0, Math.min(100, pctValue(pct) / maxPct * 100)) : 0;
+  return `<div class="percent-inline"><span>${fmtPct(pct)}</span><span class="percent-bar"><span style="width:${width.toFixed(1)}%;"></span></span></div>`;
+}
+
 function setUpdating(el) {
   if (!el) return;
   el.classList.add('updating');
@@ -2407,6 +2455,8 @@ function orderedSources(payload) {
     count: 0,
     saved_chars: 0,
     saved_tokens: 0,
+    original_chars: 0,
+    saved_pct: null,
     by_project: [],
   });
 }
@@ -2419,6 +2469,8 @@ function renderOverviewSources(payload) {
   wrap.innerHTML = sources.map(source => {
     const tokens = numberValue(source.saved_tokens);
     const chars = numberValue(source.saved_chars);
+    const originalChars = numberValue(source.original_chars);
+    const pct = source.saved_pct == null ? 0 : pctValue(source.saved_pct);
     const count = numberValue(source.count);
     const share = totalTokens > 0 ? Math.max(0, tokens) / totalTokens * 100 : 0;
     const badge = source.available === false
@@ -2426,8 +2478,8 @@ function renderOverviewSources(payload) {
       : '<span class="badge ok">available</span>';
     return `<div class="optimizer-mini-card">
       <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
-      <div class="tokens metric-value">${tokens.toLocaleString()}</div>
-      <div class="meta"><span>${count.toLocaleString()} rows/runs</span><span>${chars.toLocaleString()} chars</span></div>
+      <div class="tokens metric-value">${fmtPct(pct)} saved</div>
+      <div class="meta"><span>${tokens.toLocaleString()} tokens</span><span>${chars.toLocaleString()} / ${originalChars.toLocaleString()} chars</span><span>${count.toLocaleString()} rows/runs</span></div>
       <div class="share-bar" title="${share.toFixed(1)}% of total"><span style="width:${Math.max(0, Math.min(100, share)).toFixed(1)}%;"></span></div>
     </div>`;
   }).join('');
@@ -2463,21 +2515,24 @@ function renderProjectSavings(payload) {
   if (!body) return;
   const projects = payload && Array.isArray(payload.projects) ? payload.projects : [];
   if (!projects.length) {
-    body.innerHTML = '<tr><td colspan="5" class="empty">No persisted savings yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty">No persisted savings yet.</td></tr>';
     if (hint) hint.textContent = 'Sorted by total tokens.';
     return;
   }
   const cutoff = projectDisplayCutoff(projects.length, OVERVIEW_SOURCE_ORDER.length);
   const visible = projects.slice(0, cutoff);
   const maxTokens = Math.max(1, ...visible.map(p => Math.max(0, numberValue(p.saved_tokens))));
+  const maxPct = Math.max(0, ...visible.map(p => pctValue(p.saved_pct)));
   body.innerHTML = visible.map(project => {
     const totalTokens = numberValue(project.saved_tokens);
     const width = Math.max(0, totalTokens) / maxTokens * 100;
+    const pct = pctValue(project.saved_pct);
     return `<tr>
       <td class="project-name-cell">${escapeHtml(project.project || '(unknown)')}</td>
       ${optimizerCell(project, 'memory')}
       ${optimizerCell(project, 'output_optimizer')}
       ${optimizerCell(project, 'command_optimizer')}
+      <td class="percent-cell">${percentInline(pct, maxPct)}</td>
       <td class="project-total-cell"><span class="tokens-cell">${totalTokens.toLocaleString()}</span><div class="project-row-bar"><span style="width:${Math.max(0, Math.min(100, width)).toFixed(1)}%;"></span></div></td>
     </tr>`;
   }).join('');
@@ -2510,8 +2565,10 @@ async function loadOverview() {
   const calls = s.calls || 0;
   const savedChars = oRes ? Number(oRes.total_saved_chars || 0) : 0;
   const savedTokens = oRes && oRes.total_saved_tokens != null ? Number(oRes.total_saved_tokens) : 0;
+  const savedPct = oRes && oRes.total_saved_pct != null ? Number(oRes.total_saved_pct) : 0;
   const avgLatency = calls ? (s.total_latency_ms / Math.max(1, calls)).toFixed(0) : '—';
-  animateCount(document.getElementById('kpi-saved'), savedTokens);
+  document.getElementById('kpi-saved').textContent = `${fmtPct(savedPct)} saved`;
+  animateCount(document.getElementById('kpi-saved-tokens'), savedTokens);
   animateCount(document.getElementById('kpi-saved-chars'), savedChars);
   animateCount(document.getElementById('kpi-calls'), calls);
   setUpdating(document.getElementById('kpi-saved'));
@@ -2637,36 +2694,41 @@ function renderGainUnavailable(d) {
   animateCount(document.getElementById('gain-total-tokens'), 0);
   animateCount(document.getElementById('gain-total-chars'), 0);
   animateCount(document.getElementById('gain-total-runs'), 0);
+  document.getElementById('gain-saved-pct').textContent = '0.0%';
   document.getElementById('gain-display-count').textContent = 'waiting for data';
 }
 
 function renderGainTopCommands(rows) {
   const tbody = document.querySelector('#gain-top-tbl tbody');
   const maxSaved = Math.max(1, ...rows.map(r => numberValue(r.saved_chars)));
+  const maxPct = Math.max(0, ...rows.map(r => pctValue(r.saved_pct)));
   tbody.innerHTML = rows.map(r => {
     const chars = numberValue(r.saved_chars);
     const width = Math.max(0, Math.min(100, (chars / maxSaved) * 100));
+    const pct = pctValue(r.saved_pct);
     return `<tr>
       <td class="project-name-cell"><code>${escapeHtml(r.command || '')}</code></td>
       <td class="tokens-cell">${numberValue(r.runs).toLocaleString()}</td>
       <td class="command-gain-bar">
         <span class="tokens-cell">${numberValue(r.saved_tokens).toLocaleString()} tokens</span>
-        <span class="hint">${chars.toLocaleString()} chars</span>
+        <span class="hint">${chars.toLocaleString()} saved / ${numberValue(r.input_chars).toLocaleString()} input chars</span>
         <span class="bar"><span style="width:${width.toFixed(1)}%;"></span></span>
       </td>
-      <td><span class="badge save">−${Number(r.saved_pct_avg || 0).toFixed(1)}%</span></td>
+      <td class="percent-cell">${percentInline(pct, maxPct)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="4" class="empty">No command savings yet.</td></tr>';
 }
 
 function renderGainProjects(rows) {
   const tbody = document.querySelector('#gain-project-tbl tbody');
+  const maxPct = Math.max(0, ...rows.map(r => pctValue(r.saved_pct)));
   tbody.innerHTML = rows.map(r => `<tr>
     <td class="project-name-cell">${escapeHtml(r.project || '(unknown)')}</td>
     <td class="tokens-cell">${numberValue(r.runs).toLocaleString()}</td>
+    <td class="percent-cell">${percentInline(r.saved_pct, maxPct)}</td>
     <td class="tokens-cell">${numberValue(r.saved_chars).toLocaleString()}</td>
     <td class="tokens-cell">${numberValue(r.saved_tokens).toLocaleString()}</td>
-  </tr>`).join('') || '<tr><td colspan="4" class="empty">No project breakdown yet.</td></tr>';
+  </tr>`).join('') || '<tr><td colspan="5" class="empty">No project breakdown yet.</td></tr>';
 }
 
 function renderGainHistory(rows) {
@@ -2707,6 +2769,7 @@ async function loadGain() {
   animateCount(document.getElementById('gain-total-runs'), numberValue(d.total_runs));
   setUpdating(document.getElementById('gain-total-tokens'));
   document.getElementById('gain-token-note').textContent = `(${d.token_estimate || 'chars/4'} estimate)`;
+  document.getElementById('gain-saved-pct').textContent = fmtPct(d.saved_pct);
   document.getElementById('gain-display-count').textContent = `${numberValue(d.display_count).toLocaleString()} rows shown`;
   renderGainTopCommands(Array.isArray(d.top_commands) ? d.top_commands : []);
   renderGainProjects(Array.isArray(d.per_project) ? d.per_project : []);
@@ -2738,8 +2801,117 @@ function stopGainPolling() {
   }
 }
 
+const ENV_KIND_ORDER = ['CodingAgent', 'LocalRuntime', 'ProviderApi', 'McpServer'];
+const ENV_KIND_LABELS = {
+  CodingAgent: 'coding-agent',
+  LocalRuntime: 'local-runtime',
+  ProviderApi: 'provider-api',
+  McpServer: 'mcp-server',
+};
+let environmentLoading = false;
+
+function envList(values) {
+  return Array.isArray(values) && values.length
+    ? values.map(v => `<span class="badge">${escapeHtml(v)}</span>`).join(' ')
+    : '<span class="hint">—</span>';
+}
+
+function envKindLabel(kind) {
+  return ENV_KIND_LABELS[kind] || String(kind || 'unknown');
+}
+
+function renderEnvironment(tools) {
+  const tbody = document.querySelector('#environment-tbl tbody');
+  const notes = document.getElementById('environment-notes');
+  if (!tbody) return;
+  if (!Array.isArray(tools) || !tools.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No tools detected.</td></tr>';
+    if (notes) notes.textContent = 'Detection completed with no rows.';
+    return;
+  }
+  const groups = new Map();
+  for (const tool of tools) {
+    const kind = tool.kind || 'unknown';
+    if (!groups.has(kind)) groups.set(kind, []);
+    groups.get(kind).push(tool);
+  }
+  const orderedKinds = [
+    ...ENV_KIND_ORDER.filter(kind => groups.has(kind)),
+    ...Array.from(groups.keys()).filter(kind => !ENV_KIND_ORDER.includes(kind)).sort(),
+  ];
+  const rows = [];
+  for (const kind of orderedKinds) {
+    const groupTools = groups.get(kind).slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    rows.push(`<tr class="env-group-row"><td colspan="8">${escapeHtml(envKindLabel(kind))} · ${groupTools.length.toLocaleString()}</td></tr>`);
+    for (const tool of groupTools) {
+      const installed = tool.installed ? '<span class="badge ok">yes</span>' : '<span class="badge warn">no</span>';
+      const enabled = !!tool.enabled;
+      const toggleClass = enabled ? 'enabled' : 'disabled';
+      const models = Array.isArray(tool.models) && tool.models.length
+        ? tool.models.map(m => `<code>${escapeHtml(m)}</code>`).join(' ')
+        : '<span class="hint">—</span>';
+      const modes = envList(tool.invocation_modes);
+      const template = tool.cli_invocation || tool.config_path || tool.path || '';
+      rows.push(`<tr>
+        <td class="project-name-cell">${escapeHtml(tool.name || 'unknown')}</td>
+        <td>${installed}</td>
+        <td>${tool.version ? `<code>${escapeHtml(tool.version)}</code>` : '<span class="hint">—</span>'}</td>
+        <td>${modes}</td>
+        <td><span class="badge">${escapeHtml(tool.cost_class || 'Unknown')}</span></td>
+        <td class="env-models">${models}</td>
+        <td class="env-template">${template ? `<code>${escapeHtml(template)}</code>` : '<span class="hint">—</span>'}</td>
+        <td><button type="button" class="env-toggle ${toggleClass}" data-tool="${escapeAttr(tool.name || '')}" data-enabled="${enabled ? '1' : '0'}">${enabled ? 'Enabled' : 'Disabled'}</button></td>
+      </tr>`);
+    }
+  }
+  tbody.innerHTML = rows.join('');
+  tbody.querySelectorAll('.env-toggle').forEach(btn => {
+    btn.onclick = () => toggleEnvironmentTool(btn.dataset.tool, btn.dataset.enabled !== '1');
+  });
+  if (notes) notes.textContent = `${tools.length.toLocaleString()} detected tools. API keys are never displayed.`;
+}
+
+async function loadEnvironment() {
+  if (environmentLoading) return;
+  environmentLoading = true;
+  const tbody = document.querySelector('#environment-tbl tbody');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="empty">Loading…</td></tr>';
+  try {
+    const r = await fetch('/api/detect');
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`HTTP ${r.status}: ${text}`);
+    }
+    renderEnvironment(await r.json());
+  } catch (e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(e.message || String(e))}</td></tr>`;
+  } finally {
+    environmentLoading = false;
+  }
+}
+
+async function toggleEnvironmentTool(name, enabled) {
+  if (!name) return;
+  try {
+    const r = await fetch('/api/detect/toggle', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, enabled }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`HTTP ${r.status}: ${text}`);
+    }
+    await loadEnvironment();
+    showToast(`${name} ${enabled ? 'enabled' : 'disabled'}`, 'ok');
+  } catch (e) {
+    showToast(`Environment update failed: ${e.message || e}`, 'err');
+  }
+}
+
 document.getElementById('gain-refresh').onclick = () => { loadGain(); pushActivity('Command gain refreshed'); };
 document.getElementById('overview-refresh').onclick = () => { loadOverview(); pushActivity('Overview refreshed'); };
+document.getElementById('environment-refresh').onclick = () => { loadEnvironment(); pushActivity('Environment refreshed'); };
 
 // Recall mode toggle (bm25 / hybrid).
 (function wireRecallModeToggle() {

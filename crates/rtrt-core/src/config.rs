@@ -334,6 +334,10 @@ impl AgentsConfig {
     pub fn enabled_override(&self, name: &str) -> Option<bool> {
         self.enabled.get(name).copied()
     }
+
+    pub fn set_enabled(&mut self, name: &str, enabled: bool) {
+        self.enabled.insert(name.to_string(), enabled);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -347,6 +351,10 @@ pub struct ProvidersConfig {
 impl ProvidersConfig {
     pub fn enabled_override(&self, name: &str) -> Option<bool> {
         self.enabled.get(name).copied()
+    }
+
+    pub fn set_enabled(&mut self, name: &str, enabled: bool) {
+        self.enabled.insert(name.to_string(), enabled);
     }
 }
 
@@ -393,6 +401,22 @@ impl Config {
             *existing = entry;
         } else {
             self.projects.push(entry);
+        }
+    }
+
+    pub fn set_agent_enabled(&mut self, name: &str, enabled: bool) {
+        self.agents.set_enabled(name, enabled);
+    }
+
+    pub fn set_provider_enabled(&mut self, name: &str, enabled: bool) {
+        self.providers.set_enabled(name, enabled);
+    }
+
+    pub fn set_tool_enabled(&mut self, name: &str, enabled: bool) {
+        if self.providers.enabled.contains_key(name) {
+            self.set_provider_enabled(name, enabled);
+        } else {
+            self.set_agent_enabled(name, enabled);
         }
     }
 }

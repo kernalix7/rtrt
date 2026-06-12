@@ -641,7 +641,15 @@ fn parse_ollama_models(response: &str) -> Vec<String> {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .unwrap_or(response);
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+    // Ollama replies with HTTP/1.1 chunked framing (a hex chunk-size line
+    // precedes the JSON and a `0` terminator follows), so the raw body is not
+    // valid JSON. The /api/tags object fits in a single chunk, so parse the
+    // span from the first `{` to the last `}`.
+    let json = match (body.find('{'), body.rfind('}')) {
+        (Some(start), Some(end)) if end >= start => &body[start..=end],
+        _ => return Vec::new(),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
     };
     value

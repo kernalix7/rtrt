@@ -261,6 +261,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_round_trip() {
+        if loopback_bind_unavailable() {
+            return;
+        }
         let mut server = mockito::Server::new_async().await;
         let body = serde_json::json!({
             "id": "msg_1",
@@ -319,5 +322,9 @@ mod tests {
         let (sys, out) = split_system(&msgs);
         assert_eq!(sys, "S1\n\nS2");
         assert_eq!(out.len(), 1);
+    }
+
+    fn loopback_bind_unavailable() -> bool {
+        std::net::TcpListener::bind("127.0.0.1:0").is_err()
     }
 }

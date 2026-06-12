@@ -942,6 +942,12 @@ struct SavingsSource {
     original_chars: i64,
     saved_pct: Option<f64>,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    measurement_note: Option<String>,
     by_project: Vec<SavingsProject>,
 }
 
@@ -990,8 +996,21 @@ fn savings_source(
         original_chars,
         saved_pct: saved_pct(saved_chars, original_chars),
         source: source.to_string(),
+        level: None,
+        active: None,
+        measurement_note: None,
         by_project,
     }
+}
+
+const OUTPUT_OPTIMIZER_MEASUREMENT_NOTE: &str =
+    "Deterministic compress only — terse-mode injection savings are not measurable";
+
+fn output_optimizer_active(level: &str) -> bool {
+    !matches!(
+        level.trim().to_ascii_lowercase().as_str(),
+        "off" | "none" | "disabled"
+    )
 }
 
 fn projects_rollup(sources: &[SavingsSource]) -> Vec<ProjectRollup> {
@@ -1521,6 +1540,18 @@ async fn optimizer_overview(
     let (command_available, command_by_project) =
         command_savings_by_project(&proxy_path, project, &mut notes);
 
+    let output_level = read_output_style_level().as_str().to_string();
+    let mut output_source = savings_source(
+        "output_optimizer",
+        "Output Optimizer",
+        "memories metadata source=compress saved_chars",
+        output_available,
+        output_by_project,
+    );
+    output_source.level = Some(output_level.clone());
+    output_source.active = Some(output_optimizer_active(&output_level));
+    output_source.measurement_note = Some(OUTPUT_OPTIMIZER_MEASUREMENT_NOTE.to_string());
+
     let sources = vec![
         savings_source(
             "memory",
@@ -1529,13 +1560,7 @@ async fn optimizer_overview(
             memory_available,
             memory_by_project,
         ),
-        savings_source(
-            "output_optimizer",
-            "Output Optimizer",
-            "memories metadata source=compress saved_chars",
-            output_available,
-            output_by_project,
-        ),
+        output_source,
         savings_source(
             "command_optimizer",
             "Command Optimizer",
@@ -3958,9 +3983,14 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
 // ---------------------------------------------------------------------------
 
 const STATUSLINE_SEGMENTS: &[&str] = &[
+    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "codex", "savings",
+];
+const LEGACY_STATUSLINE_SEGMENTS: &[&str] = &[
     "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
 ];
-const STATUSLINE_DEFAULT_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
+const STATUSLINE_DEFAULT_FORMAT: &str =
+    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}";
+const LEGACY_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
 const STATUSLINE_DEFAULT_LINE2_FORMAT: &str = "{usage}";
 const STATUSLINE_DEFAULT_LINE3_FORMAT: &str = "{codex} | {savings}";
 const STATUSLINE_DEFAULT_CODEX_TIMEOUT_MS: u64 = 200;
@@ -4054,7 +4084,7 @@ async fn get_statusline_config() -> DashboardJsonResult<StatuslineConfig> {
                     format!("parse [statusline] in {}: {e}", path.display()),
                 )
             })?;
-            Ok(Json(cfg))
+            Ok(Json(upgrade_legacy_statusline_config(cfg)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(StatuslineConfig::default())),
         Err(e) => Err(api_error(
@@ -4062,6 +4092,20 @@ async fn get_statusline_config() -> DashboardJsonResult<StatuslineConfig> {
             format!("read {}: {e}", path.display()),
         )),
     }
+}
+
+fn upgrade_legacy_statusline_config(mut cfg: StatuslineConfig) -> StatuslineConfig {
+    let legacy_segments = LEGACY_STATUSLINE_SEGMENTS
+        .iter()
+        .map(|segment| segment.to_string())
+        .collect::<Vec<_>>();
+    if cfg.enabled_segments == legacy_segments {
+        cfg.enabled_segments = default_statusline_segments();
+    }
+    if cfg.format == LEGACY_STATUSLINE_FORMAT {
+        cfg.format = default_statusline_format();
+    }
+    cfg
 }
 
 async fn post_statusline_config(

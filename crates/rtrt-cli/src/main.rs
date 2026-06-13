@@ -4614,6 +4614,15 @@ struct ClaudeStatusInput {
     model_id: Option<String>,
     model_display_name: Option<String>,
     cache_pct: Option<u64>,
+    // Authoritative numbers Claude Code provides directly in the status-line
+    // payload, when present (newer CC versions). Preferred over transcript math.
+    ctx_used_pct: Option<u64>,
+    ctx_used_tokens: Option<u64>,
+    ctx_window_size: Option<u64>,
+    five_hour_pct: Option<u64>,
+    five_hour_resets_at: Option<String>,
+    seven_day_pct: Option<u64>,
+    seven_day_resets_at: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -4712,6 +4721,9 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
         .as_deref()
         .and_then(load_recent_transcript_usage);
     let mut segments = BTreeMap::new();
+    // Compute the 5h / weekly window segment while `input` is still fully owned
+    // (later inserts move its model fields).
+    let usage_seg = usage_window_segment(&input);
 
     if let Some(git) = git {
         segments.insert("project".to_string(), git.project);
@@ -4728,31 +4740,52 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
             )
         ),
     );
-    if let (Some(model), Some(usage)) = (input.model_id.as_deref(), transcript_usage) {
-        if let Some(window) = context_window_for_model(model) {
-            if usage.used_tokens > 0 {
-                let pct = percentage_rounded(usage.used_tokens, window);
-                segments.insert(
-                    "ctx".to_string(),
-                    format!(
-                        "ctx:{}%({}/{})",
-                        pct,
-                        compact_count(usage.used_tokens),
-                        compact_count(window)
-                    ),
-                );
+    // ctx: prefer Claude Code's authoritative `context_window` numbers; fall
+    // back to a transcript-derived estimate only when they are absent.
+    if let Some(pct) = input.ctx_used_pct {
+        let window = input
+            .ctx_window_size
+            .or_else(|| input.model_id.as_deref().and_then(context_window_for_model));
+        let seg = match (input.ctx_used_tokens, window) {
+            (Some(used), Some(window)) if window > 0 => {
+                format!(
+                    "ctx:{pct}%({}/{})",
+                    compact_count(used),
+                    compact_count(window)
+                )
             }
+            _ => format!("ctx:{pct}%"),
+        };
+        segments.insert("ctx".to_string(), seg);
+    }
+    if let (Some(model), Some(usage)) = (input.model_id.as_deref(), transcript_usage) {
+        if input.ctx_used_pct.is_none()
+            && let Some(window) = context_window_for_model(model)
+            && usage.used_tokens > 0
+        {
+            let pct = percentage_rounded(usage.used_tokens, window);
+            segments.insert(
+                "ctx".to_string(),
+                format!(
+                    "ctx:{}%({}/{})",
+                    pct,
+                    compact_count(usage.used_tokens),
+                    compact_count(window)
+                ),
+            );
         }
         if let Some(pct) = input.cache_pct.or_else(|| transcript_cache_pct(usage)) {
             segments.insert("cache".to_string(), format!("cache:{pct}%"));
         }
+    } else if let Some(pct) = input.cache_pct {
+        segments.insert("cache".to_string(), format!("cache:{pct}%"));
     }
     if let Some(model) = input.model_display_name.or(input.model_id) {
         segments.insert("model".to_string(), model);
     }
     let opt_level = rtrt_core::read_output_style_level_for(Some(&repo_root_from_cwd(&cwd)));
     segments.insert("opt".to_string(), format!("opt:{}", opt_level.as_str()));
-    if let Some(usage) = usage_window_segment() {
+    if let Some(usage) = usage_seg {
         segments.insert("usage".to_string(), usage);
     }
     let agents = agents_segment(cfg.codex_check_timeout_ms, statusline_agents_width_budget());
@@ -5025,6 +5058,11 @@ fn parse_claude_status_input(raw: &str) -> ClaudeStatusInput {
         .or_else(|| json_string(workspace, "project_dir"))
         .map(PathBuf::from);
     let model = value.get("model").unwrap_or(&serde_json::Value::Null);
+    let null = serde_json::Value::Null;
+    let ctx_window = value.get("context_window").unwrap_or(&null);
+    let rate_limits = value.get("rate_limits").unwrap_or(&null);
+    let five_hour = rate_limits.get("five_hour").unwrap_or(&null);
+    let seven_day = rate_limits.get("seven_day").unwrap_or(&null);
     ClaudeStatusInput {
         session_id: json_string(&value, "session_id"),
         cwd,
@@ -5032,6 +5070,79 @@ fn parse_claude_status_input(raw: &str) -> ClaudeStatusInput {
         model_id: json_string(model, "id"),
         model_display_name: json_string(model, "display_name"),
         cache_pct: value.get("cost").and_then(cache_pct_from_value),
+        ctx_used_pct: json_round_pct(ctx_window, "used_percentage"),
+        ctx_used_tokens: json_any_u64(ctx_window, "total_input_tokens"),
+        ctx_window_size: json_any_u64(ctx_window, "context_window_size"),
+        five_hour_pct: json_round_pct(five_hour, "used_percentage"),
+        five_hour_resets_at: json_string(five_hour, "resets_at"),
+        seven_day_pct: json_round_pct(seven_day, "used_percentage"),
+        seven_day_resets_at: json_string(seven_day, "resets_at"),
+    }
+}
+
+/// Read a percentage field (already 0–100) and round it to a whole number.
+fn json_round_pct(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.round().min(9_999.0) as u64)
+}
+
+/// Read an integer-ish token count (accepts JSON int or float).
+fn json_any_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value
+        .get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+}
+
+/// Parse an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]`) to a
+/// Unix epoch in seconds. Minimal, dependency-free; returns `None` on anything
+/// it cannot read.
+fn rfc3339_to_epoch(s: &str) -> Option<i64> {
+    let g = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok());
+    let (year, month, day) = (g(0, 4)?, g(5, 7)?, g(8, 10)?);
+    let (hour, min, sec) = (g(11, 13)?, g(14, 16)?, g(17, 19)?);
+    // days_from_civil (Howard Hinnant)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut epoch = days * 86_400 + hour * 3_600 + min * 60 + sec;
+    // Apply any explicit timezone offset (Z = +00:00).
+    let tz = &s[19.min(s.len())..];
+    let tz = tz.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    if let Some(pos) = tz.find(['+', '-'])
+        && let Some(off) = tz.get(pos + 1..)
+        && off.len() >= 5
+        && let (Some(oh), Some(om)) = (
+            off.get(0..2).and_then(|x| x.parse::<i64>().ok()),
+            off.get(3..5).and_then(|x| x.parse::<i64>().ok()),
+        )
+    {
+        let sign = if tz.as_bytes()[pos] == b'-' { -1 } else { 1 };
+        epoch -= sign * (oh * 3_600 + om * 60);
+    }
+    Some(epoch)
+}
+
+/// Compact remaining-time label, e.g. `3h12m` or `7m` or `now`.
+fn humanize_remaining(secs: i64) -> String {
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins}m")
+    } else {
+        format!("{mins}m")
     }
 }
 
@@ -5135,13 +5246,20 @@ fn load_recent_transcript_usage(path: &Path) -> Option<TranscriptTokenUsage> {
         }
         recent.push_back(line);
     }
-    let mut usage = TranscriptTokenUsage::default();
-    for line in recent {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+    // Use the most recent line that carries a usage object: the CURRENT context
+    // footprint, not a cumulative sum across turns. Summing over many lines
+    // re-counts the cached context that is re-read every turn (~the whole window
+    // each time), which blows the percentage far past 100% (e.g. 52535%).
+    for line in recent.iter().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            let mut usage = TranscriptTokenUsage::default();
             collect_token_usage(&value, &mut usage);
+            if usage.used_tokens > 0 {
+                return Some(usage);
+            }
         }
     }
-    (usage.used_tokens > 0).then_some(usage)
+    None
 }
 
 fn collect_token_usage(value: &serde_json::Value, usage: &mut TranscriptTokenUsage) {
@@ -5167,14 +5285,14 @@ fn collect_token_usage(value: &serde_json::Value, usage: &mut TranscriptTokenUsa
 
 fn add_usage_object(value: &serde_json::Value, usage: &mut TranscriptTokenUsage) {
     let input = token_field(value, "input_tokens").or_else(|| token_field(value, "prompt_tokens"));
-    let output =
-        token_field(value, "output_tokens").or_else(|| token_field(value, "completion_tokens"));
     let cache_read = token_field(value, "cache_read_input_tokens")
         .or_else(|| token_field(value, "cached_tokens"));
     let cache_write = token_field(value, "cache_creation_input_tokens");
+    // Context footprint = the prompt side (fresh input + cached context reused +
+    // newly written cache). Output is the generation, not occupied context, so
+    // it is excluded from the context-window percentage.
     let specific_total = input
         .unwrap_or(0)
-        .saturating_add(output.unwrap_or(0))
         .saturating_add(cache_read.unwrap_or(0))
         .saturating_add(cache_write.unwrap_or(0));
     let total = if specific_total > 0 {
@@ -5289,8 +5407,30 @@ fn session_count_today(session_id: Option<&str>, transcript_path: Option<&Path>)
     count.max(usize::from(session_id.is_some())).max(1)
 }
 
-fn usage_window_segment() -> Option<String> {
-    Some("5h:n/a ↻n/a | wk:n/a ↻n/a".to_string())
+/// Render the `5h:X% ↻… | wk:Y% ↻…` rate-limit window segment from the values
+/// Claude Code supplies in the status-line payload. Returns `None` when neither
+/// window is present (so the segment is hidden rather than showing `n/a`).
+fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64);
+    let window = |pct: Option<u64>, resets_at: Option<&str>| -> Option<String> {
+        let pct = pct?;
+        let reset = match (now, resets_at.and_then(rfc3339_to_epoch)) {
+            (Some(now), Some(reset)) => format!(" ↻{}", humanize_remaining(reset - now)),
+            _ => String::new(),
+        };
+        Some(format!("{pct}%{reset}"))
+    };
+    let five = window(input.five_hour_pct, input.five_hour_resets_at.as_deref());
+    let seven = window(input.seven_day_pct, input.seven_day_resets_at.as_deref());
+    if five.is_none() && seven.is_none() {
+        return None;
+    }
+    let five = five.unwrap_or_else(|| "—".to_string());
+    let seven = seven.unwrap_or_else(|| "—".to_string());
+    Some(format!("5h:{five} | wk:{seven}"))
 }
 
 fn agents_segment(timeout_ms: u64, width_budget: usize) -> String {

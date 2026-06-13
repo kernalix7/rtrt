@@ -5418,11 +5418,29 @@ fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64);
-    // ∅ = projected time to exhaustion at the recent burn rate.
-    let (five_eta, seven_eta) = match now {
+    // ∅ = projected time to exhaustion. Prefer the responsive recent burn rate
+    // (from the rolling log); fall back to the average rate over the current
+    // window so it shows from the first render instead of needing history.
+    let (five_recent, seven_recent) = match now {
         Some(now) => usage_burn_etas(now, input.five_hour_pct, input.seven_day_pct),
         None => (None, None),
     };
+    let combined =
+        |recent: Option<i64>, pct: Option<u64>, resets_at: Option<&str>, window_secs: i64| {
+            recent.or_else(|| average_rate_eta(now?, pct?, resets_at, window_secs))
+        };
+    let five_eta = combined(
+        five_recent,
+        input.five_hour_pct,
+        input.five_hour_resets_at.as_deref(),
+        FIVE_HOUR_SECS,
+    );
+    let seven_eta = combined(
+        seven_recent,
+        input.seven_day_pct,
+        input.seven_day_resets_at.as_deref(),
+        SEVEN_DAY_SECS,
+    );
     let window = |pct: Option<u64>, resets_at: Option<&str>, eta: Option<i64>| -> Option<String> {
         let pct = pct?;
         let reset = match (now, resets_at.and_then(rfc3339_to_epoch)) {
@@ -5453,9 +5471,33 @@ fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
 }
 
 const STATUSLINE_USAGE_LOG_CAP: usize = 4000;
+const FIVE_HOUR_SECS: i64 = 5 * 3_600;
+const SEVEN_DAY_SECS: i64 = 7 * 86_400;
 
 fn statusline_usage_log_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".rtrt").join("statusline-usage.tsv"))
+}
+
+/// Average-rate exhaustion ETA: assume the current percentage accrued evenly
+/// since the window opened (`resets_at - window_secs`) and project the rest at
+/// that average rate. This is the always-available fallback when there is no
+/// recent burn-rate sample yet. `None` at 0% (nothing to project) or without a
+/// reset time to anchor the window.
+fn average_rate_eta(now: i64, pct: u64, resets_at: Option<&str>, window_secs: i64) -> Option<i64> {
+    if pct == 0 {
+        return None;
+    }
+    let reset = resets_at.and_then(rfc3339_to_epoch)?;
+    let elapsed = now - (reset - window_secs);
+    if elapsed <= 0 {
+        return None;
+    }
+    let rate = pct as f64 / elapsed as f64;
+    if rate <= 0.0 {
+        return None;
+    }
+    let remaining = (100.0 - pct as f64).max(0.0);
+    Some((remaining / rate) as i64)
 }
 
 /// Append the current 5h / weekly percentages to a small rolling log and

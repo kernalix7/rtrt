@@ -847,6 +847,12 @@ struct SetLevelRequest {
 struct ProjectQuery {
     #[serde(default)]
     project: Option<String>,
+    /// Optional scope hint for project-aware writes. The statusline POST honours
+    /// `scope=global` (a.k.a. "Follow global") to CLEAR a project's own override
+    /// so it inherits the global config again. Absent/`custom` writes the
+    /// per-project override as before. Other endpoints ignore this field.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Resolve a `?project=` selector to an on-disk repo path.
@@ -4536,6 +4542,22 @@ struct StatuslineOk {
     ok: bool,
 }
 
+/// GET response wrapping the effective statusline config plus a scope marker so
+/// the UI can render the "Follow global / Custom (this project)" toggle.
+///
+/// `#[serde(flatten)]` keeps the config fields at the top level (back-compat
+/// with the existing UI reads) while adding:
+/// - `scope`: `"custom"` when THIS project carries its own override, else
+///   `"global"` (inherits the global config — the default).
+/// - `custom`: the same as a boolean for convenience.
+#[derive(Debug, Serialize)]
+struct StatuslineConfigResponse {
+    #[serde(flatten)]
+    config: StatuslineConfig,
+    scope: &'static str,
+    custom: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct StatuslinePreview {
     lines: Vec<String>,
@@ -4559,10 +4581,10 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Jso
 
 async fn get_statusline_config(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
-) -> DashboardJsonResult<StatuslineConfig> {
+) -> DashboardJsonResult<StatuslineConfigResponse> {
     // Per-project override wins: when the project carries its own `statusline`
-    // value in `<repo>/.rtrt/config.toml`, return it; otherwise fall through to
-    // the global statusline config (inherit).
+    // value in `<repo>/.rtrt/config.toml`, return it ("Custom" scope); otherwise
+    // fall through to the global statusline config ("Follow global" — inherit).
     if let Some(repo) = resolve_project_repo(q.project.as_deref()) {
         let project = rtrt_core::Config::load_project(&repo).map_err(|e| {
             api_error(
@@ -4580,17 +4602,34 @@ async fn get_statusline_config(
                     ),
                 )
             })?;
-            return Ok(Json(upgrade_legacy_statusline_config(cfg)));
+            return Ok(Json(StatuslineConfigResponse {
+                config: upgrade_legacy_statusline_config(cfg),
+                scope: "custom",
+                custom: true,
+            }));
         }
-        // no project override — inherit the global config below
+        // no project override — inherit the global config below ("Follow global")
     }
 
+    // Global scope, or a project that follows global: serve the effective
+    // (global) config and report `global` scope.
+    let config = read_global_statusline_config().await?;
+    Ok(Json(StatuslineConfigResponse {
+        config,
+        scope: "global",
+        custom: false,
+    }))
+}
+
+/// Read and normalise the global statusline config from `~/.rtrt/config.toml`.
+async fn read_global_statusline_config()
+-> std::result::Result<StatuslineConfig, (StatusCode, Json<ApiError>)> {
     let path = statusline_config_path()?;
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
             let root = parse_config_toml(&content, &path)?;
             let Some(statusline) = root.get("statusline") else {
-                return Ok(Json(StatuslineConfig::default()));
+                return Ok(StatuslineConfig::default());
             };
             let cfg = statusline.clone().try_into().map_err(|e| {
                 api_error(
@@ -4598,9 +4637,9 @@ async fn get_statusline_config(
                     format!("parse [statusline] in {}: {e}", path.display()),
                 )
             })?;
-            Ok(Json(upgrade_legacy_statusline_config(cfg)))
+            Ok(upgrade_legacy_statusline_config(cfg))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(StatuslineConfig::default())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StatuslineConfig::default()),
         Err(e) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("read {}: {e}", path.display()),
@@ -4626,7 +4665,13 @@ async fn post_statusline_config(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     Json(req): Json<StatuslineConfig>,
 ) -> DashboardJsonResult<StatuslineOk> {
-    validate_statusline_segments(&req.enabled_segments)?;
+    // "Follow global" action: `?scope=global` CLEARS this project's statusline
+    // override so it inherits the global config again. Only meaningful for a
+    // resolved project; ignored for the global scope (there is nothing to clear).
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
 
     // Per-project override: persist the serialized statusline config into the
     // project's `<repo>/.rtrt/config.toml` (`ProjectConfig.statusline`) instead
@@ -4638,6 +4683,19 @@ async fn post_statusline_config(
                 format!("load project config {}: {e}", repo.display()),
             )
         })?;
+        if follow_global {
+            // Clear the override. `save_project` removes the file when the
+            // ProjectConfig becomes empty, so the project falls back to global.
+            project.statusline = None;
+            rtrt_core::Config::save_project(&repo, &project).map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("write project config {}: {e}", repo.display()),
+                )
+            })?;
+            return Ok(Json(StatuslineOk { ok: true }));
+        }
+        validate_statusline_segments(&req.enabled_segments)?;
         let statusline_value = toml::Value::try_from(&req).map_err(|e| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4653,6 +4711,8 @@ async fn post_statusline_config(
         })?;
         return Ok(Json(StatuslineOk { ok: true }));
     }
+
+    validate_statusline_segments(&req.enabled_segments)?;
 
     let path = statusline_config_path()?;
     let mut root = match tokio::fs::read_to_string(&path).await {

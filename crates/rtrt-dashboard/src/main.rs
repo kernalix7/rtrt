@@ -879,27 +879,88 @@ async fn get_optimizer_level(
 ) -> impl IntoResponse {
     let repo = resolve_project_repo(q.project.as_deref());
     let level = read_output_style_level_for(repo.as_deref());
-    let scope = if repo.is_some() { "project" } else { "global" };
-    // `inherited` is true when a project scope falls back to the global value
-    // because the project has no `output_level` of its own.
-    let inherited = match &repo {
+    // `custom` is true when THIS project carries its own `output_level` override
+    // in `<repo>/.rtrt/config.toml`; otherwise it inherits the global level.
+    // `scope`/`custom`/`inherited` mirror the statusline endpoint so the UI's
+    // "Follow global / Custom (this project)" helper can be shared between them.
+    let custom = match &repo {
         Some(path) => rtrt_core::Config::load_project(path)
-            .map(|p| p.output_level.is_none())
-            .unwrap_or(true),
+            .map(|p| p.output_level.is_some())
+            .unwrap_or(false),
         None => false,
     };
+    let scope = if custom { "custom" } else { "global" };
     Json(serde_json::json!({
         "level": level.as_str(),
         "active": level.is_active(),
         "scope": scope,
-        "inherited": inherited,
+        "custom": custom,
+        // `inherited` is the inverse of `custom` for a project scope; always
+        // false for the global scope (there is nothing to inherit from).
+        "inherited": repo.is_some() && !custom,
     }))
 }
 
 async fn post_optimizer_level(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
-    Json(body): Json<SetLevelRequest>,
+    // Optional: the "Follow global" clear path (`?scope=global`) carries no body,
+    // so a missing/empty JSON payload must be tolerated. A level write supplies it.
+    body: Option<Json<SetLevelRequest>>,
 ) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+
+    // "Follow global" action: `?scope=global` CLEARS this project's
+    // `output_level` override so it inherits the global level again. Only
+    // meaningful for a resolved project; ignored for the global scope.
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+    if follow_global {
+        if let Some(path) = repo.as_deref() {
+            // Clear only the output_level field; load → set None → save_project.
+            // `save_project` re-serializes the whole ProjectConfig, so a
+            // coexisting `[statusline]` override is preserved (and the file is
+            // removed only when the ProjectConfig becomes entirely empty).
+            let mut project = match rtrt_core::Config::load_project(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
+            project.output_level = None;
+            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+            let level = read_output_style_level_for(repo.as_deref());
+            return Json(serde_json::json!({
+                "level": level.as_str(),
+                "active": level.is_active(),
+                "scope": "global",
+                "custom": false,
+                "inherited": true,
+            }))
+            .into_response();
+        }
+        // No project to clear in the global scope — fall through to a normal
+        // write below, which keeps the existing global-level behaviour.
+    }
+
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing level" })),
+        )
+            .into_response();
+    };
     let Some(level) = OutputStyleLevel::parse(&body.level) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -907,7 +968,6 @@ async fn post_optimizer_level(
         )
             .into_response();
     };
-    let repo = resolve_project_repo(q.project.as_deref());
     if let Err(e) = write_output_style_level_for(repo.as_deref(), level) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -915,12 +975,14 @@ async fn post_optimizer_level(
         )
             .into_response();
     }
-    let scope = if repo.is_some() { "project" } else { "global" };
-    // After a project write the value is the project's own, so never inherited.
+    // A project write persists the project's own override (Custom scope);
+    // the global write edits the global level (no inheritance).
+    let custom = repo.is_some();
     Json(serde_json::json!({
         "level": level.as_str(),
         "active": level.is_active(),
-        "scope": scope,
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
         "inherited": false,
     }))
     .into_response()

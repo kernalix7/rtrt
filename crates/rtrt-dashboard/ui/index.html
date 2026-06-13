@@ -1032,7 +1032,21 @@
         </div>
       </div>
       <div class="card">
-        <div class="head"><h2>Text Compression</h2><span class="hint">Default full-level rule engine</span></div>
+        <div class="head"><h2>Text Compression</h2><span class="hint" id="optimizer-level-config-hint">~/.rtrt/output-style</span></div>
+        <div class="settings-section" id="optimizer-scope-section" hidden>
+          <h3>Scope</h3>
+          <div class="scope-toggle" role="radiogroup" aria-label="Output Optimizer level scope">
+            <label class="segment-toggle">
+              <input type="radio" name="optimizer-scope" id="optimizer-scope-global" value="global" checked>
+              <span>Follow global</span>
+            </label>
+            <label class="segment-toggle">
+              <input type="radio" name="optimizer-scope" id="optimizer-scope-custom" value="custom">
+              <span>Custom (this project)</span>
+            </label>
+          </div>
+          <small class="placeholder-hint" id="optimizer-scope-hint">Follow global: this project inherits the global terse level. The level below shows the inherited value (read-only).</small>
+        </div>
         <div class="optimizer-level-panel">
           <div class="optimizer-level-copy">
             <span class="label">Terse mode</span>
@@ -2552,6 +2566,8 @@ function refreshProjectScopePage() {
   if (page === 'diagnose') refreshDiagnoseScope();
   // Statusline reads/writes a per-project override, so reload it on project change.
   if (page === 'statusline') loadStatuslinePage();
+  // The Output Optimizer level is also a per-project override, so reload it too.
+  if (page === 'compress') loadOptimizerLevel();
 }
 function setCompressEngine(engine, level) {
   if (!engine) return;
@@ -5299,15 +5315,65 @@ document.getElementById('compress-mode').addEventListener('change', function () 
 function renderOptimizerLevel(level, active) {
   const normalized = normalizedOptimizerLevel(level);
   const enabled = isOptimizerActive(normalized, active);
+  // In "Follow global" mode for a project the level is read-only (inherited),
+  // so keep the buttons disabled; otherwise they are editable.
+  const editable = !optimizerLevelLocked();
   document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.level === normalized);
-    btn.disabled = false;
+    btn.disabled = !editable;
   });
   const status = document.getElementById('optimizer-level-status');
   if (status) {
     status.classList.toggle('ok', enabled);
     status.classList.toggle('inactive', !enabled);
     status.textContent = enabled ? `Terse mode: ${normalized.toUpperCase()} (active)` : 'OFF';
+  }
+}
+
+// Build the `?project=` query for the optimizer level GET/POST so the
+// per-project override in <repo>/.rtrt/config.toml is read/written. Global
+// scope (or no project) sends no project, so the global level is used (inherit).
+function optimizerProjectQuery() {
+  const project = currentProject();
+  if (!project || isGlobalProjectValue(project)) return '';
+  return `?project=${encodeURIComponent(project)}`;
+}
+
+// True when a specific (non-global) project is selected. The Scope toggle and
+// the "Follow global / Custom" behaviour only apply in that case.
+function optimizerHasProject() {
+  const project = currentProject();
+  return !!project && !isGlobalProjectValue(project);
+}
+
+// True when the level buttons should be locked read-only: a project selected
+// and currently following global (the inherited value is shown, not editable).
+function optimizerLevelLocked() {
+  return optimizerHasProject() && document.getElementById('optimizer-scope-global').checked;
+}
+
+// Reflect the resolved scope in the UI: show/hide the Scope section, set the
+// radios, and update the source hint. The button disabled-state is applied by
+// renderOptimizerLevel (which reads optimizerLevelLocked).
+function applyOptimizerScope(scope) {
+  const section = document.getElementById('optimizer-scope-section');
+  const hint = document.getElementById('optimizer-scope-hint');
+  const cfgHint = document.getElementById('optimizer-level-config-hint');
+  if (!optimizerHasProject()) {
+    // Global scope (or no project): no per-project toggle — edit global default.
+    section.hidden = true;
+    if (cfgHint) cfgHint.textContent = '~/.rtrt/output-style';
+    return;
+  }
+  section.hidden = false;
+  const custom = scope === 'custom';
+  document.getElementById('optimizer-scope-global').checked = !custom;
+  document.getElementById('optimizer-scope-custom').checked = custom;
+  if (cfgHint) cfgHint.textContent = custom ? '<repo>/.rtrt/config.toml' : '~/.rtrt/output-style (inherited)';
+  if (hint) {
+    hint.textContent = custom
+      ? 'Custom: pick a level below to write this project’s override.'
+      : 'Follow global: this project inherits the global terse level. The level below shows the inherited value (read-only).';
   }
 }
 
@@ -5335,12 +5401,16 @@ async function loadOptimizerRuleSummary() {
 
 async function loadOptimizerLevel() {
   try {
-    const r = await fetch('/api/optimizer/level');
+    const r = await fetch(`/api/optimizer/level${optimizerProjectQuery()}`);
     if (r.ok) {
       const d = await r.json();
+      // `scope` is "custom" when this project owns an override, else "global".
+      applyOptimizerScope(d.scope === 'custom' ? 'custom' : 'global');
       renderOptimizerLevel(d.level || 'off', !!d.active);
     }
-  } catch (_) { /* keep current UI state */ }
+  } catch (_) {
+    applyOptimizerScope('global');
+  }
   await loadOptimizerRuleSummary();
 }
 
@@ -5349,7 +5419,7 @@ async function setOptimizerLevel(level) {
   const status = document.getElementById('optimizer-level-status');
   if (status) status.textContent = 'Saving…';
   try {
-    const r = await fetch('/api/optimizer/level', {
+    const r = await fetch(`/api/optimizer/level${optimizerProjectQuery()}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ level }),
@@ -5361,6 +5431,7 @@ async function setOptimizerLevel(level) {
       return;
     }
     const d = await r.json();
+    applyOptimizerScope(d.scope === 'custom' ? 'custom' : 'global');
     renderOptimizerLevel(d.level || level, !!d.active);
     await loadOptimizerRuleSummary();
     pushActivity(`terse mode · ${d.level || level}`);
@@ -5371,7 +5442,44 @@ async function setOptimizerLevel(level) {
 }
 
 document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => {
-  btn.onclick = () => setOptimizerLevel(btn.dataset.level || 'off');
+  btn.onclick = () => {
+    // While Following global for a project the level is read-only.
+    if (optimizerLevelLocked()) return;
+    setOptimizerLevel(btn.dataset.level || 'off');
+  };
+});
+
+// Scope radio handlers. Follow global clears the project override (server-side)
+// and reloads (buttons become disabled, showing the inherited global level).
+// Custom enables the buttons so the next click writes the project's override.
+document.getElementById('optimizer-scope-global').addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !optimizerHasProject()) return;
+  try {
+    const sep = optimizerProjectQuery() ? '&' : '?';
+    const r = await fetch(`/api/optimizer/level${optimizerProjectQuery()}${sep}scope=global`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: 'off' }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Optimizer level now follows global');
+    showToast('Following global terse level', 'ok');
+    await loadOptimizerLevel();
+  } catch (err) {
+    showToast(`Scope error: ${err.message || err}`, 'err');
+    // Revert the radio on failure.
+    applyOptimizerScope('custom');
+    renderOptimizerLevel(normalizedOptimizerLevel('off'), false);
+  }
+});
+
+document.getElementById('optimizer-scope-custom').addEventListener('change', (ev) => {
+  if (!ev.target.checked || !optimizerHasProject()) return;
+  // Enable the buttons (keep the inherited level shown); nothing is persisted
+  // until the user picks a level, which writes this project's override.
+  applyOptimizerScope('custom');
+  document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => { btn.disabled = false; });
 });
 
 // Tools — compress

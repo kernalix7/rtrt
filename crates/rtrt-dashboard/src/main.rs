@@ -4469,17 +4469,17 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
 // ---------------------------------------------------------------------------
 
 const STATUSLINE_SEGMENTS: &[&str] = &[
-    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "agents", "codex",
+    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "agents",
     "savings",
 ];
 const LEGACY_STATUSLINE_SEGMENTS: &[&str] = &[
     "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",
 ];
 const STATUSLINE_DEFAULT_FORMAT: &str =
-    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model}";
+    "{project} [{branch}] {wip} {sess} {ctx} {cache} {opt} {model} {agents}";
 const LEGACY_STATUSLINE_FORMAT: &str = "{project} [{branch}] {wip} {sess} {ctx} {cache} {model}";
 const STATUSLINE_DEFAULT_LINE2_FORMAT: &str = "{usage}";
-const STATUSLINE_DEFAULT_LINE3_FORMAT: &str = "{codex} | {savings}";
+const STATUSLINE_DEFAULT_LINE3_FORMAT: &str = "{savings}";
 const STATUSLINE_DEFAULT_CODEX_TIMEOUT_MS: u64 = 200;
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -5411,26 +5411,120 @@ fn session_count_today(session_id: Option<&str>, transcript_path: Option<&Path>)
 /// Claude Code supplies in the status-line payload. Returns `None` when neither
 /// window is present (so the segment is hidden rather than showing `n/a`).
 fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
+    if input.five_hour_pct.is_none() && input.seven_day_pct.is_none() {
+        return None;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs() as i64);
-    let window = |pct: Option<u64>, resets_at: Option<&str>| -> Option<String> {
+    // ∅ = projected time to exhaustion at the recent burn rate.
+    let (five_eta, seven_eta) = match now {
+        Some(now) => usage_burn_etas(now, input.five_hour_pct, input.seven_day_pct),
+        None => (None, None),
+    };
+    let window = |pct: Option<u64>, resets_at: Option<&str>, eta: Option<i64>| -> Option<String> {
         let pct = pct?;
         let reset = match (now, resets_at.and_then(rfc3339_to_epoch)) {
             (Some(now), Some(reset)) => format!(" ↻{}", humanize_remaining(reset - now)),
             _ => String::new(),
         };
-        Some(format!("{pct}%{reset}"))
+        let burn = eta
+            .map(|secs| format!(" ∅{}", humanize_remaining(secs)))
+            .unwrap_or_default();
+        Some(format!("{pct}%{reset}{burn}"))
     };
-    let five = window(input.five_hour_pct, input.five_hour_resets_at.as_deref());
-    let seven = window(input.seven_day_pct, input.seven_day_resets_at.as_deref());
+    let five = window(
+        input.five_hour_pct,
+        input.five_hour_resets_at.as_deref(),
+        five_eta,
+    );
+    let seven = window(
+        input.seven_day_pct,
+        input.seven_day_resets_at.as_deref(),
+        seven_eta,
+    );
     if five.is_none() && seven.is_none() {
         return None;
     }
     let five = five.unwrap_or_else(|| "—".to_string());
     let seven = seven.unwrap_or_else(|| "—".to_string());
     Some(format!("5h:{five} | wk:{seven}"))
+}
+
+const STATUSLINE_USAGE_LOG_CAP: usize = 4000;
+
+fn statusline_usage_log_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".rtrt").join("statusline-usage.tsv"))
+}
+
+/// Append the current 5h / weekly percentages to a small rolling log and
+/// project, from the recent burn rate, how long until each window reaches
+/// 100%. Returns `(five_hour_eta_secs, seven_day_eta_secs)`; `None` for a
+/// window whose usage is flat/falling or lacks enough history.
+fn usage_burn_etas(
+    now: i64,
+    five_pct: Option<u64>,
+    seven_pct: Option<u64>,
+) -> (Option<i64>, Option<i64>) {
+    let Some(path) = statusline_usage_log_path() else {
+        return (None, None);
+    };
+    let mut rows: Vec<(i64, f64, f64)> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for line in content.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split('\t');
+            if let (Some(ts), Some(a), Some(b)) = (fields.next(), fields.next(), fields.next())
+                && let (Ok(ts), Ok(a), Ok(b)) =
+                    (ts.parse::<i64>(), a.parse::<f64>(), b.parse::<f64>())
+            {
+                rows.push((ts, a, b));
+            }
+        }
+    }
+    // Append the current sample (-1 marks an absent window).
+    let cur = |p: Option<u64>| p.map(|v| v as f64).unwrap_or(-1.0);
+    rows.push((now, cur(five_pct), cur(seven_pct)));
+    if rows.len() > STATUSLINE_USAGE_LOG_CAP {
+        let drop = rows.len() - STATUSLINE_USAGE_LOG_CAP;
+        rows.drain(0..drop);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut out = String::from("# epoch\tfive_pct\tseven_pct\n");
+    for (ts, a, b) in &rows {
+        out.push_str(&format!("{ts}\t{a}\t{b}\n"));
+    }
+    let _ = std::fs::write(&path, out);
+
+    let eta = |cur_pct: Option<u64>, idx: usize| -> Option<i64> {
+        let cur_pct = cur_pct? as f64;
+        let val = |r: &(i64, f64, f64)| if idx == 0 { r.1 } else { r.2 };
+        let window_start = now - 1_800; // 30 min look-back
+        // Earliest in-window sample with a lower percentage (usage rose); fall
+        // back to the earliest lower sample anywhere in the log.
+        let base = rows
+            .iter()
+            .find(|r| r.0 >= window_start && val(r) >= 0.0 && val(r) < cur_pct)
+            .or_else(|| rows.iter().find(|r| val(r) >= 0.0 && val(r) < cur_pct))
+            .copied()?;
+        let dt = now - base.0;
+        let dpct = cur_pct - val(&base);
+        if dt < 30 || dpct <= 0.0 {
+            return None;
+        }
+        let rate_per_sec = dpct / dt as f64;
+        if rate_per_sec <= 0.0 {
+            return None;
+        }
+        let remaining = (100.0 - cur_pct).max(0.0);
+        Some((remaining / rate_per_sec) as i64)
+    };
+    (eta(five_pct, 0), eta(seven_pct, 1))
 }
 
 fn agents_segment(timeout_ms: u64, width_budget: usize) -> String {

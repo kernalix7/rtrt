@@ -1299,6 +1299,25 @@ impl MemoryStore {
         self.count_by_project_filtered(project, None)
     }
 
+    /// Storage efficiency for a project: `(original_chars, stored_chars)` summed
+    /// over its rows, where `original` is the pre-store content (`body_full`
+    /// when retained, else `body`) and `stored` is what Memory actually keeps
+    /// (`body`). The difference is what Memory trimmed/redacted/deduped on the
+    /// way in — a measured reduction, not an estimate.
+    pub fn storage_reduction(&self, project: &str) -> Result<(u64, u64)> {
+        let (original, stored): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(COALESCE(body_full, body))), 0), \
+                        COALESCE(SUM(LENGTH(body)), 0) \
+                   FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok((original.max(0) as u64, stored.max(0) as u64))
+    }
+
     /// [`count_by_project`] optionally restricted by `metadata.source_kind`, so
     /// the paged total matches a source-filtered timeline.
     pub fn count_by_project_filtered(

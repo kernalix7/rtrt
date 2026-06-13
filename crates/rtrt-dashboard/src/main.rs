@@ -388,6 +388,18 @@ async fn main() -> Result<()> {
             "/api/optimizer/level",
             get(get_optimizer_level).post(post_optimizer_level),
         )
+        .route(
+            "/api/compression/config",
+            get(get_compression_config).post(post_compression_config),
+        )
+        .route(
+            "/api/providers/config",
+            get(get_providers_config).post(post_providers_config),
+        )
+        .route(
+            "/api/agents/config",
+            get(get_agents_config).post(post_agents_config),
+        )
         .route("/api/templates", get(list_templates).post(create_template))
         .route(
             "/api/templates/{name}",
@@ -983,6 +995,463 @@ async fn post_optimizer_level(
         "active": level.is_active(),
         "scope": if custom { "custom" } else { "global" },
         "custom": custom,
+        "inherited": false,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/compression/config
+//
+// The `rtrt compress` default compression level (off | lite | full | ultra |
+// extreme) + enabled flag, distinct from the terse Output-Optimizer level.
+// `off` is represented by `enabled = false`; the underlying [compression]
+// section keeps `level` so a re-enable restores the chosen level. Project-aware
+// and mirrors the optimizer-level scope contract exactly.
+// ---------------------------------------------------------------------------
+
+/// Map a `CompressionConfig` to the UI's level string. `off` is the
+/// "disabled" pseudo-level so the four-button UX matches the optimizer level.
+fn compression_level_label(c: &rtrt_core::config::CompressionConfig) -> &'static str {
+    if !c.enabled {
+        return "off";
+    }
+    match c.level {
+        rtrt_core::CompressionLevel::Lite => "lite",
+        rtrt_core::CompressionLevel::Full => "full",
+        rtrt_core::CompressionLevel::Ultra => "ultra",
+        rtrt_core::CompressionLevel::Extreme => "extreme",
+    }
+}
+
+/// Parse a UI level string into a `CompressionConfig`. `off` disables
+/// compression while keeping a sensible default level for a later re-enable.
+fn parse_compression_level(value: &str) -> Option<rtrt_core::config::CompressionConfig> {
+    let (enabled, level) = match value.trim().to_ascii_lowercase().as_str() {
+        "off" => (false, rtrt_core::CompressionLevel::default()),
+        "lite" => (true, rtrt_core::CompressionLevel::Lite),
+        "full" => (true, rtrt_core::CompressionLevel::Full),
+        "ultra" => (true, rtrt_core::CompressionLevel::Ultra),
+        "extreme" => (true, rtrt_core::CompressionLevel::Extreme),
+        _ => return None,
+    };
+    Some(rtrt_core::config::CompressionConfig { level, enabled })
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCompressionRequest {
+    level: String,
+}
+
+async fn get_compression_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    // `custom` is true when THIS project carries its own `compression` override.
+    let custom = match &repo {
+        Some(path) => rtrt_core::Config::load_project(path)
+            .map(|p| p.compression.is_some())
+            .unwrap_or(false),
+        None => false,
+    };
+    // Effective compression: global, overlaid with the project override when set.
+    let cfg = rtrt_core::Config::load_effective(repo.as_deref()).unwrap_or_default();
+    let label = compression_level_label(&cfg.compression);
+    Json(serde_json::json!({
+        "level": label,
+        "enabled": cfg.compression.enabled,
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
+        "inherited": repo.is_some() && !custom,
+    }))
+}
+
+async fn post_compression_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    body: Option<Json<SetCompressionRequest>>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+
+    // "Follow global" action: CLEAR this project's `compression` override only,
+    // preserving any coexisting overrides (statusline / output_level / providers
+    // / agents) in the same `<repo>/.rtrt/config.toml`.
+    if follow_global {
+        if let Some(path) = repo.as_deref() {
+            let mut project = match rtrt_core::Config::load_project(path) {
+                Ok(p) => p,
+                Err(e) => return clear_field_error(e),
+            };
+            project.compression = None;
+            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+                return clear_field_error(e);
+            }
+            let cfg = rtrt_core::Config::load_effective(Some(path)).unwrap_or_default();
+            return Json(serde_json::json!({
+                "level": compression_level_label(&cfg.compression),
+                "enabled": cfg.compression.enabled,
+                "scope": "global",
+                "custom": false,
+                "inherited": true,
+            }))
+            .into_response();
+        }
+        // No project to clear — fall through to a normal (global) write.
+    }
+
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing level" })),
+        )
+            .into_response();
+    };
+    let Some(compression) = parse_compression_level(&body.level) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown level" })),
+        )
+            .into_response();
+    };
+
+    if let Some(path) = repo.as_deref() {
+        // Per-project override.
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.compression = Some(compression.clone());
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        return Json(serde_json::json!({
+            "level": compression_level_label(&compression),
+            "enabled": compression.enabled,
+            "scope": "custom",
+            "custom": true,
+            "inherited": false,
+        }))
+        .into_response();
+    }
+
+    // Global write.
+    let mut cfg = match rtrt_core::Config::load() {
+        Ok(c) => c,
+        Err(e) => return clear_field_error(e),
+    };
+    cfg.compression = compression.clone();
+    if let Err((status, msg)) = write_config_file(&cfg) {
+        return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+    Json(serde_json::json!({
+        "level": compression_level_label(&compression),
+        "enabled": compression.enabled,
+        "scope": "global",
+        "custom": false,
+        "inherited": false,
+    }))
+    .into_response()
+}
+
+/// Shared error reply for the project-aware config handlers.
+fn clear_field_error(e: rtrt_core::Error) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/providers/config
+//
+// Per-project active-provider + enabled overlay (`ProjectConfig.providers`).
+// GET reports the effective active provider + each detected provider's enabled
+// state (global, overlaid with the project override). POST writes the project
+// override; `?scope=global` clears it (preserving coexisting overrides).
+// ---------------------------------------------------------------------------
+
+/// Effective provider list (detected ProviderApi tools) with enabled state
+/// resolved against the effective config (global ⊕ project override).
+fn effective_provider_tools(
+    repo: Option<&std::path::Path>,
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let cfg = rtrt_core::Config::load_effective(repo).unwrap_or_default();
+    let tools = rtrt_core::detect_tools();
+    let providers: Vec<serde_json::Value> = tools
+        .iter()
+        .filter(|t| matches!(t.kind, rtrt_core::ToolKind::ProviderApi))
+        .map(|t| {
+            let enabled = cfg.providers.enabled_override(&t.name).unwrap_or(t.enabled);
+            serde_json::json!({
+                "name": t.name,
+                "enabled": enabled,
+                "installed": t.installed,
+                "has_api_key": provider_api_key_present(t),
+            })
+        })
+        .collect();
+    (cfg.providers.active.clone(), providers)
+}
+
+#[derive(Debug, Deserialize)]
+struct SetProvidersRequest {
+    /// Active provider name; empty/absent leaves the active provider unset.
+    #[serde(default)]
+    active: Option<String>,
+    /// Per-provider enable map to persist for the project override.
+    #[serde(default)]
+    enabled: std::collections::BTreeMap<String, bool>,
+}
+
+async fn get_providers_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let custom = match &repo {
+        Some(path) => rtrt_core::Config::load_project(path)
+            .map(|p| p.providers.is_some())
+            .unwrap_or(false),
+        None => false,
+    };
+    let (active, providers) = effective_provider_tools(repo.as_deref());
+    Json(serde_json::json!({
+        "active": active,
+        "providers": providers,
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
+        "inherited": repo.is_some() && !custom,
+    }))
+}
+
+async fn post_providers_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    body: Option<Json<SetProvidersRequest>>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+
+    if follow_global {
+        if let Some(path) = repo.as_deref() {
+            let mut project = match rtrt_core::Config::load_project(path) {
+                Ok(p) => p,
+                Err(e) => return clear_field_error(e),
+            };
+            project.providers = None;
+            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+                return clear_field_error(e);
+            }
+            let (active, providers) = effective_provider_tools(Some(path));
+            return Json(serde_json::json!({
+                "active": active,
+                "providers": providers,
+                "scope": "global",
+                "custom": false,
+                "inherited": true,
+            }))
+            .into_response();
+        }
+    }
+
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing body" })),
+        )
+            .into_response();
+    };
+    let active = body
+        .active
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let providers_cfg = rtrt_core::config::ProvidersConfig {
+        active,
+        enabled: body.enabled.clone(),
+    };
+
+    if let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.providers = Some(providers_cfg);
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        let (active, providers) = effective_provider_tools(Some(path));
+        return Json(serde_json::json!({
+            "active": active,
+            "providers": providers,
+            "scope": "custom",
+            "custom": true,
+            "inherited": false,
+        }))
+        .into_response();
+    }
+
+    // Global write.
+    let mut cfg = match rtrt_core::Config::load() {
+        Ok(c) => c,
+        Err(e) => return clear_field_error(e),
+    };
+    cfg.providers = providers_cfg;
+    if let Err((status, msg)) = write_config_file(&cfg) {
+        return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+    let (active, providers) = effective_provider_tools(None);
+    Json(serde_json::json!({
+        "active": active,
+        "providers": providers,
+        "scope": "global",
+        "custom": false,
+        "inherited": false,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/agents/config
+//
+// Per-project agent enable/disable overlay (`ProjectConfig.agents`). "Agents"
+// here are the detected coding-agent / local-runtime / MCP-server tools (every
+// detected tool that is NOT a provider API). GET reports each agent's effective
+// enabled state; POST writes the project override; `?scope=global` clears it.
+// ---------------------------------------------------------------------------
+
+fn agent_kind_label(kind: rtrt_core::ToolKind) -> &'static str {
+    match kind {
+        rtrt_core::ToolKind::CodingAgent => "agent",
+        rtrt_core::ToolKind::LocalRuntime => "runtime",
+        rtrt_core::ToolKind::McpServer => "mcp",
+        rtrt_core::ToolKind::ProviderApi => "provider",
+    }
+}
+
+/// Effective agent list (detected non-provider tools) with enabled state
+/// resolved against the effective config (global ⊕ project override).
+fn effective_agent_tools(repo: Option<&std::path::Path>) -> Vec<serde_json::Value> {
+    let cfg = rtrt_core::Config::load_effective(repo).unwrap_or_default();
+    rtrt_core::detect_tools()
+        .iter()
+        .filter(|t| !matches!(t.kind, rtrt_core::ToolKind::ProviderApi))
+        .map(|t| {
+            let enabled = cfg.agents.enabled_override(&t.name).unwrap_or(t.enabled);
+            serde_json::json!({
+                "name": t.name,
+                "enabled": enabled,
+                "installed": t.installed,
+                "kind": agent_kind_label(t.kind),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct SetAgentsRequest {
+    /// Per-agent enable map to persist for the project override.
+    #[serde(default)]
+    enabled: std::collections::BTreeMap<String, bool>,
+}
+
+async fn get_agents_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let custom = match &repo {
+        Some(path) => rtrt_core::Config::load_project(path)
+            .map(|p| p.agents.is_some())
+            .unwrap_or(false),
+        None => false,
+    };
+    let agents = effective_agent_tools(repo.as_deref());
+    Json(serde_json::json!({
+        "agents": agents,
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
+        "inherited": repo.is_some() && !custom,
+    }))
+}
+
+async fn post_agents_config(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    body: Option<Json<SetAgentsRequest>>,
+) -> impl IntoResponse {
+    let repo = resolve_project_repo(q.project.as_deref());
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+
+    if follow_global {
+        if let Some(path) = repo.as_deref() {
+            let mut project = match rtrt_core::Config::load_project(path) {
+                Ok(p) => p,
+                Err(e) => return clear_field_error(e),
+            };
+            project.agents = None;
+            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+                return clear_field_error(e);
+            }
+            return Json(serde_json::json!({
+                "agents": effective_agent_tools(Some(path)),
+                "scope": "global",
+                "custom": false,
+                "inherited": true,
+            }))
+            .into_response();
+        }
+    }
+
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing body" })),
+        )
+            .into_response();
+    };
+    let agents_cfg = rtrt_core::config::AgentsConfig {
+        enabled: body.enabled.clone(),
+    };
+
+    if let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.agents = Some(agents_cfg);
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        return Json(serde_json::json!({
+            "agents": effective_agent_tools(Some(path)),
+            "scope": "custom",
+            "custom": true,
+            "inherited": false,
+        }))
+        .into_response();
+    }
+
+    // Global write.
+    let mut cfg = match rtrt_core::Config::load() {
+        Ok(c) => c,
+        Err(e) => return clear_field_error(e),
+    };
+    cfg.agents = agents_cfg;
+    if let Err((status, msg)) = write_config_file(&cfg) {
+        return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+    Json(serde_json::json!({
+        "agents": effective_agent_tools(None),
+        "scope": "global",
+        "custom": false,
         "inherited": false,
     }))
     .into_response()

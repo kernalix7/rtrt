@@ -680,6 +680,37 @@
         </div>
         <div id="environment-notes" class="out-meta"></div>
       </div>
+      <!-- Per-project agent enable/disable overlay -->
+      <div class="card">
+        <div class="head"><h2>Agents enable/disable</h2><span class="hint" id="agents-config-hint">~/.rtrt/config.toml</span></div>
+        <p class="lede">Coding agents, local runtimes, and MCP servers. Used by statusline / detect / route.</p>
+        <div class="settings-section" id="agents-scope-section" hidden>
+          <h3>Scope</h3>
+          <div class="scope-toggle" role="radiogroup" aria-label="Agents scope">
+            <label class="segment-toggle">
+              <input type="radio" name="agents-scope" id="agents-scope-global" value="global" checked>
+              <span>Follow global</span>
+            </label>
+            <label class="segment-toggle">
+              <input type="radio" name="agents-scope" id="agents-scope-custom" value="custom">
+              <span>Custom (this project)</span>
+            </label>
+          </div>
+          <small class="placeholder-hint" id="agents-scope-hint">Follow global: this project inherits the global agent settings. The toggles below show the inherited values (read-only).</small>
+        </div>
+        <div id="agents-fields">
+          <div class="env-table-wrap">
+            <table id="agents-tbl">
+              <thead><tr><th>Agent</th><th>Kind</th><th>Installed</th><th>Enabled</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+            </table>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.6rem;">
+            <button id="agents-save-btn" class="primary" type="button">Save</button>
+            <span id="agents-save-result" class="out-meta"></span>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="page-route" class="page" hidden>
@@ -1122,6 +1153,38 @@
             <div class="pane-label">Compressed result</div>
             <pre id="compress-output"></pre>
           </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Compression level</h2><span class="hint" id="compression-config-hint">~/.rtrt/config.toml</span></div>
+        <p class="lede">Default level for <code>rtrt compress</code> (the rule engine). Distinct from the terse Output Optimizer level above.</p>
+        <div class="settings-section" id="compression-scope-section" hidden>
+          <h3>Scope</h3>
+          <div class="scope-toggle" role="radiogroup" aria-label="Compression level scope">
+            <label class="segment-toggle">
+              <input type="radio" name="compression-scope" id="compression-scope-global" value="global" checked>
+              <span>Follow global</span>
+            </label>
+            <label class="segment-toggle">
+              <input type="radio" name="compression-scope" id="compression-scope-custom" value="custom">
+              <span>Custom (this project)</span>
+            </label>
+          </div>
+          <small class="placeholder-hint" id="compression-scope-hint">Follow global: this project inherits the global compression level. The level below shows the inherited value (read-only).</small>
+        </div>
+        <div class="optimizer-level-panel">
+          <div class="optimizer-level-copy">
+            <span class="label">Default level</span>
+            <span class="hint">off | lite | full | ultra | extreme</span>
+          </div>
+          <div class="optimizer-level-buttons" id="compression-level-buttons" aria-label="Compression level">
+            <button type="button" data-level="off">off</button>
+            <button type="button" data-level="lite">lite</button>
+            <button type="button" data-level="full">full</button>
+            <button type="button" data-level="ultra">ultra</button>
+            <button type="button" data-level="extreme">extreme</button>
+          </div>
+          <span id="compression-level-status" class="badge optimizer-level-status inactive">Compression: off</span>
         </div>
       </div>
     </section>
@@ -1636,6 +1699,41 @@
         <div class="section-title">
           <h1>Providers</h1>
           <div class="lede">Manage Ollama models · Pull · set default model</div>
+        </div>
+      </div>
+      <!-- Active provider + enabled overlay (used by rtrt route / call) -->
+      <div class="card">
+        <div class="head"><h2>Active provider &amp; enabled</h2><span class="hint" id="providers-config-hint">~/.rtrt/config.toml</span></div>
+        <p class="lede">Default provider and enable/disable set used by <code>rtrt route</code> / <code>call</code>.</p>
+        <div class="settings-section" id="providers-scope-section" hidden>
+          <h3>Scope</h3>
+          <div class="scope-toggle" role="radiogroup" aria-label="Providers scope">
+            <label class="segment-toggle">
+              <input type="radio" name="providers-scope" id="providers-scope-global" value="global" checked>
+              <span>Follow global</span>
+            </label>
+            <label class="segment-toggle">
+              <input type="radio" name="providers-scope" id="providers-scope-custom" value="custom">
+              <span>Custom (this project)</span>
+            </label>
+          </div>
+          <small class="placeholder-hint" id="providers-scope-hint">Follow global: this project inherits the global provider settings. The fields below show the inherited values (read-only).</small>
+        </div>
+        <div id="providers-fields">
+          <div class="ctrl-field">
+            <label for="providers-active">Active provider</label>
+            <select id="providers-active"><option value="">(none / auto)</option></select>
+          </div>
+          <div class="env-table-wrap" style="margin-top:0.6rem;">
+            <table id="providers-tbl">
+              <thead><tr><th>Provider</th><th>Installed</th><th>API key</th><th>Enabled</th></tr></thead>
+              <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+            </table>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.6rem;">
+            <button id="providers-save-btn" class="primary" type="button">Save</button>
+            <span id="providers-save-result" class="out-meta"></span>
+          </div>
         </div>
       </div>
       <!-- Pull -->
@@ -2567,7 +2665,10 @@ function refreshProjectScopePage() {
   // Statusline reads/writes a per-project override, so reload it on project change.
   if (page === 'statusline') loadStatuslinePage();
   // The Output Optimizer level is also a per-project override, so reload it too.
-  if (page === 'compress') loadOptimizerLevel();
+  if (page === 'compress') { loadOptimizerLevel(); loadCompressionLevel(); }
+  // Providers (active + enabled) and Agents enable/disable are per-project too.
+  if (page === 'llm') loadProvidersConfig();
+  if (page === 'environment') loadAgentsConfig();
 }
 function setCompressEngine(engine, level) {
   if (!engine) return;
@@ -2612,6 +2713,7 @@ function navigate(page, opts = {}) {
   if (page !== 'command') stopGainPolling();
   if (page === 'environment') {
     loadEnvironment();
+    loadAgentsConfig();
   }
   if (page === 'memory') {
     refreshMemoryScope();
@@ -2637,6 +2739,7 @@ function navigate(page, opts = {}) {
   }
   if (page === 'llm') {
     // Load both lists fresh each time the page is opened.
+    loadProvidersConfig();
     loadLlmModels();
     loadLlmPs();
   }
@@ -2649,6 +2752,7 @@ function navigate(page, opts = {}) {
   }
   if (page === 'compress') {
     loadOptimizerLevel();
+    loadCompressionLevel();
     setCompressEngine(opts.compressEngine, opts.compressLevel);
     if (opts.focus === 'level') focusOptimizerLevel();
     if (opts.focus === 'proxy') focusCommandProxy();
@@ -5480,6 +5584,407 @@ document.getElementById('optimizer-scope-custom').addEventListener('change', (ev
   // until the user picks a level, which writes this project's override.
   applyOptimizerScope('custom');
   document.querySelectorAll('#optimizer-level-buttons button').forEach(btn => { btn.disabled = false; });
+});
+
+// ===========================================================================
+// Shared per-project scope helpers (used by compression / providers / agents).
+// These mirror the statusline / optimizer-level "Follow global / Custom" UX so
+// all five settings behave identically. A specific (non-global) project must be
+// selected for the Scope toggle to appear; otherwise edits target the global
+// config (no inheritance).
+// ===========================================================================
+
+// True when a specific (non-global) project is selected.
+function scopeHasProject() {
+  const project = currentProject();
+  return !!project && !isGlobalProjectValue(project);
+}
+
+// `?project=<name>` query for a per-project read/write, or '' for global.
+function scopeProjectQuery() {
+  const project = currentProject();
+  if (!project || isGlobalProjectValue(project)) return '';
+  return `?project=${encodeURIComponent(project)}`;
+}
+
+// Append `scope=global` to a per-project (or global) URL, choosing the right
+// separator. Used by the "Follow global" clear path.
+function scopeClearUrl(base) {
+  const q = scopeProjectQuery();
+  const sep = q ? '&' : '?';
+  return `${base}${q}${sep}scope=global`;
+}
+
+// Reflect the resolved scope for a settings card: show/hide the Scope section,
+// set the radios, update the source hint, and dim the fields when following
+// global (read-only inherited values).
+function applyScopeToggle(key, scope, opts) {
+  const section = document.getElementById(`${key}-scope-section`);
+  const hint = document.getElementById(`${key}-scope-hint`);
+  const cfgHint = document.getElementById(`${key}-config-hint`);
+  const fields = document.getElementById(`${key}-fields`);
+  if (!scopeHasProject()) {
+    if (section) section.hidden = true;
+    if (cfgHint) cfgHint.textContent = '~/.rtrt/config.toml';
+    if (fields) fields.classList.remove('statusline-fields-disabled');
+    if (opts && opts.onLock) opts.onLock(false);
+    return;
+  }
+  if (section) section.hidden = false;
+  const custom = scope === 'custom';
+  const globalRadio = document.getElementById(`${key}-scope-global`);
+  const customRadio = document.getElementById(`${key}-scope-custom`);
+  if (globalRadio) globalRadio.checked = !custom;
+  if (customRadio) customRadio.checked = custom;
+  if (cfgHint) cfgHint.textContent = custom ? '<repo>/.rtrt/config.toml' : '~/.rtrt/config.toml (inherited)';
+  if (hint && opts && opts.hints) hint.textContent = custom ? opts.hints.custom : opts.hints.global;
+  if (fields) fields.classList.toggle('statusline-fields-disabled', !custom);
+  // Lock = following global → fields read-only.
+  if (opts && opts.onLock) opts.onLock(!custom);
+}
+
+// ===========================================================================
+// Compression level (rtrt compress default): off | lite | full | ultra |
+// extreme. Per-project via ProjectConfig.compression; mirrors the optimizer
+// level button UX exactly.
+// ===========================================================================
+
+function compressionLevelLocked() {
+  return scopeHasProject() && document.getElementById('compression-scope-global').checked;
+}
+
+function applyCompressionScope(scope) {
+  applyScopeToggle('compression', scope, {
+    hints: {
+      custom: 'Custom: pick a level below to write this project’s override.',
+      global: 'Follow global: this project inherits the global compression level. The level below shows the inherited value (read-only).',
+    },
+    onLock: (locked) => {
+      document.querySelectorAll('#compression-level-buttons button').forEach(btn => { btn.disabled = locked; });
+    },
+  });
+}
+
+function renderCompressionLevel(level) {
+  const normalized = (level || 'off').toLowerCase();
+  const enabled = normalized !== 'off';
+  const editable = !compressionLevelLocked();
+  document.querySelectorAll('#compression-level-buttons button').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.level === normalized);
+    btn.disabled = !editable;
+  });
+  const status = document.getElementById('compression-level-status');
+  if (status) {
+    status.classList.toggle('ok', enabled);
+    status.classList.toggle('inactive', !enabled);
+    status.textContent = enabled ? `Compression: ${normalized.toUpperCase()}` : 'Compression: off';
+  }
+}
+
+async function loadCompressionLevel() {
+  try {
+    const r = await fetch(`/api/compression/config${scopeProjectQuery()}`);
+    if (r.ok) {
+      const d = await r.json();
+      applyCompressionScope(d.scope === 'custom' ? 'custom' : 'global');
+      renderCompressionLevel(d.level || 'off');
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  applyCompressionScope('global');
+  renderCompressionLevel('off');
+}
+
+async function setCompressionLevel(level) {
+  document.querySelectorAll('#compression-level-buttons button').forEach(btn => { btn.disabled = true; });
+  const status = document.getElementById('compression-level-status');
+  if (status) status.textContent = 'Saving…';
+  try {
+    const r = await fetch(`/api/compression/config${scopeProjectQuery()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    applyCompressionScope(d.scope === 'custom' ? 'custom' : 'global');
+    renderCompressionLevel(d.level || level);
+    pushActivity(`compression · ${d.level || level}`);
+  } catch (e) {
+    showToast(`Compression save error: ${e.message || e}`, 'err');
+    await loadCompressionLevel();
+  }
+}
+
+document.querySelectorAll('#compression-level-buttons button').forEach(btn => {
+  btn.onclick = () => {
+    if (compressionLevelLocked()) return;
+    setCompressionLevel(btn.dataset.level || 'off');
+  };
+});
+
+document.getElementById('compression-scope-global').addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  try {
+    const r = await fetch(scopeClearUrl('/api/compression/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: 'off' }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Compression level now follows global');
+    showToast('Following global compression level', 'ok');
+    await loadCompressionLevel();
+  } catch (err) {
+    showToast(`Scope error: ${err.message || err}`, 'err');
+    applyCompressionScope('custom');
+    renderCompressionLevel('off');
+  }
+});
+
+document.getElementById('compression-scope-custom').addEventListener('change', (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  applyCompressionScope('custom');
+  document.querySelectorAll('#compression-level-buttons button').forEach(btn => { btn.disabled = false; });
+});
+
+// ===========================================================================
+// Providers (active provider + enabled overlay). Per-project via
+// ProjectConfig.providers. Form-based: an active <select> + an enable list +
+// a Save button (mirrors the statusline form's save-then-reload flow).
+// ===========================================================================
+
+let PROVIDERS_STATE = { active: null, providers: [] };
+
+function applyProvidersScope(scope) {
+  applyScopeToggle('providers', scope, {
+    hints: {
+      custom: 'Custom: edit the fields below, then Save to write this project’s override.',
+      global: 'Follow global: this project inherits the global provider settings. The fields below show the inherited values (read-only).',
+    },
+    onLock: (locked) => setProvidersFieldsDisabled(locked),
+  });
+}
+
+function setProvidersFieldsDisabled(disabled) {
+  const active = document.getElementById('providers-active');
+  if (active) active.disabled = disabled;
+  document.querySelectorAll('#providers-tbl input[type="checkbox"]').forEach(cb => { cb.disabled = disabled; });
+  const save = document.getElementById('providers-save-btn');
+  if (save) save.disabled = disabled;
+}
+
+function renderProviders(state) {
+  PROVIDERS_STATE = { active: state.active || null, providers: state.providers || [] };
+  const select = document.getElementById('providers-active');
+  if (select) {
+    const opts = ['<option value="">(none / auto)</option>']
+      .concat(PROVIDERS_STATE.providers.map(p =>
+        `<option value="${escapeHtml(p.name)}"${p.name === PROVIDERS_STATE.active ? ' selected' : ''}>${escapeHtml(p.name)}</option>`));
+    select.innerHTML = opts.join('');
+  }
+  const tbody = document.querySelector('#providers-tbl tbody');
+  if (tbody) {
+    if (!PROVIDERS_STATE.providers.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No provider APIs detected.</td></tr>';
+    } else {
+      tbody.innerHTML = PROVIDERS_STATE.providers.map(p => `
+        <tr>
+          <td>${escapeHtml(p.name)}</td>
+          <td>${p.installed ? 'yes' : 'no'}</td>
+          <td>${p.has_api_key ? 'set' : '—'}</td>
+          <td><input type="checkbox" class="providers-enable" data-name="${escapeHtml(p.name)}"${p.enabled ? ' checked' : ''}></td>
+        </tr>`).join('');
+    }
+  }
+}
+
+async function loadProvidersConfig() {
+  const result = document.getElementById('providers-save-result');
+  if (result) result.textContent = '';
+  try {
+    const r = await fetch(`/api/providers/config${scopeProjectQuery()}`);
+    if (r.ok) {
+      const d = await r.json();
+      renderProviders(d);
+      applyProvidersScope(d.scope === 'custom' ? 'custom' : 'global');
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  renderProviders({ active: null, providers: [] });
+  applyProvidersScope('global');
+}
+
+function readProvidersForm() {
+  const enabled = {};
+  document.querySelectorAll('#providers-tbl .providers-enable').forEach(cb => {
+    enabled[cb.dataset.name] = cb.checked;
+  });
+  const active = document.getElementById('providers-active').value || null;
+  return { active, enabled };
+}
+
+document.getElementById('providers-save-btn').addEventListener('click', async () => {
+  const result = document.getElementById('providers-save-result');
+  if (result) result.textContent = 'Saving…';
+  try {
+    const r = await fetch(`/api/providers/config${scopeProjectQuery()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readProvidersForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    renderProviders(d);
+    applyProvidersScope(d.scope === 'custom' ? 'custom' : 'global');
+    if (result) result.textContent = '';
+    showToast('Providers saved', 'ok');
+    pushActivity('Providers config saved');
+  } catch (err) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+  }
+});
+
+document.getElementById('providers-scope-global').addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  const result = document.getElementById('providers-save-result');
+  if (result) result.textContent = 'Switching to global…';
+  try {
+    const r = await fetch(scopeClearUrl('/api/providers/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readProvidersForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Providers now follow global');
+    showToast('Following global providers', 'ok');
+    await loadProvidersConfig();
+  } catch (err) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+    applyProvidersScope('custom');
+  }
+});
+
+document.getElementById('providers-scope-custom').addEventListener('change', (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  applyProvidersScope('custom');
+  const result = document.getElementById('providers-save-result');
+  if (result) result.textContent = 'Editing project override — click Save to apply.';
+});
+
+// ===========================================================================
+// Agents enable/disable (coding agents / runtimes / MCP servers). Per-project
+// via ProjectConfig.agents. Form-based enable list + Save (same flow).
+// ===========================================================================
+
+let AGENTS_STATE = [];
+
+function applyAgentsScope(scope) {
+  applyScopeToggle('agents', scope, {
+    hints: {
+      custom: 'Custom: edit the toggles below, then Save to write this project’s override.',
+      global: 'Follow global: this project inherits the global agent settings. The toggles below show the inherited values (read-only).',
+    },
+    onLock: (locked) => setAgentsFieldsDisabled(locked),
+  });
+}
+
+function setAgentsFieldsDisabled(disabled) {
+  document.querySelectorAll('#agents-tbl input[type="checkbox"]').forEach(cb => { cb.disabled = disabled; });
+  const save = document.getElementById('agents-save-btn');
+  if (save) save.disabled = disabled;
+}
+
+function renderAgents(agents) {
+  AGENTS_STATE = agents || [];
+  const tbody = document.querySelector('#agents-tbl tbody');
+  if (!tbody) return;
+  if (!AGENTS_STATE.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No agents detected.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = AGENTS_STATE.map(a => `
+    <tr>
+      <td>${escapeHtml(a.name)}</td>
+      <td>${escapeHtml(a.kind || '')}</td>
+      <td>${a.installed ? 'yes' : 'no'}</td>
+      <td><input type="checkbox" class="agents-enable" data-name="${escapeHtml(a.name)}"${a.enabled ? ' checked' : ''}></td>
+    </tr>`).join('');
+}
+
+async function loadAgentsConfig() {
+  const result = document.getElementById('agents-save-result');
+  if (result) result.textContent = '';
+  try {
+    const r = await fetch(`/api/agents/config${scopeProjectQuery()}`);
+    if (r.ok) {
+      const d = await r.json();
+      renderAgents(d.agents || []);
+      applyAgentsScope(d.scope === 'custom' ? 'custom' : 'global');
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  renderAgents([]);
+  applyAgentsScope('global');
+}
+
+function readAgentsForm() {
+  const enabled = {};
+  document.querySelectorAll('#agents-tbl .agents-enable').forEach(cb => {
+    enabled[cb.dataset.name] = cb.checked;
+  });
+  return { enabled };
+}
+
+document.getElementById('agents-save-btn').addEventListener('click', async () => {
+  const result = document.getElementById('agents-save-result');
+  if (result) result.textContent = 'Saving…';
+  try {
+    const r = await fetch(`/api/agents/config${scopeProjectQuery()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readAgentsForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    renderAgents(d.agents || []);
+    applyAgentsScope(d.scope === 'custom' ? 'custom' : 'global');
+    if (result) result.textContent = '';
+    showToast('Agents saved', 'ok');
+    pushActivity('Agents config saved');
+  } catch (err) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+  }
+});
+
+document.getElementById('agents-scope-global').addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  const result = document.getElementById('agents-save-result');
+  if (result) result.textContent = 'Switching to global…';
+  try {
+    const r = await fetch(scopeClearUrl('/api/agents/config'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readAgentsForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Agents now follow global');
+    showToast('Following global agents', 'ok');
+    await loadAgentsConfig();
+  } catch (err) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+    applyAgentsScope('custom');
+  }
+});
+
+document.getElementById('agents-scope-custom').addEventListener('change', (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  applyAgentsScope('custom');
+  const result = document.getElementById('agents-save-result');
+  if (result) result.textContent = 'Editing project override — click Save to apply.';
 });
 
 // Tools — compress

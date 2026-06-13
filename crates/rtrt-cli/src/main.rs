@@ -4794,7 +4794,7 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     let savings_project = rtrt_core::project_for_cwd(&cwd);
     segments.insert(
         "savings".to_string(),
-        statusline_savings_segment(&savings_project)
+        statusline_savings_segment(&savings_project, opt_level)
             .unwrap_or_else(|| format!("💯Σ:{}", total_savings_tokens())),
     );
 
@@ -5813,39 +5813,45 @@ fn savings_pct(saved: u64, original: u64) -> u64 {
 /// `📝opt:X% 🧠mem:N ⚡cmd:Y% 💯Σ:Z%` — Output Optimizer reduction, Memory
 /// saves, Command Optimizer reduction, and the overall reduction. Cached for
 /// [`SAVINGS_CACHE_TTL_SECS`] so the per-render cost stays negligible.
-fn statusline_savings_segment(project: &str) -> Option<String> {
+fn statusline_savings_segment(project: &str, opt_level: OutputStyleLevel) -> Option<String> {
     if let Some(cached) = read_savings_cache(project) {
         return Some(cached);
     }
-    let segment = compute_statusline_savings(project);
+    let segment = compute_statusline_savings(project, opt_level);
     if let Some(segment) = &segment {
         write_savings_cache(project, segment);
     }
     segment
 }
 
-fn compute_statusline_savings(project: &str) -> Option<String> {
+fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let (opt_saved, opt_original, mem_saves) = memory_savings_for_statusline(project);
+    // Output Optimizer: the measured compress reduction when present, otherwise
+    // the active terse level. Terse mode is prompt-injection (no before/after to
+    // measure), so its effect is shown as a level — never a fabricated percent.
     if opt_original > 0 {
         parts.push(format!("📝opt:{}%", savings_pct(opt_saved, opt_original)));
+    } else if opt_level.is_active() {
+        parts.push(format!("📝opt:{}", opt_level.as_str()));
     }
     if mem_saves > 0 {
         parts.push(format!("🧠mem:{}", compact_count(mem_saves as u64)));
     }
-    let (cmd_saved, cmd_input) = proxy_stats::load_summary(Some(project), None, false)
-        .ok()
-        .map(|summary| (summary.saved_chars, summary.input_chars))
-        .unwrap_or((0, 0));
+    // Command Optimizer: EFFECTIVE reduction over runs that actually filtered,
+    // excluding passthroughs (a bare grep, or a cat of an already-terse file)
+    // that otherwise dilute the rate toward zero.
+    let (cmd_saved, cmd_input) =
+        proxy_stats::load_effective_reduction(Some(project)).unwrap_or((0, 0));
     if cmd_input > 0 {
         parts.push(format!("⚡cmd:{}%", savings_pct(cmd_saved, cmd_input)));
     }
+    // Overall: blended reduction across the measured surfaces (compress + the
+    // effective Command Optimizer). Terse mode is excluded — it is unmeasured.
     let total_saved = opt_saved.saturating_add(cmd_saved);
     let total_original = opt_original.saturating_add(cmd_input);
     if total_original > 0 {
         parts.push(format!("💯Σ:{}%", savings_pct(total_saved, total_original)));
-    } else if !parts.is_empty() {
-        parts.push(format!("💯Σ:{}", total_savings_tokens()));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }

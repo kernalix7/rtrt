@@ -133,6 +133,35 @@ pub fn reset(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Effective reduction: sum of saved/input chars over runs that actually
+/// reduced output (`saved_chars > 0`), optionally scoped to a project. This
+/// excludes passthrough runs (filters that don't apply, e.g. a bare `grep` or a
+/// `cat` of an already-minimal file) which otherwise dilute the headline rate.
+/// Returns `(saved_chars, input_chars)`; `None` when there is no reduced run.
+pub fn load_effective_reduction(project: Option<&str>) -> Option<(u64, u64)> {
+    let path = default_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let (saved, input): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(saved_chars), 0), COALESCE(SUM(input_chars), 0)
+             FROM proxy_runs WHERE saved_chars > 0 AND (?1 IS NULL OR project = ?1)",
+            params![project],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    if input <= 0 {
+        return None;
+    }
+    Some((nonnegative_u64(saved), nonnegative_u64(input)))
+}
+
 pub fn load_summary(
     project: Option<&str>,
     bucket: Option<Bucket>,

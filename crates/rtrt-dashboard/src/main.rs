@@ -4469,7 +4469,8 @@ async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, 
 // ---------------------------------------------------------------------------
 
 const STATUSLINE_SEGMENTS: &[&str] = &[
-    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "codex", "savings",
+    "project", "branch", "wip", "sess", "ctx", "cache", "opt", "model", "usage", "agents", "codex",
+    "savings",
 ];
 const LEGACY_STATUSLINE_SEGMENTS: &[&str] = &[
     "project", "branch", "wip", "sess", "ctx", "cache", "model", "usage", "codex", "savings",

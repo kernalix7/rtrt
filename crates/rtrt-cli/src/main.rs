@@ -5833,8 +5833,9 @@ fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Opt
     if opt_level.is_active() {
         parts.push(format!("📝opt:{}", opt_level.as_str()));
     }
-    // Memory: storage reduction (what it trims/redacts/dedups before storing)
-    // plus recall reuse (recalled context reused instead of being re-derived).
+    // Memory: storage reduction — what it trims/redacts/dedups before storing.
+    // This is an internal storage efficiency, shown as its own pillar; it is
+    // NOT folded into Σ (Σ is agent-token savings, below).
     let (mem_saved, mem_base) = memory_savings_for_statusline(project);
     if mem_base > 0 {
         parts.push(format!("🧠mem:{}%", savings_pct(mem_saved, mem_base)));
@@ -5847,23 +5848,24 @@ fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Opt
     if cmd_input > 0 {
         parts.push(format!("⚡cmd:{}%", savings_pct(cmd_saved, cmd_input)));
     }
-    // Overall: every measured surface, volume-weighted (Memory + Command
-    // Optimizer). Terse mode is excluded — it is genuinely unmeasured.
-    let total_saved = mem_saved.saturating_add(cmd_saved);
-    let total_base = mem_base.saturating_add(cmd_input);
-    if total_base > 0 {
-        parts.push(format!("💯Σ:{}%", savings_pct(total_saved, total_base)));
+    // Σ = agent-token savings: tokens kept OUT of the model context — Command
+    // Optimizer filtering plus recall reuse (recalled instead of re-derived).
+    // Memory storage compression is internal (not model tokens) and terse mode
+    // is unmeasured, so both are excluded here.
+    let recall = read_recall_savings(project);
+    let sigma_saved = cmd_saved.saturating_add(recall);
+    let sigma_base = cmd_input.saturating_add(recall);
+    if sigma_base > 0 {
+        parts.push(format!("💯Σ:{}%", savings_pct(sigma_saved, sigma_base)));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Comprehensive Memory savings for `project`, as `(saved_chars, baseline_chars)`:
-/// the storage reduction (original `body_full` vs stored `body`) plus recall
-/// reuse (recalled context the agent did not have to re-derive). Scoped to the
-/// CURRENT project. Both parts are measured — storage from a cheap SQL aggregate,
-/// recall from the per-project recall log — so there is no row walk.
+/// Memory STORAGE reduction for `project`, as `(saved_chars, original_chars)`:
+/// original (`body_full`) vs stored (`body`) via a cheap SQL aggregate. This is
+/// the internal storage efficiency shown as the Memory pillar; recall reuse is
+/// counted separately in Σ (agent-token savings), not here.
 fn memory_savings_for_statusline(project: &str) -> (u64, u64) {
-    let recall = read_recall_savings(project);
     let path = std::env::var_os("RTRT_MEMORY_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(default_memory_path);
@@ -5875,10 +5877,7 @@ fn memory_savings_for_statusline(project: &str) -> (u64, u64) {
     } else {
         (0, 0)
     };
-    let storage_saved = original.saturating_sub(stored);
-    let saved = storage_saved.saturating_add(recall);
-    let baseline = original.saturating_add(recall);
-    (saved, baseline)
+    (original.saturating_sub(stored), original)
 }
 
 fn home_dir() -> Option<PathBuf> {

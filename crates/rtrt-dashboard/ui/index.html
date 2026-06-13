@@ -268,6 +268,10 @@
   .segment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.45rem; }
   .segment-toggle { display: flex; align-items: center; gap: 0.45rem; padding: 0.45rem 0.55rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
   .segment-toggle input { margin: 0; }
+  .scope-toggle { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+  .scope-toggle .segment-toggle { cursor: pointer; }
+  .scope-toggle .segment-toggle:has(input:checked) { border-color: var(--accent); }
+  .statusline-fields-disabled { opacity: 0.55; }
   .statusline-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr); gap: 1rem; align-items: start; }
   .statusline-preview { background: #0b0e14; color: #e6edf3; border-color: #232a35; min-height: 108px; margin: 0; }
   .placeholder-hint { color: var(--muted); font-size: 0.78em; }
@@ -1420,8 +1424,22 @@
       </div>
       <div class="statusline-grid">
         <div class="card">
-          <div class="head"><h2>Segments and Format</h2><span class="hint">~/.rtrt/config.toml</span></div>
+          <div class="head"><h2>Segments and Format</h2><span class="hint" id="statusline-config-hint">~/.rtrt/config.toml</span></div>
           <form id="statusline-form">
+            <div class="settings-section" id="statusline-scope-section" hidden>
+              <h3>Scope</h3>
+              <div class="scope-toggle" role="radiogroup" aria-label="Statusline scope">
+                <label class="segment-toggle">
+                  <input type="radio" name="statusline-scope" id="statusline-scope-global" value="global" checked>
+                  <span>Follow global</span>
+                </label>
+                <label class="segment-toggle">
+                  <input type="radio" name="statusline-scope" id="statusline-scope-custom" value="custom">
+                  <span>Custom (this project)</span>
+                </label>
+              </div>
+              <small class="placeholder-hint" id="statusline-scope-hint">Follow global: this project inherits the global statusline. The fields below show the inherited values (read-only).</small>
+            </div>
             <div class="settings-section">
               <h3>Segments</h3>
               <div id="statusline-segments" class="segment-grid"></div>
@@ -6159,6 +6177,50 @@ function readStatuslineForm() {
   };
 }
 
+// True when a specific (non-global) project is selected. The Scope toggle and
+// the "Follow global / Custom" behaviour only apply in that case.
+function statuslineHasProject() {
+  const project = currentProject();
+  return !!project && !isGlobalProjectValue(project);
+}
+
+// Enable or disable every editable statusline field (segments, the 3 format
+// inputs, timeout). Disabled = greyed read-only view used by "Follow global".
+function setStatuslineFieldsDisabled(disabled) {
+  const ids = ['statusline-format', 'statusline-line2-format', 'statusline-line3-format', 'statusline-timeout'];
+  ids.forEach(id => { document.getElementById(id).disabled = disabled; });
+  document.querySelectorAll('#statusline-segments input[type="checkbox"]').forEach(cb => { cb.disabled = disabled; });
+  document.getElementById('statusline-segments').classList.toggle('statusline-fields-disabled', disabled);
+  const saveBtn = document.querySelector('#statusline-form button[type="submit"]');
+  if (saveBtn) saveBtn.disabled = disabled;
+}
+
+// Reflect the resolved scope in the UI: show/hide the Scope section, set the
+// radios, toggle the field-enabled state, and update the source hint.
+function applyStatuslineScope(scope) {
+  const section = document.getElementById('statusline-scope-section');
+  const hint = document.getElementById('statusline-scope-hint');
+  const cfgHint = document.getElementById('statusline-config-hint');
+  if (!statuslineHasProject()) {
+    // Global scope (or no project): no per-project toggle — edit global defaults.
+    section.hidden = true;
+    setStatuslineFieldsDisabled(false);
+    if (cfgHint) cfgHint.textContent = '~/.rtrt/config.toml';
+    return;
+  }
+  section.hidden = false;
+  const custom = scope === 'custom';
+  document.getElementById('statusline-scope-global').checked = !custom;
+  document.getElementById('statusline-scope-custom').checked = custom;
+  setStatuslineFieldsDisabled(!custom);
+  if (cfgHint) cfgHint.textContent = custom ? '<repo>/.rtrt/config.toml' : '~/.rtrt/config.toml (inherited)';
+  if (hint) {
+    hint.textContent = custom
+      ? 'Custom: edit the fields below, then Save to write this project’s override.'
+      : 'Follow global: this project inherits the global statusline. The fields below show the inherited values (read-only).';
+  }
+}
+
 async function loadStatuslineConfig() {
   const result = document.getElementById('statusline-save-result');
   try {
@@ -6170,12 +6232,51 @@ async function loadStatuslineConfig() {
     document.getElementById('statusline-line2-format').value = d.line2_format || '';
     document.getElementById('statusline-line3-format').value = d.line3_format || '';
     document.getElementById('statusline-timeout').value = d.codex_check_timeout_ms ?? 200;
+    // `scope` is "custom" when this project owns an override, else "global".
+    applyStatuslineScope(d.scope === 'custom' ? 'custom' : 'global');
     result.textContent = '';
   } catch (err) {
     renderStatuslineSegments();
+    applyStatuslineScope('global');
     result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
   }
 }
+
+// Scope radio handlers. Follow global clears the project override (server-side)
+// and reloads (fields become disabled, showing the inherited global values).
+// Custom enables the fields, seeded from the currently-shown global values, so
+// the user can edit and Save writes the override.
+document.getElementById('statusline-scope-global').addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !statuslineHasProject()) return;
+  const result = document.getElementById('statusline-save-result');
+  result.textContent = 'Switching to global…';
+  try {
+    const sep = statuslineProjectQuery() ? '&' : '?';
+    const r = await fetch(`/api/statusline/config${statuslineProjectQuery()}${sep}scope=global`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(readStatuslineForm()),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Statusline now follows global');
+    showToast('Following global statusline', 'ok');
+    await loadStatuslineConfig();
+    await loadStatuslinePreview();
+  } catch (err) {
+    result.innerHTML = `<span style="color:var(--err);">${escapeHtml(err.message || String(err))}</span>`;
+    // Revert the radio on failure.
+    applyStatuslineScope('custom');
+  }
+});
+
+document.getElementById('statusline-scope-custom').addEventListener('change', (ev) => {
+  if (!ev.target.checked || !statuslineHasProject()) return;
+  // Enable fields seeded from the currently-shown (inherited) values; nothing is
+  // persisted until the user clicks Save.
+  applyStatuslineScope('custom');
+  document.getElementById('statusline-save-result').textContent = 'Editing project override — click Save to apply.';
+});
 
 async function loadStatuslinePreview() {
   const pre = document.getElementById('statusline-preview');
@@ -6198,6 +6299,12 @@ async function loadStatuslinePage() {
 document.getElementById('statusline-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const result = document.getElementById('statusline-save-result');
+  // In Follow-global mode for a project there is nothing to save — the override
+  // is already cleared; saving would (re)write one. Guard against it.
+  if (statuslineHasProject() && document.getElementById('statusline-scope-global').checked) {
+    result.textContent = 'Following global — switch to Custom to edit this project.';
+    return;
+  }
   result.textContent = 'Saving...';
   try {
     const r = await fetch(`/api/statusline/config${statuslineProjectQuery()}`, {

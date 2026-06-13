@@ -4705,16 +4705,18 @@ fn print_statusline(opts: StatuslineOptions) {
 }
 
 fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> Option<String> {
-    let mut cfg = load_statusline_config();
-    if let Some(format) = format_override {
-        cfg.format = format;
-    }
     let input = parse_claude_status_input(raw_stdin);
     let cwd = input
         .cwd
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
+    // Effective statusline config: the repo's per-project override ("Custom")
+    // when set, else the global config ("Follow global", the default).
+    let mut cfg = load_statusline_config(Some(&repo_root_from_cwd(&cwd)));
+    if let Some(format) = format_override {
+        cfg.format = format;
+    }
     let git = load_git_status(&cwd);
     let transcript_usage = input
         .transcript_path
@@ -4866,7 +4868,16 @@ fn clean_statusline_line(line: &str) -> String {
         .to_string()
 }
 
-fn load_statusline_config() -> StatuslineConfig {
+fn load_statusline_config(repo: Option<&std::path::Path>) -> StatuslineConfig {
+    // Per-project override ("Custom" mode) wins when the repo set one; otherwise
+    // the project follows the global statusline (the default).
+    if let Some(repo) = repo
+        && let Ok(project) = rtrt_core::Config::load_project(repo)
+        && let Some(section) = project.statusline_section_toml()
+        && let Some(cfg) = parse_statusline_config(&section)
+    {
+        return upgrade_legacy_statusline_config(cfg);
+    }
     let Some(path) = home_dir().map(|home| home.join(".rtrt").join("config.toml")) else {
         return StatuslineConfig::default();
     };

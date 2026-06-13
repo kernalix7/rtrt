@@ -4620,9 +4620,9 @@ struct ClaudeStatusInput {
     ctx_used_tokens: Option<u64>,
     ctx_window_size: Option<u64>,
     five_hour_pct: Option<u64>,
-    five_hour_resets_at: Option<String>,
+    five_hour_resets_at: Option<i64>,
     seven_day_pct: Option<u64>,
-    seven_day_resets_at: Option<String>,
+    seven_day_resets_at: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -5074,10 +5074,23 @@ fn parse_claude_status_input(raw: &str) -> ClaudeStatusInput {
         ctx_used_tokens: json_any_u64(ctx_window, "total_input_tokens"),
         ctx_window_size: json_any_u64(ctx_window, "context_window_size"),
         five_hour_pct: json_round_pct(five_hour, "used_percentage"),
-        five_hour_resets_at: json_string(five_hour, "resets_at"),
+        five_hour_resets_at: json_epoch(five_hour, "resets_at"),
         seven_day_pct: json_round_pct(seven_day, "used_percentage"),
-        seven_day_resets_at: json_string(seven_day, "resets_at"),
+        seven_day_resets_at: json_epoch(seven_day, "resets_at"),
     }
+}
+
+/// Read a reset timestamp that Claude Code may send either as a Unix epoch
+/// (integer or float seconds) or as an RFC 3339 string. Returns epoch seconds.
+fn json_epoch(value: &serde_json::Value, key: &str) -> Option<i64> {
+    let v = value.get(key)?;
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(f as i64);
+    }
+    v.as_str().and_then(rfc3339_to_epoch)
 }
 
 /// Read a percentage field (already 0–100) and round it to a whole number.
@@ -5426,24 +5439,24 @@ fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
         None => (None, None),
     };
     let combined =
-        |recent: Option<i64>, pct: Option<u64>, resets_at: Option<&str>, window_secs: i64| {
+        |recent: Option<i64>, pct: Option<u64>, resets_at: Option<i64>, window_secs: i64| {
             recent.or_else(|| average_rate_eta(now?, pct?, resets_at, window_secs))
         };
     let five_eta = combined(
         five_recent,
         input.five_hour_pct,
-        input.five_hour_resets_at.as_deref(),
+        input.five_hour_resets_at,
         FIVE_HOUR_SECS,
     );
     let seven_eta = combined(
         seven_recent,
         input.seven_day_pct,
-        input.seven_day_resets_at.as_deref(),
+        input.seven_day_resets_at,
         SEVEN_DAY_SECS,
     );
-    let window = |pct: Option<u64>, resets_at: Option<&str>, eta: Option<i64>| -> Option<String> {
+    let window = |pct: Option<u64>, resets_at: Option<i64>, eta: Option<i64>| -> Option<String> {
         let pct = pct?;
-        let reset = match (now, resets_at.and_then(rfc3339_to_epoch)) {
+        let reset = match (now, resets_at) {
             (Some(now), Some(reset)) => format!(" ↻{}", humanize_remaining(reset - now)),
             _ => String::new(),
         };
@@ -5452,16 +5465,8 @@ fn usage_window_segment(input: &ClaudeStatusInput) -> Option<String> {
             .unwrap_or_default();
         Some(format!("{pct}%{reset}{burn}"))
     };
-    let five = window(
-        input.five_hour_pct,
-        input.five_hour_resets_at.as_deref(),
-        five_eta,
-    );
-    let seven = window(
-        input.seven_day_pct,
-        input.seven_day_resets_at.as_deref(),
-        seven_eta,
-    );
+    let five = window(input.five_hour_pct, input.five_hour_resets_at, five_eta);
+    let seven = window(input.seven_day_pct, input.seven_day_resets_at, seven_eta);
     if five.is_none() && seven.is_none() {
         return None;
     }
@@ -5483,11 +5488,11 @@ fn statusline_usage_log_path() -> Option<PathBuf> {
 /// that average rate. This is the always-available fallback when there is no
 /// recent burn-rate sample yet. `None` at 0% (nothing to project) or without a
 /// reset time to anchor the window.
-fn average_rate_eta(now: i64, pct: u64, resets_at: Option<&str>, window_secs: i64) -> Option<i64> {
+fn average_rate_eta(now: i64, pct: u64, resets_at: Option<i64>, window_secs: i64) -> Option<i64> {
     if pct == 0 {
         return None;
     }
-    let reset = resets_at.and_then(rfc3339_to_epoch)?;
+    let reset = resets_at?;
     let elapsed = now - (reset - window_secs);
     if elapsed <= 0 {
         return None;

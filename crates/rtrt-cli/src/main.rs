@@ -4791,9 +4791,11 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     let agents = agents_segment(cfg.codex_check_timeout_ms, statusline_agents_width_budget());
     segments.insert("agents".to_string(), agents.clone());
     segments.insert("codex".to_string(), agents);
+    let savings_project = rtrt_core::project_for_cwd(&cwd);
     segments.insert(
         "savings".to_string(),
-        format!("💯Σ:{}", total_savings_tokens()),
+        statusline_savings_segment(&savings_project)
+            .unwrap_or_else(|| format!("💯Σ:{}", total_savings_tokens())),
     );
 
     Some(render_statusline(&cfg, &segments))
@@ -5765,6 +5767,140 @@ fn total_savings_tokens() -> u64 {
         .ok()
         .map(|summary| estimated_tokens(summary.saved_chars))
         .unwrap_or(0)
+}
+
+const SAVINGS_CACHE_TTL_SECS: u64 = 60;
+
+fn savings_cache_path(project: &str) -> PathBuf {
+    let safe: String = project
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    home_dir()
+        .map(|home| {
+            home.join(".rtrt")
+                .join(format!("statusline-savings-{safe}.cache"))
+        })
+        .unwrap_or_else(|| PathBuf::from(format!(".rtrt/statusline-savings-{safe}.cache")))
+}
+
+fn read_savings_cache(project: &str) -> Option<String> {
+    let path = savings_cache_path(project);
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    if modified.elapsed().ok()?.as_secs() > SAVINGS_CACHE_TTL_SECS {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    (!raw.trim().is_empty()).then(|| raw.trim().to_string())
+}
+
+fn write_savings_cache(project: &str, segment: &str) {
+    let path = savings_cache_path(project);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, segment);
+}
+
+fn savings_pct(saved: u64, original: u64) -> u64 {
+    if original == 0 {
+        return 0;
+    }
+    (saved.saturating_mul(100).saturating_add(original / 2) / original).min(100)
+}
+
+/// Per-surface reduction breakdown for status-line line 3:
+/// `📝opt:X% 🧠mem:N ⚡cmd:Y% 💯Σ:Z%` — Output Optimizer reduction, Memory
+/// saves, Command Optimizer reduction, and the overall reduction. Cached for
+/// [`SAVINGS_CACHE_TTL_SECS`] so the per-render cost stays negligible.
+fn statusline_savings_segment(project: &str) -> Option<String> {
+    if let Some(cached) = read_savings_cache(project) {
+        return Some(cached);
+    }
+    let segment = compute_statusline_savings(project);
+    if let Some(segment) = &segment {
+        write_savings_cache(project, segment);
+    }
+    segment
+}
+
+fn compute_statusline_savings(project: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let (opt_saved, opt_original, mem_saves) = memory_savings_for_statusline(project);
+    if opt_original > 0 {
+        parts.push(format!("📝opt:{}%", savings_pct(opt_saved, opt_original)));
+    }
+    if mem_saves > 0 {
+        parts.push(format!("🧠mem:{}", compact_count(mem_saves as u64)));
+    }
+    let (cmd_saved, cmd_input) = proxy_stats::load_summary(Some(project), None, false)
+        .ok()
+        .map(|summary| (summary.saved_chars, summary.input_chars))
+        .unwrap_or((0, 0));
+    if cmd_input > 0 {
+        parts.push(format!("⚡cmd:{}%", savings_pct(cmd_saved, cmd_input)));
+    }
+    let total_saved = opt_saved.saturating_add(cmd_saved);
+    let total_original = opt_original.saturating_add(cmd_input);
+    if total_original > 0 {
+        parts.push(format!("💯Σ:{}%", savings_pct(total_saved, total_original)));
+    } else if !parts.is_empty() {
+        parts.push(format!("💯Σ:{}", total_savings_tokens()));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Walk one project's memory rows for Output Optimizer (`source = compress`)
+/// reduction and that project's saved-row count. Scoped to `project` so the
+/// status line reflects the CURRENT project, not the global aggregate. Returns
+/// `(saved_chars, original_chars, memory_saves)`.
+fn memory_savings_for_statusline(project: &str) -> (u64, u64, usize) {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_memory_path);
+    if !path.exists() {
+        return (0, 0, 0);
+    }
+    let Ok(store) = MemoryStore::open(&path) else {
+        return (0, 0, 0);
+    };
+    let memory_saves = store.count_by_project(project).unwrap_or(0);
+    if memory_saves == 0 {
+        return (0, 0, 0);
+    }
+    let mut saved = 0u64;
+    let mut original = 0u64;
+    if let Ok(rows) = store.list_by_project(project, memory_saves) {
+        for row in rows {
+            let Ok(meta) = store.get_metadata(row.id) else {
+                continue;
+            };
+            if meta.get("source").map(String::as_str) != Some("compress") {
+                continue;
+            }
+            let from = meta
+                .get("compressed_from_chars")
+                .and_then(|value| value.parse::<u64>().ok());
+            let to = meta
+                .get("compressed_to_chars")
+                .and_then(|value| value.parse::<u64>().ok());
+            match (from, to) {
+                (Some(from), Some(to)) if from >= to => {
+                    original = original.saturating_add(from);
+                    saved = saved.saturating_add(from - to);
+                }
+                _ => {
+                    if let Some(s) = meta
+                        .get("saved_chars")
+                        .and_then(|value| parse_saved_chars(value))
+                    {
+                        saved = saved.saturating_add(s);
+                    }
+                }
+            }
+        }
+    }
+    (saved, original, memory_saves)
 }
 
 fn home_dir() -> Option<PathBuf> {

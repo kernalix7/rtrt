@@ -40,8 +40,11 @@ struct Cli {
 enum Cmd {
     /// Compress text read from stdin or --file.
     Compress {
-        #[arg(short, long, value_enum, default_value = "full")]
-        level: LevelArg,
+        /// Compression level. When omitted, defaults to the repo's effective
+        /// per-project `[compression] level` (`<repo>/.rtrt/config.toml`),
+        /// else the global default (`full`).
+        #[arg(short, long, value_enum)]
+        level: Option<LevelArg>,
         /// Read input from a file instead of stdin.
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
@@ -2525,6 +2528,11 @@ async fn main() -> Result<()> {
             if prompt.trim().is_empty() {
                 bail!("rtrt call: prompt is empty");
             }
+            // Honor a per-project opt-out: if `<repo>/.rtrt/config.toml`
+            // explicitly disables this target via `[agents]`/`[providers]`,
+            // refuse to invoke it. An absent override leaves global behavior
+            // unchanged.
+            ensure_target_enabled(&target)?;
             let outcome = invoke_agent(
                 &target,
                 &prompt,
@@ -2967,7 +2975,9 @@ const TOKEN_LOG_METRIC_LABELS: &[&str] = &[
 const SAVINGS_SOURCES: &[&str] = &["compress", "proxy"];
 
 struct CompressCliOptions {
-    level: LevelArg,
+    /// Explicit `-l/--level`. `None` means "fall back to the repo's effective
+    /// per-project compression level".
+    level: Option<LevelArg>,
     file: Option<PathBuf>,
     in_place: bool,
     backup: bool,
@@ -3027,8 +3037,26 @@ async fn run_compress(opts: CompressCliOptions) -> Result<()> {
         };
         compressor.compress(&input, target)
     } else {
-        let compressor = Compressor::new(opts.level.into());
-        compressor.compress_to(&input, opts.format.into())
+        // Level resolution: an explicit `-l/--level` always wins. Otherwise
+        // fall back to the repo's *effective* per-project compression
+        // (`<repo>/.rtrt/config.toml` overlaid on the global config). When the
+        // project has set `[compression] enabled = false`, an unflagged
+        // `rtrt compress` passes the input through unchanged.
+        match opts.level {
+            Some(level) => {
+                let compressor = Compressor::new(level.into());
+                compressor.compress_to(&input, opts.format.into())
+            }
+            None => {
+                let compression = effective_config_for_cwd().compression;
+                if compression.enabled {
+                    let compressor = Compressor::new(compression.level);
+                    compressor.compress_to(&input, opts.format.into())
+                } else {
+                    input.clone()
+                }
+            }
+        }
     };
 
     if opts.in_place {
@@ -3792,7 +3820,9 @@ fn run_detect(
     enabled_only: bool,
 ) -> Result<()> {
     let selected_kind = kind.map(ToolKind::from);
-    let mut tools = rtrt_core::detect_tools();
+    // Detect with the repo's effective config so the `enabled` column reflects
+    // per-project `[agents]`/`[providers]` overrides (global when no repo).
+    let mut tools = rtrt_core::detect_tools_with_config(effective_config_for_cwd());
     tools.retain(|tool| {
         selected_kind.is_none_or(|kind| tool.kind == kind)
             && (!installed_only || tool.installed)
@@ -3949,25 +3979,37 @@ struct RouteCliOptions {
 
 async fn run_route(opts: RouteCliOptions) -> Result<()> {
     let prompt = opts.prompt.join(" ");
-    if prompt.trim().is_empty() {
+    // `--explain` / `--dry-run` only print the decision, so they don't need a
+    // prompt. A prompt is required only when we actually invoke the target.
+    let will_invoke = !opts.explain && !opts.dry_run;
+    if will_invoke && prompt.trim().is_empty() {
         bail!("rtrt route: prompt is empty");
     }
     let mode = InvokeMode::from(opts.mode);
+    // Effective config = global overlaid with `<repo>/.rtrt/config.toml`. It
+    // drives two things: the per-project `[agents]`/`[providers]` enable map
+    // (fed into detection so disabled targets drop out of the candidate set),
+    // and the per-project `[providers] active` preference (used as the route
+    // target when the user gave no explicit `--target`).
+    let cfg = effective_config_for_cwd();
+    let target = opts.target.or_else(|| cfg.providers.active.clone());
     let req = RouteRequest {
         capability: opts.capability.map(Capability::from),
         prefer: Prefer::from(opts.prefer),
-        target: opts.target,
+        target,
         model: opts.model,
         mode: (mode != InvokeMode::Auto).then_some(mode),
     };
-    let tools = rtrt_core::detect_tools();
+    let tools = rtrt_core::detect_tools_with_config(cfg);
     let usage = UsageSnapshot::load_best_effort();
     let decision = select_route(&req, &tools, &usage)?;
 
     if opts.explain || opts.dry_run {
         print_route_decision(&decision, opts.explain, &usage);
     }
-    if opts.dry_run {
+    // Stop before invoking on `--dry-run`, or on `--explain` with no prompt
+    // (decision-only inspection).
+    if opts.dry_run || prompt.trim().is_empty() {
         return Ok(());
     }
 
@@ -4511,6 +4553,37 @@ fn hook_repo_root(raw: &str) -> Option<PathBuf> {
     extract_json_str(raw, "cwd").map(|cwd| repo_root_from_cwd(std::path::Path::new(&cwd)))
 }
 
+/// The repo root enclosing the current working directory, if any. Returns
+/// `None` when the cwd is not inside a repo (no `.git` / `.rtrt` ancestor) so
+/// callers fall back to the global config — keeping the no-repo path identical
+/// to today's behavior.
+fn cwd_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = repo_root_from_cwd(&cwd);
+    (root.join(".git").exists() || root.join(".rtrt").exists()).then_some(root)
+}
+
+/// Load the config effective for the current working directory: the global
+/// config overlaid with `<repo>/.rtrt/config.toml` when the cwd is inside a
+/// repo, else the plain global config. Errors fall back to the default config
+/// so a malformed per-project file never breaks a routing/compression command.
+fn effective_config_for_cwd() -> rtrt_core::Config {
+    rtrt_core::Config::load_effective(cwd_repo_root().as_deref()).unwrap_or_default()
+}
+
+/// Refuse to act on a target the repo's effective config explicitly disables
+/// (`[agents] <name> = false` / `[providers] <name> = false`). Only an explicit
+/// `false` blocks; an absent entry leaves global behavior unchanged.
+fn ensure_target_enabled(target: &str) -> Result<()> {
+    let cfg = effective_config_for_cwd();
+    let disabled = cfg.providers.enabled_override(target) == Some(false)
+        || cfg.agents.enabled_override(target) == Some(false);
+    if disabled {
+        bail!("target '{target}' is disabled for this project (.rtrt/config.toml)");
+    }
+    Ok(())
+}
+
 fn run_hook_style() -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
@@ -4711,9 +4784,10 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
+    let repo_root = repo_root_from_cwd(&cwd);
     // Effective statusline config: the repo's per-project override ("Custom")
     // when set, else the global config ("Follow global", the default).
-    let mut cfg = load_statusline_config(Some(&repo_root_from_cwd(&cwd)));
+    let mut cfg = load_statusline_config(Some(&repo_root));
     if let Some(format) = format_override {
         cfg.format = format;
     }
@@ -4785,12 +4859,16 @@ fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> 
     if let Some(model) = input.model_display_name.or(input.model_id) {
         segments.insert("model".to_string(), model);
     }
-    let opt_level = rtrt_core::read_output_style_level_for(Some(&repo_root_from_cwd(&cwd)));
+    let opt_level = rtrt_core::read_output_style_level_for(Some(&repo_root));
     segments.insert("opt".to_string(), format!("opt:{}", opt_level.as_str()));
     if let Some(usage) = usage_seg {
         segments.insert("usage".to_string(), usage);
     }
-    let agents = agents_segment(cfg.codex_check_timeout_ms, statusline_agents_width_budget());
+    let agents = agents_segment(
+        &repo_root,
+        cfg.codex_check_timeout_ms,
+        statusline_agents_width_budget(),
+    );
     segments.insert("agents".to_string(), agents.clone());
     segments.insert("codex".to_string(), agents);
     let savings_project = rtrt_core::project_for_cwd(&cwd);
@@ -5587,33 +5665,69 @@ fn usage_burn_etas(
     (eta(five_pct, 0), eta(seven_pct, 1))
 }
 
-fn agents_segment(timeout_ms: u64, width_budget: usize) -> String {
-    if let Some(cached) = read_agents_status_cache() {
+fn agents_segment(repo: &std::path::Path, timeout_ms: u64, width_budget: usize) -> String {
+    // Resolve the repo's effective config up front (cheap file read) so the
+    // detection thread filters the agents list by the per-project
+    // `[agents]`/`[providers]` enable map. No repo / no override → global
+    // behavior, identical to before.
+    let cfg = rtrt_core::Config::load_effective(Some(repo)).unwrap_or_default();
+    // The cache key folds in the repo *and* the enable/active fingerprint so
+    // editing `<repo>/.rtrt/config.toml` (e.g. `codex = false`) invalidates a
+    // stale cached segment instead of masking the override.
+    let cache_key = agents_cache_key(repo, &cfg);
+    if let Some(cached) = read_agents_status_cache(cache_key) {
         return cached;
     }
+    // The full detection thread can blow the timeout (it execs each agent's
+    // `--version`), so the fallback `cheap_statusline_agents` must apply the
+    // same per-project opt-outs — otherwise a disabled agent reappears whenever
+    // detection is slow. Keep a copy of the agent enable map for that path.
+    let agents = cfg.agents.clone();
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("rtrt-statusline-agents".into())
         .spawn(move || {
-            let names = detected_statusline_agents();
+            let names = detected_statusline_agents(cfg);
             let _ = tx.send(names);
         });
     let names = rx
         .recv_timeout(timeout)
-        .unwrap_or_else(|_| cheap_statusline_agents());
+        .unwrap_or_else(|_| cheap_statusline_agents(&agents));
     let segment = format_agents_segment(&names, width_budget);
-    write_agents_status_cache(&segment);
+    write_agents_status_cache(cache_key, &segment);
     segment
 }
 
-fn detected_statusline_agents() -> Vec<String> {
+/// Cache key for the agents segment: the repo path plus the per-project agent
+/// and provider enable maps (and active provider). A config edit changes the
+/// key, so a stale cache never masks a freshly disabled/enabled agent.
+fn agents_cache_key(repo: &std::path::Path, cfg: &rtrt_core::Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut hasher);
+    for (name, enabled) in &cfg.agents.enabled {
+        name.hash(&mut hasher);
+        enabled.hash(&mut hasher);
+    }
+    for (name, enabled) in &cfg.providers.enabled {
+        name.hash(&mut hasher);
+        enabled.hash(&mut hasher);
+    }
+    cfg.providers.active.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn detected_statusline_agents(cfg: rtrt_core::Config) -> Vec<String> {
     let mut names = Vec::new();
-    for tool in rtrt_core::detect_tools().into_iter().filter(|tool| {
-        matches!(tool.kind, ToolKind::CodingAgent | ToolKind::LocalRuntime)
-            && tool.installed
-            && tool.enabled
-    }) {
+    for tool in rtrt_core::detect_tools_with_config(cfg)
+        .into_iter()
+        .filter(|tool| {
+            matches!(tool.kind, ToolKind::CodingAgent | ToolKind::LocalRuntime)
+                && tool.installed
+                && tool.enabled
+        })
+    {
         let name = short_tool_name(&tool.name).to_string();
         if !names.contains(&name) {
             names.push(name);
@@ -5630,21 +5744,28 @@ fn short_tool_name(name: &str) -> &str {
     }
 }
 
-fn cheap_statusline_agents() -> Vec<String> {
-    const CANDIDATES: &[(&str, &[&str])] = &[
-        ("claude", &["claude"]),
-        ("codex", &["codex"]),
-        ("opencode", &["opencode"]),
-        ("ollama", &["ollama"]),
-        ("aider", &["aider"]),
-        ("cursor", &["cursor-agent", "cursor"]),
-        ("gemini", &["gemini"]),
-        ("gh", &["gh"]),
+fn cheap_statusline_agents(agents: &rtrt_core::AgentsConfig) -> Vec<String> {
+    // (short name, canonical descriptor name, candidate binaries). The
+    // canonical name is what `[agents]` keys on (e.g. `gh-copilot`); the short
+    // name is what the segment displays (`gh`).
+    const CANDIDATES: &[(&str, &str, &[&str])] = &[
+        ("claude", "claude", &["claude"]),
+        ("codex", "codex", &["codex"]),
+        ("opencode", "opencode", &["opencode"]),
+        ("ollama", "ollama", &["ollama"]),
+        ("aider", "aider", &["aider"]),
+        ("cursor", "cursor", &["cursor-agent", "cursor"]),
+        ("gemini", "gemini", &["gemini"]),
+        ("gh", "gh-copilot", &["gh"]),
     ];
     CANDIDATES
         .iter()
-        .filter(|(_name, bins)| bins.iter().any(|bin| binary_on_path(bin)))
-        .map(|(name, _bins)| (*name).to_string())
+        // Drop agents the project explicitly disabled so the fast fallback
+        // honors the same override as full detection. An absent entry keeps the
+        // PATH-probe default (enabled when the binary is present).
+        .filter(|(_short, canonical, _bins)| agents.enabled_override(canonical) != Some(false))
+        .filter(|(_short, _canonical, bins)| bins.iter().any(|bin| binary_on_path(bin)))
+        .map(|(short, _canonical, _bins)| (*short).to_string())
         .collect()
 }
 
@@ -5746,8 +5867,8 @@ fn format_agents_segment(names: &[String], width_budget: usize) -> String {
     out
 }
 
-fn read_agents_status_cache() -> Option<String> {
-    let path = agents_status_cache_path();
+fn read_agents_status_cache(key: u64) -> Option<String> {
+    let path = agents_status_cache_path(key);
     let meta = std::fs::metadata(&path).ok()?;
     let modified = meta.modified().ok()?;
     if modified.elapsed().ok()?.as_secs() > AGENTS_STATUS_CACHE_TTL_SECS {
@@ -5761,12 +5882,16 @@ fn read_agents_status_cache() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn write_agents_status_cache(status: &str) {
-    let _ = std::fs::write(agents_status_cache_path(), status);
+fn write_agents_status_cache(key: u64, status: &str) {
+    let _ = std::fs::write(agents_status_cache_path(key), status);
 }
 
-fn agents_status_cache_path() -> PathBuf {
-    std::env::temp_dir().join("rtrt-agents-status.cache")
+/// The agents-status cache is keyed per repo + per-project enable fingerprint
+/// (see [`agents_cache_key`]) so a project's `[agents]` override (e.g.
+/// `codex = false`) is not masked by another repo's — or a pre-edit — cached
+/// agents list.
+fn agents_status_cache_path(key: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("rtrt-agents-status-{key:016x}.cache"))
 }
 
 fn total_savings_tokens() -> u64 {

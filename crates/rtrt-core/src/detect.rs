@@ -418,7 +418,21 @@ const REGISTRY: &[ToolDescriptor] = &[
 ];
 
 pub fn detect_tools() -> Vec<DetectedTool> {
-    let context = Arc::new(DetectionContext::from_system());
+    detect_with_context(DetectionContext::from_system())
+}
+
+/// Detect tools while honouring a caller-supplied config for the `enabled`
+/// overlay. Used by the CLI to feed the *effective* per-project config
+/// (`Config::load_effective(Some(repo))`) so a project's `[agents]` /
+/// `[providers]` enable map decides which targets are enabled, instead of the
+/// global config that `detect_tools()` loads. Everything else (binary probing,
+/// env detection, MCP parsing) is identical.
+pub fn detect_tools_with_config(config: Config) -> Vec<DetectedTool> {
+    detect_with_context(DetectionContext::from_system_with_config(config))
+}
+
+fn detect_with_context(context: DetectionContext) -> Vec<DetectedTool> {
+    let context = Arc::new(context);
     let mut handles = Vec::with_capacity(REGISTRY.len());
     for descriptor in REGISTRY {
         let context = Arc::clone(&context);
@@ -760,6 +774,13 @@ fn parse_codex_mcp_servers(raw: &str) -> Vec<McpServer> {
 
 impl DetectionContext {
     fn from_system() -> Self {
+        Self::from_system_with_config(Config::load().unwrap_or_default())
+    }
+
+    /// Same system probe as [`Self::from_system`] but with a caller-supplied
+    /// config so the `enabled` overlay can reflect the effective per-project
+    /// config instead of the global one.
+    fn from_system_with_config(config: Config) -> Self {
         let home_dir = dirs::home_dir();
         let claude_json = read_home_file(home_dir.as_deref(), ".claude.json");
         let codex_toml = read_home_file(home_dir.as_deref(), ".codex/config.toml");
@@ -769,7 +790,7 @@ impl DetectionContext {
             present_env_vars: env::vars()
                 .filter_map(|(name, value)| (!value.is_empty()).then_some(name))
                 .collect(),
-            config: Config::load().unwrap_or_default(),
+            config,
             home_dir,
             claude_json,
             codex_toml,

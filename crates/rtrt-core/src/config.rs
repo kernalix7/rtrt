@@ -105,6 +105,17 @@ impl ProjectConfig {
         toml::from_str(s).map_err(|e| Error::Config(format!("project config TOML: {e}")))
     }
 
+    /// The per-project statusline override serialized as a `[statusline]` TOML
+    /// section, if the project set one (the "Custom" mode). `None` means the
+    /// project follows the global statusline (the default). Returned as text so
+    /// callers can reuse their existing `[statusline]` parser without depending
+    /// on the `toml` crate.
+    pub fn statusline_section_toml(&self) -> Option<String> {
+        let value = self.statusline.as_ref()?;
+        let body = toml::to_string(value).ok()?;
+        Some(format!("[statusline]\n{body}"))
+    }
+
     /// True when no override is set — used to delete the file and keep the repo
     /// clean rather than leave an empty `.rtrt/config.toml`.
     pub fn is_empty(&self) -> bool {

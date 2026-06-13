@@ -5826,17 +5826,18 @@ fn statusline_savings_segment(project: &str, opt_level: OutputStyleLevel) -> Opt
 
 fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    let (opt_saved, opt_original, mem_saves) = memory_savings_for_statusline(project);
-    // Output Optimizer: the measured compress reduction when present, otherwise
-    // the active terse level. Terse mode is prompt-injection (no before/after to
-    // measure), so its effect is shown as a level — never a fabricated percent.
-    if opt_original > 0 {
-        parts.push(format!("📝opt:{}%", savings_pct(opt_saved, opt_original)));
-    } else if opt_level.is_active() {
+    // Output Optimizer: terse mode is prompt-injection — no before/after to
+    // measure — so it is shown as its active level, never a fabricated percent.
+    // Its measurable compress output lands in the memory store, so that reduction
+    // is already counted under Memory below.
+    if opt_level.is_active() {
         parts.push(format!("📝opt:{}", opt_level.as_str()));
     }
-    if mem_saves > 0 {
-        parts.push(format!("🧠mem:{}", compact_count(mem_saves as u64)));
+    // Memory: storage reduction (what it trims/redacts/dedups before storing)
+    // plus recall reuse (recalled context reused instead of being re-derived).
+    let (mem_saved, mem_base) = memory_savings_for_statusline(project);
+    if mem_base > 0 {
+        parts.push(format!("🧠mem:{}%", savings_pct(mem_saved, mem_base)));
     }
     // Command Optimizer: EFFECTIVE reduction over runs that actually filtered,
     // excluding passthroughs (a bare grep, or a cat of an already-terse file)
@@ -5846,67 +5847,38 @@ fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Opt
     if cmd_input > 0 {
         parts.push(format!("⚡cmd:{}%", savings_pct(cmd_saved, cmd_input)));
     }
-    // Overall: blended reduction across the measured surfaces (compress + the
-    // effective Command Optimizer). Terse mode is excluded — it is unmeasured.
-    let total_saved = opt_saved.saturating_add(cmd_saved);
-    let total_original = opt_original.saturating_add(cmd_input);
-    if total_original > 0 {
-        parts.push(format!("💯Σ:{}%", savings_pct(total_saved, total_original)));
+    // Overall: every measured surface, volume-weighted (Memory + Command
+    // Optimizer). Terse mode is excluded — it is genuinely unmeasured.
+    let total_saved = mem_saved.saturating_add(cmd_saved);
+    let total_base = mem_base.saturating_add(cmd_input);
+    if total_base > 0 {
+        parts.push(format!("💯Σ:{}%", savings_pct(total_saved, total_base)));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Walk one project's memory rows for Output Optimizer (`source = compress`)
-/// reduction and that project's saved-row count. Scoped to `project` so the
-/// status line reflects the CURRENT project, not the global aggregate. Returns
-/// `(saved_chars, original_chars, memory_saves)`.
-fn memory_savings_for_statusline(project: &str) -> (u64, u64, usize) {
+/// Comprehensive Memory savings for `project`, as `(saved_chars, baseline_chars)`:
+/// the storage reduction (original `body_full` vs stored `body`) plus recall
+/// reuse (recalled context the agent did not have to re-derive). Scoped to the
+/// CURRENT project. Both parts are measured — storage from a cheap SQL aggregate,
+/// recall from the per-project recall log — so there is no row walk.
+fn memory_savings_for_statusline(project: &str) -> (u64, u64) {
+    let recall = read_recall_savings(project);
     let path = std::env::var_os("RTRT_MEMORY_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(default_memory_path);
-    if !path.exists() {
-        return (0, 0, 0);
-    }
-    let Ok(store) = MemoryStore::open(&path) else {
-        return (0, 0, 0);
+    let (original, stored) = if path.exists() {
+        MemoryStore::open(&path)
+            .ok()
+            .and_then(|store| store.storage_reduction(project).ok())
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
     };
-    let memory_saves = store.count_by_project(project).unwrap_or(0);
-    if memory_saves == 0 {
-        return (0, 0, 0);
-    }
-    let mut saved = 0u64;
-    let mut original = 0u64;
-    if let Ok(rows) = store.list_by_project(project, memory_saves) {
-        for row in rows {
-            let Ok(meta) = store.get_metadata(row.id) else {
-                continue;
-            };
-            if meta.get("source").map(String::as_str) != Some("compress") {
-                continue;
-            }
-            let from = meta
-                .get("compressed_from_chars")
-                .and_then(|value| value.parse::<u64>().ok());
-            let to = meta
-                .get("compressed_to_chars")
-                .and_then(|value| value.parse::<u64>().ok());
-            match (from, to) {
-                (Some(from), Some(to)) if from >= to => {
-                    original = original.saturating_add(from);
-                    saved = saved.saturating_add(from - to);
-                }
-                _ => {
-                    if let Some(s) = meta
-                        .get("saved_chars")
-                        .and_then(|value| parse_saved_chars(value))
-                    {
-                        saved = saved.saturating_add(s);
-                    }
-                }
-            }
-        }
-    }
-    (saved, original, memory_saves)
+    let storage_saved = original.saturating_sub(stored);
+    let saved = storage_saved.saturating_add(recall);
+    let baseline = original.saturating_add(recall);
+    (saved, baseline)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -6049,12 +6021,64 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
     }
     // stdout of a UserPromptSubmit hook is injected into the model context.
     println!("## Relevant project memory ({project})");
+    let mut recalled_chars = 0u64;
     for h in hits {
         let body = h.body.replace('\n', " ");
         let clipped: String = body.chars().take(240).collect();
+        recalled_chars = recalled_chars.saturating_add(clipped.chars().count() as u64);
         println!("- [{}] {}", h.kind, clipped);
     }
+    // Recall reuse: this context is reused instead of being re-derived from
+    // source, so log the recalled char count as a per-project Memory saving.
+    record_recall_savings(&project, recalled_chars);
     Ok(())
+}
+
+fn recall_savings_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".rtrt").join("recall-savings.tsv"))
+}
+
+/// Append a recall-reuse sample (`project\tchars`). Each recall reuses stored
+/// context the agent would otherwise re-derive, so the recalled char count is a
+/// measured Memory saving.
+fn record_recall_savings(project: &str, chars: u64) {
+    if chars == 0 {
+        return;
+    }
+    let Some(path) = recall_savings_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{project}\t{chars}");
+    }
+}
+
+/// Total recall-reuse chars logged for a project.
+fn read_recall_savings(project: &str) -> u64 {
+    let Some(path) = recall_savings_path() else {
+        return 0;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for line in content.lines() {
+        let mut fields = line.split('\t');
+        if let (Some(p), Some(c)) = (fields.next(), fields.next())
+            && p == project
+        {
+            total = total.saturating_add(c.parse::<u64>().unwrap_or(0));
+        }
+    }
+    total
 }
 
 /// SessionStart context injection. Prints the project's top-N memories

@@ -1773,9 +1773,9 @@ const GLOBAL_PROJECT_VALUE = '__global__';
 const GLOBAL_SCOPE_MESSAGE = 'Global mode — select an individual project';
 // Mirror of the Rust STATUSLINE_SEGMENTS const. `agents` is the orchestration
 // segment (labelled "Agents"); `codex` is kept as a backward-compat alias.
-const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'opt', 'model', 'usage', 'agents', 'codex', 'savings'];
+const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'opt', 'model', 'usage', 'agents', 'savings'];
 // Human-friendly labels for the segment toggles (key -> label).
-const STATUSLINE_SEGMENT_LABELS = { agents: 'Agents', codex: 'Codex (alias)' };
+const STATUSLINE_SEGMENT_LABELS = { agents: 'Agents' };
 const STATUSLINE_TOKENS_HINT = STATUSLINE_SEGMENTS.map(segment => `{${segment}}`).join(', ');
 const OUTPUT_OPTIMIZER_MEASUREMENT_NOTE = 'Deterministic compress only — terse-mode injection savings are not measurable';
 

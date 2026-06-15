@@ -375,6 +375,11 @@ async fn main() -> Result<()> {
     let token_arc = token.clone().map(Arc::new);
     let app = Router::new()
         .route("/", get(index))
+        .route("/assets/styles.css", get(asset_styles_css))
+        .route("/assets/js/api.js", get(asset_js_api))
+        .route("/assets/js/components.js", get(asset_js_components))
+        .route("/assets/js/pages.js", get(asset_js_pages))
+        .route("/assets/js/app.js", get(asset_js_app))
         .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
         .route("/api/stats", get(stats))
@@ -833,6 +838,35 @@ async fn vendor_asset(
         ],
         body,
     ))
+}
+
+/// Serve a front-end asset (split out of index.html) with an explicit
+/// Content-Type. Embedded via include_str! so the binary stays self-contained.
+fn asset_response(
+    body: &'static str,
+    content_type: &'static str,
+) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+}
+
+async fn asset_styles_css() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    asset_response(ASSET_STYLES_CSS, "text/css; charset=utf-8")
+}
+
+async fn asset_js_api() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    asset_response(ASSET_JS_API, "text/javascript; charset=utf-8")
+}
+
+async fn asset_js_components() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    asset_response(ASSET_JS_COMPONENTS, "text/javascript; charset=utf-8")
+}
+
+async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    asset_response(ASSET_JS_PAGES, "text/javascript; charset=utf-8")
+}
+
+async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+    asset_response(ASSET_JS_APP, "text/javascript; charset=utf-8")
 }
 
 async fn healthz() -> &'static str {
@@ -6665,6 +6699,15 @@ async fn ollama_delete(
 }
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
+
+// Front-end assets split out of index.html (served at /assets/*), embedded in
+// the binary via include_str! so the dashboard stays a self-contained, offline,
+// no-build-step app — no filesystem reads, no CDN.
+const ASSET_STYLES_CSS: &str = include_str!("../ui/assets/styles.css");
+const ASSET_JS_API: &str = include_str!("../ui/assets/js/api.js");
+const ASSET_JS_COMPONENTS: &str = include_str!("../ui/assets/js/components.js");
+const ASSET_JS_PAGES: &str = include_str!("../ui/assets/js/pages.js");
+const ASSET_JS_APP: &str = include_str!("../ui/assets/js/app.js");
 
 // Vendored graph libraries (served at /vendor/*) so the map needs no CDN.
 const VENDOR_CYTOSCAPE: &str = include_str!("../ui/vendor/cytoscape.min.js");

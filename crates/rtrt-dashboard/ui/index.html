@@ -112,9 +112,10 @@
           <button type="button" data-window="all">All</button>
         </div>
       </div>
+      <!-- Pillar-led savings model: Σ agent-token saved % + three pillar cards -->
       <div class="card savings-hero">
         <div class="head">
-          <h2>Total Saved</h2>
+          <h2>Σ Agent-Token Saved</h2>
           <span id="overview-live" class="badge ok overview-live">live</span>
         </div>
         <div class="savings-total" id="kpi-saved">0% saved</div>
@@ -123,9 +124,7 @@
           <span><span id="kpi-saved-chars" class="countup" data-target="0">0</span> total chars</span>
           <span id="kpi-window-label">window: All</span>
         </div>
-      </div>
-      <div class="card">
-        <div class="head"><h2>Optimizer Savings</h2><span class="hint">Tokens are estimated from characters.</span></div>
+        <p class="lede" style="margin:0;">💯 Σ blends the three savings pillars below — the same model the status line reports.</p>
         <div id="optimizer-source-cards" class="savings-source-grid">
           <div class="empty">Loading…</div>
         </div>
@@ -134,7 +133,7 @@
       <div class="card">
         <div class="head"><h2>Per-Project Savings</h2><span class="hint" id="project-savings-hint">Sorted by total tokens.</span></div>
         <table id="project-savings-tbl">
-          <thead><tr><th>Project</th><th>Memory</th><th>Output Optimizer</th><th>Command Optimizer</th><th>%</th><th>Total tokens</th></tr></thead>
+          <thead><tr><th>Project</th><th>📝 Output Optimizer</th><th>🧠 Memory</th><th>⚡ Command Optimizer</th><th>%</th><th>Total tokens</th></tr></thead>
           <tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
@@ -170,11 +169,8 @@
       </div>
       <div class="card">
         <div class="head"><h2>Detected Tools</h2><a id="environment-refresh">Refresh</a></div>
-        <div class="env-table-wrap">
-          <table id="environment-tbl">
-            <thead><tr><th>Name</th><th>Installed</th><th>Version</th><th>Modes</th><th>Cost class</th><th>Models</th><th>Invocation template</th><th>Enabled</th></tr></thead>
-            <tbody><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
-          </table>
+        <div id="environment-groups" class="env-groups">
+          <div class="empty">Loading…</div>
         </div>
         <div id="environment-notes" class="out-meta"></div>
       </div>

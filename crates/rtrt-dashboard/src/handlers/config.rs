@@ -140,6 +140,77 @@ pub(crate) async fn post_config(
 }
 
 // ---------------------------------------------------------------------------
+// GET/POST /api/memory/settings
+//
+// Global `[memory]` section: the on-disk memory store `path` and the
+// `embed_model` name. Plain global settings (no per-project scope toggle) —
+// persisted to `~/.rtrt/config.toml` via `write_config_file`.
+//
+// `path` is editable but flagged on the client with a warning, because pointing
+// it at a different file makes the dashboard/CLI read a *different* store; the
+// change only takes effect after a restart (the running server keeps its open
+// handle). `embed_model` is a free-text input.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MemorySettingsResponse {
+    /// Memory store path as configured (may be relative, e.g. the default
+    /// `.rtrt/memory.sqlite`).
+    path: String,
+    embed_model: String,
+    /// Config file the values live in (so the UI can show provenance).
+    config_path: String,
+}
+
+fn memory_settings_response(cfg: &rtrt_core::Config) -> MemorySettingsResponse {
+    let config_path = rtrt_core::Config::default_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    MemorySettingsResponse {
+        path: cfg.memory.path.to_string_lossy().into_owned(),
+        embed_model: cfg.memory.embed_model.clone(),
+        config_path,
+    }
+}
+
+pub(crate) async fn get_memory_settings()
+-> std::result::Result<Json<MemorySettingsResponse>, (StatusCode, String)> {
+    let cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(memory_settings_response(&cfg)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetMemorySettingsRequest {
+    /// New memory store path. Absent/empty keeps the existing path.
+    #[serde(default)]
+    path: Option<String>,
+    /// New embedding model name. Absent/empty keeps the existing model.
+    #[serde(default)]
+    embed_model: Option<String>,
+}
+
+pub(crate) async fn post_memory_settings(
+    Json(req): Json<SetMemorySettingsRequest>,
+) -> std::result::Result<Json<MemorySettingsResponse>, (StatusCode, String)> {
+    let mut cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(path) = req.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        cfg.memory.path = std::path::PathBuf::from(path);
+    }
+    if let Some(model) = req
+        .embed_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cfg.memory.embed_model = model.to_string();
+    }
+    write_config_file(&cfg)?;
+    Ok(Json(memory_settings_response(&cfg)))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/models
 // ---------------------------------------------------------------------------
 

@@ -22,8 +22,12 @@ pub(crate) use crate::handlers::compress::{
     proxy_filter, repo_map, setup_snippet,
 };
 pub(crate) use crate::handlers::config::{
-    ConfigResponse, ConfigWriteRequest, ConfigWriteResponse, ModelEntry, ModelsResponse,
-    get_config, get_models, post_config,
+    ConfigResponse, ConfigWriteRequest, ConfigWriteResponse, MemorySettingsResponse, ModelEntry,
+    ModelsResponse, SetMemorySettingsRequest, get_config, get_memory_settings, get_models,
+    post_config, post_memory_settings,
+};
+pub(crate) use crate::handlers::limits::{
+    LimitTargetView, LimitsConfigResponse, SetLimitsRequest, get_limits_config, post_limits_config,
 };
 pub(crate) use crate::handlers::memgraph::{
     BRAIN_MIN_COOCCUR, CACHE_KEY_SEP, CLUSTER_MAX_NODES, CLUSTER_MIN_WEIGHT, CLUSTER_TOP_K,
@@ -67,11 +71,13 @@ pub(crate) use crate::handlers::savings::{
     output_savings_by_project, projects_rollup, savings_source, usize_to_i64,
 };
 pub(crate) use crate::handlers::scope::{
-    ProjectQuery, SetAgentsRequest, SetCompressionRequest, SetLevelRequest, SetProvidersRequest,
-    agent_kind_label, compression_level_label, effective_agent_tools, effective_provider_tools,
-    get_agents_config, get_compression_config, get_optimizer_level, get_providers_config,
-    parse_compression_level, post_agents_config, post_compression_config, post_optimizer_level,
-    post_providers_config, resolve_project_repo,
+    ProjectQuery, SetAgentsRequest, SetCompressionRequest, SetEmbeddingsProjectRequest,
+    SetLevelRequest, SetProvidersRequest, SetSecurityProjectRequest, agent_kind_label,
+    compression_level_label, effective_agent_tools, effective_provider_tools, get_agents_config,
+    get_compression_config, get_embeddings_project, get_optimizer_level, get_providers_config,
+    get_security_project, parse_compression_level, post_agents_config, post_compression_config,
+    post_embeddings_project, post_optimizer_level, post_providers_config, post_security_project,
+    resolve_project_name, resolve_project_repo,
 };
 pub(crate) use crate::handlers::security::{
     ProfileSaveReq, SecurityScanRequest, security_profile, security_profile_save,

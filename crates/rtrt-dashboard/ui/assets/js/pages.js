@@ -1,8 +1,14 @@
-const OVERVIEW_SOURCE_ORDER = ['memory', 'output_optimizer', 'command_optimizer'];
+const OVERVIEW_SOURCE_ORDER = ['output_optimizer', 'memory', 'command_optimizer'];
 const OVERVIEW_SOURCE_LABELS = {
   memory: 'Memory',
   output_optimizer: 'Output Optimizer',
   command_optimizer: 'Command Optimizer',
+};
+// Status-line savings pillars: glyph + the metric each pillar reports.
+const OVERVIEW_SOURCE_PILLARS = {
+  output_optimizer: { glyph: '📝', metric: 'terse level + rule compress' },
+  memory: { glyph: '🧠', metric: 'storage-reduction %' },
+  command_optimizer: { glyph: '⚡', metric: 'effective %' },
 };
 const OVERVIEW_WINDOWS = new Set(['1h', '6h', '24h', '7d', '30d', 'all']);
 let overviewPollTimer = null;
@@ -153,11 +159,14 @@ function renderOverviewSources(payload) {
     const badge = source.available === false
       ? '<span class="badge warn">unavailable</span>'
       : '<span class="badge ok">available</span>';
+    const pillar = OVERVIEW_SOURCE_PILLARS[source.name] || { glyph: '•', metric: 'savings' };
+    const name = `<span class="name"><span class="pillar-glyph" aria-hidden="true">${pillar.glyph}</span> ${escapeHtml(source.label || source.name)}</span>`;
+    const pillarMetric = `<div class="overall pillar-metric">${escapeHtml(pillar.metric)}</div>`;
     if (source.name === 'output_optimizer') {
       return `<div class="optimizer-mini-card">
-        <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
+        <div class="top">${name}${badge}</div>
+        ${pillarMetric}
         <div class="optimizer-level-primary metric-value">${optimizerLevelBadge(source.level, source.active)}</div>
-        <div class="overall">${escapeHtml(optimizerMeasurementNote(source))}</div>
         <div class="metric-lead metric-value">${fmtPctMaybe(effective)} effective</div>
         <div class="meta"><span>${coverageLead(source)}</span></div>
         <div class="flow"><span>${withoutWithSaved(source)}</span><span class="overall">${tokens.toLocaleString()} tokens · ${chars.toLocaleString()} chars saved · ${optimizerRuleSummary(source)}</span></div>
@@ -165,7 +174,8 @@ function renderOverviewSources(payload) {
       </div>`;
     }
     return `<div class="optimizer-mini-card">
-      <div class="top"><span class="name">${escapeHtml(source.label || source.name)}</span>${badge}</div>
+      <div class="top">${name}${badge}</div>
+      ${pillarMetric}
       <div class="metric-lead metric-value">${fmtPctMaybe(effective)} effective</div>
       <div class="meta"><span>${coverageLead(source)}</span></div>
       <div class="flow"><span>${withoutWithSaved(source)}</span><span class="overall">overall ${fmtPctMaybe(source.saved_pct)} blended · ${tokens.toLocaleString()} tokens · ${chars.toLocaleString()} chars saved</span></div>
@@ -221,8 +231,8 @@ function renderProjectSavings(payload) {
     const pct = pctValue(project.saved_pct);
     return `<tr>
       <td class="project-name-cell">${escapeHtml(project.project || '(unknown)')}</td>
-      ${optimizerCell(project, 'memory')}
       ${optimizerCell(project, 'output_optimizer')}
+      ${optimizerCell(project, 'memory')}
       ${optimizerCell(project, 'command_optimizer')}
       <td class="percent-cell">${percentInline(pct, maxPct)}</td>
       <td class="project-total-cell"><span class="tokens-cell">${totalTokens.toLocaleString()}</span><div class="project-row-bar"><span style="width:${Math.max(0, Math.min(100, width)).toFixed(1)}%;"></span></div></td>
@@ -497,13 +507,16 @@ function stopGainPolling() {
   }
 }
 
+// Group detected tools by their `kind` field from /api/detect.
+// Readable section titles; any kind the endpoint may add later falls into "Other".
 const ENV_KIND_ORDER = ['CodingAgent', 'LocalRuntime', 'ProviderApi', 'McpServer'];
 const ENV_KIND_LABELS = {
-  CodingAgent: 'coding-agent',
-  LocalRuntime: 'local-runtime',
-  ProviderApi: 'provider-api',
-  McpServer: 'mcp-server',
+  CodingAgent: 'Coding Agents',
+  LocalRuntime: 'Local Runtimes',
+  ProviderApi: 'Provider APIs',
+  McpServer: 'MCP Servers',
 };
+const ENV_OTHER_KIND = 'Other';
 let environmentLoading = false;
 
 function envList(values) {
@@ -513,65 +526,92 @@ function envList(values) {
 }
 
 function envKindLabel(kind) {
-  return ENV_KIND_LABELS[kind] || String(kind || 'unknown');
+  if (ENV_KIND_LABELS[kind]) return ENV_KIND_LABELS[kind];
+  return kind === ENV_OTHER_KIND ? ENV_OTHER_KIND : String(kind || ENV_OTHER_KIND);
+}
+
+// Enabled-state badge: active vs disabled, per the task spec (separate from installed).
+function envEnabledBadge(enabled) {
+  return enabled
+    ? '<span class="badge ok">active</span>'
+    : '<span class="badge warn">disabled</span>';
+}
+
+function envToolRow(tool) {
+  const enabled = !!tool.enabled;
+  const toggleClass = enabled ? 'enabled' : 'disabled';
+  const installed = tool.installed ? '<span class="badge ok">yes</span>' : '<span class="badge warn">no</span>';
+  const models = Array.isArray(tool.models) && tool.models.length
+    ? tool.models.map(m => `<code>${escapeHtml(m)}</code>`).join(' ')
+    : '<span class="hint">—</span>';
+  const modes = envList(tool.invocation_modes);
+  const template = tool.cli_invocation || tool.config_path || tool.path || '';
+  return `<tr>
+    <td class="project-name-cell">${escapeHtml(tool.name || 'unknown')}</td>
+    <td>${envEnabledBadge(enabled)}</td>
+    <td>${installed}</td>
+    <td>${tool.version ? `<code>${escapeHtml(tool.version)}</code>` : '<span class="hint">—</span>'}</td>
+    <td>${modes}</td>
+    <td><span class="badge">${escapeHtml(tool.cost_class || 'Unknown')}</span></td>
+    <td class="env-models">${models}</td>
+    <td class="env-template">${template ? `<code>${escapeHtml(template)}</code>` : '<span class="hint">—</span>'}</td>
+    <td><button type="button" class="env-toggle ${toggleClass}" data-tool="${escapeAttr(tool.name || '')}" data-enabled="${enabled ? '1' : '0'}">${enabled ? 'Enabled' : 'Disabled'}</button></td>
+  </tr>`;
+}
+
+function envGroupCard(kind, groupTools) {
+  const active = groupTools.filter(t => t.enabled).length;
+  const sorted = groupTools.slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  const body = sorted.length
+    ? sorted.map(envToolRow).join('')
+    : '<tr><td colspan="9" class="empty">none</td></tr>';
+  return `<div class="card env-group-card">
+    <div class="head">
+      <h2>${escapeHtml(envKindLabel(kind))}</h2>
+      <span class="hint">${active.toLocaleString()} active · ${groupTools.length.toLocaleString()} detected</span>
+    </div>
+    <div class="env-table-wrap">
+      <table class="environment-tbl">
+        <thead><tr><th>Name</th><th>State</th><th>Installed</th><th>Version</th><th>Modes</th><th>Cost class</th><th>Models</th><th>Invocation template</th><th>Enabled</th></tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  </div>`;
 }
 
 function renderEnvironment(tools) {
-  const tbody = document.querySelector('#environment-tbl tbody');
+  const wrap = document.getElementById('environment-groups');
   const notes = document.getElementById('environment-notes');
-  if (!tbody) return;
+  if (!wrap) return;
   if (!Array.isArray(tools) || !tools.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">No tools detected.</td></tr>';
+    wrap.innerHTML = '<div class="empty">No tools detected.</div>';
     if (notes) notes.textContent = 'Detection completed with no rows.';
     return;
   }
   const groups = new Map();
   for (const tool of tools) {
-    const kind = tool.kind || 'unknown';
+    const raw = tool.kind || ENV_OTHER_KIND;
+    const kind = ENV_KIND_LABELS[raw] ? raw : ENV_OTHER_KIND;
     if (!groups.has(kind)) groups.set(kind, []);
     groups.get(kind).push(tool);
   }
+  // Known kinds in canonical order, then "Other" last (only if present).
   const orderedKinds = [
     ...ENV_KIND_ORDER.filter(kind => groups.has(kind)),
-    ...Array.from(groups.keys()).filter(kind => !ENV_KIND_ORDER.includes(kind)).sort(),
+    ...(groups.has(ENV_OTHER_KIND) ? [ENV_OTHER_KIND] : []),
   ];
-  const rows = [];
-  for (const kind of orderedKinds) {
-    const groupTools = groups.get(kind).slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
-    rows.push(`<tr class="env-group-row"><td colspan="8">${escapeHtml(envKindLabel(kind))} · ${groupTools.length.toLocaleString()}</td></tr>`);
-    for (const tool of groupTools) {
-      const installed = tool.installed ? '<span class="badge ok">yes</span>' : '<span class="badge warn">no</span>';
-      const enabled = !!tool.enabled;
-      const toggleClass = enabled ? 'enabled' : 'disabled';
-      const models = Array.isArray(tool.models) && tool.models.length
-        ? tool.models.map(m => `<code>${escapeHtml(m)}</code>`).join(' ')
-        : '<span class="hint">—</span>';
-      const modes = envList(tool.invocation_modes);
-      const template = tool.cli_invocation || tool.config_path || tool.path || '';
-      rows.push(`<tr>
-        <td class="project-name-cell">${escapeHtml(tool.name || 'unknown')}</td>
-        <td>${installed}</td>
-        <td>${tool.version ? `<code>${escapeHtml(tool.version)}</code>` : '<span class="hint">—</span>'}</td>
-        <td>${modes}</td>
-        <td><span class="badge">${escapeHtml(tool.cost_class || 'Unknown')}</span></td>
-        <td class="env-models">${models}</td>
-        <td class="env-template">${template ? `<code>${escapeHtml(template)}</code>` : '<span class="hint">—</span>'}</td>
-        <td><button type="button" class="env-toggle ${toggleClass}" data-tool="${escapeAttr(tool.name || '')}" data-enabled="${enabled ? '1' : '0'}">${enabled ? 'Enabled' : 'Disabled'}</button></td>
-      </tr>`);
-    }
-  }
-  tbody.innerHTML = rows.join('');
-  tbody.querySelectorAll('.env-toggle').forEach(btn => {
+  wrap.innerHTML = orderedKinds.map(kind => envGroupCard(kind, groups.get(kind))).join('');
+  wrap.querySelectorAll('.env-toggle').forEach(btn => {
     btn.onclick = () => toggleEnvironmentTool(btn.dataset.tool, btn.dataset.enabled !== '1');
   });
-  if (notes) notes.textContent = `${tools.length.toLocaleString()} detected tools. API keys are never displayed.`;
+  if (notes) notes.textContent = `${tools.length.toLocaleString()} detected tools across ${orderedKinds.length.toLocaleString()} groups. API keys are never displayed.`;
 }
 
 async function loadEnvironment() {
   if (environmentLoading) return;
   environmentLoading = true;
-  const tbody = document.querySelector('#environment-tbl tbody');
-  if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="empty">Loading…</td></tr>';
+  const wrap = document.getElementById('environment-groups');
+  if (wrap) wrap.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const r = await fetch('/api/detect');
     if (!r.ok) {
@@ -580,7 +620,7 @@ async function loadEnvironment() {
     }
     renderEnvironment(await r.json());
   } catch (e) {
-    if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(e.message || String(e))}</td></tr>`;
+    if (wrap) wrap.innerHTML = `<div class="empty">${escapeHtml(e.message || String(e))}</div>`;
   } finally {
     environmentLoading = false;
   }
@@ -631,11 +671,22 @@ function routeCostBadge(costClass) {
   return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
 }
 
+function routeCapabilities(caps) {
+  return Array.isArray(caps) && caps.length
+    ? caps.map(c => `<span class="badge">${escapeHtml(String(c))}</span>`).join(' ')
+    : '';
+}
+
 function renderRouteResult(data) {
   const chosen = data.chosen || {};
   const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
   const usage = data.usage_headroom || {};
   const byTarget = usage.by_target || {};
+  // The chosen target's headroom (if the endpoint reports usage limits for it)
+  // is part of "why" — surface it alongside cost class / mode / reason.
+  const chosenHeadroom = (chosen.target && byTarget[chosen.target] && byTarget[chosen.target].label)
+    ? byTarget[chosen.target].label
+    : null;
   document.getElementById('route-results').hidden = false;
   document.getElementById('route-chosen').innerHTML = `
     <div class="route-chosen-card">
@@ -646,17 +697,21 @@ function renderRouteResult(data) {
       <div class="route-meta-grid">
         <div class="route-meta-box"><div class="label">mode</div><div class="value">${escapeHtml(routeValue(chosen.mode))}</div></div>
         <div class="route-meta-box"><div class="label">model</div><div class="value">${escapeHtml(routeValue(chosen.model))}</div></div>
-        <div class="route-meta-box"><div class="label">reason</div><div class="value">${escapeHtml(routeValue(chosen.reason))}</div></div>
+        <div class="route-meta-box"><div class="label">headroom</div><div class="value">${escapeHtml(chosenHeadroom || 'n/a')}</div></div>
+        <div class="route-meta-box"><div class="label">why</div><div class="value">${escapeHtml(routeValue(chosen.reason))}</div></div>
       </div>
     </div>`;
   document.getElementById('route-alternatives').innerHTML = alternatives.length
-    ? alternatives.map((alt, idx) => `
+    ? alternatives.map((alt, idx) => {
+      const caps = routeCapabilities(alt.capabilities);
+      return `
       <div class="route-alt-row">
         <div><span class="badge">#${idx + 1}</span> <strong>${escapeHtml(routeValue(alt.target))}</strong></div>
         <div>${routeCostBadge(alt.cost_class)}</div>
         <div><code>${escapeHtml(routeValue(alt.mode))}</code>${alt.model ? `<div class="hint">${escapeHtml(alt.model)}</div>` : ''}</div>
-        <div>${escapeHtml(routeValue(alt.reason))}<div class="hint">${escapeHtml(routeValue(alt.headroom))}</div></div>
-      </div>`).join('')
+        <div>${escapeHtml(routeValue(alt.reason))}<div class="hint">${escapeHtml(routeValue(alt.headroom))}</div>${caps ? `<div class="hint">${caps}</div>` : ''}</div>
+      </div>`;
+    }).join('')
     : '<div class="empty">No alternatives returned for this request.</div>';
   const headroomRows = Object.entries(byTarget);
   document.getElementById('route-headroom').innerHTML = headroomRows.length

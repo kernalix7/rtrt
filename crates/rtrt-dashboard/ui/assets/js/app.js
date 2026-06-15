@@ -345,6 +345,9 @@ function refreshSecurityScope() {
   if (!msg) {
     const p = selectedProject();
     loadSecurityProfiles(p && p.security_profile ? p.security_profile : GLOBAL_DEFAULT_PROFILE);
+    loadSecurityProjectProfile();
+  } else {
+    applySecurityProfileScope('global');
   }
 }
 

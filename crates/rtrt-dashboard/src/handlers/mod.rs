@@ -4,6 +4,7 @@
 pub(crate) mod chat;
 pub(crate) mod compress;
 pub(crate) mod config;
+pub(crate) mod limits;
 pub(crate) mod memgraph;
 pub(crate) mod memory;
 pub(crate) mod ollama;

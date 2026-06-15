@@ -49,6 +49,22 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
             "/api/agents/config",
             get(get_agents_config).post(post_agents_config),
         )
+        .route(
+            "/api/embeddings/project",
+            get(get_embeddings_project).post(post_embeddings_project),
+        )
+        .route(
+            "/api/security/project",
+            get(get_security_project).post(post_security_project),
+        )
+        .route(
+            "/api/limits/config",
+            get(get_limits_config).post(post_limits_config),
+        )
+        .route(
+            "/api/memory/settings",
+            get(get_memory_settings).post(post_memory_settings),
+        )
         .route("/api/templates", get(list_templates).post(create_template))
         .route(
             "/api/templates/{name}",

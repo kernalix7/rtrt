@@ -74,6 +74,48 @@ pub(crate) fn resolve_project_repo(project: Option<&str>) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
+/// Resolve a `?project=` selector to a registered project NAME (not a repo
+/// path). The per-project `embeddings_enabled` / `security_profile` overrides
+/// live on the `ProjectEntry` in the GLOBAL config keyed by name, so these two
+/// endpoints need the name — unlike the `.rtrt/config.toml`-backed settings
+/// that go through `resolve_project_repo`. Returns `None` for the
+/// `global`/empty sentinel.
+pub(crate) fn resolve_project_name(project: Option<&str>) -> Option<String> {
+    let name = project.map(str::trim).filter(|n| !n.is_empty())?;
+    if name.eq_ignore_ascii_case("global") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Load the global config, run `mutate` on the named project's entry (creating
+/// it if absent, preserving its other fields), then persist. Shared by the
+/// embeddings + security_profile per-project writers. The error is boxed so the
+/// `Err` variant stays small (clippy `result_large_err`).
+fn upsert_project_field(
+    name: &str,
+    mutate: impl FnOnce(&mut rtrt_core::ProjectEntry),
+) -> std::result::Result<(), Box<axum::response::Response>> {
+    let mut cfg = rtrt_core::Config::load().map_err(|e| Box::new(clear_field_error(e)))?;
+    let mut entry = cfg
+        .project(name)
+        .cloned()
+        .unwrap_or(rtrt_core::ProjectEntry {
+            name: name.to_string(),
+            path: None,
+            security_profile: None,
+            embeddings_enabled: None,
+        });
+    mutate(&mut entry);
+    cfg.upsert_project(entry);
+    if let Err((status, msg)) = write_config_file(&cfg) {
+        return Err(Box::new(
+            (status, Json(serde_json::json!({ "error": msg }))).into_response(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn get_optimizer_level(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
@@ -625,4 +667,201 @@ pub(crate) async fn post_agents_config(
         "inherited": false,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/embeddings/project
+//
+// Per-project `embeddings_enabled` override on `ProjectEntry` (force semantic
+// memory on/off for one project). `None` = Follow global (`[embeddings] enabled`).
+// `?scope=global` clears the override back to None. Mirrors the shared
+// "Follow global / Custom (this project)" scope contract used by the five
+// `.rtrt/config.toml`-backed settings — but the value lives on the global
+// config's `[[projects]]` entry, keyed by name.
+// ---------------------------------------------------------------------------
+
+/// Effective embeddings-enabled for a project: the per-project override when
+/// set, else the global `[embeddings] enabled`.
+fn effective_embeddings_enabled(over: Option<bool>) -> bool {
+    match over {
+        Some(v) => v,
+        None => rtrt_core::Config::load()
+            .map(|c| c.embeddings.enabled)
+            .unwrap_or(false),
+    }
+}
+
+fn embeddings_project_json(name_present: bool, over: Option<bool>) -> serde_json::Value {
+    // `custom` is true only for a real project that pins its own override.
+    let custom = name_present && over.is_some();
+    serde_json::json!({
+        "enabled": effective_embeddings_enabled(over),
+        "override": over,
+        "global_enabled": rtrt_core::Config::load().map(|c| c.embeddings.enabled).unwrap_or(false),
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
+        "inherited": name_present && !custom,
+    })
+}
+
+pub(crate) async fn get_embeddings_project(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let name = resolve_project_name(q.project.as_deref());
+    let over = match &name {
+        Some(n) => rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.project(n).and_then(|p| p.embeddings_enabled)),
+        None => None,
+    };
+    Json(embeddings_project_json(name.is_some(), over))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetEmbeddingsProjectRequest {
+    /// `Some(true)`/`Some(false)` forces semantic memory on/off; absent leaves
+    /// the existing override (only the `?scope=global` clear path removes it).
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+pub(crate) async fn post_embeddings_project(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    body: Option<Json<SetEmbeddingsProjectRequest>>,
+) -> impl IntoResponse {
+    let name = resolve_project_name(q.project.as_deref());
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+
+    let Some(name) = name else {
+        // No project selected — embeddings_enabled is a per-project field with
+        // no global write target (the global toggle lives in [embeddings]).
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "select a project to set the per-project embeddings override" })),
+        )
+            .into_response();
+    };
+
+    // "Follow global": clear the per-project override back to None.
+    if follow_global {
+        if let Err(resp) = upsert_project_field(&name, |e| e.embeddings_enabled = None) {
+            return *resp;
+        }
+        return Json(embeddings_project_json(true, None)).into_response();
+    }
+
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing enabled" })),
+        )
+            .into_response();
+    };
+    let Some(enabled) = body.enabled else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing enabled" })),
+        )
+            .into_response();
+    };
+    if let Err(resp) = upsert_project_field(&name, |e| e.embeddings_enabled = Some(enabled)) {
+        return *resp;
+    }
+    Json(embeddings_project_json(true, Some(enabled))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET/POST /api/security/project
+//
+// Per-project `security_profile` override on `ProjectEntry` (bound profile name,
+// else the global `[security] default_profile`). `None` = Follow global.
+// `?scope=global` clears it. Same scope contract as the embeddings endpoint.
+// ---------------------------------------------------------------------------
+
+fn global_default_profile() -> String {
+    rtrt_core::Config::load()
+        .map(|c| c.security.default_profile)
+        .unwrap_or_else(|_| "ai-default".to_string())
+}
+
+fn security_project_json(name_present: bool, over: Option<&str>) -> serde_json::Value {
+    let custom = name_present && over.is_some();
+    let default_profile = global_default_profile();
+    let effective = over
+        .map(str::to_string)
+        .unwrap_or_else(|| default_profile.clone());
+    serde_json::json!({
+        "profile": effective,
+        "override": over,
+        "default_profile": default_profile,
+        "scope": if custom { "custom" } else { "global" },
+        "custom": custom,
+        "inherited": name_present && !custom,
+    })
+}
+
+pub(crate) async fn get_security_project(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let name = resolve_project_name(q.project.as_deref());
+    let over = match &name {
+        Some(n) => rtrt_core::Config::load()
+            .ok()
+            .and_then(|c| c.project(n).and_then(|p| p.security_profile.clone())),
+        None => None,
+    };
+    Json(security_project_json(name.is_some(), over.as_deref()))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetSecurityProjectRequest {
+    /// Bound profile name; absent/empty with no `?scope=global` is rejected.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+pub(crate) async fn post_security_project(
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    body: Option<Json<SetSecurityProjectRequest>>,
+) -> impl IntoResponse {
+    let name = resolve_project_name(q.project.as_deref());
+    let follow_global = q
+        .scope
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+
+    let Some(name) = name else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "select a project to bind a security profile" })),
+        )
+            .into_response();
+    };
+
+    if follow_global {
+        if let Err(resp) = upsert_project_field(&name, |e| e.security_profile = None) {
+            return *resp;
+        }
+        return Json(security_project_json(true, None)).into_response();
+    }
+
+    let profile = body
+        .and_then(|Json(b)| b.profile)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(profile) = profile else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing profile" })),
+        )
+            .into_response();
+    };
+    let stored = profile.clone();
+    if let Err(resp) = upsert_project_field(&name, |e| e.security_profile = Some(stored)) {
+        return *resp;
+    }
+    Json(security_project_json(true, Some(&profile))).into_response()
 }

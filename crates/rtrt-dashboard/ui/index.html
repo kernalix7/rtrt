@@ -464,6 +464,32 @@
 
         <!-- Stats subtab -->
         <div id="sub-memstats" class="subpage" hidden>
+          <!-- Per-project embeddings override (force semantic memory on/off) -->
+          <div class="card">
+            <div class="head"><h2>Embeddings (semantic memory)</h2><span class="hint" id="embeddings-config-hint">~/.rtrt/config.toml</span></div>
+            <p class="lede">Force semantic (vector) memory on or off for this project, or follow the global <code>[embeddings] enabled</code> default.</p>
+            <div class="settings-section" id="embeddings-scope-section" hidden>
+              <h3>Scope</h3>
+              <div class="scope-toggle" role="radiogroup" aria-label="Embeddings scope">
+                <label class="segment-toggle">
+                  <input type="radio" name="embeddings-scope" id="embeddings-scope-global" value="global" checked>
+                  <span>Follow global</span>
+                </label>
+                <label class="segment-toggle">
+                  <input type="radio" name="embeddings-scope" id="embeddings-scope-custom" value="custom">
+                  <span>Custom (this project)</span>
+                </label>
+              </div>
+              <small class="placeholder-hint" id="embeddings-scope-hint">Follow global: this project inherits the global embeddings setting. The toggle below shows the inherited value (read-only).</small>
+            </div>
+            <div id="embeddings-fields">
+              <div class="toggle-row">
+                <input type="checkbox" id="embeddings-project-enabled">
+                <label for="embeddings-project-enabled">Semantic memory enabled for this project</label>
+              </div>
+              <div id="embeddings-project-status" class="out-meta" style="margin-top:0.4rem;"></div>
+            </div>
+          </div>
           <div class="card">
             <div class="head"><h2>Memory Stats</h2><a id="memstats-refresh" style="cursor:pointer;font-size:0.88em;">Refresh</a></div>
             <div id="memstats-loading" class="empty">Loads automatically once a project is selected.</div>
@@ -1189,6 +1215,61 @@
         </div>
         <div id="compress-now-result" class="compress-now-result out-meta"></div>
       </div>
+      <!-- Memory settings (global [memory]: store path + embed model) -->
+      <div class="card" style="margin-top:1rem;">
+        <div class="head"><h2>Memory settings</h2><span class="hint" id="memory-settings-hint">~/.rtrt/config.toml [memory]</span></div>
+        <p class="lede">Global memory store location and the embedding model name recorded in <code>[memory]</code>.</p>
+        <div class="settings-section">
+          <div class="field-row">
+            <label class="field-label" for="memory-settings-path">
+              <span>path (memory store)</span>
+              <input type="text" id="memory-settings-path" placeholder=".rtrt/memory.sqlite">
+            </label>
+            <label class="field-label" for="memory-settings-embed-model">
+              <span>embed_model</span>
+              <input type="text" id="memory-settings-embed-model" placeholder="all-MiniLM-L6-v2">
+            </label>
+          </div>
+          <div class="note" style="margin-top:0.5rem;">
+            <strong>Changing the path points the dashboard and CLI at a different store.</strong>
+            Existing memories are not moved; the new path takes effect after a server restart.
+          </div>
+          <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.6rem;flex-wrap:wrap;">
+            <button id="memory-settings-save-btn" class="primary" type="button">Save memory settings</button>
+            <span id="memory-settings-result" class="out-meta"></span>
+          </div>
+        </div>
+      </div>
+      <!-- Daily usage limits (global [limits.<target>]) -->
+      <div class="card" style="margin-top:1rem;">
+        <div class="head"><h2>Daily usage limits</h2><span class="hint" id="limits-config-hint">~/.rtrt/config.toml [limits]</span></div>
+        <p class="lede">Optional daily ceilings per provider/target. Leave a field blank for no limit on that axis.</p>
+        <div class="env-table-wrap">
+          <table id="limits-tbl">
+            <thead><tr><th>Target</th><th>daily_tokens</th><th>daily_requests</th><th></th></tr></thead>
+            <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:flex-end;flex-wrap:wrap;margin-top:0.6rem;">
+          <div class="field-label">
+            <span>target</span>
+            <input type="text" id="limits-add-target" placeholder="openai" style="min-width:140px;">
+          </div>
+          <div class="field-label">
+            <span>daily_tokens</span>
+            <input type="number" id="limits-add-tokens" min="0" placeholder="—" style="min-width:120px;">
+          </div>
+          <div class="field-label">
+            <span>daily_requests</span>
+            <input type="number" id="limits-add-requests" min="0" placeholder="—" style="min-width:120px;">
+          </div>
+          <button id="limits-add-btn" class="ghost" type="button">Add target</button>
+        </div>
+        <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.6rem;flex-wrap:wrap;">
+          <button id="limits-save-btn" class="primary" type="button">Save limits</button>
+          <span id="limits-save-result" class="out-meta"></span>
+        </div>
+      </div>
     </section>
 
     <!-- Providers -->
@@ -1269,6 +1350,35 @@
       </nav>
       <div id="sub-securityscan" class="subpage">
         <div id="security-scope-empty" class="scope-empty" hidden>Select or add a project</div>
+        <!-- Per-project bound security profile (else global default_profile) -->
+        <div class="card">
+          <div class="head"><h2>Bound security profile</h2><span class="hint" id="security-profile-config-hint">~/.rtrt/config.toml</span></div>
+          <p class="lede">Bind this project to a named security profile, or follow the global <code>[security] default_profile</code>.</p>
+          <div class="settings-section" id="security-profile-scope-section" hidden>
+            <h3>Scope</h3>
+            <div class="scope-toggle" role="radiogroup" aria-label="Security profile scope">
+              <label class="segment-toggle">
+                <input type="radio" name="security-profile-scope" id="security-profile-scope-global" value="global" checked>
+                <span>Follow global</span>
+              </label>
+              <label class="segment-toggle">
+                <input type="radio" name="security-profile-scope" id="security-profile-scope-custom" value="custom">
+                <span>Custom (this project)</span>
+              </label>
+            </div>
+            <small class="placeholder-hint" id="security-profile-scope-hint">Follow global: this project uses the global default profile. The select below shows the inherited value (read-only).</small>
+          </div>
+          <div id="security-profile-fields">
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label" for="security-project-profile-select">
+                <span>bound profile</span>
+                <select id="security-project-profile-select"><option value="">Loading…</option></select>
+              </label>
+              <button id="security-project-profile-save-btn" class="primary" type="button">Save bound profile</button>
+            </div>
+            <div id="security-project-profile-status" class="out-meta" style="margin-top:0.4rem;"></div>
+          </div>
+        </div>
         <div class="card">
           <div class="head"><h2>Scan</h2><span class="hint">Scans the selected project path</span></div>
           <div id="security-project-meta" class="out-meta scope-status"></div>

@@ -4090,6 +4090,9 @@ async function loadConfig() {
   populateEmbModelSelect(emb.model || '');
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
   await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
+  // Global [memory] + [limits] cards live on the same Settings page.
+  await loadMemorySettings();
+  await loadLimitsConfig();
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {
@@ -4134,6 +4137,368 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
   pushActivity('Settings saved');
   showToast('Settings saved', 'ok');
 };
+
+// ===========================================================================
+// Memory settings (global [memory]: store path + embed_model). Plain global
+// settings — no scope toggle. GET/POST /api/memory/settings.
+// ===========================================================================
+async function loadMemorySettings() {
+  try {
+    const r = await fetch('/api/memory/settings');
+    if (!r.ok) return;
+    const d = await r.json();
+    const pathEl = document.getElementById('memory-settings-path');
+    const modelEl = document.getElementById('memory-settings-embed-model');
+    if (pathEl) pathEl.value = d.path || '';
+    if (modelEl) modelEl.value = d.embed_model || '';
+    const hint = document.getElementById('memory-settings-hint');
+    if (hint && d.config_path) hint.textContent = `${d.config_path} [memory]`;
+  } catch (_) { /* ignore */ }
+}
+
+async function saveMemorySettings() {
+  const result = document.getElementById('memory-settings-result');
+  const path = document.getElementById('memory-settings-path').value.trim();
+  const embed_model = document.getElementById('memory-settings-embed-model').value.trim();
+  if (result) result.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/memory/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, embed_model }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    if (result) result.innerHTML = '<span class="badge ok">✓ Saved · restart to apply path change</span>';
+    pushActivity('Memory settings saved');
+    showToast('Memory settings saved', 'ok');
+  } catch (e) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    showToast(`Memory settings error: ${e.message || e}`, 'err');
+  }
+}
+
+const memorySettingsSaveBtn = document.getElementById('memory-settings-save-btn');
+if (memorySettingsSaveBtn) memorySettingsSaveBtn.onclick = saveMemorySettings;
+
+// ===========================================================================
+// Daily usage limits (global [limits.<target>]). Plain global setting — a
+// table of targets with optional daily_tokens / daily_requests ceilings.
+// GET/POST /api/limits/config. Full-replace write.
+// ===========================================================================
+let LIMITS_STATE = [];
+
+function renderLimitsTable() {
+  const tbody = document.querySelector('#limits-tbl tbody');
+  if (!tbody) return;
+  if (!LIMITS_STATE.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No limits set.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = LIMITS_STATE.map((row, i) => `
+    <tr>
+      <td>${escapeHtml(row.target)}</td>
+      <td><input type="number" min="0" data-limit-idx="${i}" data-limit-field="daily_tokens" value="${row.daily_tokens ?? ''}" placeholder="—" style="width:120px;"></td>
+      <td><input type="number" min="0" data-limit-idx="${i}" data-limit-field="daily_requests" value="${row.daily_requests ?? ''}" placeholder="—" style="width:120px;"></td>
+      <td><button class="ghost" type="button" data-limit-remove="${i}">Remove</button></td>
+    </tr>`).join('');
+  tbody.querySelectorAll('input[data-limit-idx]').forEach(inp => {
+    inp.onchange = () => {
+      const idx = Number(inp.dataset.limitIdx);
+      const field = inp.dataset.limitField;
+      const v = inp.value.trim();
+      LIMITS_STATE[idx][field] = v === '' ? null : Number(v);
+    };
+  });
+  tbody.querySelectorAll('[data-limit-remove]').forEach(btn => {
+    btn.onclick = () => {
+      LIMITS_STATE.splice(Number(btn.dataset.limitRemove), 1);
+      renderLimitsTable();
+    };
+  });
+}
+
+async function loadLimitsConfig() {
+  try {
+    const r = await fetch('/api/limits/config');
+    if (!r.ok) return;
+    const d = await r.json();
+    LIMITS_STATE = Array.isArray(d.targets) ? d.targets.map(t => ({
+      target: t.target,
+      daily_tokens: t.daily_tokens ?? null,
+      daily_requests: t.daily_requests ?? null,
+    })) : [];
+    const hint = document.getElementById('limits-config-hint');
+    if (hint && d.path) hint.textContent = `${d.path} [limits]`;
+    renderLimitsTable();
+  } catch (_) { /* ignore */ }
+}
+
+function addLimitTarget() {
+  const target = document.getElementById('limits-add-target').value.trim();
+  if (!target) { showToast('Enter a target name.', 'err'); return; }
+  if (LIMITS_STATE.some(r => r.target === target)) { showToast('That target already exists.', 'err'); return; }
+  const tokVal = document.getElementById('limits-add-tokens').value.trim();
+  const reqVal = document.getElementById('limits-add-requests').value.trim();
+  LIMITS_STATE.push({
+    target,
+    daily_tokens: tokVal === '' ? null : Number(tokVal),
+    daily_requests: reqVal === '' ? null : Number(reqVal),
+  });
+  document.getElementById('limits-add-target').value = '';
+  document.getElementById('limits-add-tokens').value = '';
+  document.getElementById('limits-add-requests').value = '';
+  renderLimitsTable();
+}
+
+async function saveLimitsConfig() {
+  const result = document.getElementById('limits-save-result');
+  if (result) result.textContent = 'Saving…';
+  // Drop rows that pin neither axis so an empty target isn't persisted.
+  const targets = LIMITS_STATE
+    .filter(r => r.target && (r.daily_tokens != null || r.daily_requests != null))
+    .map(r => ({
+      target: r.target,
+      daily_tokens: r.daily_tokens == null ? null : Number(r.daily_tokens),
+      daily_requests: r.daily_requests == null ? null : Number(r.daily_requests),
+    }));
+  try {
+    const r = await fetch('/api/limits/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targets }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    LIMITS_STATE = Array.isArray(d.targets) ? d.targets.map(t => ({
+      target: t.target,
+      daily_tokens: t.daily_tokens ?? null,
+      daily_requests: t.daily_requests ?? null,
+    })) : [];
+    renderLimitsTable();
+    if (result) result.innerHTML = '<span class="badge ok">✓ Saved</span>';
+    pushActivity('Daily usage limits saved');
+    showToast('Limits saved', 'ok');
+  } catch (e) {
+    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    showToast(`Limits save error: ${e.message || e}`, 'err');
+  }
+}
+
+const limitsAddBtn = document.getElementById('limits-add-btn');
+if (limitsAddBtn) limitsAddBtn.onclick = addLimitTarget;
+const limitsSaveBtn = document.getElementById('limits-save-btn');
+if (limitsSaveBtn) limitsSaveBtn.onclick = saveLimitsConfig;
+
+// ===========================================================================
+// Per-project embeddings override (force semantic memory on/off). Lives on the
+// global config's [[projects]] entry (keyed by name), but uses the shared
+// "Follow global / Custom (this project)" scope toggle. GET/POST
+// /api/embeddings/project?project=X (+ ?scope=global to clear back to None).
+// ===========================================================================
+function embeddingsProjectLocked() {
+  return scopeHasProject() && document.getElementById('embeddings-scope-global').checked;
+}
+
+function applyEmbeddingsScope(scope) {
+  applyScopeToggle('embeddings', scope, {
+    hints: {
+      custom: 'Custom: toggle below to write this project’s embeddings override.',
+      global: 'Follow global: this project inherits the global embeddings setting. The toggle below shows the inherited value (read-only).',
+    },
+    onLock: (locked) => {
+      const cb = document.getElementById('embeddings-project-enabled');
+      if (cb) cb.disabled = locked;
+    },
+  });
+}
+
+function renderEmbeddingsProject(d) {
+  const cb = document.getElementById('embeddings-project-enabled');
+  if (cb) {
+    cb.checked = !!d.enabled;
+    cb.disabled = embeddingsProjectLocked();
+  }
+  const status = document.getElementById('embeddings-project-status');
+  if (status) {
+    const src = d.custom ? 'this project' : `global default (${d.global_enabled ? 'on' : 'off'})`;
+    status.textContent = `Semantic memory ${d.enabled ? 'ON' : 'OFF'} · source: ${src}`;
+  }
+}
+
+async function loadEmbeddingsProject() {
+  if (!scopeHasProject()) {
+    applyEmbeddingsScope('global');
+    return;
+  }
+  try {
+    const r = await fetch(`/api/embeddings/project${scopeProjectQuery()}`);
+    if (r.ok) {
+      const d = await r.json();
+      applyEmbeddingsScope(d.scope === 'custom' ? 'custom' : 'global');
+      renderEmbeddingsProject(d);
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  applyEmbeddingsScope('global');
+}
+
+async function setEmbeddingsProject(enabled) {
+  try {
+    const r = await fetch(`/api/embeddings/project${scopeProjectQuery()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    applyEmbeddingsScope(d.scope === 'custom' ? 'custom' : 'global');
+    renderEmbeddingsProject(d);
+    pushActivity(`embeddings · ${currentProject()} · ${enabled ? 'on' : 'off'}`);
+  } catch (e) {
+    showToast(`Embeddings save error: ${e.message || e}`, 'err');
+    await loadEmbeddingsProject();
+  }
+}
+
+const embeddingsProjectCb = document.getElementById('embeddings-project-enabled');
+if (embeddingsProjectCb) embeddingsProjectCb.addEventListener('change', (ev) => {
+  if (embeddingsProjectLocked()) return;
+  setEmbeddingsProject(ev.target.checked);
+});
+
+const embeddingsScopeGlobal = document.getElementById('embeddings-scope-global');
+if (embeddingsScopeGlobal) embeddingsScopeGlobal.addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  try {
+    const r = await fetch(scopeClearUrl('/api/embeddings/project'), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    pushActivity('Embeddings now follow global');
+    showToast('Following global embeddings setting', 'ok');
+    await loadEmbeddingsProject();
+  } catch (err) {
+    showToast(`Scope error: ${err.message || err}`, 'err');
+    await loadEmbeddingsProject();
+  }
+});
+
+const embeddingsScopeCustom = document.getElementById('embeddings-scope-custom');
+if (embeddingsScopeCustom) embeddingsScopeCustom.addEventListener('change', (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  applyEmbeddingsScope('custom');
+  const cb = document.getElementById('embeddings-project-enabled');
+  if (cb) cb.disabled = false;
+});
+
+// ===========================================================================
+// Per-project bound security profile (else global default_profile). Lives on
+// the global config's [[projects]] entry (keyed by name), uses the shared scope
+// toggle. GET/POST /api/security/project?project=X (+ ?scope=global to clear).
+// ===========================================================================
+function securityProfileLocked() {
+  return scopeHasProject() && document.getElementById('security-profile-scope-global').checked;
+}
+
+function applySecurityProfileScope(scope) {
+  applyScopeToggle('security-profile', scope, {
+    hints: {
+      custom: 'Custom: pick a profile below, then Save to bind it to this project.',
+      global: 'Follow global: this project uses the global default profile. The select below shows the inherited value (read-only).',
+    },
+    onLock: (locked) => {
+      const sel = document.getElementById('security-project-profile-select');
+      if (sel) sel.disabled = locked;
+      const save = document.getElementById('security-project-profile-save-btn');
+      if (save) save.disabled = locked;
+    },
+  });
+}
+
+function renderSecurityProjectProfile(d) {
+  const status = document.getElementById('security-project-profile-status');
+  if (status) {
+    status.textContent = d.custom
+      ? `Bound profile: ${d.profile}`
+      : `Follows global default: ${d.default_profile}`;
+  }
+}
+
+async function loadSecurityProjectProfile() {
+  if (!scopeHasProject()) {
+    applySecurityProfileScope('global');
+    return;
+  }
+  try {
+    const r = await fetch(`/api/security/project${scopeProjectQuery()}`);
+    if (r.ok) {
+      const d = await r.json();
+      applySecurityProfileScope(d.scope === 'custom' ? 'custom' : 'global');
+      await populateSecurityProfileSelect('security-project-profile-select', d.profile);
+      const sel = document.getElementById('security-project-profile-select');
+      if (sel) sel.disabled = securityProfileLocked();
+      renderSecurityProjectProfile(d);
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  applySecurityProfileScope('global');
+}
+
+async function saveSecurityProjectProfile() {
+  if (securityProfileLocked()) return;
+  const profile = document.getElementById('security-project-profile-select').value;
+  if (!profile) { showToast('Select a profile.', 'err'); return; }
+  try {
+    const r = await fetch(`/api/security/project${scopeProjectQuery()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    applySecurityProfileScope(d.scope === 'custom' ? 'custom' : 'global');
+    renderSecurityProjectProfile(d);
+    // Keep the cached project entry + scan profile select in sync.
+    const p = selectedProject();
+    if (p) p.security_profile = d.override || null;
+    pushActivity(`security profile · ${currentProject()} · ${d.profile}`);
+    showToast('Bound profile saved', 'ok');
+  } catch (e) {
+    showToast(`Bound profile error: ${e.message || e}`, 'err');
+    await loadSecurityProjectProfile();
+  }
+}
+
+const securityProjectProfileSaveBtn = document.getElementById('security-project-profile-save-btn');
+if (securityProjectProfileSaveBtn) securityProjectProfileSaveBtn.onclick = saveSecurityProjectProfile;
+
+const securityProfileScopeGlobal = document.getElementById('security-profile-scope-global');
+if (securityProfileScopeGlobal) securityProfileScopeGlobal.addEventListener('change', async (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  try {
+    const r = await fetch(scopeClearUrl('/api/security/project'), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `${r.status}`);
+    const p = selectedProject();
+    if (p) p.security_profile = null;
+    pushActivity('Security profile now follows global');
+    showToast('Following global default profile', 'ok');
+    await loadSecurityProjectProfile();
+  } catch (err) {
+    showToast(`Scope error: ${err.message || err}`, 'err');
+    await loadSecurityProjectProfile();
+  }
+});
+
+const securityProfileScopeCustom = document.getElementById('security-profile-scope-custom');
+if (securityProfileScopeCustom) securityProfileScopeCustom.addEventListener('change', (ev) => {
+  if (!ev.target.checked || !scopeHasProject()) return;
+  applySecurityProfileScope('custom');
+  const sel = document.getElementById('security-project-profile-select');
+  if (sel) sel.disabled = false;
+  const save = document.getElementById('security-project-profile-save-btn');
+  if (save) save.disabled = false;
+});
 
 document.getElementById('compress-now-btn').onclick = async () => {
   const project = document.getElementById('compress-now-project').value.trim();

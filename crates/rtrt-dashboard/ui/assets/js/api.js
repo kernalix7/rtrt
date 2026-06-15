@@ -278,7 +278,7 @@ wireSubtabs('memory-subtabs', (sub) => {
   memmapStopLayout();
   if (isGlobalScope()) { refreshMemoryScope(); return; }
   // Auto-load stats + compression queue when the stats tab is activated.
-  if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); }
+  if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); loadEmbeddingsProject(); }
   // Auto-load governance stats when governance tab opens.
   if (sub === 'memgovern' && project) { loadGovStats(project); }
 });

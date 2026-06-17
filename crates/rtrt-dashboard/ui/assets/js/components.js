@@ -429,10 +429,12 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
 // Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
 const PALETTE_ITEMS = [
   { label: 'Overview · Token Savings', hint: 'overview / optimizer savings', run: () => navigate('overview') },
-  { label: 'Memory · Recall', hint: 'memory / recall', run: () => navigate('memory', { sub: 'memquery' }) },
+  { label: 'Memory · Search', hint: 'memory / recall', run: () => navigate('memory', { sub: 'memquery' }) },
   { label: 'Memory · Timeline', hint: 'memory / timeline', run: () => navigate('memory', { sub: 'memhistory' }) },
-  { label: 'Memory · Brain Map', hint: 'memory / graph', run: () => navigate('memory', { sub: 'memmap' }) },
+  { label: 'Memory · Map', hint: 'memory / graph', run: () => navigate('memory', { sub: 'memmap' }) },
   { label: 'Memory · Blocks', hint: 'memory / blocks', run: () => navigate('memory', { sub: 'memblocks' }) },
+  { label: 'Memory · Stats', hint: 'memory / stats and manage', run: () => navigate('memory', { sub: 'memstats' }) },
+  { label: 'Memory · Backup', hint: 'memory / export', run: () => navigate('memory', { sub: 'membackup' }) },
   { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
   { label: 'Output Optimizer · Compress Lite', hint: 'rules / lite', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'lite' }); document.getElementById('compress-input').focus(); } },
   { label: 'Output Optimizer · Compress Full', hint: 'rules / full', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'full' }); document.getElementById('compress-input').focus(); } },

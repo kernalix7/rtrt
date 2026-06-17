@@ -277,10 +277,9 @@ wireSubtabs('memory-subtabs', (sub) => {
   // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
   memmapStopLayout();
   if (isGlobalScope()) { refreshMemoryScope(); return; }
-  // Auto-load stats + compression queue when the stats tab is activated.
-  if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); loadEmbeddingsProject(); }
-  // Auto-load governance stats when governance tab opens.
-  if (sub === 'memgovern' && project) { loadGovStats(project); }
+  // Stats tab now also hosts the merged-in Manage section, so load stats +
+  // compression queue + the governance summary together when it activates.
+  if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); loadEmbeddingsProject(); loadGovStats(project); }
 });
 wireSubtabs('security-subtabs', (sub) => {
   if (sub === 'securityprofiles') loadSecurityProfileSettings();

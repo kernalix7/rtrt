@@ -4149,9 +4149,9 @@ async function loadConfig() {
   populateEmbModelSelect(emb.model || '');
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
   await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
-  // Global [memory] + [limits] cards live on the same Settings page.
+  // Global [memory] card lives on the Settings page. The [limits] card moved
+  // to its own Tools › Limits page (loaded via the navigate() 'limits' hook).
   await loadMemorySettings();
-  await loadLimitsConfig();
 }
 
 document.getElementById('settings-form').onsubmit = async (ev) => {

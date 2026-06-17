@@ -23,9 +23,9 @@ use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_TIMEOUT_SECS, InvokeOptions, Mode as InvokeMode, OpenAICompatibleProvider,
-    OpenAIProvider, Prefer, Provider, Role, RouteDecision, RouteRequest, TargetHeadroom,
-    TargetWindows, UsageSnapshot, invoke_agent, provider_usage_windows, record_invocation,
-    select_route, target_headroom,
+    OpenAIProvider, Prefer, Provider, RankedTarget, Role, RouteDecision, RouteRequest,
+    TargetHeadroom, TargetWindows, UsageSnapshot, invoke_agent, invoke_with_failover,
+    provider_usage_windows, record_invocation, select_route, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -220,6 +220,10 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value = "text")]
         format: CallFormatArg,
+        /// On a retryable failure (rate-limit / quota / 429 / 5xx / timeout),
+        /// fall over to the next ranked target instead of erroring out.
+        #[arg(long)]
+        failover: bool,
         /// Prompt text. Multiple words are joined with spaces.
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -247,6 +251,11 @@ enum Cmd {
         /// Print only the decision and do not invoke the target.
         #[arg(long)]
         dry_run: bool,
+        /// When invoking (no explicit --target), walk the ranked candidate list
+        /// with automatic failover on retryable errors. Ignored for --dry-run /
+        /// --explain and for an explicit --target.
+        #[arg(long)]
+        failover: bool,
         /// Prompt text. Multiple words are joined with spaces.
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -2531,6 +2540,7 @@ async fn main() -> Result<()> {
             model,
             timeout,
             format,
+            failover,
             prompt,
         } => {
             let prompt = prompt.join(" ");
@@ -2542,20 +2552,32 @@ async fn main() -> Result<()> {
             // refuse to invoke it. An absent override leaves global behavior
             // unchanged.
             ensure_target_enabled(&target)?;
-            let outcome = invoke_agent(
-                &target,
-                &prompt,
-                InvokeOptions {
-                    mode: Some(mode.into()),
-                    model,
-                    timeout: std::time::Duration::from_secs(timeout),
-                },
-            )
-            .await
-            .with_context(|| format!("rtrt call {target}"))?;
-            match format {
-                CallFormatArg::Text => print!("{}", outcome.output),
-                CallFormatArg::Json => println!("{}", serde_json::to_string_pretty(&outcome)?),
+            let timeout = std::time::Duration::from_secs(timeout);
+            if failover {
+                // `--failover`: keep <target> as the primary pick, then append
+                // the rest of the ranked, headroom-aware candidate list so a
+                // retryable failure falls over instead of erroring out.
+                run_call_with_failover(&target, mode.into(), model, timeout, &prompt, format)
+                    .await?;
+            } else {
+                // Default single-target behavior is untouched.
+                let outcome = invoke_agent(
+                    &target,
+                    &prompt,
+                    InvokeOptions {
+                        mode: Some(mode.into()),
+                        model,
+                        timeout,
+                    },
+                )
+                .await
+                .with_context(|| format!("rtrt call {target}"))?;
+                match format {
+                    CallFormatArg::Text => print!("{}", outcome.output),
+                    CallFormatArg::Json => {
+                        println!("{}", serde_json::to_string_pretty(&outcome)?)
+                    }
+                }
             }
         }
         Cmd::Route {
@@ -2566,6 +2588,7 @@ async fn main() -> Result<()> {
             mode,
             explain,
             dry_run,
+            failover,
             prompt,
         } => {
             run_route(RouteCliOptions {
@@ -2576,6 +2599,7 @@ async fn main() -> Result<()> {
                 mode,
                 explain,
                 dry_run,
+                failover,
                 prompt,
             })
             .await?;
@@ -3984,6 +4008,7 @@ struct RouteCliOptions {
     mode: CallModeArg,
     explain: bool,
     dry_run: bool,
+    failover: bool,
     prompt: Vec<String>,
 }
 
@@ -4011,7 +4036,10 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
         mode: (mode != InvokeMode::Auto).then_some(mode),
     };
     let tools = rtrt_core::detect_tools_with_config(cfg);
-    let usage = UsageSnapshot::load_best_effort();
+    // Overlay the provider-usage ledger's rolling 24h window so ranking is
+    // headroom-aware: exhausted `[limits]` targets are demoted and near-limit
+    // ones penalized (targets with no cap keep pure cost-tier order).
+    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
     let decision = select_route(&req, &tools, &usage)?;
 
     if opts.explain || opts.dry_run {
@@ -4028,19 +4056,94 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
         return Ok(());
     }
 
+    let timeout = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+    // `--failover` (only meaningful without an explicit `--target`): walk the
+    // ranked candidate list, falling over on retryable failures. An explicit
+    // target produces a single-element ranked list, so it still targets exactly
+    // that one even with `--failover`.
+    if opts.failover {
+        let ranked = decision.ranked_targets();
+        let result = invoke_with_failover(&ranked, &prompt, timeout)
+            .await
+            .with_context(|| format!("rtrt route --failover ({} candidate(s))", ranked.len()))?;
+        eprintln!("route: {}", result.summary());
+        print!("{}", result.outcome.output);
+        return Ok(());
+    }
+
     let outcome = invoke_agent(
         &decision.target,
         &prompt,
         InvokeOptions {
             mode: Some(decision.mode),
             model: decision.model.clone(),
-            timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout,
         },
     )
     .await
     .with_context(|| format!("rtrt route {}", decision.target))?;
     print!("{}", outcome.output);
     Ok(())
+}
+
+/// `rtrt call <target> --failover`: invoke `<target>` first, then fall over
+/// through the rest of the headroom-aware ranked list on retryable failures.
+async fn run_call_with_failover(
+    target: &str,
+    mode: InvokeMode,
+    model: Option<String>,
+    timeout: std::time::Duration,
+    prompt: &str,
+    format: CallFormatArg,
+) -> Result<()> {
+    let ranked = ranked_targets_for_call(target, mode, model);
+    let result = invoke_with_failover(&ranked, prompt, timeout)
+        .await
+        .with_context(|| format!("rtrt call {target} --failover"))?;
+    eprintln!("call: {}", result.summary());
+    match format {
+        CallFormatArg::Text => print!("{}", result.outcome.output),
+        CallFormatArg::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+    }
+    Ok(())
+}
+
+/// Build the failover order for `rtrt call <target> --failover`: the explicit
+/// target stays the primary pick, then the remaining ranked, headroom-aware
+/// candidates (route with no explicit target) are appended, dropping the
+/// primary if it reappears. On any routing failure we fall back to a
+/// single-element list so the explicit call still runs exactly as before.
+fn ranked_targets_for_call(
+    target: &str,
+    mode: InvokeMode,
+    model: Option<String>,
+) -> Vec<RankedTarget> {
+    let primary = RankedTarget {
+        target: target.to_string(),
+        mode,
+        model: model.clone(),
+        cost_class: CostClass::Unknown,
+    };
+    let cfg = effective_config_for_cwd();
+    let tools = rtrt_core::detect_tools_with_config(cfg);
+    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
+    let req = RouteRequest {
+        capability: None,
+        prefer: Prefer::Cheapest,
+        target: None,
+        model: None,
+        mode: (mode != InvokeMode::Auto).then_some(mode),
+    };
+    let mut ranked = vec![primary];
+    if let Ok(decision) = select_route(&req, &tools, &usage) {
+        let normalized = target.to_ascii_lowercase();
+        for candidate in decision.ranked_targets() {
+            if candidate.target.to_ascii_lowercase() != normalized {
+                ranked.push(candidate);
+            }
+        }
+    }
+    ranked
 }
 
 fn print_route_decision(

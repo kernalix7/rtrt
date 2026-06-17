@@ -8,7 +8,7 @@ use rtrt_core::{CostClass, DetectedTool, Error, InvocationMode, Result};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::{ChatMessage, ChatRequest, Gateway, Role, usage_ledger};
+use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage_ledger};
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
@@ -170,6 +170,197 @@ pub async fn invoke_agent(
         exit_code,
         ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// One failed candidate in a failover walk, kept for the aggregated error and
+/// the result's audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverAttempt {
+    pub target: String,
+    pub retryable: bool,
+    pub error: String,
+}
+
+/// The outcome of an [`invoke_with_failover`] walk: the successful invocation
+/// plus how many candidates were tried before it served the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverOutcome {
+    /// The invocation that succeeded.
+    pub outcome: InvokeOutcome,
+    /// Targets that failed (in order) before this one served the request.
+    pub failed_over: Vec<FailoverAttempt>,
+}
+
+impl FailoverOutcome {
+    /// How many candidates fell over (retryable failures) before success.
+    pub fn fell_over(&self) -> usize {
+        self.failed_over.len()
+    }
+
+    /// A one-line audit string, e.g. `served by openai after 2 fell over
+    /// (ollama: retryable, claude: retryable)`.
+    pub fn summary(&self) -> String {
+        if self.failed_over.is_empty() {
+            return format!("served by {} (no failover)", self.outcome.target);
+        }
+        let trail = self
+            .failed_over
+            .iter()
+            .map(|a| format!("{}: {}", a.target, classify_label(a.retryable)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "served by {} after {} fell over ({trail})",
+            self.outcome.target,
+            self.failed_over.len()
+        )
+    }
+}
+
+/// Classify an invocation [`Error`] as retryable (fall over to the next ranked
+/// candidate) versus terminal (return immediately).
+///
+/// We are deliberately conservative: only failures that another provider could
+/// plausibly satisfy are retryable. Rate-limit / quota / 429 / 5xx / timeouts /
+/// process-spawn failures fall over. Auth, other 4xx, empty-prompt, and
+/// unknown-target are user/config errors — falling over would just repeat the
+/// same mistake — so they are terminal.
+pub fn is_retryable_error(err: &Error) -> bool {
+    // Errors surface as `Error::Provider(String)`; we classify on the message.
+    let Error::Provider(message) = err else {
+        // I/O and serde errors are transient/local plumbing, not provider state
+        // a peer would share — treat as retryable so failover can try a peer.
+        return true;
+    };
+    let lower = message.to_ascii_lowercase();
+
+    // Terminal first: these must NOT fall over even if a status-code substring
+    // would otherwise look retryable.
+    const TERMINAL_MARKERS: &[&str] = &[
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "authentication",
+        "api key",
+        "not detected",
+        "not installed",
+        "disabled",
+        "does not support",
+        "requires --model",
+        "needs --model",
+        "no cli invocation",
+        "is empty",
+        "available targets",
+    ];
+    if TERMINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    // Retryable: rate limits, quota, server-side and transient failures, and
+    // local spawn/timeout errors a different target could route around.
+    const RETRYABLE_MARKERS: &[&str] = &[
+        "429",
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "quota",
+        "overloaded",
+        "capacity",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "spawn",
+        "500",
+        "502",
+        "503",
+        "504",
+        "budget exceeded",
+    ];
+    RETRYABLE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+fn classify_label(retryable: bool) -> &'static str {
+    if retryable { "retryable" } else { "terminal" }
+}
+
+/// Invoke targets in ranked order with automatic cross-provider failover.
+///
+/// Tries each [`RankedTarget`] at most once. On a **retryable** failure
+/// (rate-limit / quota / 429 / 5xx / timeout / spawn) it records the attempt and
+/// falls through to the next candidate. On a **terminal** failure (auth, other
+/// 4xx, empty prompt, unknown/disabled target) it stops immediately and returns
+/// that error — falling over would only repeat a user/config mistake. Returns
+/// the first success (with its failover trail), or an aggregated error listing
+/// every attempt if all candidates fail.
+///
+/// `invoke_agent`'s single-target behavior is untouched; this is an additional
+/// layer on top. Each underlying call still records to the ledger (failures as
+/// `ok = 0`), so balance accounting is identical to a direct invocation.
+pub async fn invoke_with_failover(
+    targets: &[RankedTarget],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<FailoverOutcome> {
+    if targets.is_empty() {
+        return Err(Error::Provider(
+            "invoke: failover received no ranked targets".to_string(),
+        ));
+    }
+
+    let mut failed_over = Vec::new();
+    for candidate in targets {
+        let opts = InvokeOptions {
+            mode: Some(candidate.mode),
+            model: candidate.model.clone(),
+            timeout,
+        };
+        match invoke_agent(&candidate.target, prompt, opts).await {
+            Ok(outcome) => {
+                return Ok(FailoverOutcome {
+                    outcome,
+                    failed_over,
+                });
+            }
+            Err(err) => {
+                let retryable = is_retryable_error(&err);
+                failed_over.push(FailoverAttempt {
+                    target: candidate.target.clone(),
+                    retryable,
+                    error: err.to_string(),
+                });
+                // Terminal failure: do not fall over — repeating a user/config
+                // mistake against the next target would not help.
+                if !retryable {
+                    return Err(aggregated_error(&failed_over));
+                }
+                // Retryable: the ledger already recorded ok=0 inside
+                // invoke_agent; walk on to the next ranked candidate.
+            }
+        }
+    }
+    Err(aggregated_error(&failed_over))
+}
+
+/// Build a single error summarizing every failover attempt, in order.
+fn aggregated_error(attempts: &[FailoverAttempt]) -> Error {
+    let trail = attempts
+        .iter()
+        .map(|a| {
+            format!(
+                "{} ({}): {}",
+                a.target,
+                classify_label(a.retryable),
+                a.error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::Provider(format!(
+        "invoke: all {} candidate(s) failed: {trail}",
+        attempts.len()
+    ))
 }
 
 /// Record an estimated-token ledger row from a prompt/output text pair
@@ -484,6 +675,109 @@ mod tests {
             CostClass::ApiMetered,
         );
         assert_eq!(auto_mode_for(&api_tool), Mode::Api);
+    }
+
+    #[test]
+    fn classifies_rate_limit_and_5xx_and_timeout_as_retryable() {
+        for message in [
+            "anthropic 429: rate limit exceeded",
+            "openai 503 Service Unavailable",
+            "gateway: budget exceeded for openai",
+            "invoke: command 'ollama' timed out after 120s",
+            "invoke: spawn 'codex': No such file or directory",
+            "provider overloaded, retry later",
+            "daily quota reached",
+        ] {
+            let err = Error::Provider(message.to_string());
+            assert!(
+                is_retryable_error(&err),
+                "expected retryable for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_auth_and_config_errors_as_terminal() {
+        for message in [
+            "anthropic 401: invalid api key",
+            "openai 403: forbidden",
+            "invoke: target 'foo' is not detected; available targets: claude",
+            "invoke: target 'claude' does not support API mode",
+            "invoke: target 'openai' API mode requires --model",
+            "rtrt call: prompt is empty",
+        ] {
+            let err = Error::Provider(message.to_string());
+            assert!(
+                !is_retryable_error(&err),
+                "expected terminal for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_markers_win_over_status_substrings() {
+        // A 401 that also mentions "rate limit" must stay terminal: an auth
+        // failure will not be fixed by falling over to another provider.
+        let err = Error::Provider("anthropic 401: rate limit note".to_string());
+        assert!(!is_retryable_error(&err));
+    }
+
+    #[tokio::test]
+    async fn failover_stops_immediately_on_terminal_first_candidate() {
+        // An unknown target yields a terminal "not detected" error; failover
+        // must return immediately without walking the (healthy) second target.
+        let targets = vec![
+            ranked("__definitely_not_a_real_target__"),
+            ranked("__second_unreachable_target__"),
+        ];
+        let err = invoke_with_failover(&targets, "hi", Duration::from_secs(1))
+            .await
+            .expect_err("terminal first candidate should fail");
+        let msg = err.to_string();
+        // Exactly one attempt recorded — the second target was never tried.
+        assert!(msg.contains("all 1 candidate(s) failed"), "got: {msg}");
+        assert!(msg.contains("__definitely_not_a_real_target__"));
+        assert!(!msg.contains("__second_unreachable_target__"));
+    }
+
+    #[tokio::test]
+    async fn failover_rejects_empty_target_list() {
+        let err = invoke_with_failover(&[], "hi", Duration::from_secs(1))
+            .await
+            .expect_err("empty list should error");
+        assert!(err.to_string().contains("no ranked targets"));
+    }
+
+    #[test]
+    fn failover_summary_reports_served_target_and_count() {
+        let outcome = FailoverOutcome {
+            outcome: InvokeOutcome {
+                target: "openai".to_string(),
+                mode_used: Mode::Api,
+                model: Some("gpt-x".to_string()),
+                output: "ok".to_string(),
+                exit_code: None,
+                ms: 1,
+            },
+            failed_over: vec![FailoverAttempt {
+                target: "ollama".to_string(),
+                retryable: true,
+                error: "ollama 429".to_string(),
+            }],
+        };
+        assert_eq!(outcome.fell_over(), 1);
+        let summary = outcome.summary();
+        assert!(summary.contains("served by openai after 1 fell over"));
+        assert!(summary.contains("ollama: retryable"));
+    }
+
+    fn ranked(name: &str) -> RankedTarget {
+        RankedTarget {
+            target: name.to_string(),
+            mode: Mode::Auto,
+            model: None,
+            cost_class: CostClass::Unknown,
+        }
     }
 
     #[test]

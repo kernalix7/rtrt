@@ -101,6 +101,10 @@ pub(crate) use crate::handlers::templates::{
     template_write_error_status, update_template, validate_template_manifest,
     validate_template_name,
 };
+pub(crate) use crate::handlers::usage::{
+    RoutePreviewQuery, UsageHeadroomView, UsageResponse, UsageTargetView, UsageWindowView,
+    UsageWindowsView, route_preview_api, usage_api,
+};
 pub(crate) use crate::state::{
     AppState, CLUSTER_INDEX_TTL, GatewayAdapter, LEVEL_TOKEN_SEQ, LEVEL_TOKEN_TTL, STALL_DOMINANCE,
     TokenEntry, broadcast_event, compress_saved_pct_from_meta, dynamic_branch, dynamic_leaf,

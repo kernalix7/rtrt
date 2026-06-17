@@ -570,6 +570,13 @@ function navigate(page, opts = {}) {
     // Tools › Limits — daily usage ceilings (moved out of Capture/Config).
     loadLimitsConfig();
   }
+  if (page === 'usage') {
+    // Tools › Router — provider usage + headroom + load-balancing decision.
+    startUsagePolling();
+    refreshUsagePage();
+  } else {
+    stopUsagePolling();
+  }
   if (page === 'security') {
     loadSecurityProfiles();
     refreshSecurityScope();

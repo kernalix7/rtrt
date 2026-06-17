@@ -751,7 +751,7 @@ const MODE_PAGES = {
   },
   tools: {
     default: 'llm',
-    pages: ['llm', 'limits', 'environment', 'route', 'connect'],
+    pages: ['llm', 'limits', 'environment', 'usage', 'route', 'connect'],
   },
 };
 const PAGE_MODE = {};

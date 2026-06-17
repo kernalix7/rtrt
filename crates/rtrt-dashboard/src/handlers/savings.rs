@@ -834,6 +834,63 @@ pub(crate) struct OverviewQuery {
     window: Option<String>,
 }
 
+/// Effective Command Optimizer reduction over the REDUCED runs only (those that
+/// actually filtered output, `saved_chars > 0`), returned as
+/// `(saved_chars, input_chars)`. Passthroughs are excluded so they do not dilute
+/// the agent-token rate toward zero — this mirrors the status line's
+/// `load_effective_reduction`. Scoped to `project` when given, else global.
+pub(crate) fn command_effective_reduction(
+    db_path: &std::path::Path,
+    project: Option<&str>,
+    window: DashboardWindow,
+) -> (i64, i64) {
+    if !db_path.exists() {
+        return (0, 0);
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return (0, 0);
+    };
+    conn.query_row(
+        "SELECT COALESCE(SUM(saved_chars), 0), COALESCE(SUM(input_chars), 0) \
+         FROM proxy_runs \
+         WHERE saved_chars > 0 \
+           AND (?1 IS NULL OR project = ?1) \
+           AND (?2 IS NULL OR datetime(ts) >= datetime('now', ?2))",
+        rusqlite::params![project, window.proxy_modifier],
+        |row| Ok((nonnegative_i64(row.get(0)?), nonnegative_i64(row.get(1)?))),
+    )
+    .unwrap_or((0, 0))
+}
+
+/// Total recall-reuse chars from `~/.rtrt/recall-savings.tsv` (lines
+/// `project\tchars`). Summed for `project` when scoped, else across all
+/// projects. Mirrors the CLI's `read_recall_savings`. Recalled context is reused
+/// instead of being re-derived from source, so it counts as agent-token savings.
+pub(crate) fn read_recall_savings(project: Option<&str>) -> i64 {
+    let path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rtrt")
+        .join("recall-savings.tsv");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut total: i64 = 0;
+    for line in content.lines() {
+        let mut fields = line.split('\t');
+        if let (Some(p), Some(c)) = (fields.next(), fields.next())
+            && project.is_none_or(|scope| scope == p)
+        {
+            total = total.saturating_add(c.trim().parse::<i64>().unwrap_or(0).max(0));
+        }
+    }
+    total
+}
+
 pub(crate) async fn optimizer_overview(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<OverviewQuery>,
@@ -910,6 +967,19 @@ pub(crate) async fn optimizer_overview(
     let projects = projects_rollup(&sources);
     let available = sources.iter().any(|source| source.available);
 
+    // Σ = AGENT-TOKEN savings: tokens kept OUT of the model context = effective
+    // Command Optimizer filtering (reduced runs only) + Memory recall reuse.
+    // Memory STORAGE compression is excluded — it is internal (not model tokens)
+    // and its volume would otherwise bury the real number — and terse mode is
+    // unmeasured. This mirrors the status line's `compute_statusline_savings`.
+    let (cmd_effective_saved, cmd_effective_input) =
+        command_effective_reduction(&proxy_path, project, window);
+    let recall_reuse = read_recall_savings(project);
+    let agent_token_saved_chars = cmd_effective_saved.saturating_add(recall_reuse);
+    let agent_token_base_chars = cmd_effective_input.saturating_add(recall_reuse);
+    let agent_token_saved_tokens = estimate_saved_tokens(agent_token_saved_chars);
+    let agent_token_saved_pct = saved_pct(agent_token_saved_chars, agent_token_base_chars);
+
     Json(serde_json::json!({
         "available": available,
         "scope": project.unwrap_or("all"),
@@ -919,6 +989,9 @@ pub(crate) async fn optimizer_overview(
         "total_original_chars": total_original_chars,
         "total_with_rtrt_chars": total_with_rtrt_chars,
         "total_saved_pct": saved_pct(total_saved_chars, total_original_chars),
+        "agent_token_saved_chars": agent_token_saved_chars,
+        "agent_token_saved_tokens": agent_token_saved_tokens,
+        "agent_token_saved_pct": agent_token_saved_pct,
         "token_estimate": "chars/4",
         "sources": sources,
         "projects": projects,

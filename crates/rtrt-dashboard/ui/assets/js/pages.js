@@ -266,9 +266,13 @@ async function loadOverview() {
   }
   const s = mRes.summary || {};
   const calls = s.calls || 0;
-  const savedChars = oRes ? Number(oRes.total_saved_chars || 0) : 0;
-  const savedTokens = oRes && oRes.total_saved_tokens != null ? Number(oRes.total_saved_tokens) : 0;
-  const savedPct = oRes && oRes.total_saved_pct != null ? Number(oRes.total_saved_pct) : null;
+  // Σ Agent-Token Saved = tokens kept OUT of the model context = effective
+  // Command Optimizer filtering + Memory recall reuse. Memory STORAGE
+  // compression is excluded (it is internal and would bury the real number); it
+  // is still shown on its own pillar card below. Mirrors the status-line model.
+  const savedChars = oRes ? Number(oRes.agent_token_saved_chars || 0) : 0;
+  const savedTokens = oRes && oRes.agent_token_saved_tokens != null ? Number(oRes.agent_token_saved_tokens) : 0;
+  const savedPct = oRes && oRes.agent_token_saved_pct != null ? Number(oRes.agent_token_saved_pct) : null;
   const avgLatency = calls ? (s.total_latency_ms / Math.max(1, calls)).toFixed(0) : '—';
   syncOverviewWindowButtons();
   document.getElementById('kpi-saved').textContent = `${fmtPctMaybe(savedPct)} saved`;
@@ -276,7 +280,7 @@ async function loadOverview() {
   animateCount(document.getElementById('kpi-saved-chars'), savedChars);
   animateCount(document.getElementById('kpi-calls'), calls);
   setUpdating(document.getElementById('kpi-saved'));
-  document.getElementById('kpi-saved-sub').textContent = '(estimate, chars/4)';
+  document.getElementById('kpi-saved-sub').textContent = 'Command Optimizer filtering + Memory recall reuse (chars/4; storage compression shown per-pillar)';
   document.getElementById('kpi-latency').textContent = `${avgLatency} ms`;
   document.getElementById('kpi-spent').textContent = bRes ? fmtUsd(bRes.spent_usd) : '—';
   document.getElementById('kpi-spent-sub').textContent = bRes && bRes.cap_usd ? `cap ${fmtUsd(bRes.cap_usd)}` : 'no cap set';

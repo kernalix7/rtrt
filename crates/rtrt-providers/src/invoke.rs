@@ -8,7 +8,7 @@ use rtrt_core::{CostClass, DetectedTool, Error, InvocationMode, Result};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
-use crate::{ChatMessage, ChatRequest, Gateway, Role};
+use crate::{ChatMessage, ChatRequest, Gateway, Role, usage_ledger};
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
@@ -79,24 +79,54 @@ pub async fn invoke_agent(
     let model = opts.model.clone().or_else(|| tool.models.first().cloned());
     let started = Instant::now();
 
+    // Per-mode invocation. On any failure we still record the request (with
+    // `ok = 0`) before propagating the error, so the ledger reflects spent
+    // request budget even for failed calls.
+    let ledger_model = model.clone().unwrap_or_default();
     let (output, exit_code) = match mode_used {
         Mode::Cli => {
-            let template = tool.cli_invocation.as_deref().ok_or_else(|| {
-                Error::Provider(format!(
-                    "invoke: target '{}' has no CLI invocation",
-                    tool.name
-                ))
-            })?;
-            let argv = template_to_argv(template, prompt, model.as_deref())?;
-            run_cli_argv(&argv, opts.timeout).await?
+            let template = match tool.cli_invocation.as_deref() {
+                Some(template) => template,
+                None => {
+                    record_cli(&tool.name, &ledger_model, prompt, "", false);
+                    return Err(Error::Provider(format!(
+                        "invoke: target '{}' has no CLI invocation",
+                        tool.name
+                    )));
+                }
+            };
+            let argv = match template_to_argv(template, prompt, model.as_deref()) {
+                Ok(argv) => argv,
+                Err(err) => {
+                    record_cli(&tool.name, &ledger_model, prompt, "", false);
+                    return Err(err);
+                }
+            };
+            match run_cli_argv(&argv, opts.timeout).await {
+                Ok((output, exit_code)) => {
+                    // CLI shell-outs report no usage; estimate from chars/4 and
+                    // mark the row as estimated. `ok` follows the exit code.
+                    let ok = exit_code.unwrap_or(0) == 0;
+                    record_cli(&tool.name, &ledger_model, prompt, &output, ok);
+                    (output, exit_code)
+                }
+                Err(err) => {
+                    record_cli(&tool.name, &ledger_model, prompt, "", false);
+                    return Err(err);
+                }
+            }
         }
         Mode::Api => {
-            let model = model.as_deref().ok_or_else(|| {
-                Error::Provider(format!(
-                    "invoke: target '{}' API mode requires --model",
-                    tool.name
-                ))
-            })?;
+            let model = match model.as_deref() {
+                Some(model) => model,
+                None => {
+                    record_cli(&tool.name, &ledger_model, prompt, "", false);
+                    return Err(Error::Provider(format!(
+                        "invoke: target '{}' API mode requires --model",
+                        tool.name
+                    )));
+                }
+            };
             let req = ChatRequest {
                 model: model.to_string(),
                 messages: vec![ChatMessage {
@@ -106,8 +136,24 @@ pub async fn invoke_agent(
                 max_tokens: Some(API_MAX_TOKENS),
                 temperature: None,
             };
-            let resp = Gateway::from_env().chat(req).await?;
-            (resp.content, None)
+            match Gateway::from_env().chat(req).await {
+                Ok(resp) => {
+                    // API mode returns real token counts; record them exactly.
+                    usage_ledger::record_invocation(
+                        &tool.name,
+                        model,
+                        resp.usage.input_tokens,
+                        resp.usage.output_tokens,
+                        false,
+                        true,
+                    );
+                    (resp.content, None)
+                }
+                Err(err) => {
+                    record_cli(&tool.name, model, prompt, "", false);
+                    return Err(err);
+                }
+            }
         }
         Mode::Auto => {
             return Err(Error::Provider(
@@ -124,6 +170,20 @@ pub async fn invoke_agent(
         exit_code,
         ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// Record an estimated-token ledger row from a prompt/output text pair
+/// (`chars / 4`). Used for CLI shell-outs and for any failed invocation where
+/// we have no real usage to report.
+fn record_cli(target: &str, model: &str, prompt: &str, output: &str, ok: bool) {
+    usage_ledger::record_invocation(
+        target,
+        model,
+        usage_ledger::estimate_tokens(prompt),
+        usage_ledger::estimate_tokens(output),
+        true,
+        ok,
+    );
 }
 
 pub fn template_to_argv(template: &str, prompt: &str, model: Option<&str>) -> Result<Vec<String>> {

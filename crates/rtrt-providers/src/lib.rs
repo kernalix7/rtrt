@@ -19,6 +19,7 @@ pub mod openai_compatible;
 pub mod router;
 pub mod stream;
 pub mod usage;
+pub mod usage_ledger;
 
 pub use anthropic::AnthropicProvider;
 pub use context7::Context7Client;
@@ -30,6 +31,10 @@ pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{Prefer, RouteAlternative, RouteDecision, RouteRequest, select_route};
 pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
+pub use usage_ledger::{
+    LedgerRow, TargetHeadroom, TargetWindows, WindowUsage, estimate_tokens, headroom_for_target,
+    provider_usage_windows, record_invocation, target_headroom,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

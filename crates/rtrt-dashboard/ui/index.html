@@ -25,6 +25,14 @@
 <body>
 <div class="topbar">
   <div class="brand"><span class="logo">RT</span> RTRT</div>
+  <!-- Top-level MODE switch: Project (per-project work) vs Tools (multi-provider /
+       orchestration). Each mode owns its own sidebar nav set (see aside [data-mode]).
+       setMode() in app.js toggles the visible sidebar, persists to localStorage,
+       and navigates to the mode's default page. -->
+  <div id="mode-switch" class="mode-switch" role="tablist" aria-label="Top-level mode">
+    <button type="button" class="mode-seg active" data-mode="project" role="tab" aria-selected="true">Project</button>
+    <button type="button" class="mode-seg" data-mode="tools" role="tab" aria-selected="false">Tools</button>
+  </div>
   <span id="pill-gateway" class="pill"><span class="dot"></span>Gateway</span>
   <span id="pill-memory" class="pill"><span class="dot"></span>Memory</span>
   <span id="pill-cache" class="pill"><span class="dot"></span>Cache</span>
@@ -44,55 +52,77 @@
         <button id="project-add-btn" class="ghost icon-btn" type="button" title="Add / edit project">＋</button>
       </div>
     </div>
-    <div class="nav-group">
-      <a class="nav active" data-page="overview"><span class="icon">📊</span><span class="nav-copy"><span class="nav-label">Overview</span><span class="nav-sub">token savings</span></span></a>
-    </div>
-    <div class="nav-divider">Savings</div>
-    <details class="nav-group" open>
-      <summary class="group">🧠 Memory</summary>
-      <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Recall</span><span class="nav-sub">search and hybrid recall</span></span></a>
-      <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
-      <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">captured activity</span></span></a>
-      <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
-      <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Brain Map</span><span class="nav-sub">concept graph</span></span></a>
-      <a class="nav" data-page="memory" data-sub="memgovern"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Profile</span><span class="nav-sub">governance and backup</span></span></a>
-    </details>
-    <details class="nav-group" open>
-      <summary class="group">📝 Output Optimizer</summary>
-      <a class="nav" data-page="compress" data-focus="level"><span class="icon">◉</span><span class="nav-copy"><span class="nav-label">Level</span><span class="nav-sub">terse mode toggle</span></span></a>
-      <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="full"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress</span><span class="nav-sub">text reduction</span></span></a>
-    </details>
-    <details class="nav-group" open>
-      <summary class="group">⚡ Command Optimizer</summary>
-      <a class="nav" data-page="command" data-sub="command-gain"><span class="icon">↗</span><span class="nav-copy"><span class="nav-label">Gain</span><span class="nav-sub">proxy-run analytics</span></span></a>
-      <a class="nav" data-page="command" data-sub="command-coverage"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Coverage</span><span class="nav-sub">34 command filters</span></span></a>
-      <a class="nav" data-page="command" data-sub="command-proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">stdin filter demo</span></span></a>
-      <a class="nav" data-page="command" data-sub="command-repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
-    </details>
-    <div class="nav-divider">Orchestrate</div>
-    <details class="nav-group" open>
-      <summary class="group">🔀 Environment</summary>
-      <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
-      <a class="nav" data-page="route"><span class="icon">⇄</span><span class="nav-copy"><span class="nav-label">Route</span><span class="nav-sub">dry-run selection</span></span></a>
-      <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">local models</span></span></a>
-    </details>
-    <div class="nav-divider">Customize</div>
-    <details class="nav-group" open>
-      <summary class="group">🎨 Statusline</summary>
-      <a class="nav" data-page="statusline"><span class="icon">▤</span><span class="nav-copy"><span class="nav-label">Statusline</span><span class="nav-sub">rich prompt line</span></span></a>
-      <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Capture / Config</span><span class="nav-sub">capture defaults</span></span></a>
-    </details>
-    <details class="nav-group" open>
-      <summary class="group">📦 Library</summary>
-      <a class="nav" data-page="templates"><span class="icon">□</span><span class="nav-copy"><span class="nav-label">Templates</span><span class="nav-sub">project scaffolds</span></span></a>
-      <a class="nav" data-page="prompts"><span class="icon">¶</span><span class="nav-copy"><span class="nav-label">Prompts</span><span class="nav-sub">version registry</span></span></a>
-    </details>
-    <details class="nav-group" open>
-      <summary class="group">🛠 Tools</summary>
-      <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
-      <a class="nav" data-page="security"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">Security</span><span class="nav-sub">profiles and scans</span></span></a>
-      <a class="nav" data-page="connect"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Setup</span><span class="nav-sub">client snippets</span></span></a>
-    </details>
+    <!-- ── PROJECT MODE nav (per-project work) ──────────────────────────────
+         Overview · Memory · Output Optimizer · Command Optimizer · Statusline ·
+         Capture/Config · Templates · Prompts · Diagnose · Security.
+         Default page = overview. -->
+    <nav class="mode-nav" data-mode="project">
+      <div class="nav-group">
+        <a class="nav active" data-page="overview"><span class="icon">📊</span><span class="nav-copy"><span class="nav-label">Overview</span><span class="nav-sub">token savings</span></span></a>
+      </div>
+      <div class="nav-divider">Savings</div>
+      <details class="nav-group" open>
+        <summary class="group">🧠 Memory</summary>
+        <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Recall</span><span class="nav-sub">search and hybrid recall</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">captured activity</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Brain Map</span><span class="nav-sub">concept graph</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memgovern"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Profile</span><span class="nav-sub">governance and backup</span></span></a>
+      </details>
+      <details class="nav-group" open>
+        <summary class="group">📝 Output Optimizer</summary>
+        <a class="nav" data-page="compress" data-focus="level"><span class="icon">◉</span><span class="nav-copy"><span class="nav-label">Level</span><span class="nav-sub">terse mode toggle</span></span></a>
+        <a class="nav" data-page="compress" data-compress-engine="rules" data-compress-level="full"><span class="icon">⊟</span><span class="nav-copy"><span class="nav-label">Compress</span><span class="nav-sub">text reduction</span></span></a>
+      </details>
+      <details class="nav-group" open>
+        <summary class="group">⚡ Command Optimizer</summary>
+        <a class="nav" data-page="command" data-sub="command-gain"><span class="icon">↗</span><span class="nav-copy"><span class="nav-label">Gain</span><span class="nav-sub">proxy-run analytics</span></span></a>
+        <a class="nav" data-page="command" data-sub="command-coverage"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Coverage</span><span class="nav-sub">34 command filters</span></span></a>
+        <a class="nav" data-page="command" data-sub="command-proxy"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Proxy</span><span class="nav-sub">stdin filter demo</span></span></a>
+        <a class="nav" data-page="command" data-sub="command-repomap"><span class="icon">⌗</span><span class="nav-copy"><span class="nav-label">Repo Map</span><span class="nav-sub">code signatures</span></span></a>
+      </details>
+      <div class="nav-divider">Customize</div>
+      <details class="nav-group" open>
+        <summary class="group">🎨 Statusline</summary>
+        <a class="nav" data-page="statusline"><span class="icon">▤</span><span class="nav-copy"><span class="nav-label">Statusline</span><span class="nav-sub">rich prompt line</span></span></a>
+        <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Capture / Config</span><span class="nav-sub">capture defaults</span></span></a>
+      </details>
+      <details class="nav-group" open>
+        <summary class="group">📦 Library</summary>
+        <a class="nav" data-page="templates"><span class="icon">□</span><span class="nav-copy"><span class="nav-label">Templates</span><span class="nav-sub">project scaffolds</span></span></a>
+        <a class="nav" data-page="prompts"><span class="icon">¶</span><span class="nav-copy"><span class="nav-label">Prompts</span><span class="nav-sub">version registry</span></span></a>
+      </details>
+      <details class="nav-group" open>
+        <summary class="group">🛠 Tools</summary>
+        <a class="nav" data-page="diagnose"><span class="icon">△</span><span class="nav-copy"><span class="nav-label">Diagnose</span><span class="nav-sub">failure triage</span></span></a>
+        <a class="nav" data-page="security"><span class="icon">◇</span><span class="nav-copy"><span class="nav-label">Security</span><span class="nav-sub">profiles and scans</span></span></a>
+      </details>
+    </nav>
+
+    <!-- ── TOOLS MODE nav (multi-AI-provider / orchestration) ────────────────
+         Providers · Environment · Route · Limits · Setup. Default page =
+         providers (the dedicated provider settings). Structured into groups so
+         the future load-balancing router has room to grow. -->
+    <nav class="mode-nav" data-mode="tools" hidden>
+      <div class="nav-divider">Providers</div>
+      <details class="nav-group" open>
+        <summary class="group">◈ Providers</summary>
+        <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">active · local models</span></span></a>
+        <a class="nav" data-page="limits"><span class="icon">⛽</span><span class="nav-copy"><span class="nav-label">Limits</span><span class="nav-sub">daily usage ceilings</span></span></a>
+      </details>
+      <div class="nav-divider">Orchestrate</div>
+      <details class="nav-group" open>
+        <summary class="group">🔀 Routing</summary>
+        <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
+        <a class="nav" data-page="route"><span class="icon">⇄</span><span class="nav-copy"><span class="nav-label">Route</span><span class="nav-sub">dry-run selection</span></span></a>
+      </details>
+      <div class="nav-divider">Connect</div>
+      <details class="nav-group" open>
+        <summary class="group">⌁ Setup</summary>
+        <a class="nav" data-page="connect"><span class="icon">⌁</span><span class="nav-copy"><span class="nav-label">Setup</span><span class="nav-sub">client snippets</span></span></a>
+      </details>
+    </nav>
   </aside>
 
   <main>
@@ -1236,8 +1266,19 @@
           </div>
         </div>
       </div>
-      <!-- Daily usage limits (global [limits.<target>]) -->
-      <div class="card" style="margin-top:1rem;">
+    </section>
+
+    <!-- Limits (Tools mode) — daily usage ceilings per provider/target.
+         Moved out of Capture/Config so it lives under Tools › Providers › Limits.
+         Same #limits-* ids + /api/limits/config endpoint as before. -->
+    <section id="page-limits" class="page" hidden>
+      <div class="section-head">
+        <div class="section-title">
+          <h1>Daily usage limits</h1>
+          <div class="lede">Optional daily ceilings per provider/target, used by routing to respect headroom.</div>
+        </div>
+      </div>
+      <div class="card">
         <div class="head"><h2>Daily usage limits</h2><span class="hint" id="limits-config-hint">~/.rtrt/config.toml [limits]</span></div>
         <p class="lede">Optional daily ceilings per provider/target. Leave a field blank for no limit on that axis.</p>
         <div class="env-table-wrap">

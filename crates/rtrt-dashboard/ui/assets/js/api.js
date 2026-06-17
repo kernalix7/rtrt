@@ -161,7 +161,7 @@ async function loadProjects() {
       PROJECTS_CACHE = [];
       syncProjectInputs('');
       refreshProjectScopePage();
-      navigate('settings');
+      navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
       return;
     }
     const projects = await r.json();
@@ -175,7 +175,7 @@ async function loadProjects() {
     localStorage.setItem('rtrt.project', select.value);
     localStorage.setItem('rtrt-project', select.value);
     refreshProjectScopePage();
-    if (isGlobalScope()) navigate('settings');
+    if (isGlobalScope()) navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
   } catch (e) {
     showToast(`Project load error: ${e.message || e}`, 'err');
     select.innerHTML = globalOption + '<option value="">Failed to load projects</option>';
@@ -183,7 +183,7 @@ async function loadProjects() {
     PROJECTS_CACHE = [];
     syncProjectInputs('');
     refreshProjectScopePage();
-    navigate('settings');
+    navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
   }
 }
 
@@ -216,7 +216,7 @@ document.getElementById('project-selector').onchange = () => {
   syncProjectInputs(isGlobalScope() ? '' : name);
   updateGlobalScopeIndicators();
   if (isGlobalScope()) {
-    navigate('settings');
+    navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
     return;
   }
   refreshProjectScopePage();

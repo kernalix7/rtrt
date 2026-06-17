@@ -24,6 +24,14 @@
   .topbar .pill.warn .dot { background: var(--warn); }
   .topbar .spacer { flex: 1; }
   .topbar #theme-toggle { cursor: pointer; background: transparent; border: 1px solid var(--border); color: var(--fg); padding: 0.3rem 0.6rem; border-radius: 6px; font-size: 0.9em; }
+  /* Top-level MODE switch (Project | Tools): a segmented control in the top bar,
+     styled to match the .segment-toggle / button language used elsewhere. */
+  .mode-switch { display: inline-flex; align-items: center; gap: 0; padding: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+  .mode-switch .mode-seg { cursor: pointer; border: none; background: transparent; color: var(--muted); padding: 0.32rem 0.85rem; border-radius: 6px; font-size: 0.85em; font-weight: 600; line-height: 1.2; }
+  .mode-switch .mode-seg:hover { color: var(--fg); }
+  .mode-switch .mode-seg.active { background: var(--surface); color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  /* Per-mode sidebar nav sets — only the active mode's nav is shown. */
+  aside nav.mode-nav[hidden] { display: none; }
 
   /* Layout: sidebar + main */
   .layout { display: grid; grid-template-columns: 250px 1fr; min-height: calc(100vh - 53px - 32px); }

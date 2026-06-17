@@ -516,6 +516,10 @@ function focusOptimizerLevel() {
 
 function navigate(page, opts = {}) {
   updateGlobalScopeIndicators();
+  // Keep the top-level mode switch + visible sidebar in sync with the target
+  // page (defined in app.js). A page may be opened programmatically from the
+  // other mode (e.g. loadProjects -> 'settings'); this re-parents the chrome.
+  if (typeof syncModeForPage === 'function') syncModeForPage(page);
   document.querySelectorAll('aside a.nav').forEach(x => x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x => x.hidden = true);
   let link = opts.source || null;
@@ -561,6 +565,10 @@ function navigate(page, opts = {}) {
     loadProvidersConfig();
     loadLlmModels();
     loadLlmPs();
+  }
+  if (page === 'limits') {
+    // Tools › Limits — daily usage ceilings (moved out of Capture/Config).
+    loadLimitsConfig();
   }
   if (page === 'security') {
     loadSecurityProfiles();

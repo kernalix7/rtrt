@@ -737,6 +737,78 @@ document.getElementById('llm-pull-btn').onclick = async () => {
 document.getElementById('llm-models-refresh').onclick = () => loadLlmModels();
 document.getElementById('llm-ps-refresh').onclick = () => loadLlmPs();
 
+// ── Top-level MODE switch (Project | Tools) ──────────────────────────────────
+// Project mode = per-project work; Tools mode = multi-provider / orchestration.
+// Each mode owns its own sidebar nav set (<nav class="mode-nav" data-mode="…">).
+// MODE_PAGES maps each mode to the page-* ids that live under it, and the default
+// page shown when the mode is entered. PAGE_MODE inverts it so navigate() can keep
+// the visible sidebar in sync when a page is opened programmatically (e.g.
+// loadProjects() jumping to 'settings').
+const MODE_PAGES = {
+  project: {
+    default: 'overview',
+    pages: ['overview', 'memory', 'compress', 'command', 'statusline', 'settings', 'templates', 'prompts', 'diagnose', 'security'],
+  },
+  tools: {
+    default: 'llm',
+    pages: ['llm', 'limits', 'environment', 'route', 'connect'],
+  },
+};
+const PAGE_MODE = {};
+Object.entries(MODE_PAGES).forEach(([mode, def]) => def.pages.forEach(p => { PAGE_MODE[p] = mode; }));
+
+const MODE_STORAGE_KEY = 'rtrt.mode';
+let CURRENT_MODE = 'project';
+
+function savedMode() {
+  const m = localStorage.getItem(MODE_STORAGE_KEY);
+  return MODE_PAGES[m] ? m : 'project';
+}
+
+// Swap which sidebar nav set is visible + the active top-bar segment. When
+// `navigateTo` is true (the default), jump to the mode's default page. Pass
+// false to only sync the chrome (used when navigate() detects a cross-mode page).
+function setMode(mode, navigateTo = true) {
+  if (!MODE_PAGES[mode]) mode = 'project';
+  CURRENT_MODE = mode;
+  localStorage.setItem(MODE_STORAGE_KEY, mode);
+  document.querySelectorAll('aside nav.mode-nav').forEach(nav => {
+    nav.hidden = nav.dataset.mode !== mode;
+  });
+  document.querySelectorAll('#mode-switch .mode-seg').forEach(btn => {
+    const on = btn.dataset.mode === mode;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  if (navigateTo) navigate(MODE_PAGES[mode].default);
+}
+
+// Keep the mode chrome in sync when a page is shown programmatically.
+function syncModeForPage(page) {
+  const mode = PAGE_MODE[page];
+  if (mode && mode !== CURRENT_MODE) setMode(mode, false);
+}
+
+// Where to land when the global ("🌐 Global") scope is selected. Project mode
+// lands on Capture/Config (where global defaults are edited); Tools mode stays
+// on its own default page so switching the project doesn't yank the user out of
+// Tools. api.js calls this via a typeof guard (it loads before app.js).
+function globalScopeLandingPage() {
+  return CURRENT_MODE === 'tools' ? MODE_PAGES.tools.default : 'settings';
+}
+
+document.querySelectorAll('#mode-switch .mode-seg').forEach(btn => {
+  btn.onclick = () => setMode(btn.dataset.mode);
+});
+
+// Restore the persisted mode BEFORE the initial navigate so the right sidebar
+// shows. For the Project mode (the HTML default), the shown page is already
+// Overview — only sync the chrome so loadProjects()'s own navigate path stays in
+// control. For Tools mode, navigate to its default (Providers) so the visible
+// page matches the restored sidebar.
+const RESTORED_MODE = savedMode();
+setMode(RESTORED_MODE, RESTORED_MODE !== 'project');
+
 // Init
 document.getElementById('env-bind').textContent = window.location.host;
 syncOverviewWindowButtons();

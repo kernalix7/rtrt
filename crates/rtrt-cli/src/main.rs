@@ -23,8 +23,9 @@ use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_TIMEOUT_SECS, InvokeOptions, Mode as InvokeMode, OpenAICompatibleProvider,
-    OpenAIProvider, Prefer, Provider, Role, RouteDecision, RouteRequest, UsageSnapshot,
-    invoke_agent, select_route,
+    OpenAIProvider, Prefer, Provider, Role, RouteDecision, RouteRequest, TargetHeadroom,
+    TargetWindows, UsageSnapshot, invoke_agent, provider_usage_windows, record_invocation,
+    select_route, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -249,6 +250,14 @@ enum Cmd {
         /// Prompt text. Multiple words are joined with spaces.
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
+    },
+    /// Show per-target windowed provider usage (5h / 24h / 7d) and the
+    /// headroom remaining against the configured `[limits]` daily caps.
+    /// Estimated rows (CLI shell-outs) are marked with `~`.
+    Usage {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: ReportFormatArg,
     },
     /// Persistent memory operations (SQLite-backed).
     Memory {
@@ -2571,6 +2580,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
+        Cmd::Usage { format } => run_usage(format)?,
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
@@ -4005,7 +4015,12 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
     let decision = select_route(&req, &tools, &usage)?;
 
     if opts.explain || opts.dry_run {
-        print_route_decision(&decision, opts.explain, &usage);
+        // Windowed ledger view + per-target headroom against the effective
+        // `[limits]` caps, surfaced per candidate in `--explain`.
+        let ledger_cfg = effective_config_for_cwd();
+        let windows = provider_usage_windows();
+        let headroom = target_headroom(&ledger_cfg);
+        print_route_decision(&decision, opts.explain, &usage, &windows, &headroom);
     }
     // Stop before invoking on `--dry-run`, or on `--explain` with no prompt
     // (decision-only inspection).
@@ -4028,7 +4043,13 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
     Ok(())
 }
 
-fn print_route_decision(decision: &RouteDecision, explain: bool, usage: &UsageSnapshot) {
+fn print_route_decision(
+    decision: &RouteDecision,
+    explain: bool,
+    usage: &UsageSnapshot,
+    windows: &BTreeMap<String, TargetWindows>,
+    headroom: &BTreeMap<String, TargetHeadroom>,
+) {
     println!("target: {}", decision.target);
     println!("mode: {}", invoke_mode_label(decision.mode));
     println!("model: {}", decision.model.as_deref().unwrap_or("-"));
@@ -4036,6 +4057,13 @@ fn print_route_decision(decision: &RouteDecision, explain: bool, usage: &UsageSn
     println!("reason: {}", decision.reason);
     if !explain {
         return;
+    }
+    // Per-candidate recent usage + remaining headroom from the ledger. The
+    // chosen target is listed first, then each ranked alternative.
+    println!("candidates:");
+    print_candidate_headroom("* ", &decision.target, windows, headroom);
+    for alt in &decision.alternatives {
+        print_candidate_headroom("  ", &alt.target, windows, headroom);
     }
     println!("alternatives:");
     if decision.alternatives.is_empty() {
@@ -4081,6 +4109,129 @@ fn print_route_decision(decision: &RouteDecision, explain: bool, usage: &UsageSn
     println!("sources:");
     for source in &usage.sources {
         println!("  {source}");
+    }
+}
+
+/// One candidate's recent (24h) usage and remaining headroom, formatted for
+/// `route --explain`. The `~` prefix on a token count marks an estimate (CLI
+/// shell-outs); a `?` for headroom means no `[limits]` cap is configured.
+fn print_candidate_headroom(
+    marker: &str,
+    target: &str,
+    windows: &BTreeMap<String, TargetWindows>,
+    headroom: &BTreeMap<String, TargetHeadroom>,
+) {
+    let normalized = target.to_ascii_lowercase();
+    let window = windows.get(&normalized).copied().unwrap_or_default();
+    let recent = window.last_24h;
+    let used = format_token_count(recent.tokens, recent.has_estimates());
+    let head = headroom
+        .get(&normalized)
+        .map(format_headroom)
+        .unwrap_or_else(|| "?".to_string());
+    println!(
+        "{marker}{target}: 24h used={used} requests={} remaining={head}",
+        recent.requests
+    );
+}
+
+/// Per-target windowed usage + headroom table (`rtrt usage`).
+fn run_usage(format: ReportFormatArg) -> Result<()> {
+    let config = effective_config_for_cwd();
+    let windows = provider_usage_windows();
+    let headroom = target_headroom(&config);
+
+    match format {
+        ReportFormatArg::Json => {
+            let value = serde_json::json!({
+                "windows": windows,
+                "headroom": headroom,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        ReportFormatArg::Table => print_usage_table(&windows, &headroom),
+    }
+    Ok(())
+}
+
+fn print_usage_table(
+    windows: &BTreeMap<String, TargetWindows>,
+    headroom: &BTreeMap<String, TargetHeadroom>,
+) {
+    let mut targets = windows.keys().cloned().collect::<Vec<_>>();
+    for target in headroom.keys() {
+        targets.push(target.clone());
+    }
+    targets.sort();
+    targets.dedup();
+
+    if targets.is_empty() {
+        println!("no provider usage recorded yet (~/.rtrt/provider-usage.tsv is empty)");
+        return;
+    }
+
+    println!(
+        "provider usage (rolling windows; ~ = estimated, CLI shell-outs report no real tokens)"
+    );
+    println!(
+        "{:<16} {:>14} {:>14} {:>14}  headroom (24h vs daily limit)",
+        "target", "5h tok/req", "24h tok/req", "7d tok/req"
+    );
+    for target in targets {
+        let window = windows.get(&target).copied().unwrap_or_default();
+        let head = headroom
+            .get(&target)
+            .map(format_headroom)
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{:<16} {:>14} {:>14} {:>14}  {}",
+            target,
+            format_window_cell(&window.last_5h),
+            format_window_cell(&window.last_24h),
+            format_window_cell(&window.last_7d),
+            head,
+        );
+    }
+}
+
+fn format_window_cell(usage: &rtrt_providers::WindowUsage) -> String {
+    format!(
+        "{}/{}",
+        format_token_count(usage.tokens, usage.has_estimates()),
+        usage.requests
+    )
+}
+
+/// Tokens with a leading `~` when any contributing row was estimated.
+fn format_token_count(tokens: u64, estimated: bool) -> String {
+    if estimated {
+        format!("~{tokens}")
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Remaining headroom against the configured daily limit. `?` when no
+/// `[limits]` cap is set — we never fabricate a ceiling.
+fn format_headroom(headroom: &TargetHeadroom) -> String {
+    if headroom.limits_unknown() {
+        return "? (no [limits] cap)".to_string();
+    }
+    let mut parts = Vec::new();
+    if let (Some(remaining), Some(limit)) = (headroom.remaining_tokens, headroom.limit_tokens) {
+        let used = format_token_count(headroom.used_tokens, headroom.tokens_estimated);
+        parts.push(format!("{remaining}/{limit} tok left (used {used})"));
+    }
+    if let (Some(remaining), Some(limit)) = (headroom.remaining_requests, headroom.request_limit) {
+        parts.push(format!(
+            "{remaining}/{limit} req left (used {})",
+            headroom.used_requests
+        ));
+    }
+    if parts.is_empty() {
+        "?".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -4144,6 +4295,7 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
         }
     };
 
+    let ledger_target = provider_arg_target(kind);
     if stream {
         let mut s = provider.chat_stream(req).await?;
         let mut stdout = std::io::stdout().lock();
@@ -4163,6 +4315,15 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
             "[usage] input={} output={}",
             final_usage.input_tokens, final_usage.output_tokens
         );
+        // Real API usage from the stream → record as exact (est = 0).
+        record_invocation(
+            ledger_target,
+            &model,
+            final_usage.input_tokens,
+            final_usage.output_tokens,
+            false,
+            true,
+        );
     } else {
         let resp = provider.chat(req).await?;
         println!("{}", resp.content);
@@ -4170,8 +4331,25 @@ async fn run_provider(cmd: ProviderCmd) -> Result<()> {
             "[usage] provider={} model={} input={} output={}",
             resp.provider, resp.model, resp.usage.input_tokens, resp.usage.output_tokens
         );
+        record_invocation(
+            ledger_target,
+            &resp.model,
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            false,
+            true,
+        );
     }
     Ok(())
+}
+
+/// Ledger target name for a `provider chat` invocation.
+fn provider_arg_target(kind: ProviderArg) -> &'static str {
+    match kind {
+        ProviderArg::Anthropic => "anthropic",
+        ProviderArg::Openai => "openai",
+        ProviderArg::OpenaiCompat => "openai-compat",
+    }
 }
 
 fn run_context(cmd: ContextCmd) -> Result<()> {

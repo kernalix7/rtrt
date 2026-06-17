@@ -74,6 +74,28 @@ impl UsageSnapshot {
         snapshot
     }
 
+    /// Overlay the per-provider usage ledger's rolling 24h window onto this
+    /// snapshot, so `select_route` can rank candidates by recent ledger usage
+    /// against the configured `[limits]` daily caps.
+    ///
+    /// Additive and opt-in: `load_best_effort` does NOT call this, so default
+    /// routing behavior is unchanged in P1. P2 wires it in to make routing
+    /// usage-aware. Ledger windows replace the per-target counters they cover
+    /// (the ledger is the authoritative recent-usage source for routing).
+    pub fn with_ledger_window(mut self) -> Self {
+        let windows = crate::usage_ledger::provider_usage_windows();
+        for (target, window) in windows {
+            let recent = window.last_24h;
+            self.usage_by_target.insert(target.clone(), recent.tokens);
+            self.requests_by_target.insert(target, recent.requests);
+        }
+        self.sources.push(format!(
+            "provider-usage-ledger: {} target(s) in the rolling 24h window",
+            self.usage_by_target.len()
+        ));
+        self
+    }
+
     pub fn headroom(&self, target: &str) -> Option<QuotaHeadroom> {
         let target = normalize_target(target);
         let limit = self.limits_by_target.get(&target).copied();

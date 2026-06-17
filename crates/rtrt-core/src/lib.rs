@@ -11,7 +11,9 @@ pub mod plugin;
 pub mod project;
 pub mod token;
 
-pub use config::{AgentsConfig, Config, ProjectConfig, ProjectEntry, ProvidersConfig};
+pub use config::{
+    AgentsConfig, Config, LimitsConfig, ProjectConfig, ProjectEntry, ProvidersConfig, TargetLimit,
+};
 pub use detect::{
     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,
     detect_tools_with_config,

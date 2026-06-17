@@ -767,6 +767,213 @@ document.getElementById('route-form').onsubmit = async (ev) => {
   }
 };
 
+// ── Router page: provider usage + headroom + load-balancing decision ─────────
+// Global (provider usage is not per-project). Cards reuse the savings-bar idiom
+// for the headroom bar; the routing preview reuses the Route page's cost badge +
+// alt-row renderers via /api/route/preview (no prompt required).
+
+function usageNum(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : '0';
+}
+
+// Classify the headroom bar by the scarcest configured dimension, mirroring the
+// router's own healthy / near(<15%) / exhausted bands. Returns {pct, cls} where
+// pct is the USED fraction (0..100) and cls drives the bar color token.
+const USAGE_NEAR_FRACTION = 0.15;
+function headroomBand(h) {
+  // Pick the dimension with the least remaining fraction (the binding one).
+  const dims = [];
+  if (h.limit_tokens != null && h.limit_tokens > 0) {
+    dims.push({ used: h.used_tokens || 0, limit: h.limit_tokens });
+  }
+  if (h.request_limit != null && h.request_limit > 0) {
+    dims.push({ used: h.used_requests || 0, limit: h.request_limit });
+  }
+  if (!dims.length) return { pct: 0, cls: '', remainingFrac: 1 };
+  let worst = dims[0];
+  let worstFrac = 1;
+  dims.forEach(d => {
+    const frac = Math.max(0, (d.limit - d.used) / d.limit);
+    if (frac <= worstFrac) { worstFrac = frac; worst = d; }
+  });
+  const usedPct = Math.max(0, Math.min(100, (worst.used / worst.limit) * 100));
+  let cls = '';
+  if (worstFrac <= 0) cls = 'exhausted';
+  else if (worstFrac < USAGE_NEAR_FRACTION) cls = 'near';
+  return { pct: usedPct, cls, remainingFrac: worstFrac };
+}
+
+function usageWindowCell(label, win, estimated) {
+  const w = win || {};
+  const tilde = estimated ? '~' : '';
+  return `
+    <div class="usage-window">
+      <div class="label">${escapeHtml(label)}</div>
+      <div class="tokens">${tilde}${usageNum(w.tokens)}</div>
+      <div class="requests">${tilde}${usageNum(w.requests)} req</div>
+    </div>`;
+}
+
+function usageHeadroomBlock(t) {
+  const h = t.headroom;
+  if (!h) {
+    // No [limits] cap — point the user at the Limits page to set one.
+    return `<div class="usage-nocap">⚖ no <code>[limits]</code> cap set ·
+      <a data-goto-limits href="#">set it on Limits</a></div>`;
+  }
+  const band = headroomBand(h);
+  const est = t.estimated ? '~' : '';
+  const parts = [];
+  if (h.limit_tokens != null) {
+    parts.push(`${est}${usageNum(h.used_tokens)} / ${usageNum(h.limit_tokens)} tok`);
+  }
+  if (h.request_limit != null) {
+    parts.push(`${usageNum(h.used_requests)} / ${usageNum(h.request_limit)} req`);
+  }
+  const remainPct = `${(band.remainingFrac * 100).toFixed(0)}% left`;
+  return `
+    <div class="usage-headroom-bar ${band.cls}"><span style="width:${band.pct.toFixed(1)}%;"></span></div>
+    <div class="usage-headroom-label"><span>${escapeHtml(parts.join(' · '))}</span><span>${escapeHtml(remainPct)}</span></div>`;
+}
+
+function usageEnabledBadge(t) {
+  // A configured [limits] cap that is fully spent reads as "exhausted"; an
+  // estimated target is flagged; otherwise it's an active provider.
+  if (t.headroom) {
+    const band = headroomBand(t.headroom);
+    if (band.cls === 'exhausted') return '<span class="badge err">exhausted</span>';
+    if (band.cls === 'near') return '<span class="badge warn">near limit</span>';
+  }
+  return '<span class="badge ok">active</span>';
+}
+
+function renderUsageCards(targets) {
+  const grid = document.getElementById('usage-grid');
+  if (!grid) return;
+  if (!Array.isArray(targets) || !targets.length) {
+    grid.innerHTML = '<div class="empty">No provider usage recorded yet. Usage appears here once rtrt routes a request.</div>';
+    return;
+  }
+  grid.innerHTML = targets.map(t => {
+    const est = t.estimated ? ' <span class="badge warn">~ estimated</span>' : '';
+    return `
+    <div class="usage-card">
+      <div class="usage-card-top">
+        <div class="usage-card-name">${escapeHtml(routeValue(t.target))}</div>
+        ${usageEnabledBadge(t)}
+      </div>
+      ${usageHeadroomBlock(t)}
+      <div class="usage-windows">
+        ${usageWindowCell('5h', t.windows && t.windows['5h'], t.estimated)}
+        ${usageWindowCell('24h', t.windows && t.windows['24h'], t.estimated)}
+        ${usageWindowCell('7d', t.windows && t.windows['7d'], t.estimated)}
+      </div>
+      <div class="hint">${est ? 'token counts include CLI estimates (~)' : 'real API token counts'}</div>
+    </div>`;
+  }).join('');
+  // Wire the "set it on Limits" hints to the Limits page.
+  grid.querySelectorAll('[data-goto-limits]').forEach(a => {
+    a.onclick = (ev) => { ev.preventDefault(); navigate('limits'); };
+  });
+}
+
+async function loadUsage() {
+  const grid = document.getElementById('usage-grid');
+  const meta = document.getElementById('usage-meta');
+  try {
+    const r = await fetch('/api/usage');
+    const data = r.ok ? await r.json() : { targets: [] };
+    const targets = Array.isArray(data.targets) ? data.targets : [];
+    renderUsageCards(targets);
+    if (meta) {
+      const capped = targets.filter(t => t.headroom).length;
+      meta.textContent = targets.length
+        ? `${targets.length.toLocaleString()} target${targets.length === 1 ? '' : 's'} · ${capped.toLocaleString()} with a [limits] cap`
+        : 'no usage yet';
+    }
+  } catch (e) {
+    if (grid) grid.innerHTML = `<div class="empty">Failed to load usage: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+function renderUsageRoutePreview(data) {
+  const chosen = data.chosen || {};
+  const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
+  document.getElementById('usage-route-results').hidden = false;
+  document.getElementById('usage-route-chosen').innerHTML = `
+    <div class="route-alt-row chosen">
+      <div><span class="badge ok">chosen</span> <strong>${escapeHtml(routeValue(chosen.target))}</strong></div>
+      <div>${routeCostBadge(chosen.cost_class)}</div>
+      <div><code>${escapeHtml(routeValue(chosen.mode))}</code>${chosen.model ? `<div class="hint">${escapeHtml(chosen.model)}</div>` : ''}</div>
+      <div>${escapeHtml(routeValue(chosen.reason))}</div>
+    </div>`;
+  document.getElementById('usage-route-alternatives').innerHTML = alternatives.length
+    ? alternatives.map((alt, idx) => {
+      const caps = routeCapabilities(alt.capabilities);
+      return `
+      <div class="route-alt-row">
+        <div><span class="badge">#${idx + 2}</span> <strong>${escapeHtml(routeValue(alt.target))}</strong></div>
+        <div>${routeCostBadge(alt.cost_class)}</div>
+        <div><code>${escapeHtml(routeValue(alt.mode))}</code>${alt.model ? `<div class="hint">${escapeHtml(alt.model)}</div>` : ''}</div>
+        <div>${escapeHtml(routeValue(alt.reason))}<div class="hint">${escapeHtml(routeValue(alt.headroom))}</div>${caps ? `<div class="hint">${caps}</div>` : ''}</div>
+      </div>`;
+    }).join('')
+    : '<div class="empty">No alternative targets — only one candidate would serve.</div>';
+}
+
+async function loadUsageRoutePreview() {
+  const status = document.getElementById('usage-route-status');
+  const prefer = document.getElementById('usage-prefer').value;
+  const capability = document.getElementById('usage-capability').value;
+  const params = new URLSearchParams({ prefer, capability });
+  try {
+    const r = await fetch(`/api/route/preview?${params.toString()}`);
+    const text = await r.text();
+    let data = {};
+    if (text) { try { data = JSON.parse(text); } catch (_) { data = { error: text }; } }
+    if (!r.ok) {
+      const msg = data.error || `HTTP ${r.status}`;
+      document.getElementById('usage-route-results').hidden = true;
+      if (status) status.innerHTML = `<span style="color:var(--muted);">${escapeHtml(msg)}</span>`;
+      return;
+    }
+    renderUsageRoutePreview(data);
+    if (status) status.innerHTML = '<span class="badge ok">load-balanced selection</span>';
+  } catch (e) {
+    document.getElementById('usage-route-results').hidden = true;
+    if (status) status.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+  }
+}
+
+function refreshUsagePage() {
+  loadUsage();
+  loadUsageRoutePreview();
+}
+
+// Light auto-refresh so usage updates live while the Router page is open. Same
+// cadence + active-page guard as the overview poller.
+let usagePollTimer = null;
+function startUsagePolling() {
+  if (usagePollTimer) return;
+  usagePollTimer = setInterval(() => {
+    if (activePage() === 'usage') refreshUsagePage();
+  }, 5000);
+}
+function stopUsagePolling() {
+  if (!usagePollTimer) return;
+  clearInterval(usagePollTimer);
+  usagePollTimer = null;
+}
+
+(function wireUsagePage() {
+  const form = document.getElementById('usage-route-form');
+  if (form) {
+    form.onsubmit = (ev) => { ev.preventDefault(); loadUsageRoutePreview(); };
+  }
+  const refresh = document.getElementById('usage-refresh');
+  if (refresh) refresh.onclick = () => { refreshUsagePage(); pushActivity('router · refreshed usage'); };
+})();
+
 // Recall mode toggle (bm25 / hybrid).
 (function wireRecallModeToggle() {
   const bm25Btn = document.getElementById('recall-mode-bm25');

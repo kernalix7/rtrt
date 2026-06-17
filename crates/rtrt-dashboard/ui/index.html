@@ -115,6 +115,7 @@
       <details class="nav-group" open>
         <summary class="group">🔀 Routing</summary>
         <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
+        <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · balance</span></span></a>
         <a class="nav" data-page="route"><span class="icon">⇄</span><span class="nav-copy"><span class="nav-label">Route</span><span class="nav-sub">dry-run selection</span></span></a>
       </details>
       <div class="nav-divider">Connect</div>
@@ -285,6 +286,60 @@
           <div class="head"><h2>Usage Headroom</h2><span id="route-headroom-sources" class="hint"></span></div>
           <div id="route-headroom" class="route-headroom-grid"></div>
         </div>
+      </div>
+    </section>
+
+    <!-- Router (usage + headroom + load-balancing decision) -->
+    <section id="page-usage" class="page" hidden>
+      <div class="section-head">
+        <div class="section-title">
+          <h1>Router</h1>
+          <div class="lede">Live provider usage, headroom, and the load-balancing decision for the next request. Global across projects.</div>
+        </div>
+        <div class="section-controls">
+          <button id="usage-refresh" class="ghost" type="button">Refresh</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head">
+          <h2>Routing Preview</h2>
+          <span class="hint">Who serves the next request, and why. No provider call is made.</span>
+        </div>
+        <form id="usage-route-form" class="route-form-grid">
+          <div class="ctrl-field">
+            <label for="usage-prefer">Prefer</label>
+            <select id="usage-prefer">
+              <option value="cheapest">cheapest</option>
+              <option value="local">local</option>
+              <option value="quality">quality</option>
+            </select>
+          </div>
+          <div class="ctrl-field">
+            <label for="usage-capability">Capability</label>
+            <select id="usage-capability">
+              <option value="chat">chat</option>
+              <option value="code">code</option>
+              <option value="reasoning">reasoning</option>
+              <option value="summarize">summarize</option>
+            </select>
+          </div>
+          <button id="usage-route-submit" class="primary" type="submit">Preview</button>
+        </form>
+        <div id="usage-route-status" class="out-meta"></div>
+        <div id="usage-route-results" hidden>
+          <div class="usage-route-chosen-head">Chosen <span class="hint">marked; alternatives ranked below</span></div>
+          <div id="usage-route-chosen"></div>
+          <div id="usage-route-alternatives" class="route-alt-list"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head">
+          <h2>Provider Usage &amp; Headroom</h2>
+          <span id="usage-meta" class="hint"></span>
+        </div>
+        <div id="usage-grid" class="usage-grid"><div class="empty">Loading…</div></div>
       </div>
     </section>
 

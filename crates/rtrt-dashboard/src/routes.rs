@@ -32,6 +32,8 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
         .route("/api/gain", get(gain))
         .route("/api/detect", get(detect_tools_api))
         .route("/api/route", get(route_api))
+        .route("/api/route/preview", get(route_preview_api))
+        .route("/api/usage", get(usage_api))
         .route("/api/detect/toggle", post(toggle_detected_tool))
         .route(
             "/api/optimizer/level",

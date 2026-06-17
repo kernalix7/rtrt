@@ -16,3 +16,4 @@ pub(crate) mod scope;
 pub(crate) mod security;
 pub(crate) mod statusline;
 pub(crate) mod templates;
+pub(crate) mod usage;

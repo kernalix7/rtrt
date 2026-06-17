@@ -26,10 +26,15 @@ pub use context7::Context7Client;
 pub use gateway::{
     Budget, Gateway, GatewaySummary, MetricsView, ModelPricing, RequestMetric, default_pricing,
 };
-pub use invoke::{DEFAULT_TIMEOUT_SECS, InvokeOptions, InvokeOutcome, Mode, invoke_agent};
+pub use invoke::{
+    DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, InvokeOptions, InvokeOutcome, Mode,
+    invoke_agent, invoke_with_failover, is_retryable_error,
+};
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
-pub use router::{Prefer, RouteAlternative, RouteDecision, RouteRequest, select_route};
+pub use router::{
+    Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
+};
 pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
     LedgerRow, TargetHeadroom, TargetWindows, WindowUsage, estimate_tokens, headroom_for_target,

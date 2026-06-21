@@ -593,6 +593,9 @@ function navigate(page, opts = {}) {
     if (opts.focus === 'level') focusOptimizerLevel();
     if (opts.focus === 'proxy') focusCommandProxy();
   }
+  // Mirror the destination into the address bar (History API). Defined in app.js,
+  // which loads after this file; guard so navigate() works even if it's absent.
+  if (typeof syncUrl === 'function') syncUrl(page, opts);
 }
 function subClick(navId, sub) {
   const a = document.querySelector(`#${navId} a[data-sub="${sub}"]`);

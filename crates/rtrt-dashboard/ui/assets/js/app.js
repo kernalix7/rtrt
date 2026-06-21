@@ -757,6 +757,110 @@ const MODE_PAGES = {
 const PAGE_MODE = {};
 Object.entries(MODE_PAGES).forEach(([mode, def]) => def.pages.forEach(p => { PAGE_MODE[p] = mode; }));
 
+// ── URL routing (History API, clean paths) ───────────────────────────────────
+// The address bar mirrors the active page so a refresh stays put and the route is
+// shareable. Scheme: /{page} or /{page}/{sub}, with the selected project carried
+// as ?project=<name> (global scope → no param). The top-level mode (Project|Tools)
+// is NEVER in the path — it's derived from the page via PAGE_MODE above.
+//
+// URL slugs decouple the address bar from internal ids: most pages map 1:1 to
+// their data-page, but a couple read better with a friendlier slug (e.g. the
+// router page id is `usage` but the URL is /router). Sub slugs do the same for
+// data-sub ids (e.g. memory's `memquery` sub → /memory/search).
+const PAGE_SLUG = { usage: 'router' };          // page id -> URL slug (override only)
+const SUB_SLUG = {                              // internal data-sub -> URL slug
+  memquery: 'search', memhistory: 'timeline', memmap: 'map',
+  memblocks: 'blocks', memstats: 'stats', membackup: 'backup',
+  'command-gain': 'gain', 'command-coverage': 'coverage',
+  'command-proxy': 'proxy', 'command-repomap': 'repomap',
+  securityscan: 'scan', securityprofiles: 'profiles',
+};
+const SLUG_PAGE = {};   // URL slug -> page id (inverse of PAGE_SLUG, identity otherwise)
+const SLUG_SUB = {};    // URL sub slug -> internal data-sub (inverse of SUB_SLUG)
+Object.keys(PAGE_MODE).forEach(p => { SLUG_PAGE[p] = p; });
+Object.entries(PAGE_SLUG).forEach(([page, slug]) => { SLUG_PAGE[slug] = page; });
+Object.entries(SUB_SLUG).forEach(([sub, slug]) => { SLUG_SUB[slug] = sub; });
+
+const DEFAULT_PAGE = MODE_PAGES.project.default; // overview
+// Guard so popstate-driven navigate() doesn't push a duplicate history entry.
+let SUPPRESS_URL_PUSH = false;
+
+// Build the clean URL for a page/sub, carrying the current project as ?project=.
+function buildUrl(page, sub) {
+  const slug = PAGE_SLUG[page] || page;
+  let path = '/' + slug;
+  if (sub && SUB_SLUG[sub]) path += '/' + SUB_SLUG[sub];
+  let qs = '';
+  const project = (typeof currentProject === 'function') ? currentProject() : '';
+  if (project && !isGlobalProjectValue(project)) qs = '?project=' + encodeURIComponent(project);
+  return path + qs;
+}
+
+// Pull {page, sub} from opts the same way navigate() resolves a sub for a page.
+// Only memory/command/security carry a sub in the URL; other opt fields (focus,
+// compressEngine, …) are transient UI state, not part of the shareable route.
+function routeSubFromOpts(page, opts) {
+  if (!opts || !opts.sub) return null;
+  return SUB_SLUG[opts.sub] ? opts.sub : null;
+}
+
+// Sync the address bar to the just-navigated page. Called at the tail of
+// navigate(); a no-op when navigate() is itself reacting to popstate.
+function syncUrl(page, opts) {
+  if (SUPPRESS_URL_PUSH) return;
+  const sub = routeSubFromOpts(page, opts);
+  const url = buildUrl(page, sub);
+  const state = { page, sub };
+  if (url !== window.location.pathname + window.location.search) {
+    history.pushState(state, '', url);
+  } else {
+    history.replaceState(state, '', url);
+  }
+}
+
+// Keep ?project= current (and shareable) when the project selector changes,
+// without adding a history entry. Page/sub in the path are left untouched.
+function syncUrlProject() {
+  const page = (typeof activePage === 'function') ? activePage() : DEFAULT_PAGE;
+  const activeSub = document.querySelector(`#${page}-subtabs a.active`);
+  const sub = activeSub ? activeSub.dataset.sub : null;
+  history.replaceState({ page, sub }, '', buildUrl(page, sub && SUB_SLUG[sub] ? sub : null));
+}
+
+// Resolve the current location into navigate() inputs.
+// /{slug}/{subSlug}?project=… → { page, opts:{sub}, project }. Unknown slug →
+// the default page (no error). Root path → default page.
+function parseLocation() {
+  const segs = window.location.pathname.split('/').filter(Boolean);
+  const page = (segs.length && SLUG_PAGE[segs[0]]) ? SLUG_PAGE[segs[0]] : DEFAULT_PAGE;
+  const opts = {};
+  if (segs.length > 1 && SLUG_SUB[segs[1]]) opts.sub = SLUG_SUB[segs[1]];
+  const params = new URLSearchParams(window.location.search);
+  const project = params.get('project') || '';
+  return { page, opts, project };
+}
+
+// Restore the page/sub from the current URL on first load (and on back/forward).
+// `push` controls whether navigate() should push a new history entry: false for
+// the initial load and popstate (we only want to reflect, not stack entries).
+function routeFromLocation(push) {
+  const { page, opts } = parseLocation();
+  SUPPRESS_URL_PUSH = !push;
+  try {
+    navigate(page, opts);
+  } finally {
+    SUPPRESS_URL_PUSH = false;
+  }
+  // On the very first load, replaceState so the state object is populated for the
+  // initial entry (so the first back/forward has a state to restore).
+  if (push === false) {
+    history.replaceState({ page, sub: opts.sub || null }, '', buildUrl(page, opts.sub || null));
+  }
+}
+
+// Back/forward: reflect the target without pushing a new entry.
+window.addEventListener('popstate', () => { routeFromLocation(false); });
+
 const MODE_STORAGE_KEY = 'rtrt.mode';
 let CURRENT_MODE = 'project';
 
@@ -801,18 +905,36 @@ document.querySelectorAll('#mode-switch .mode-seg').forEach(btn => {
   btn.onclick = () => setMode(btn.dataset.mode);
 });
 
-// Restore the persisted mode BEFORE the initial navigate so the right sidebar
-// shows. For the Project mode (the HTML default), the shown page is already
-// Overview — only sync the chrome so loadProjects()'s own navigate path stays in
-// control. For Tools mode, navigate to its default (Providers) so the visible
-// page matches the restored sidebar.
-const RESTORED_MODE = savedMode();
-setMode(RESTORED_MODE, RESTORED_MODE !== 'project');
+// Resolve the initial route from the address bar so a refresh on a deep URL
+// (e.g. /memory/search?project=X) restores that page instead of falling back to
+// the default. The mode is DERIVED from the URL's page (never stored in the
+// path); the persisted mode is only a fallback for the root path.
+const INITIAL_ROUTE = parseLocation();
+const atRoot = window.location.pathname === '/' || window.location.pathname === '';
+// Root path → restore the persisted mode + its default page (legacy behaviour).
+// Deep path → enter the mode that owns the URL's page so the right sidebar shows.
+const INITIAL_MODE = atRoot
+  ? savedMode()
+  : (PAGE_MODE[INITIAL_ROUTE.page] || savedMode());
+// Seed the project keys loadProjects() reads from, so a ?project= in the URL
+// wins over localStorage and the selector lands on the shared project.
+if (INITIAL_ROUTE.project) {
+  localStorage.setItem('rtrt.project', INITIAL_ROUTE.project);
+  localStorage.setItem('rtrt-project', INITIAL_ROUTE.project);
+}
+// Sync the mode chrome only (no navigate) — the URL drives the final page below.
+setMode(INITIAL_MODE, false);
 
 // Init
 document.getElementById('env-bind').textContent = window.location.host;
 syncOverviewWindowButtons();
-loadProjects();
+// loadProjects() populates the selector (honouring the seeded ?project=); once it
+// settles, route from the URL so the deep page/sub is restored. Suppress URL
+// pushes during this async window so loadProjects()'s own navigate() (global
+// scope) can't stack intermediate history entries — routeFromLocation(false)
+// then reflects the real URL with replaceState and clears the flag.
+SUPPRESS_URL_PUSH = true;
+Promise.resolve(loadProjects()).finally(() => routeFromLocation(false));
 startOverviewPolling();
 loadTemplates();
 loadPrompts();

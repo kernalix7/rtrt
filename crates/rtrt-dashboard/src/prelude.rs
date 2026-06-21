@@ -7,7 +7,7 @@ pub(crate) use crate::assets::{
     ASSET_JS_API, ASSET_JS_APP, ASSET_JS_COMPONENTS, ASSET_JS_PAGES, ASSET_STYLES_CSS, INDEX_HTML,
     VENDOR_COLA, VENDOR_COSE_BASE, VENDOR_CYTO_COLA, VENDOR_CYTOSCAPE, VENDOR_FCOSE,
     VENDOR_LAYOUT_BASE, asset_js_api, asset_js_app, asset_js_components, asset_js_pages,
-    asset_response, asset_styles_css, index, vendor_asset,
+    asset_response, asset_styles_css, index, spa_fallback, vendor_asset,
 };
 pub(crate) use crate::daemons::{
     spawn_auto_compress_daemon, spawn_auto_embed_daemon, spawn_consolidation_daemon,

@@ -39,6 +39,23 @@ pub(crate) async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+/// Catch-all fallback for SPA deep links. Any path that didn't match an explicit
+/// route serves the same `index.html` shell as `GET /`, so a browser refresh on
+/// a deep URL (e.g. `/memory/search`) returns the app, which then restores the
+/// page from the path. Unmatched `/api/*`, `/assets/*`, and `/vendor/*` paths
+/// keep returning 404 rather than masquerading as the HTML shell.
+pub(crate) async fn spa_fallback(uri: axum::http::Uri) -> axum::response::Response {
+    let path = uri.path();
+    if path.starts_with("/api/")
+        || path == "/api"
+        || path.starts_with("/assets/")
+        || path.starts_with("/vendor/")
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(INDEX_HTML).into_response()
+}
+
 /// Serve the vendored graph libraries (Cytoscape + cola/fcose layout deps) from
 /// the binary itself, so the memory map renders WITHOUT any CDN / internet — a
 /// blocked CDN was making the map fall back to a plain list.

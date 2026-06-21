@@ -215,6 +215,9 @@ document.getElementById('project-selector').onchange = () => {
   localStorage.setItem('rtrt-project', name);
   syncProjectInputs(isGlobalScope() ? '' : name);
   updateGlobalScopeIndicators();
+  // Keep the shareable ?project= in the address bar current (replaceState — a
+  // project switch is not a new history entry). Defined in app.js.
+  if (typeof syncUrlProject === 'function') syncUrlProject();
   if (isGlobalScope()) {
     navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
     return;
@@ -267,6 +270,11 @@ function wireSubtabs(navId, onActivate) {
     parent.querySelectorAll('.subpage').forEach(x => x.hidden = true);
     document.getElementById('sub-' + a.dataset.sub).hidden = false;
     if (onActivate) onActivate(a.dataset.sub);
+    // Reflect a direct sub-tab click into the address bar (deep route). These
+    // clicks don't go through navigate(), so sync the URL here. Defined in app.js.
+    if (typeof syncUrl === 'function') {
+      syncUrl(typeof activePage === 'function' ? activePage() : a.dataset.page, { sub: a.dataset.sub });
+    }
   });
 }
 wireSubtabs('memory-subtabs', (sub) => {

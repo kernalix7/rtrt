@@ -63,12 +63,13 @@
       <div class="nav-divider">Savings</div>
       <details class="nav-group" open>
         <summary class="group">🧠 Memory</summary>
-        <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Recall</span><span class="nav-sub">search and hybrid recall</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Search</span><span class="nav-sub">recall · BM25 · Hybrid</span></span></a>
         <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
-        <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">captured activity</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">activity by session</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Map</span><span class="nav-sub">concept graph</span></span></a>
         <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
-        <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Brain Map</span><span class="nav-sub">concept graph</span></span></a>
-        <a class="nav" data-page="memory" data-sub="memgovern"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Profile</span><span class="nav-sub">governance and backup</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memstats"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Stats</span><span class="nav-sub">stats and manage</span></span></a>
+        <a class="nav" data-page="memory" data-sub="membackup"><span class="icon">◌</span><span class="nav-copy"><span class="nav-label">Backup</span><span class="nav-sub">export and governance</span></span></a>
       </details>
       <details class="nav-group" open>
         <summary class="group">📝 Output Optimizer</summary>
@@ -354,12 +355,12 @@
           <span id="mem-detail-meta" class="muted"></span>
         </div>
         <nav class="subtabs" id="memory-subtabs">
-          <a class="active" data-sub="memhistory">Timeline</a>
           <a data-sub="memquery">Search</a>
-          <a data-sub="memgovern">Manage</a>
-          <a data-sub="memstats">Stats</a>
+          <a class="active" data-sub="memhistory">Timeline</a>
+          <a data-sub="memhistory">Sessions</a>
           <a data-sub="memmap">Map</a>
           <a data-sub="memblocks">Blocks</a>
+          <a data-sub="memstats">Stats</a>
           <a data-sub="membackup">Backup</a>
         </nav>
 
@@ -487,63 +488,7 @@
           </div>
         </div>
 
-        <!-- Manage subtab -->
-        <div id="sub-memgovern" class="subpage" hidden>
-          <div class="card">
-            <div class="head"><h2>Memory Manage</h2><a id="gov-refresh" style="cursor:pointer;font-size:0.88em;">Refresh</a></div>
-            <!-- Stat summary -->
-            <div id="gov-stat-summary" class="gov-stat-summary">
-              <div class="gov-stat-box"><div class="label">All</div><div class="value" id="gov-total">—</div></div>
-              <div class="gov-stat-box"><div class="label">Compressed</div><div class="value" id="gov-compressed">—</div></div>
-              <div class="gov-stat-box"><div class="label">Uncompressed</div><div class="value" id="gov-uncompressed">—</div></div>
-              <div class="gov-stat-box"><div class="label">Saved chars</div><div class="value" id="gov-saved">—</div></div>
-            </div>
-            <!-- Filters -->
-            <div class="gov-filter-row">
-              <div class="ctrl-field">
-                <label style="font-size:0.79em;color:var(--muted);">kind</label>
-                <select id="gov-kind">
-                  <option value="">All</option>
-                  <option value="note">note</option>
-                  <option value="feedback">feedback</option>
-                  <option value="project">project</option>
-                  <option value="reference">reference</option>
-                  <option value="user">user</option>
-                  <option value="block">block</option>
-                </select>
-              </div>
-              <div class="ctrl-field">
-                <label style="font-size:0.79em;color:var(--muted);">Compressed?</label>
-                <select id="gov-compress-filter">
-                  <option value="">All</option>
-                  <option value="compressed">Compressed only</option>
-                  <option value="uncompressed">Uncompressed only</option>
-                </select>
-              </div>
-              <div class="ctrl-field">
-                <label style="font-size:0.79em;color:var(--muted);">Before date</label>
-                <input id="gov-before" type="date">
-              </div>
-              <div class="ctrl-field">
-                <label style="font-size:0.79em;color:var(--muted);">After date</label>
-                <input id="gov-after" type="date">
-              </div>
-              <button id="gov-preview-btn" class="primary" type="button" style="align-self:flex-end;">Preview</button>
-            </div>
-            <!-- Preview list -->
-            <div id="gov-preview-result" class="hist-list" style="margin-bottom:0.75rem;"></div>
-            <!-- Danger zone -->
-            <div id="gov-danger-zone" hidden style="border-top:1px solid var(--border);padding-top:0.75rem;margin-top:0.25rem;">
-              <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
-                <span id="gov-match-count" style="font-size:0.88em;color:var(--muted);"></span>
-                <button id="gov-bulk-delete-btn" class="danger-confirm" type="button">Delete all selected (danger)</button>
-                <span id="gov-delete-result" class="out-meta"></span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Stats subtab -->
+        <!-- Stats subtab — merged Stats + Manage into a single view -->
         <div id="sub-memstats" class="subpage" hidden>
           <!-- Per-project embeddings override (force semantic memory on/off) -->
           <div class="card">
@@ -595,6 +540,59 @@
             </div>
             <div id="queue-summary" class="hint" style="margin-bottom:0.5rem;">Loads once a project is selected.</div>
             <div id="queue-list" class="hist-list"></div>
+          </div>
+          <!-- Manage section — merged in from the former Manage subtab -->
+          <div class="card" style="margin-top:1rem;">
+            <div class="head"><h2>Manage</h2><a id="gov-refresh" style="cursor:pointer;font-size:0.88em;">Refresh</a></div>
+            <!-- Stat summary -->
+            <div id="gov-stat-summary" class="gov-stat-summary">
+              <div class="gov-stat-box"><div class="label">All</div><div class="value" id="gov-total">—</div></div>
+              <div class="gov-stat-box"><div class="label">Compressed</div><div class="value" id="gov-compressed">—</div></div>
+              <div class="gov-stat-box"><div class="label">Uncompressed</div><div class="value" id="gov-uncompressed">—</div></div>
+              <div class="gov-stat-box"><div class="label">Saved chars</div><div class="value" id="gov-saved">—</div></div>
+            </div>
+            <!-- Filters -->
+            <div class="gov-filter-row">
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">kind</label>
+                <select id="gov-kind">
+                  <option value="">All</option>
+                  <option value="note">note</option>
+                  <option value="feedback">feedback</option>
+                  <option value="project">project</option>
+                  <option value="reference">reference</option>
+                  <option value="user">user</option>
+                  <option value="block">block</option>
+                </select>
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">Compressed?</label>
+                <select id="gov-compress-filter">
+                  <option value="">All</option>
+                  <option value="compressed">Compressed only</option>
+                  <option value="uncompressed">Uncompressed only</option>
+                </select>
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">Before date</label>
+                <input id="gov-before" type="date">
+              </div>
+              <div class="ctrl-field">
+                <label style="font-size:0.79em;color:var(--muted);">After date</label>
+                <input id="gov-after" type="date">
+              </div>
+              <button id="gov-preview-btn" class="primary" type="button" style="align-self:flex-end;">Preview</button>
+            </div>
+            <!-- Preview list -->
+            <div id="gov-preview-result" class="hist-list" style="margin-bottom:0.75rem;"></div>
+            <!-- Danger zone -->
+            <div id="gov-danger-zone" hidden style="border-top:1px solid var(--border);padding-top:0.75rem;margin-top:0.25rem;">
+              <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+                <span id="gov-match-count" style="font-size:0.88em;color:var(--muted);"></span>
+                <button id="gov-bulk-delete-btn" class="danger-confirm" type="button">Delete all selected (danger)</button>
+                <span id="gov-delete-result" class="out-meta"></span>
+              </div>
+            </div>
           </div>
         </div>
 

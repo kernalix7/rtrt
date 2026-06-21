@@ -124,6 +124,13 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),
         )
+        // SPA deep-link catch-all: any path that didn't match an explicit route
+        // above (and isn't /api/* or /assets/*) serves the same index.html shell
+        // as `GET /`, so refreshing a deep URL (e.g. /memory/search) returns the
+        // app, which then restores the page from the path. Declared before the
+        // bearer layer so the guard still wraps it; the guard already allows SPA
+        // shell paths to bootstrap while keeping /api + /assets token-protected.
+        .fallback(spa_fallback)
         .layer(axum::middleware::from_fn(move |req, next| {
             let token = token_arc.clone();
             async move { bearer_guard(token, req, next).await }

@@ -131,6 +131,22 @@ pub(crate) fn normalize_project(project: Option<String>) -> String {
 pub(crate) const SECS_PER_HOUR: i64 = 60 * 60;
 pub(crate) const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
 
+/// Is `path` a SPA HTML-shell route (served either by `GET /` or the catch-all
+/// fallback)? These bootstrap the UI and carry no secrets — they are token-exempt
+/// exactly like `/`. The API, static assets, and vendored libs are NOT shell
+/// routes: they keep their normal token requirement.
+pub(crate) fn is_spa_shell_path(path: &str) -> bool {
+    if matches!(path, "/" | "/healthz" | "/favicon.ico") {
+        return true;
+    }
+    // Anything not under an explicit prefix is a deep SPA route the fallback
+    // serves as the index shell. Prefixes below keep their own (guarded) handlers.
+    !(path.starts_with("/api/")
+        || path == "/api"
+        || path.starts_with("/assets/")
+        || path.starts_with("/vendor/"))
+}
+
 pub(crate) async fn bearer_guard(
     expected: Option<Arc<String>>,
     req: axum::extract::Request,
@@ -138,9 +154,13 @@ pub(crate) async fn bearer_guard(
 ) -> axum::response::Response {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     let path = req.uri().path().to_string();
-    // Always allow the bundled HTML, health probe, and favicon so the UI can
-    // bootstrap; the API routes still require the token.
-    if matches!(path.as_str(), "/" | "/healthz" | "/favicon.ico") {
+    // Always allow the SPA HTML shell, health probe, and favicon so the UI can
+    // bootstrap; the API + static-asset routes still require the token. Deep SPA
+    // routes (e.g. /memory/search) are served by the catch-all fallback as the
+    // very same shell as `/`, so a browser refresh on a deep URL must reach it
+    // without a bearer header (the browser can't attach one to a navigation).
+    // Carry the same exemption — but never for /api, /assets, or /vendor.
+    if is_spa_shell_path(&path) {
         return next.run(req).await;
     }
     let Some(expected) = expected else {

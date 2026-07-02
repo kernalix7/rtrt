@@ -1,0 +1,27 @@
+   Compiling runner v0.1.0 (/work/runner)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/runner-47b94ed7af4f5e56)
+
+running 2 tests
+test tests::quick_check ... ok
+test tests::harness_replay_fails ... FAILED
+
+failures:
+
+---- tests::harness_replay_fails stdout ----
+running 2 tests
+test inner ... ok
+   Compiling x
+Running step 3 of 5
+
+thread 'tests::harness_replay_fails' (1276483) panicked at src/lib.rs:18:9:
+replay diverged at step 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::harness_replay_fails
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

@@ -16,6 +16,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 ### Changed
 
 - `memory_recall` / `memory_smart_search` MCP tool descriptions and server instructions now describe actual runtime behavior (hybrid when an embedder is attached, BM25 otherwise) instead of a static claim.
+### Highlights — descriptive memory-map cluster labels + zoom-to-drill
+
+**Cluster bubbles now say what's actually inside them, and zooming into the map reveals detail automatically instead of staying a flat blob at any depth.**
+
+- **c-TF-IDF cluster labels** (`rtrt-memory`): every cluster bubble's label is now its top 2-4 DISTINCTIVE tokens (in-cluster frequency × inverse cluster frequency across the index), not an arbitrary member's first 60 chars. Shared by both the lexical and vector (embedding) clustering paths and every LOD depth (`subcluster`); a single linear pass over token sets (no O(n²)); non-English tokens survive (Unicode word-like, not an ASCII-only filter).
+- **Zoom-to-drill** (dashboard Memory map): crossing a zoom threshold over a cluster bubble auto-drills into it — the same call the click handler already makes — and rendering the children in place; zooming back out re-aggregates one level. Debounced so a continuous wheel/trackpad gesture settles once instead of spamming the API. Click-drill and the leaf preview text are unchanged.
 
 ### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
 

@@ -273,6 +273,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - `.github/workflows/release.yml`: tagged-release builds 5-target matrix, extracts the CHANGELOG section on `REL-` tags, publishes crates.io in dependency order.
 - `.github/workflows/deny.yml`: blocking `cargo deny check licenses sources bans advisories` on every push/PR/weekly cron.
 - `deny.toml`: license allowlist (MIT, Apache-2.0, BSD-{2,3}-Clause, ISC, MPL-2.0, Unicode-3.0, Zlib, BSL-1.0, OpenSSL exception for `ring`); copyleft denied.
+- **`rtrt-proxy` heavy-output filters** — the three biggest previously-unfiltered outputs get real, lossless-for-understanding condensers:
+  - `git diff`: summary head line (`N files, +A -B`); every `+`/`-` line and `diff --git`/`---`/`+++`/`@@` header kept byte-identical; runs of unchanged context collapse to the change-adjacent line(s) + `… N lines unchanged` (interior runs keep first+last); `index`/`similarity index` metadata dropped, mode changes / renames / binary markers kept; anything unparseable (e.g. combined merge diffs) passes through raw. Measured on real captures: ~10% bytes at `-U3`, ~38% at `-U10`.
+  - `cargo test`: consecutive `test … ok` lines collapse into `✓ N passed` per test-binary section; FAILED lines, panic/assertion output, `failures:` blocks, and `test result:` summaries survive verbatim (mirrors the nextest filter). ~93% bytes on an all-green run, ~28% on a failing run.
+  - `grep` / `rg` (incl. `grep -rn`): consecutive matches group per file; groups above a data-derived cap (`max(3, √total-matches)`) keep the first `cap` matches + `… +N more in <file>`, filenames and line numbers intact; context output (`-C`) and unparseable formats fall back untouched. ~25-40% bytes on real workspace searches.
+  - Fixture-driven integration tests pin the guarantees against real captured `git diff` / `cargo test` / `rg` outputs (changed lines, failures, filenames, line numbers must survive byte-identical).
 
 ### Changed
 

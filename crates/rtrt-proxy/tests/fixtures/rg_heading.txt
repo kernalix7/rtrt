@@ -1,0 +1,76 @@
+crates/rtrt-proxy/src/node.rs
+13:pub(crate) fn node_filter(input: &str) -> String {
+36:pub(crate) fn node_diagnostics(input: &str) -> String {
+63:    fn npm_drops_install_progress_and_keeps_errors() {
+73:    fn tsc_diagnostics_keep_errors() {
+
+crates/rtrt-proxy/src/lib.rs
+25:    pub fn apply(&self, raw: &str) -> String {
+169:pub fn filter_for(command: &str) -> Option<&'static CommandFilter> {
+173:fn command_matches(command: &str, prefix: &str) -> bool {
+191:pub fn errors_only(input: &str, context_lines: usize) -> String {
+224:pub fn ultra_compact(input: &str) -> String {
+256:pub(crate) fn is_error_or_warning(line: &str) -> bool {
+260:pub(crate) fn collapse_repeated_adjacent(input: &str) -> String {
+287:fn push_repeated_line(out: &mut String, line: &str, run: usize) {
+300:    fn picks_expanded_filters() {
+313:    fn errors_only_keeps_failures_with_context() {
+325:    fn ultra_compact_collapses_runs_and_strips_ansi() {
+334:    fn filter_count_tracks_broad_command_coverage() {
+
+crates/rtrt-proxy/src/kubernetes.rs
+3:pub(crate) fn kubectl_filter(input: &str) -> String {
+29:    fn kubectl_drops_defaulted_container_noise_and_keeps_errors() {
+
+crates/rtrt-proxy/src/git.rs
+17:pub(crate) fn git_status(input: &str) -> String {
+77:fn parse_tracking(line: &str) -> Option<String> {
+81:fn looks_like_short_status(input: &str) -> bool {
+111:fn short_status(input: &str) -> String {
+143:fn is_status_change(line: &str) -> bool {
+160:fn looks_like_untracked_file(line: &str) -> bool {
+169:pub(crate) fn git_passthrough(input: &str) -> String {
+173:pub(crate) fn git_show(input: &str) -> String {
+177:pub(crate) fn git_stash(input: &str) -> String {
+181:pub(crate) fn git_log(input: &str) -> String {
+192:pub(crate) fn git_branch(input: &str) -> String {
+266:fn normalize_remote_branch(name: &str) -> Option<String> {
+272:fn derived_display_cap(total: usize) -> usize {
+283:    fn git_status_condenses_branch_tracking_and_dirty_summary() {
+294:    fn git_status_short_clean_emits_ok() {
+299:    fn git_branch_strips_origin_and_summarizes_remote_only() {
+311:    fn git_log_oneline_passes_through() {
+
+crates/rtrt-proxy/src/generic.rs
+14:pub fn collapse_blanks(input: &str) -> String {
+29:pub(crate) fn passthrough(input: &str) -> String {
+33:pub(crate) fn ls_passthrough(input: &str) -> String {
+37:pub(crate) fn ls_long(input: &str) -> String {
+77:fn parse_ls_long_line(line: &str) -> Option<LsEntry> {
+103:pub(crate) fn grep_filter(input: &str) -> String {
+111:fn derived_huge_output_threshold(input: &str) -> usize {
+117:pub(crate) fn find_filter(input: &str) -> String {
+121:pub(crate) fn http_client_filter(input: &str) -> String {
+137:pub(crate) fn gh_filter(input: &str) -> String {
+159:pub(crate) fn pytest_filter(input: &str) -> String {
+176:pub(crate) fn go_test_filter(input: &str) -> String {
+196:pub(crate) fn pip_filter(input: &str) -> String {
+224:    fn ls_long_drops_permissions_owner_group_date_and_dirs_first() {
+237:    fn grep_rn_style_output_can_pass_through_unchanged() {
+243:    fn http_clients_drop_progress_and_keep_errors() {
+252:    fn pytest_keeps_failure_sections() {
+262:    fn go_test_returns_ok_for_success_noise_only() {
+268:    fn gh_filter_keeps_failing_checks_and_summarizes_passes() {
+281:    fn gh_filter_all_passing_collapses_to_summary() {
+287:    fn gh_filter_passes_through_non_check_lines() {
+
+crates/rtrt-proxy/src/containers.rs
+13:pub(crate) fn docker_filter(input: &str) -> String {
+42:    fn docker_drops_layer_progress_and_keeps_errors() {
+
+crates/rtrt-proxy/src/cargo.rs
+17:pub fn cargo_noise(input: &str) -> String {
+37:pub(crate) fn cargo_nextest(input: &str) -> String {
+69:    fn cargo_strips_compiling_lines_and_keeps_errors() {
+79:    fn cargo_clippy_keeps_warnings() {
+88:    fn nextest_drops_pass_progress_but_keeps_failures() {

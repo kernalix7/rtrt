@@ -34,7 +34,7 @@ pub static FILTERS: &[CommandFilter] = &[
     },
     CommandFilter {
         command: "git diff",
-        apply: git::git_passthrough,
+        apply: git::git_diff,
     },
     CommandFilter {
         command: "git show",
@@ -70,7 +70,7 @@ pub static FILTERS: &[CommandFilter] = &[
     },
     CommandFilter {
         command: "cargo test",
-        apply: cargo::cargo_noise,
+        apply: cargo::cargo_test,
     },
     CommandFilter {
         command: "ls -la",
@@ -86,7 +86,7 @@ pub static FILTERS: &[CommandFilter] = &[
     },
     CommandFilter {
         command: "grep -rn",
-        apply: generic::passthrough,
+        apply: generic::grep_filter,
     },
     CommandFilter {
         command: "grep",

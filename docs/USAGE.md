@@ -260,6 +260,17 @@ rtrt mcp --transport http --bind 127.0.0.1:7312 \
   --allowed-origins https://app.example.com
 ```
 
+### `rtrt gateway`
+
+Run an OpenAI-compatible HTTP endpoint so **any** tool that speaks the OpenAI
+wire format becomes an rtrt client. See [Gateway](#gateway-rtrt-gateway-serve).
+
+```bash
+rtrt gateway serve                       # http://127.0.0.1:7412/v1 (loopback)
+rtrt gateway serve --port 8080 --host 127.0.0.1
+RTRT_GATEWAY_TOKEN=$(openssl rand -hex 16) rtrt gateway serve
+```
+
 ### `rtrt benchmark`
 
 Wrap `cargo bench` so the published 60%+ savings claim is one command away.
@@ -267,6 +278,64 @@ Wrap `cargo bench` so the published 60%+ savings claim is one command away.
 ```bash
 rtrt benchmark                    # cargo bench -p rtrt-compress --bench compress_bench
 rtrt benchmark --extra '--quick'
+```
+
+## Gateway (`rtrt gateway serve`)
+
+Point any OpenAI-compatible client at `http://127.0.0.1:7412/v1` and rtrt
+auto-routes each request across your detected providers — one env var turns
+Cursor, the OpenAI SDK, `llm`, Continue, or any curl script into an rtrt
+client. It binds loopback by default.
+
+```bash
+rtrt gateway serve --port 7412 --host 127.0.0.1
+export OPENAI_BASE_URL=http://127.0.0.1:7412/v1
+export OPENAI_API_KEY=unused      # or the RTRT_GATEWAY_TOKEN you set
+```
+
+Endpoints:
+
+- `POST /v1/chat/completions` — OpenAI Chat Completions (request + response; SSE `chat.completion.chunk` stream when `stream:true`, ending with `data: [DONE]`).
+- `GET /v1/models` — the routable pseudo-models plus every detected target/model.
+- `GET /healthz` — liveness probe (always open, even with a token set).
+
+The `model` field selects the routing strategy:
+
+| `model` | Behaviour |
+|---------|-----------|
+| `auto` / `""` / `rtrt/auto` | Full route: infer a capability from the request, then headroom-aware `select_route` + automatic failover down the ranked targets. |
+| `rtrt/cheapest` | Same ranked list, cheapest cost tier first. |
+| `rtrt/best` | Same ranked list, highest-capability tier first. |
+| `anthropic/claude-…`, `openai/gpt-…`, `ollama/…`, or a bare model id | Dispatched through the existing provider gateway by model-id prefix. |
+
+Capability inference for the `auto` family is deliberately simple: a fenced
+code block (```` ``` ````) routes as **code**, an otherwise long request (over
+~2000 chars) routes as **reasoning**, everything else is general **chat**.
+
+Every dispatch records to the same usage ledger the router balances on (via the
+machinery it reuses), so there is no separate accounting and no double-counting.
+
+Security:
+
+- Binds `127.0.0.1` by default. A non-loopback bind without a token logs a warning.
+- `--token <T>` / `RTRT_GATEWAY_TOKEN` requires `Authorization: Bearer <T>` on `/v1/*` (401 + `WWW-Authenticate` on miss; constant-time comparison). `/healthz` stays open.
+
+Limitations (honest): this is a **text-only** bridge. Requests are flattened to
+a single prompt for the routed path, so tool-calling / function-calling / vision
+content is not passed through yet. Streaming is buffered — the routed answer is
+computed in full and emitted as SSE chunks (CLI-mode targets only produce full
+text), so `stream:true` is wire-compatible but not token-by-token.
+
+```bash
+# Auto-routed, non-streaming
+curl http://127.0.0.1:7412/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+
+# Explicit local model, streaming
+curl -N http://127.0.0.1:7412/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"ollama/gemma3:4b","stream":true,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## MCP server (`rtrt-mcp`)

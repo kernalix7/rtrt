@@ -1,0 +1,4 @@
+# Fixtures are byte-exact captures; never apply EOL conversion (keeps LF on
+# Windows checkouts so filter output matches, and preserves the intentional
+# CRLF bytes in git_diff_crlf.txt).
+* -text

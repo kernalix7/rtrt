@@ -9,6 +9,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
+
+**Every dashboard surface now does something real: the Sessions decoy became a feature, Route merged into Router, the gateway cards got a live data source, and the last dead panels were removed or wired.**
+
+- **Memory › Sessions is real**: new `GET /api/memory/sessions` (per-session summary rows with count + first/last activity; `?session=<id>` returns that session's memories). The Sessions nav/subtab — previously an alias of Timeline — now renders a session table that drills into per-session memories (rows open the shared detail modal). Deep-linkable at `/memory/sessions`.
+- **Route merged into Router**: the near-duplicate Route page is gone; the Router's Routing Preview gained an optional task prompt (prompt → `GET /api/route` dry-run, empty → `GET /api/route/preview`). Old `/route` deep links redirect to `/router`.
+- **Chat playground (Tools › Chat)**: a minimal gateway playground over `POST /api/chat` — model select (shared `/api/models` cache), conversation thread, per-reply provider/token/latency meta. This gives the Overview gateway cards (Response Trend / Recent Calls / Budget) a first-party data source; until a call is made they collapse into one honest "Gateway inactive" empty state that links to the playground.
+- **Dead surfaces removed/wired**: unreachable Environment-info panel (never-populated auth-token row) deleted; Diagnose's hand-typed model id replaced with the same populated model select the rest of the UI uses; template cards gained a Scaffold action (the generate-project modal was previously unreachable).
+- **Navigation**: ⌘K palette now covers every page and subpage in both modes (Sessions, Router, Limits, Chat, Security subtabs included); `/security/scan|profiles` deep links activate the right subtab; Statusline + Capture/Config re-homed under a neutral "Settings" group; Setup page names the real clients (Claude Code / Cursor / Codex CLI).
+- **Polish**: installed-model dates use the browser locale (was hard-coded), the topbar Memory pill reflects the savings source's actual availability, and the Recent Calls empty state points at the playground.
+
 ### Highlights — interactive memory graph (no-LLM similarity by default)
 
 **The memory graph goes from scattered dots to an explorable map. The default mode needs no entity extraction and no generative LLM.**

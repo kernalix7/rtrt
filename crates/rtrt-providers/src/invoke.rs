@@ -13,7 +13,6 @@ use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const API_MAX_TOKENS: u32 = 1024;
 const PROMPT_PLACEHOLDER: &str = "{prompt}";
 const MODEL_PLACEHOLDER: &str = "{model}";
 const ASCII_SPINNER_CHARS: &[char] = &['|', '/', '-', '\\'];
@@ -133,10 +132,17 @@ pub async fn invoke_agent(
                     role: Role::User,
                     content: prompt.to_string(),
                 }],
-                max_tokens: Some(API_MAX_TOKENS),
+                max_tokens: Some(api_max_tokens()),
                 temperature: None,
             };
-            match Gateway::from_env().chat(req).await {
+            // This path keeps its own ledger rows (attributed to the detected
+            // tool name, including pre-dispatch failures), so the gateway's
+            // own recording is switched off to avoid double-counting.
+            match Gateway::from_env()
+                .with_usage_recording(false)
+                .chat(req)
+                .await
+            {
                 Ok(resp) => {
                     // API mode returns real token counts; record them exactly.
                     usage_ledger::record_invocation(
@@ -361,6 +367,16 @@ fn aggregated_error(attempts: &[FailoverAttempt]) -> Error {
         "invoke: all {} candidate(s) failed: {trail}",
         attempts.len()
     ))
+}
+
+/// Output-token ceiling for API-mode invocations: `RTRT_API_MAX_TOKENS` env
+/// var → the effective (global ⊕ project) `[providers] api_max_tokens` →
+/// [`rtrt_core::DEFAULT_API_MAX_TOKENS`]. Previously a hardcoded 1024, which
+/// silently truncated routed API answers.
+fn api_max_tokens() -> u32 {
+    rtrt_core::Config::load_effective_for_cwd()
+        .providers
+        .effective_api_max_tokens()
 }
 
 /// Record an estimated-token ledger row from a prompt/output text pair

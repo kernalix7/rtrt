@@ -200,6 +200,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **Headroom-aware routing everywhere**: MCP `agent_route` and the dashboard route preview/`/api/route` now rank candidates on the same ledger-overlaid usage snapshot as the CLI (`UsageSnapshot::load_for_routing()`, new shared helper), instead of routing blind on stale best-effort data.
+- **MCP detection parity**: `agent_route` detects targets with the effective (global ⊕ project `.rtrt/config.toml`) config via `detect_tools_with_config`, so per-project agent/provider enable maps apply to MCP routing; `agent_route`'s capability parser accepts `agentic`.
+- **Configurable API answer length**: the routed API-mode output-token ceiling is no longer a hardcoded 1024 — it resolves `RTRT_API_MAX_TOKENS` env → `[providers] api_max_tokens` (global or per-project) → a 4096 default. New `rtrt_core::repo_root_from` / `Config::load_effective_for_cwd()` helpers back the per-project resolution.
 - `rtrt-core`: `CompressionLevel` and `Config` switch to `#[derive(Default)]` with `#[default]` enum variant; manual impls removed (clippy `derivable_impls`).
 - `rtrt-providers` workspace deps add `eventsource-stream`, `futures-util`, `mockito`.
 - `Cargo.toml` adds workspace deps for `rmcp`, `schemars`, `criterion`, `fastembed`, `eventsource-stream`, `futures-util`, `mockito`, `tree-sitter`, `tree-sitter-rust`, `instant-distance`, `handlebars`.
@@ -207,6 +210,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **Router telemetry split-brain**: only the CLI recorded provider usage; MCP `provider_chat`, the dashboard chat handler, and every other gateway consumer were invisible to the headroom ledger. `Gateway::from_env` gateways now append each dispatched request to the provider-usage ledger (real API counts as exact `est=0` rows, chars/4 estimates with `est=1` when no usage block is returned, failures as `ok=0`); `Gateway::new` stays ledger-silent for embedded/test use, and the `rtrt route`/`call` API path opts out of gateway recording to keep its tool-name-attributed rows without double counting.
+- **Ledger trim race**: `trim_to_cap`'s read-rewrite could drop concurrently appended rows when multiple rtrt processes wrote the ledger at once. Writers now serialize behind a best-effort `provider-usage.tsv.lock` (`O_EXCL` create, bounded retries, 10s stale-steal); when the lock is contended the append still lands and only the trim is skipped.
+- `rtrt-compress`: the protection layer now stashes bare path-shaped (`docs/reference/api.md`) and filename/version-shaped (`main.rs`, `1.2.3`) tokens, so abbreviation and article rules can no longer corrupt identifiers outside backticks (`docs/reference/api.md` no longer becomes `docs/ref/api.md`).
+- `rtrt-compress`: pleasantry removal (`sure`, `let me`, …) is anchored to sentence starts — "Make sure you do not delete" keeps its "sure" instead of becoming "Make you do not delete".
+- `rtrt-compress`: word deduplication skips numeric tokens, so repeated data points ("10 10 10") are no longer collapsed to one.
+- `rtrt-compress`: the heuristic ML scorer hard-keeps negations (not / don't / never / without / unless / …), numerals, and error-code-shaped tokens (E0308, HTTP 500) — "do not delete the production database" at ratio 0.5 no longer compresses to "delete production database".
+- `rtrt-compress`: when whatlang misclassifies short technical English as another language, mostly-ASCII text (>=90%) still gets the English rule set instead of silently skipping all compression.
+- `rtrt-proxy`: the `gh` filter had its polarity inverted — it dropped `X `-prefixed FAILING check lines and kept `✓` pass lines. Failures are now always kept verbatim and pass lines collapse into a single `✓ N passed` summary.
 - AIPS plugin workaround at init time: `lib/detect-project.sh` emits unquoted multi-word values (e.g. `DEPLOYMENT=GitHub Actions`), which breaks `lib/render-claude-md.sh`'s `eval` call. Worked around locally.
 - `rtrt-cli` clippy fixes on stable: `sort_by(|a,b| b.cmp(a))` → `sort_by_key(Reverse(...))`; manual `if zero { 0 } else { x*100/y }` → `checked_sub` + `checked_mul` + `checked_div` chain.
 - Install/uninstall hardening: uninstallers now unwire the Claude Code integration (MCP + hooks + statusline via `rtrt uninstall --agent claude --plugin --apply`) and fall back to direct service-unit cleanup; `rtrt uninstall --agent claude` drops the rtrt `statusLine` entry; `install.sh` gains pipefail (where supported), a fixed `--ref` clone fallback, working release-path `--dry-run`, and a hard error when a published SHA256 can't be verified; `install.ps1` forces TLS 1.2+ and safe PATH guidance (no `setx` truncation); docs drop the broken `irm | iex -Args` pattern.

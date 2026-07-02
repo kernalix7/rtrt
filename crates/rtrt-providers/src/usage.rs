@@ -96,6 +96,15 @@ impl UsageSnapshot {
         self
     }
 
+    /// The snapshot every routing surface (CLI, MCP `agent_route`, dashboard
+    /// route preview) must use: best-effort sources overlaid with the
+    /// provider-usage ledger's rolling 24h window, so `select_route` ranks
+    /// candidates headroom-aware everywhere — never on stale token-log data
+    /// alone.
+    pub fn load_for_routing() -> Self {
+        Self::load_best_effort().with_ledger_window()
+    }
+
     pub fn headroom(&self, target: &str) -> Option<QuotaHeadroom> {
         let target = normalize_target(target);
         let limit = self.limits_by_target.get(&target).copied();

@@ -117,7 +117,10 @@ pub(crate) async fn route_api(
         mode: None,
     };
     let tools = detected_tools_with_config_overrides();
-    let usage = UsageSnapshot::load_best_effort();
+    // Overlay the provider-usage ledger's rolling 24h window (same snapshot
+    // the CLI routes on) so the preview is headroom-aware, not blind to
+    // recent spend.
+    let usage = UsageSnapshot::load_for_routing();
     let decision = match select_route(&request, &tools, &usage) {
         Ok(decision) => decision,
         Err(e) => return route_error(StatusCode::BAD_REQUEST, &e.to_string()),

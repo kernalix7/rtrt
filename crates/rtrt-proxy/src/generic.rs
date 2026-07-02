@@ -135,15 +135,23 @@ pub(crate) fn http_client_filter(input: &str) -> String {
 }
 
 pub(crate) fn gh_filter(input: &str) -> String {
+    // In `gh pr checks` / `gh run view`, "X " marks a FAILING check and "✓"
+    // a passing one. Failures are the whole point of reading the output, so
+    // they are always kept verbatim; the passing lines are pure noise and
+    // collapse into a single "✓ N passed" summary.
     let mut out = String::new();
+    let mut passed = 0usize;
     for line in input.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("X ") && !is_error_or_warning(trimmed) && !trimmed.contains("failed")
-        {
+        if trimmed.starts_with('✓') {
+            passed += 1;
             continue;
         }
         out.push_str(line);
         out.push('\n');
+    }
+    if passed > 0 {
+        out.push_str(&format!("✓ {passed} passed\n"));
     }
     collapse_blanks(&out)
 }
@@ -254,5 +262,32 @@ mod tests {
     fn go_test_returns_ok_for_success_noise_only() {
         let raw = "ok  \texample.com/project\t0.012s\nPASS\n";
         assert_eq!(go_test_filter(raw), "ok\n");
+    }
+
+    #[test]
+    fn gh_filter_keeps_failing_checks_and_summarizes_passes() {
+        // "X" marks a FAILING check — dropping those lines hid the only
+        // information the caller cares about.
+        let raw = "✓ build (1m2s)\n✓ lint (12s)\nX test (45s)\nX docs (3s)\n";
+        let out = gh_filter(raw);
+        assert!(out.contains("X test (45s)"), "{out}");
+        assert!(out.contains("X docs (3s)"), "{out}");
+        assert!(!out.contains("✓ build"), "{out}");
+        assert!(!out.contains("✓ lint"), "{out}");
+        assert!(out.contains("✓ 2 passed"), "{out}");
+    }
+
+    #[test]
+    fn gh_filter_all_passing_collapses_to_summary() {
+        let raw = "✓ build (1m2s)\n✓ lint (12s)\n✓ test (45s)\n";
+        assert_eq!(gh_filter(raw).trim(), "✓ 3 passed");
+    }
+
+    #[test]
+    fn gh_filter_passes_through_non_check_lines() {
+        let raw = "Some checks were not successful\nX test (45s)\n";
+        let out = gh_filter(raw);
+        assert!(out.contains("Some checks were not successful"), "{out}");
+        assert!(out.contains("X test (45s)"), "{out}");
     }
 }

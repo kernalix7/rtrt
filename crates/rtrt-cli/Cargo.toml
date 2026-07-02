@@ -34,3 +34,8 @@ default = []
 # Forwards to `rtrt-compress/onnx` so `rtrt compress --ml --onnx-model …` can
 # load a real LLMLingua-2-style scorer instead of the heuristic.
 onnx = ["rtrt-compress/onnx"]
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"

@@ -297,7 +297,7 @@ enum Cmd {
         #[arg(long, default_value = "/mcp")]
         path: String,
         /// Path to the SQLite memory store.
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         memory: PathBuf,
         /// Bearer token for HTTP transport. Reads from RTRT_MCP_HTTP_TOKEN by default.
         #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
@@ -636,7 +636,7 @@ enum MemoryCmd {
         #[arg(long, default_value = "note")]
         kind: String,
         body: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
         /// Metadata pair `key=value` (repeatable) — wires into qdrant-style
         /// payload filtering on recall.
@@ -656,7 +656,7 @@ enum MemoryCmd {
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
         /// qdrant-style payload filter (e.g. `source=claude,topic~^auth`).
         #[arg(long)]
@@ -666,7 +666,7 @@ enum MemoryCmd {
     Export {
         #[arg(long)]
         project: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
         /// Destination file. `-` (or omit) writes to stdout.
         #[arg(long)]
@@ -674,7 +674,7 @@ enum MemoryCmd {
     },
     /// Import JSON Lines emitted by `rtrt memory export` (stdin if `--in` omitted).
     Import {
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
         /// Source file. `-` (or omit) reads from stdin.
         #[arg(long = "in")]
@@ -693,7 +693,7 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
     },
     /// Compress old memories — keep the most recent N, summarise the rest.
@@ -708,7 +708,7 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
     },
 }
@@ -822,7 +822,7 @@ enum BlockCmd {
         project: String,
         name: String,
         body: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
     },
     /// Print one block.
@@ -830,14 +830,14 @@ enum BlockCmd {
         #[arg(long)]
         project: String,
         name: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
     },
     /// List every block in a project.
     List {
         #[arg(long)]
         project: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
         store: PathBuf,
     },
 }
@@ -4573,12 +4573,7 @@ fn run_prompt(cmd: PromptCmd) -> Result<()> {
 }
 
 fn default_memory_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rtrt")
-        .join("memory.sqlite")
+    rtrt_core::default_memory_store_path()
 }
 
 /// Resolve the project bucket for a hook command. Explicit `--project`
@@ -6390,28 +6385,14 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
         return Ok(());
     }
     let memory = MemoryStore::open(&store_path)?;
-    // Build an FTS5 OR query: a natural-language prompt joined with spaces
-    // is treated as implicit AND by FTS5, which almost never matches a
-    // terse memory row. OR-joining the content words ranks any row sharing
-    // a term, which is what we want for context injection. Stopwords and
-    // sub-3-char tokens are dropped to cut noise.
-    const STOP: &[&str] = &[
-        "the", "and", "for", "with", "this", "that", "how", "does", "what", "why", "you", "are",
-        "was", "were", "can", "should", "would", "could", "from", "into", "have", "has",
-    ];
-    let terms: Vec<String> = prompt
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .filter(|w| w.len() >= 3 && !STOP.contains(&w.as_str()))
-        .take(32)
-        .collect();
-    if terms.is_empty() {
+    // Build a safe FTS5 OR query via the shared sanitizer: a natural-language
+    // prompt joined with spaces is treated as implicit AND by FTS5 (and its
+    // punctuation can hard-fail the parser), while OR-joining the content
+    // words ranks any row sharing a term — what context injection wants.
+    // Stopwords and sub-3-char tokens are dropped to cut noise.
+    let Some(query) = rtrt_memory::sanitize_fts_query(&prompt) else {
         return Ok(());
-    }
-    let query = terms.join(" OR ");
+    };
 
     // Recall strategy: try HYBRID (BM25 + dense vector RRF) only when it can be
     // done safely, otherwise fall back to pure BM25 — and NEVER stall the

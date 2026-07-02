@@ -154,8 +154,8 @@ pub(crate) async fn post_config(
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MemorySettingsResponse {
-    /// Memory store path as configured (may be relative, e.g. the default
-    /// `.rtrt/memory.sqlite`).
+    /// Memory store path as configured (defaults to the toolkit-wide
+    /// `~/.rtrt/memory.sqlite`).
     path: String,
     embed_model: String,
     /// Config file the values live in (so the UI can show provenance).

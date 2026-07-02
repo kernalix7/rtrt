@@ -40,8 +40,10 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(name = "rtrt-mcp", version, about = "RTRT MCP server (stdio + http)", long_about = None)]
 struct Cli {
-    /// Path to the SQLite memory store. Created if missing.
-    #[arg(long, env = "RTRT_MEMORY_PATH", default_value = ".rtrt/memory.sqlite")]
+    /// Path to the SQLite memory store. Created if missing. Defaults to
+    /// `~/.rtrt/memory.sqlite` — the same store as the CLI, hooks, and
+    /// dashboard.
+    #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
     memory: PathBuf,
     /// Transport. `stdio` is the default for local agent integrations;
     /// `http` exposes the Streamable HTTP transport over an axum router.
@@ -578,21 +580,19 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Knowledge graph traversal from one or more seed memory ids. Returns every reachable memory record across edges within `depth` hops."
+        description = "Knowledge graph traversal from one or more seed memory ids. Walks edges within `depth` hops, staying inside `project` and capped to a data-scaled visit budget. Returns every reached memory record."
     )]
     async fn memory_relations(
         &self,
         Parameters(args): Parameters<MemoryRelationsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.state.memory.lock().await;
+        // Project scoping happens inside the traversal (foreign rows never
+        // act as bridges) and the walk is visit-capped in the store.
         let items = store
-            .recall_via_graph(&args.seed_ids, args.depth)
+            .recall_via_graph_scoped(&args.seed_ids, args.depth, Some(&args.project))
             .map_err(|e| McpError::internal_error(format!("memory.relations: {e}"), None))?;
-        let scoped: Vec<_> = items
-            .into_iter()
-            .filter(|r| r.project == args.project)
-            .collect();
-        let body = serde_json::to_value(&scoped).map_err(|e| {
+        let body = serde_json::to_value(&items).map_err(|e| {
             McpError::internal_error(format!("memory.relations serialize: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -638,23 +638,24 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Run the 4-tier consolidation sweep on `project`: keep the most recent `keep` memories untouched and roll older rows into a single summary block."
+        description = "No-LLM consolidation sweep on `project`: keep the most recent `keep` memories untouched, roll every older row into one archival digest row (kind `archival`, payload `archive=true`, one preview line per archived row), then delete the originals. Returns the digest row id."
     )]
     async fn memory_consolidate(
         &self,
         Parameters(args): Parameters<MemoryConsolidateArgs>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.state.memory.lock().await;
-        let before = store
-            .count_by_project(&args.project)
-            .map_err(|e| McpError::internal_error(format!("memory.consolidate: {e}"), None))?;
-        let removed = store
+        let (removed, digest_id) = store
             .archive_overflow_no_llm(&args.project, args.keep as usize)
+            .map_err(|e| McpError::internal_error(format!("memory.consolidate: {e}"), None))?;
+        let after = store
+            .count_by_project(&args.project)
             .map_err(|e| McpError::internal_error(format!("memory.consolidate: {e}"), None))?;
         let body = serde_json::json!({
             "project": args.project,
             "removed": removed,
-            "kept": (before.saturating_sub(removed)),
+            "digest_id": digest_id,
+            "kept": after,
         });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),

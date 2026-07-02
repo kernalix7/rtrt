@@ -266,10 +266,11 @@ pub(crate) async fn setup_snippet(
     Json(req): Json<SetupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let binary = req.binary.clone().unwrap_or_else(|| "rtrt-mcp".to_string());
-    let memory = req
-        .memory
-        .clone()
-        .unwrap_or_else(|| ".rtrt/memory.sqlite".to_string());
+    let memory = req.memory.clone().unwrap_or_else(|| {
+        rtrt_core::default_memory_store_path()
+            .to_string_lossy()
+            .into_owned()
+    });
     let (target_path, snippet) = match req.agent.as_str() {
         "claude-code" => (
             "~/.claude/mcp.json".to_string(),

@@ -359,7 +359,22 @@ impl Default for MemoryConfig {
 }
 
 fn default_memory_path() -> PathBuf {
-    PathBuf::from(".rtrt/memory.sqlite")
+    default_memory_store_path()
+}
+
+/// Canonical default memory store: `~/.rtrt/memory.sqlite`.
+///
+/// Every surface (CLI, MCP server, dashboard, hooks, services) must resolve
+/// the store through this function when no explicit `--store` /
+/// `RTRT_MEMORY_PATH` override is given, so a fresh install reads and writes
+/// one SQLite file instead of scattering cwd-relative stores per directory.
+pub fn default_memory_store_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rtrt")
+        .join("memory.sqlite")
 }
 
 fn default_embed_model() -> String {

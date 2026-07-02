@@ -268,6 +268,14 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             .clone()
             .unwrap_or_else(rtrt_core::default_memory_store_path),
     );
+    // Semantic (hybrid) recall on-by-default when a local Ollama with an
+    // embedding-capable model is already there — same spirit as the rest of
+    // `rtrt setup` wiring itself up rather than asking for manual config.
+    // Independent of which agent is being set up, so it runs once per
+    // invocation regardless of the branch below.
+    if let Err(e) = maybe_enable_embeddings_from_ollama(plan.apply) {
+        println!("embeddings: skipped ({e})");
+    }
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
     }
@@ -310,6 +318,100 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             apply_codex_toml(&plan, &binary, &memory_path)
         }
     }
+}
+
+/// Ollama model name substrings that mark it as embedding-capable — matches
+/// the common embedding model families available on Ollama's registry (not
+/// exhaustive). Used only to decide whether `rtrt setup` can safely default
+/// hybrid recall on; an explicit `[embeddings]` setting in the user's config
+/// always wins over this heuristic.
+const OLLAMA_EMBED_MODEL_HINTS: &[&str] =
+    &["embed", "bge", "nomic", "minilm", "gte-", "e5-", "mxbai"];
+
+fn is_embedding_capable_model(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    OLLAMA_EMBED_MODEL_HINTS
+        .iter()
+        .any(|hint| lower.contains(hint))
+}
+
+/// Best embedding-capable model pulled into a locally reachable Ollama, if
+/// any. `None` when Ollama isn't running or has no embedding model pulled —
+/// in that case `rtrt setup` leaves hybrid recall off, same as if Ollama were
+/// never installed.
+fn detect_ollama_embedding_model() -> Option<String> {
+    rtrt_core::detect_tools()
+        .into_iter()
+        .find(|t| t.name == "ollama" && t.server_running == Some(true))
+        .and_then(|t| t.models.into_iter().find(|m| is_embedding_capable_model(m)))
+}
+
+/// Whether `[embeddings].<key>` is explicitly present in the raw config TOML
+/// text — the signal that the user has already made their own choice, which
+/// `rtrt setup` must never override. A missing file, missing section, or
+/// missing key are all "not explicit" and safe to default.
+fn embeddings_key_explicit(raw: &str, key: &str) -> bool {
+    raw.parse::<toml::Value>()
+        .ok()
+        .and_then(|v| v.get("embeddings").and_then(|e| e.get(key)).map(|_| ()))
+        .is_some()
+}
+
+/// When a local Ollama with an embedding-capable model is detected, turns on
+/// hybrid (semantic) recall by default — `[embeddings] enabled = true` in the
+/// global `~/.rtrt/config.toml` — unless the user already made an explicit
+/// choice for that key (never flips an explicit `enabled = false`). Also
+/// fills in `model` when the user hasn't pinned one, so the default actually
+/// points at a model that's really pulled. A no-op (besides a status line)
+/// when Ollama or an embedding model isn't found, or `enabled` is already
+/// explicit in the file.
+fn maybe_enable_embeddings_from_ollama(apply: bool) -> Result<()> {
+    let Some(model) = detect_ollama_embedding_model() else {
+        println!(
+            "embeddings: no local Ollama embedding model detected; hybrid recall stays off (BM25 only)"
+        );
+        return Ok(());
+    };
+    let path = rtrt_core::Config::default_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config path"))?;
+    let raw = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if embeddings_key_explicit(&raw, "enabled") {
+        println!(
+            "embeddings: Ollama model '{model}' detected, but [embeddings] enabled is already set in {} — leaving it as-is",
+            path.display()
+        );
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "[dry-run] embeddings: would enable hybrid recall in {} (Ollama model '{model}' detected)",
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut cfg = rtrt_core::Config::load()?;
+    cfg.embeddings.enabled = true;
+    if !embeddings_key_explicit(&raw, "model") {
+        cfg.embeddings.model = model.clone();
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    if path.exists() {
+        backup_if_needed(&path)?;
+    }
+    let rendered =
+        toml::to_string_pretty(&cfg).map_err(|e| anyhow::anyhow!("serialize config: {e}"))?;
+    std::fs::write(&path, rendered).with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "embeddings: enabled hybrid recall in {} (Ollama model '{model}' detected)",
+        path.display()
+    );
+    Ok(())
 }
 
 fn apply_json(
@@ -440,7 +542,7 @@ fn expand_home(rel: &str) -> Result<PathBuf> {
     }
 }
 
-fn dirs_home() -> Result<PathBuf> {
+pub(crate) fn dirs_home() -> Result<PathBuf> {
     if let Some(h) = std::env::var_os("HOME") {
         return Ok(PathBuf::from(h));
     }
@@ -1208,9 +1310,244 @@ fn backup_if_needed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shared health checks — used by `rtrt project status`/`health` and
+// `rtrt doctor` so the Claude Code integration / memory-store probes live in
+// exactly one place. Every check reads real local state; nothing here is
+// fabricated.
+// ---------------------------------------------------------------------------
+
+const CLAUDE_HOOK_NEEDLE: &str = "rtrt hook";
+const CLAUDE_STATUSLINE_NEEDLE: &str = "statusline --rich";
+
+/// Pass/warn/fail state for a single health-check row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl CheckState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+pub struct ClaudeSettingsStatus {
+    pub hooks_state: CheckState,
+    pub hooks_detail: String,
+    pub statusline_state: CheckState,
+    pub statusline_detail: String,
+}
+
+/// Checks `~/.claude/settings.json` for rtrt-owned hook entries and the rich
+/// statusLine command. `health` escalates a read/parse failure from WARN to
+/// FAIL (used by `rtrt project health`); a missing file is always WARN since
+/// the Claude Code integration is opt-in.
+pub fn claude_settings_status(health: bool) -> ClaudeSettingsStatus {
+    let missing = ClaudeSettingsStatus {
+        hooks_state: CheckState::Warn,
+        hooks_detail: "settings file missing".into(),
+        statusline_state: CheckState::Warn,
+        statusline_detail: "settings file missing".into(),
+    };
+    let Some(settings_path) = dirs_home()
+        .ok()
+        .map(|home| home.join(".claude/settings.json"))
+    else {
+        return ClaudeSettingsStatus {
+            hooks_detail: "home directory unavailable".into(),
+            statusline_detail: "home directory unavailable".into(),
+            ..missing
+        };
+    };
+    if !settings_path.exists() {
+        return missing;
+    }
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            let state = if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("read failed: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("read failed: {err}"),
+            };
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let state = if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("invalid JSON: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("invalid JSON: {err}"),
+            };
+        }
+    };
+    let hooks_present = parsed
+        .get("hooks")
+        .is_some_and(|hooks| json_contains_text(hooks, CLAUDE_HOOK_NEEDLE));
+    let statusline_present = parsed
+        .get("statusLine")
+        .is_some_and(|statusline| json_contains_text(statusline, CLAUDE_STATUSLINE_NEEDLE));
+    ClaudeSettingsStatus {
+        hooks_state: if hooks_present {
+            CheckState::Pass
+        } else {
+            CheckState::Warn
+        },
+        hooks_detail: if hooks_present {
+            "rtrt hook entries found".into()
+        } else {
+            "rtrt hook entries missing".into()
+        },
+        statusline_state: if statusline_present {
+            CheckState::Pass
+        } else {
+            CheckState::Warn
+        },
+        statusline_detail: if statusline_present {
+            "rtrt rich statusLine found".into()
+        } else {
+            "rtrt rich statusLine missing".into()
+        },
+    }
+}
+
+fn json_contains_text(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains(needle),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| json_contains_text(item, needle))
+        }
+        serde_json::Value::Object(map) => map.values().any(|item| json_contains_text(item, needle)),
+        _ => false,
+    }
+}
+
+/// Checks whether `~/.claude.json` registers the `rtrt` MCP server
+/// (`mcpServers.rtrt`) — the entry `rtrt setup --agent claude --apply` writes.
+pub fn claude_mcp_registered_status() -> (CheckState, String) {
+    let Some(path) = dirs_home().ok().map(|home| home.join(".claude.json")) else {
+        return (CheckState::Warn, "home directory unavailable".into());
+    };
+    if !path.exists() {
+        return (CheckState::Warn, format!("missing {}", path.display()));
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => return (CheckState::Warn, format!("read failed: {err}")),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => return (CheckState::Warn, format!("invalid JSON: {err}")),
+    };
+    let registered = parsed
+        .get("mcpServers")
+        .and_then(|servers| servers.get("rtrt"))
+        .is_some();
+    if registered {
+        (
+            CheckState::Pass,
+            format!("rtrt registered in {}", path.display()),
+        )
+    } else {
+        (
+            CheckState::Warn,
+            format!("rtrt not registered in {}", path.display()),
+        )
+    }
+}
+
+/// Opens the memory store read-only and confirms the `memories` table
+/// answers a query, reporting the row count on success. `health` escalates
+/// an existing-but-broken store from WARN to FAIL; a store that simply
+/// hasn't been created yet is always WARN.
+pub fn memory_reachable_status(health: bool) -> (CheckState, String) {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(rtrt_core::default_memory_store_path);
+    if !path.exists() {
+        return (CheckState::Warn, format!("missing {}", path.display()));
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match rusqlite::Connection::open_with_flags(&path, flags).and_then(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    }) {
+        Ok(count) => (
+            CheckState::Pass,
+            format!("reachable {} ({count} rows)", path.display()),
+        ),
+        Err(err) => (
+            if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            },
+            format!("unreachable {}: {err}", path.display()),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_embedding_capable_model_matches_known_families_case_insensitively() {
+        assert!(is_embedding_capable_model("bge-m3"));
+        assert!(is_embedding_capable_model("BGE-M3:LATEST"));
+        assert!(is_embedding_capable_model("nomic-embed-text"));
+        assert!(is_embedding_capable_model("mxbai-embed-large"));
+        assert!(is_embedding_capable_model("all-minilm"));
+        assert!(!is_embedding_capable_model("llama3.2"));
+        assert!(!is_embedding_capable_model("qwen2.5-coder"));
+    }
+
+    #[test]
+    fn embeddings_key_explicit_detects_presence_not_value() {
+        // No file / empty text: never explicit.
+        assert!(!embeddings_key_explicit("", "enabled"));
+        // Section present but key absent: not explicit.
+        assert!(!embeddings_key_explicit(
+            "[embeddings]\nmodel = \"bge-m3\"\n",
+            "enabled"
+        ));
+        // Key present and false: still explicit — this is exactly the case
+        // `rtrt setup` must never override.
+        assert!(embeddings_key_explicit(
+            "[embeddings]\nenabled = false\n",
+            "enabled"
+        ));
+        // Key present and true: explicit too.
+        assert!(embeddings_key_explicit(
+            "[embeddings]\nenabled = true\n",
+            "enabled"
+        ));
+        // Malformed TOML: treated as not explicit (never panics, never blocks
+        // setup on an unrelated parse error).
+        assert!(!embeddings_key_explicit("not valid toml {{{", "enabled"));
+    }
 
     #[test]
     fn claude_statusline_entry_uses_rich_command() {

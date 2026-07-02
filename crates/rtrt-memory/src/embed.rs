@@ -183,10 +183,48 @@ mod ollama_impl {
             Ok(out)
         }
     }
+
+    /// Coverage + config gate for hybrid recall, shared by every entry point
+    /// outside the dashboard's periodic auto-embed daemon (the CLI
+    /// `UserPromptSubmit` hook, MCP `memory_recall` / `memory_smart_search`)
+    /// so they all agree on when it's worth spending an Ollama round-trip:
+    /// embeddings must be enabled (config/env, via
+    /// [`EmbeddingsConfig::is_enabled`](rtrt_core::config::EmbeddingsConfig::is_enabled))
+    /// AND the project must already have meaningful embedding coverage
+    /// (`embedded > 0 && embedded * 2 >= total`) — without coverage, hybrid
+    /// adds latency for no recall gain. Pure SQLite + config read, no
+    /// network, so it's cheap to call before deciding whether to spend a
+    /// timeout budget on the embedder itself.
+    pub fn hybrid_recall_ready(
+        store: &crate::MemoryStore,
+        project: &str,
+        cfg: &rtrt_core::Config,
+    ) -> bool {
+        if !cfg.embeddings.is_enabled() {
+            return false;
+        }
+        match store.embedding_coverage(project) {
+            Ok((embedded, total)) => embedded > 0 && embedded.saturating_mul(2) >= total,
+            Err(_) => false,
+        }
+    }
+
+    /// Builds the `OllamaEmbedder` for hybrid recall from `cfg`, resolving
+    /// `base_url`/`model` the same way the dashboard's auto-embed daemon does:
+    /// `embeddings.base_url` → `auto_compress.base_url` → the Ollama default.
+    /// Construction alone never touches the network — the round-trip only
+    /// happens on `embed`/`embed_one`.
+    pub fn hybrid_embedder_from_config(cfg: &rtrt_core::Config) -> OllamaEmbedder {
+        let base_url = cfg
+            .embeddings
+            .resolved_base_url(cfg.auto_compress.base_url.as_deref());
+        let model = cfg.embeddings.effective_model();
+        OllamaEmbedder::new(base_url, model)
+    }
 }
 
 #[cfg(feature = "ollama-embed")]
-pub use ollama_impl::OllamaEmbedder;
+pub use ollama_impl::{OllamaEmbedder, hybrid_embedder_from_config, hybrid_recall_ready};
 
 #[cfg(feature = "embeddings")]
 mod fastembed_impl {

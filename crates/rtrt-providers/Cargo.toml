@@ -18,7 +18,10 @@ tokio.workspace = true
 tracing.workspace = true
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
+axum.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true }

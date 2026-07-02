@@ -3262,7 +3262,9 @@ dependencies = [
 name = "rtrt-providers"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "axum",
  "eventsource-stream",
  "futures-util",
  "mockito",
@@ -3271,6 +3273,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
 ]
 

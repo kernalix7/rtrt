@@ -246,6 +246,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **OpenAI-compatible gateway**: `rtrt gateway serve [--port 7412] [--host 127.0.0.1] [--token]` exposes `POST /v1/chat/completions` (OpenAI wire format, SSE streaming when `stream:true`), `GET /v1/models`, and `GET /healthz`, so any OpenAI client becomes an rtrt client with one env var. The `model` field routes: `auto` / `rtrt/cheapest` / `rtrt/best` run the headroom-aware router + automatic failover (capability inferred from the request), while `provider/model` (or a bare id) dispatches through the existing provider gateway. Every dispatch records to the same usage ledger the router balances on (no double-counting). Loopback by default; optional constant-time bearer guard via `RTRT_GATEWAY_TOKEN`. Text-only for now (no tool-calling passthrough); streaming is buffered but wire-compatible.
 - **MCP HTTP transport**: `--transport http --bind ADDR --path /mcp` boots `rmcp::StreamableHttpService` behind an axum `Router`. `--http-token` enforces a constant-time bearer guard. `--allowed-origins` plumbs `StreamableHttpServerConfig.allowed_origins`.
 - **MCP tools**: `compress_ml`, `proxy`, `memory_set_block` / `memory_get_block` / `memory_list_blocks`, `filter` parameter on `memory_recall`.
 - **Memory payload filter DSL**: `PayloadFilter::parse("source=claude,topic~^auth")`, `recall_bm25_with_filter`, `save_with_metadata`, `get_metadata`, `set_metadata`; v3 schema migration adds the `metadata` column.

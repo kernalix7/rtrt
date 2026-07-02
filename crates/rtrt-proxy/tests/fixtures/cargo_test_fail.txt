@@ -1,0 +1,40 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/sample-e21b4ac95c1ccdbc)
+
+running 10 tests
+test tests::adds_commutative ... ok
+test tests::adds_positive ... ok
+test tests::adds_negative ... ok
+test tests::adds_zero ... ok
+test tests::adds_overflow_expectation ... FAILED
+test tests::doubles_small ... ok
+test tests::doubles_large ... ok
+test tests::slow_integration ... ignored
+test tests::doubles_zero ... ok
+test tests::doubles_wrong_expectation ... FAILED
+
+failures:
+
+---- tests::adds_overflow_expectation stdout ----
+
+thread 'tests::adds_overflow_expectation' (811849) panicked at src/lib.rs:13:46:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::doubles_wrong_expectation stdout ----
+
+thread 'tests::doubles_wrong_expectation' (811854) panicked at src/lib.rs:12:46:
+assertion `left == right` failed: double(5) should be 11 (intentionally wrong)
+  left: 10
+ right: 11
+
+
+failures:
+    tests::adds_overflow_expectation
+    tests::doubles_wrong_expectation
+
+test result: FAILED. 7 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

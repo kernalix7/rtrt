@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod context7;
 pub mod gateway;
+pub mod gateway_server;
 pub mod invoke;
 pub mod openai;
 pub mod openai_compatible;
@@ -25,6 +26,11 @@ pub use anthropic::AnthropicProvider;
 pub use context7::Context7Client;
 pub use gateway::{
     Budget, Gateway, GatewaySummary, MetricsView, ModelPricing, RequestMetric, default_pricing,
+};
+pub use gateway_server::{
+    ChatCompletionRequest, ChatCompletionResponse, DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT,
+    GatewayState, ModelRoute, app as gateway_app, default_timeout as gateway_default_timeout,
+    infer_capability, serve as serve_gateway,
 };
 pub use invoke::{
     DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, InvokeOptions, InvokeOutcome, Mode,

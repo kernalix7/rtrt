@@ -122,10 +122,9 @@ impl ProjectConfig {
         self.output_level.is_none()
             && self.compression.is_none()
             && self.agents.as_ref().is_none_or(|a| a.enabled.is_empty())
-            && self
-                .providers
-                .as_ref()
-                .is_none_or(|p| p.enabled.is_empty() && p.active.is_none())
+            && self.providers.as_ref().is_none_or(|p| {
+                p.enabled.is_empty() && p.active.is_none() && p.api_max_tokens.is_none()
+            })
             && self.statusline.is_none()
     }
 }
@@ -415,10 +414,19 @@ impl AgentsConfig {
     }
 }
 
+/// Default output-token ceiling for routed API-mode invocations when neither
+/// `[providers] api_max_tokens` nor `RTRT_API_MAX_TOKENS` is set.
+pub const DEFAULT_API_MAX_TOKENS: u32 = 4096;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
     #[serde(default)]
     pub active: Option<String>,
+    /// Max output tokens for routed API-mode invocations (`rtrt route` /
+    /// `rtrt call --mode api`, MCP `agent_call` / `agent_route`). `None`
+    /// falls back to [`DEFAULT_API_MAX_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_max_tokens: Option<u32>,
     #[serde(flatten)]
     pub enabled: BTreeMap<String, bool>,
 }
@@ -430,6 +438,22 @@ impl ProvidersConfig {
 
     pub fn set_enabled(&mut self, name: &str, enabled: bool) {
         self.enabled.insert(name.to_string(), enabled);
+    }
+
+    /// Effective output-token ceiling for API-mode invocations. Resolution
+    /// order mirrors the other provider knobs: `RTRT_API_MAX_TOKENS` env var
+    /// → `[providers] api_max_tokens` → [`DEFAULT_API_MAX_TOKENS`]. Zero and
+    /// unparseable values are ignored so a typo never truncates answers to 0.
+    pub fn effective_api_max_tokens(&self) -> u32 {
+        if let Ok(raw) = std::env::var("RTRT_API_MAX_TOKENS")
+            && let Ok(value) = raw.trim().parse::<u32>()
+            && value > 0
+        {
+            return value;
+        }
+        self.api_max_tokens
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_API_MAX_TOKENS)
     }
 }
 
@@ -556,6 +580,18 @@ impl Config {
         Ok(base)
     }
 
+    /// The config effective for the current working directory: the global
+    /// config overlaid with the enclosing repo's `.rtrt/config.toml` when the
+    /// cwd is inside a repo, else the plain global config. Errors fall back to
+    /// the default config so a malformed per-project file never breaks the
+    /// caller (routing, MCP tool dispatch, hooks).
+    pub fn load_effective_for_cwd() -> Self {
+        let repo = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| repo_root_from(&cwd));
+        Self::load_effective(repo.as_deref()).unwrap_or_default()
+    }
+
     /// Overlay one project's customization overrides onto this config.
     pub fn apply_project_overrides(&mut self, over: &ProjectConfig) {
         if let Some(compression) = &over.compression {
@@ -572,6 +608,9 @@ impl Config {
             }
             if providers.active.is_some() {
                 self.providers.active = providers.active.clone();
+            }
+            if providers.api_max_tokens.is_some() {
+                self.providers.api_max_tokens = providers.api_max_tokens;
             }
         }
     }
@@ -594,6 +633,20 @@ impl Config {
             .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
         Ok(())
     }
+}
+
+/// Walk up from `start` to the enclosing repo root — the first ancestor with a
+/// `.git` or `.rtrt` entry. Returns `None` when `start` is not inside a repo,
+/// so callers fall back to the plain global config.
+pub fn repo_root_from(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() || dir.join(".rtrt").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -750,6 +803,96 @@ mod tests {
         let alpha = c.project("alpha").unwrap();
         assert_eq!(alpha.path.as_deref(), Some("/repo/alpha-2"));
         assert_eq!(alpha.security_profile.as_deref(), Some("ai-default"));
+    }
+
+    #[test]
+    fn api_max_tokens_loads_and_defaults() {
+        // Absent → the safe default (no silent truncation to a tiny cap).
+        let c = Config::from_toml_str("").unwrap();
+        assert_eq!(c.providers.api_max_tokens, None);
+        assert_eq!(
+            c.providers.effective_api_max_tokens(),
+            DEFAULT_API_MAX_TOKENS
+        );
+
+        // Explicit value in [providers] wins; sibling flattened bool entries
+        // (the enable map) must keep loading next to the typed field.
+        let c = Config::from_toml_str(
+            r#"
+            [providers]
+            active = "openai"
+            api_max_tokens = 8192
+            openrouter = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.providers.api_max_tokens, Some(8192));
+        assert_eq!(c.providers.effective_api_max_tokens(), 8192);
+        assert_eq!(c.providers.enabled_override("openrouter"), Some(false));
+
+        // Zero is ignored — a typo must never truncate answers to nothing.
+        let zeroed = ProvidersConfig {
+            api_max_tokens: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zeroed.effective_api_max_tokens(), DEFAULT_API_MAX_TOKENS);
+    }
+
+    #[test]
+    fn project_override_carries_api_max_tokens() {
+        let mut base = Config::from_toml_str(
+            r#"
+            [providers]
+            api_max_tokens = 2048
+            "#,
+        )
+        .unwrap();
+        let over = ProjectConfig::from_toml_str(
+            r#"
+            [providers]
+            api_max_tokens = 512
+            "#,
+        )
+        .unwrap();
+        assert!(!over.is_empty());
+        base.apply_project_overrides(&over);
+        assert_eq!(base.providers.api_max_tokens, Some(512));
+
+        // An override without the field leaves the global value alone.
+        let mut base = Config::from_toml_str(
+            r#"
+            [providers]
+            api_max_tokens = 2048
+            "#,
+        )
+        .unwrap();
+        let over = ProjectConfig::from_toml_str(
+            r#"
+            [providers]
+            active = "openai"
+            "#,
+        )
+        .unwrap();
+        base.apply_project_overrides(&over);
+        assert_eq!(base.providers.api_max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn repo_root_walks_up_to_rtrt_or_git_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "rtrt-core-repo-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(repo_root_from(&nested), None);
+        std::fs::create_dir_all(root.join(".rtrt")).unwrap();
+        assert_eq!(repo_root_from(&nested), Some(root.clone()));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

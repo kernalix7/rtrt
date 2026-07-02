@@ -426,16 +426,19 @@ document.querySelectorAll('[data-sample]').forEach(btn => btn.onclick = () => {
   if (fn) fn();
 });
 
-// Command palette — Cmd+K / Ctrl+K opens. Searches pages + sub-tabs + samples.
+// Command palette — Cmd+K / Ctrl+K opens. Covers EVERY page + subpage in both
+// modes (keep in sync with the sidebar navs and MODE_PAGES in app.js).
 const PALETTE_ITEMS = [
+  // ── Project mode ──
   { label: 'Overview · Token Savings', hint: 'overview / optimizer savings', run: () => navigate('overview') },
   { label: 'Memory · Search', hint: 'memory / recall', run: () => navigate('memory', { sub: 'memquery' }) },
   { label: 'Memory · Timeline', hint: 'memory / timeline', run: () => navigate('memory', { sub: 'memhistory' }) },
-  { label: 'Memory · Map', hint: 'memory / graph', run: () => navigate('memory', { sub: 'memmap' }) },
+  { label: 'Memory · Sessions', hint: 'memory / activity by session', run: () => navigate('memory', { sub: 'memsessions' }) },
+  { label: 'Memory · Map', hint: 'memory / concept graph', run: () => navigate('memory', { sub: 'memmap' }) },
   { label: 'Memory · Blocks', hint: 'memory / blocks', run: () => navigate('memory', { sub: 'memblocks' }) },
   { label: 'Memory · Stats', hint: 'memory / stats and manage', run: () => navigate('memory', { sub: 'memstats' }) },
   { label: 'Memory · Backup', hint: 'memory / export', run: () => navigate('memory', { sub: 'membackup' }) },
-  { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
+  { label: 'Output Optimizer · Level', hint: 'terse mode toggle', run: () => navigate('compress', { focus: 'level' }) },
   { label: 'Output Optimizer · Compress Lite', hint: 'rules / lite', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'lite' }); document.getElementById('compress-input').focus(); } },
   { label: 'Output Optimizer · Compress Full', hint: 'rules / full', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'full' }); document.getElementById('compress-input').focus(); } },
   { label: 'Output Optimizer · Compress Ultra', hint: 'rules / ultra', run: () => { navigate('compress', { compressEngine: 'rules', compressLevel: 'ultra' }); document.getElementById('compress-input').focus(); } },
@@ -444,20 +447,26 @@ const PALETTE_ITEMS = [
   { label: 'Command Optimizer · Coverage', hint: '34 command filters', run: () => navigate('command', { sub: 'command-coverage' }) },
   { label: 'Command Optimizer · Proxy', hint: 'stdin filter demo', run: () => navigate('command', { sub: 'command-proxy' }) },
   { label: 'Command Optimizer · Repo Map', hint: 'repo-map', run: () => navigate('command', { sub: 'command-repomap' }) },
-  { label: 'Orchestrate · Environment', hint: 'tools and routing', run: () => navigate('environment') },
-  { label: 'Orchestrate · Route', hint: 'dry-run routing', run: () => navigate('route') },
-  { label: 'Orchestrate · Providers', hint: 'providers / local models', run: () => navigate('llm') },
-  { label: 'Library · Prompts', hint: 'prompts', run: () => navigate('prompts') },
-  { label: 'Library · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
-  { label: 'Tools · Setup', hint: 'client setup', run: () => navigate('connect') },
-  { label: 'Tools · Diagnose', hint: 'diagnose', run: () => navigate('diagnose') },
-  { label: 'Tools · Security', hint: 'security', run: () => navigate('security') },
   { label: 'Customize · Statusline', hint: 'rich statusline', run: () => navigate('statusline') },
   { label: 'Customize · Capture / Config', hint: 'config / auto-compress', run: () => navigate('settings') },
+  { label: 'Library · Templates', hint: 'project scaffolds', run: () => navigate('templates') },
+  { label: 'Library · Prompts', hint: 'prompts', run: () => navigate('prompts') },
+  { label: 'Tools · Diagnose', hint: 'failure triage', run: () => navigate('diagnose') },
+  { label: 'Security · Scan', hint: 'security / project scan', run: () => navigate('security', { sub: 'securityscan' }) },
+  { label: 'Security · Profile settings', hint: 'security / profiles', run: () => navigate('security', { sub: 'securityprofiles' }) },
+  // ── Tools mode ──
+  { label: 'Providers · Active & models', hint: 'providers / local models', run: () => navigate('llm') },
+  { label: 'Providers · Chat playground', hint: 'gateway chat / POST /api/chat', run: () => navigate('chat') },
+  { label: 'Providers · Limits', hint: 'daily usage ceilings', run: () => navigate('limits') },
+  { label: 'Orchestrate · Environment', hint: 'detected tools', run: () => navigate('environment') },
+  { label: 'Orchestrate · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
+  { label: 'Connect · Setup', hint: 'client snippets', run: () => navigate('connect') },
+  // ── Actions ──
+  { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
   { label: 'Toggle theme', hint: 'dark / light', run: () => document.getElementById('theme-toggle').click() },
   { label: 'Output Optimizer · sample', hint: 'sample · compress', run: () => { navigate('compress'); SAMPLES.compress(); } },
   { label: 'Command Optimizer · sample', hint: 'sample · proxy', run: () => { navigate('command', { sub: 'command-proxy' }); SAMPLES.proxy(); } },
-  { label: 'Tools · sample diagnose', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
+  { label: 'Diagnose · sample', hint: 'sample · diagnose', run: () => { navigate('diagnose'); SAMPLES.diagnose(); } },
 ];
 function refreshMemoryScope() {
   openProject(currentProject());
@@ -582,6 +591,12 @@ function navigate(page, opts = {}) {
   if (page === 'security') {
     loadSecurityProfiles();
     refreshSecurityScope();
+    // Deep-linked subtab (/security/scan | /security/profiles).
+    if (opts.sub) subClick('security-subtabs', opts.sub);
+  }
+  if (page === 'chat') {
+    // Refresh the model select from the shared cache each visit.
+    populateModelSelects();
   }
   if (page === 'statusline') {
     loadStatuslinePage();

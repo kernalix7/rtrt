@@ -57,7 +57,7 @@ impl Compressor {
         let detected_lang = detect_language(&redacted);
         let (placeheld, slots) = stash_protected(&redacted);
         let mut out = placeheld;
-        if detected_lang == Some(Lang::Eng) {
+        if should_apply_english_rules(detected_lang, &redacted) {
             for (regex, replacement) in english_rules_for(self.level) {
                 out = regex.replace_all(&out, *replacement).into_owned();
             }
@@ -223,6 +223,24 @@ static LANGUAGE_PACKS: &[LanguagePackEntry] = &[
     },
 ];
 
+/// Whatlang misclassifies short technical English (CLI output, log lines,
+/// commit messages) often enough that gating the English rule set on a
+/// positive `Lang::Eng` silently turns the compressor into a no-op. Mostly
+/// ASCII text is English-or-code in practice, so fall back to the English
+/// rules whenever detection disagrees but the bytes are >=90% ASCII.
+/// Language packs (Korean/Japanese/... fillers) still apply independently.
+fn should_apply_english_rules(detected: Option<Lang>, text: &str) -> bool {
+    if detected == Some(Lang::Eng) {
+        return true;
+    }
+    let total = text.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let ascii = text.chars().filter(char::is_ascii).count();
+    ascii as f64 / total as f64 >= 0.9
+}
+
 fn detect_language(text: &str) -> Option<Lang> {
     detect(text)
         .filter(|info| info.confidence() >= minimum_detection_confidence(text))
@@ -336,7 +354,13 @@ fn dedup_immediate_words(input: &str) -> String {
         match token_kind {
             TokenKind::Word => {
                 let token_key = token.to_lowercase();
-                if pending_whitespace.is_some() && previous_word.as_deref() == Some(&token_key) {
+                // Repeated numbers are data ("10 10 10" is three samples,
+                // not a stutter) — only prose words get deduplicated.
+                let numeric = token.chars().all(|ch| ch.is_ascii_digit());
+                if !numeric
+                    && pending_whitespace.is_some()
+                    && previous_word.as_deref() == Some(&token_key)
+                {
                     pending_whitespace = None;
                 } else {
                     if let Some(whitespace) = pending_whitespace.take() {
@@ -425,9 +449,13 @@ static FILLERS: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+// Anchored to sentence starts (text/line start or after ./!/? + whitespace):
+// mid-sentence these words carry meaning ("make sure", "you let me know") and
+// stripping them there inverts instructions. The rule tables restore the
+// captured sentence boundary via the "$1" replacement.
 static PLEASANTRIES: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)\b(sure|certainly|of course|happy to|let me|i'll|i can|i would|i'd be happy to)\b[,!\.]?\s*",
+        r"(?im)(^|[.!?]\s+)(sure|certainly|of course|happy to|let me|i'll|i can|i would|i'd be happy to)\b[,!\.]?\s*",
     )
     .unwrap()
 });
@@ -545,7 +573,7 @@ static LITE_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
 static FULL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         (&*FILLERS, ""),
-        (&*PLEASANTRIES, ""),
+        (&*PLEASANTRIES, "$1"),
         (&*HEDGES, ""),
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
@@ -558,7 +586,7 @@ static FULL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
 static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         (&*FILLERS, ""),
-        (&*PLEASANTRIES, ""),
+        (&*PLEASANTRIES, "$1"),
         (&*HEDGES, ""),
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
@@ -617,7 +645,7 @@ static ULTRA_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
 static EXTREME_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     vec![
         (&*FILLERS, ""),
-        (&*PLEASANTRIES, ""),
+        (&*PLEASANTRIES, "$1"),
         (&*HEDGES, ""),
         (&*DISCOURSE, ""),
         (&*META_PHRASES, ""),
@@ -683,8 +711,25 @@ fn english_rules_for(level: CompressionLevel) -> &'static [Rule] {
     }
 }
 
-static PROTECT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?s)```.*?```|`[^`]*`|https?://\S+|"[^"]*""#).unwrap());
+// Alternation order matters (leftmost-first): fenced/inline code, URLs, and
+// quoted strings win over the bare-token fallbacks below. Path-shaped
+// (`docs/reference/api.md`) and filename-shaped (`main.rs`, `v1.2.3`) tokens
+// are stashed even outside backticks because ABBR/article rules would
+// otherwise rewrite identifiers the agent must echo back verbatim
+// (`docs/reference/api.md` -> `docs/ref/api.md` corrupts the path).
+static PROTECT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?sx)
+        ```.*?```               # fenced code blocks
+        | `[^`]*`               # inline code
+        | https?://\S+          # URLs
+        | "[^"]*"               # quoted strings
+        | \S+/\S+               # bare path-shaped tokens
+        | \w[\w.-]*\.\w{1,4}    # filename/version-shaped tokens
+        "#,
+    )
+    .unwrap()
+});
 
 fn stash_protected(input: &str) -> (String, Vec<String>) {
     let mut slots: Vec<String> = Vec::new();
@@ -896,5 +941,85 @@ mod tests {
         let c = Compressor::new(CompressionLevel::Ultra);
         let out = c.compress("函数 `foo()` 返回值");
         assert!(out.contains("`foo()`"), "{out}");
+    }
+
+    #[test]
+    fn bare_paths_survive_all_levels() {
+        // ABBR rules used to rewrite un-backticked paths (reference -> ref),
+        // corrupting identifiers the agent must echo back verbatim.
+        let input = "Edit docs/reference/api.md and crates/rtrt-compress/src/lib.rs before release";
+        for level in [
+            CompressionLevel::Lite,
+            CompressionLevel::Full,
+            CompressionLevel::Ultra,
+            CompressionLevel::Extreme,
+        ] {
+            let out = Compressor::new(level).compress(input);
+            assert!(out.contains("docs/reference/api.md"), "{level:?}: {out}");
+            assert!(
+                out.contains("crates/rtrt-compress/src/lib.rs"),
+                "{level:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_filenames_survive_all_levels() {
+        let input = "Rename configuration.yaml then check error.log for version 1.2.3 entries";
+        for level in [
+            CompressionLevel::Lite,
+            CompressionLevel::Full,
+            CompressionLevel::Ultra,
+            CompressionLevel::Extreme,
+        ] {
+            let out = Compressor::new(level).compress(input);
+            assert!(out.contains("configuration.yaml"), "{level:?}: {out}");
+            assert!(out.contains("error.log"), "{level:?}: {out}");
+            assert!(out.contains("1.2.3"), "{level:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn mid_sentence_pleasantries_survive() {
+        // "Make sure you do not delete" must not become "Make you do not delete".
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("Make sure you do not delete the backup.");
+        assert!(out.to_lowercase().contains("sure"), "{out}");
+        assert!(out.to_lowercase().contains("not delete"), "{out}");
+        let out = c.compress("Ping me and let me know when done.");
+        assert!(out.to_lowercase().contains("let me know"), "{out}");
+    }
+
+    #[test]
+    fn sentence_initial_pleasantries_dropped() {
+        let c = Compressor::new(CompressionLevel::Full);
+        let out = c.compress("Sure, we will fix it. Let me check the parser.");
+        assert!(!out.contains("Sure"), "{out}");
+        assert!(!out.contains("Let me"), "{out}");
+    }
+
+    #[test]
+    fn repeated_numbers_survive_dedup() {
+        // "10 10 10" is three data points, not a stutter; only prose words
+        // ("the the") are deduplicated.
+        let c = Compressor::new(CompressionLevel::Lite);
+        let out = c.compress("the the retries took 10 10 10 ms");
+        assert!(out.contains("10 10 10"), "{out}");
+        assert!(!out.contains("the the"), "{out}");
+    }
+
+    #[test]
+    fn english_rules_fall_back_on_mostly_ascii_text() {
+        // Whatlang misfires on short technical English; >=90% ASCII must
+        // still get the English rule set instead of a silent no-op.
+        let english = "the build failed because the cache was stale";
+        assert!(should_apply_english_rules(Some(Lang::Dan), english));
+        assert!(should_apply_english_rules(None, english));
+        // Genuinely non-ASCII text keeps English rules off.
+        assert!(!should_apply_english_rules(
+            Some(Lang::Kor),
+            "저는 학교에 갔어요. 오늘도 학교에 갔어요."
+        ));
+        assert!(!should_apply_english_rules(None, ""));
     }
 }

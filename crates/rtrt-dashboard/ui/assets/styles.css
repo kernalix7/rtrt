@@ -515,6 +515,18 @@
   .usage-route-chosen-head { font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0.75rem 0 0.4rem; }
   .route-alt-row.chosen { border-color: var(--accent); background: var(--accent-soft); }
 
+  /* Chat playground (Tools › Chat) — user right / assistant left bubbles. */
+  .chat-thread { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.85rem; max-height: 420px; overflow: auto; }
+  .chat-msg { border: 1px solid var(--border); border-radius: 10px; padding: 0.55rem 0.75rem; font-size: 0.92em; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 85%; }
+  .chat-msg.user { background: var(--accent-soft); border-color: var(--accent); align-self: flex-end; }
+  .chat-msg.assistant { background: var(--bg); align-self: flex-start; }
+  .chat-msg.pending { color: var(--muted); }
+  .chat-msg .chat-msg-meta { display: block; margin-top: 0.35rem; color: var(--muted); font-size: 0.8em; font-variant-numeric: tabular-nums; }
+
+  /* Memory Sessions — clickable session summary rows. */
+  #sessions-tbl .session-row { cursor: pointer; }
+  #sessions-tbl .session-row:hover td { background: var(--accent-soft); }
+
   /* Mobile */
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }

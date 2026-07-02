@@ -53,9 +53,9 @@
       </div>
     </div>
     <!-- ── PROJECT MODE nav (per-project work) ──────────────────────────────
-         Overview · Memory · Output Optimizer · Command Optimizer · Statusline ·
-         Capture/Config · Templates · Prompts · Diagnose · Security.
-         Default page = overview. -->
+         Overview · Memory · Output Optimizer · Command Optimizer · Settings
+         (Statusline + Capture/Config) · Templates · Prompts · Diagnose ·
+         Security. Default page = overview. -->
     <nav class="mode-nav" data-mode="project">
       <div class="nav-group">
         <a class="nav active" data-page="overview"><span class="icon">📊</span><span class="nav-copy"><span class="nav-label">Overview</span><span class="nav-sub">token savings</span></span></a>
@@ -65,7 +65,7 @@
         <summary class="group">🧠 Memory</summary>
         <a class="nav" data-page="memory" data-sub="memquery"><span class="icon">⌕</span><span class="nav-copy"><span class="nav-label">Search</span><span class="nav-sub">recall · BM25 · Hybrid</span></span></a>
         <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">≡</span><span class="nav-copy"><span class="nav-label">Timeline</span><span class="nav-sub">saved context stream</span></span></a>
-        <a class="nav" data-page="memory" data-sub="memhistory"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">activity by session</span></span></a>
+        <a class="nav" data-page="memory" data-sub="memsessions"><span class="icon">◷</span><span class="nav-copy"><span class="nav-label">Sessions</span><span class="nav-sub">activity by session</span></span></a>
         <a class="nav" data-page="memory" data-sub="memmap"><span class="icon">◎</span><span class="nav-copy"><span class="nav-label">Map</span><span class="nav-sub">concept graph</span></span></a>
         <a class="nav" data-page="memory" data-sub="memblocks"><span class="icon">▣</span><span class="nav-copy"><span class="nav-label">Blocks</span><span class="nav-sub">persistent slots</span></span></a>
         <a class="nav" data-page="memory" data-sub="memstats"><span class="icon">▦</span><span class="nav-copy"><span class="nav-label">Stats</span><span class="nav-sub">stats and manage</span></span></a>
@@ -85,9 +85,9 @@
       </details>
       <div class="nav-divider">Customize</div>
       <details class="nav-group" open>
-        <summary class="group">🎨 Statusline</summary>
+        <summary class="group">⚙ Settings</summary>
         <a class="nav" data-page="statusline"><span class="icon">▤</span><span class="nav-copy"><span class="nav-label">Statusline</span><span class="nav-sub">rich prompt line</span></span></a>
-        <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Capture / Config</span><span class="nav-sub">capture defaults</span></span></a>
+        <a class="nav" data-page="settings"><span class="icon">⚙</span><span class="nav-copy"><span class="nav-label">Capture / Config</span><span class="nav-sub">capture · auto-compress</span></span></a>
       </details>
       <details class="nav-group" open>
         <summary class="group">📦 Library</summary>
@@ -102,22 +102,22 @@
     </nav>
 
     <!-- ── TOOLS MODE nav (multi-AI-provider / orchestration) ────────────────
-         Providers · Environment · Route · Limits · Setup. Default page =
-         providers (the dedicated provider settings). Structured into groups so
-         the future load-balancing router has room to grow. -->
+         Providers · Chat · Limits · Environment · Router · Setup. Default page
+         = providers (the dedicated provider settings). Structured into groups
+         so the load-balancing router has room to grow. -->
     <nav class="mode-nav" data-mode="tools" hidden>
       <div class="nav-divider">Providers</div>
       <details class="nav-group" open>
         <summary class="group">◈ Providers</summary>
         <a class="nav" data-page="llm"><span class="icon">◈</span><span class="nav-copy"><span class="nav-label">Providers</span><span class="nav-sub">active · local models</span></span></a>
+        <a class="nav" data-page="chat"><span class="icon">✎</span><span class="nav-copy"><span class="nav-label">Chat</span><span class="nav-sub">gateway playground</span></span></a>
         <a class="nav" data-page="limits"><span class="icon">⛽</span><span class="nav-copy"><span class="nav-label">Limits</span><span class="nav-sub">daily usage ceilings</span></span></a>
       </details>
       <div class="nav-divider">Orchestrate</div>
       <details class="nav-group" open>
         <summary class="group">🔀 Routing</summary>
         <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
-        <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · balance</span></span></a>
-        <a class="nav" data-page="route"><span class="icon">⇄</span><span class="nav-copy"><span class="nav-label">Route</span><span class="nav-sub">dry-run selection</span></span></a>
+        <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · preview</span></span></a>
       </details>
       <div class="nav-divider">Connect</div>
       <details class="nav-group" open>
@@ -169,25 +169,35 @@
           <tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
         </table>
       </div>
-      <div class="card">
-        <div class="head"><h2>Response Trend</h2><span class="hint">last 50 requests</span></div>
-        <div class="kpis" style="margin-bottom:0.75rem;">
-          <div class="kpi"><div class="label">Calls</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">gateway total</div></div>
-          <div class="kpi"><div class="label">Avg latency</div><div class="value" id="kpi-latency">— ms</div><div class="sub">last 50</div></div>
-        </div>
-        <div class="row">
-          <div class="chart-wrap"><div class="chart-label">Latency (ms)</div><svg id="chart-latency" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
-          <div class="chart-wrap"><div class="chart-label">Tokens (in + out)</div><svg id="chart-tokens" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
-        </div>
+      <!-- Gateway cards: hidden behind one honest empty state until the rtrt
+           gateway has actually served a call (POST /api/chat — e.g. the Tools ›
+           Chat playground — or rtrt provider chat / MCP). -->
+      <div id="overview-gateway-empty" class="card" hidden>
+        <div class="head"><h2>Gateway</h2><span class="hint">response trend · recent calls · budget</span></div>
+        <div class="empty">Gateway inactive — no LLM calls have gone through the rtrt gateway yet.<br>
+          Send one from the <a id="overview-open-chat" style="cursor:pointer;">Chat playground</a> (Tools › Chat) or via <code>rtrt provider chat</code> / MCP; trend, recent calls, and budget appear here live.</div>
       </div>
-      <div class="card">
-        <div class="head"><h2>Recent Calls</h2><a id="overview-refresh">Refresh</a></div>
-        <table id="recent-tbl"><thead><tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>Latency</th><th>Status</th></tr></thead><tbody></tbody></table>
-      </div>
-      <div class="card">
-        <div class="head"><h2>Budget</h2><span class="hint">Gateway spend and cache status</span></div>
-        <div class="kpis">
-          <div class="kpi"><div class="label">Spend</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">no cap set</div></div>
+      <div id="overview-gateway-cards" hidden>
+        <div class="card">
+          <div class="head"><h2>Response Trend</h2><span class="hint">last 50 requests</span></div>
+          <div class="kpis" style="margin-bottom:0.75rem;">
+            <div class="kpi"><div class="label">Calls</div><div class="value countup" id="kpi-calls" data-target="0">0</div><div class="sub">gateway total</div></div>
+            <div class="kpi"><div class="label">Avg latency</div><div class="value" id="kpi-latency">— ms</div><div class="sub">last 50</div></div>
+          </div>
+          <div class="row">
+            <div class="chart-wrap"><div class="chart-label">Latency (ms)</div><svg id="chart-latency" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
+            <div class="chart-wrap"><div class="chart-label">Tokens (in + out)</div><svg id="chart-tokens" class="spark" viewBox="0 0 400 64" preserveAspectRatio="none"></svg></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="head"><h2>Recent Calls</h2><a id="overview-refresh">Refresh</a></div>
+          <table id="recent-tbl"><thead><tr><th>Time</th><th>Provider</th><th>Model</th><th>in</th><th>out</th><th>Latency</th><th>Status</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <div class="head"><h2>Budget</h2><span class="hint">Gateway spend and cache status</span></div>
+          <div class="kpis">
+            <div class="kpi"><div class="label">Spend</div><div class="value" id="kpi-spent">—</div><div class="sub" id="kpi-spent-sub">no cap set</div></div>
+          </div>
         </div>
       </div>
     </section>
@@ -239,58 +249,9 @@
       </div>
     </section>
 
-    <section id="page-route" class="page" hidden>
-      <div class="section-head">
-        <div class="section-title">
-          <h1>Route</h1>
-          <div class="lede">Dry-run orchestration routing across detected targets.</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="head"><h2>Route Preview</h2><span class="hint">No provider call is made.</span></div>
-        <form id="route-form" class="route-form-grid">
-          <div class="ctrl-field">
-            <label for="route-prompt">Task prompt</label>
-            <input id="route-prompt" placeholder="refactor parser module" required>
-          </div>
-          <div class="ctrl-field">
-            <label for="route-prefer">Prefer</label>
-            <select id="route-prefer">
-              <option value="cheapest">cheapest</option>
-              <option value="local">local</option>
-              <option value="quality">quality</option>
-            </select>
-          </div>
-          <div class="ctrl-field">
-            <label for="route-capability">Capability</label>
-            <select id="route-capability">
-              <option value="code">code</option>
-              <option value="reasoning">reasoning</option>
-              <option value="chat">chat</option>
-              <option value="summarize">summarize</option>
-            </select>
-          </div>
-          <button id="route-submit" class="primary" type="submit">Preview</button>
-        </form>
-        <div id="route-status" class="out-meta"></div>
-      </div>
-      <div id="route-results" hidden>
-        <div class="card">
-          <div class="head"><h2>Chosen Target</h2><span class="hint">Selected by router dry-run</span></div>
-          <div id="route-chosen"></div>
-        </div>
-        <div class="card">
-          <div class="head"><h2>Alternatives</h2><span class="hint">Ranked fallback targets</span></div>
-          <div id="route-alternatives" class="route-alt-list"></div>
-        </div>
-        <div class="card">
-          <div class="head"><h2>Usage Headroom</h2><span id="route-headroom-sources" class="hint"></span></div>
-          <div id="route-headroom" class="route-headroom-grid"></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Router (usage + headroom + load-balancing decision) -->
+    <!-- Router (usage + headroom + load-balancing decision + dry-run preview).
+         The former separate Route page is merged in here: the optional task
+         prompt drives GET /api/route; without it GET /api/route/preview runs. -->
     <section id="page-usage" class="page" hidden>
       <div class="section-head">
         <div class="section-title">
@@ -308,6 +269,10 @@
           <span class="hint">Who serves the next request, and why. No provider call is made.</span>
         </div>
         <form id="usage-route-form" class="route-form-grid">
+          <div class="ctrl-field">
+            <label for="usage-route-prompt">Task prompt (optional)</label>
+            <input id="usage-route-prompt" placeholder="e.g. refactor parser module">
+          </div>
           <div class="ctrl-field">
             <label for="usage-prefer">Prefer</label>
             <select id="usage-prefer">
@@ -357,7 +322,7 @@
         <nav class="subtabs" id="memory-subtabs">
           <a data-sub="memquery">Search</a>
           <a class="active" data-sub="memhistory">Timeline</a>
-          <a data-sub="memhistory">Sessions</a>
+          <a data-sub="memsessions">Sessions</a>
           <a data-sub="memmap">Map</a>
           <a data-sub="memblocks">Blocks</a>
           <a data-sub="memstats">Stats</a>
@@ -428,6 +393,23 @@
             <div id="detail-modal-body">
               <div class="empty">Loading…</div>
             </div>
+          </div>
+        </div>
+
+        <!-- Sessions — one row per agent session (GET /api/memory/sessions);
+             clicking a row drills into that session's saved memories. -->
+        <div id="sub-memsessions" class="subpage" hidden>
+          <div id="sessions-overview-card" class="card">
+            <div class="head"><h2>Sessions</h2><span class="hint" id="sessions-meta">memories grouped by agent session</span></div>
+            <div id="sessions-list"><div class="empty">Loading…</div></div>
+          </div>
+          <div id="session-rows-card" class="card" hidden>
+            <div class="head">
+              <h2 id="session-rows-title">Session</h2>
+              <button id="session-rows-back" class="ghost" type="button">← All sessions</button>
+            </div>
+            <div id="session-rows-meta" class="out-meta" style="margin-bottom:0.5rem;"></div>
+            <div id="session-rows" class="hist-list"><div class="empty">Loading…</div></div>
           </div>
         </div>
 
@@ -942,7 +924,11 @@
           <div class="head"><h2>Failure Diagnosis</h2><span class="hint">Log → LLM gives the cause + a one-line fix</span></div>
           <div id="diagnose-project-meta" class="out-meta scope-status"></div>
           <form id="diagnose-form">
-            <input id="diagnose-model" placeholder="model (e.g. claude-haiku-4-5)" required>
+            <div class="ctrl-field">
+              <label for="diagnose-model">Model</label>
+              <!-- populated from GET /api/models, same as the other model selects -->
+              <select id="diagnose-model" required><option value="">Select a model…</option></select>
+            </div>
             <textarea id="diagnose-raw" rows="8" placeholder="Build / test failure log" required></textarea>
             <div style="display:flex;gap:0.5rem;">
               <button class="primary" type="submit">Diagnose</button>
@@ -1081,9 +1067,9 @@
           <form id="setup-form">
             <div class="row">
               <select id="setup-agent">
-                <option value="claude-code">desktop agent</option>
-                <option value="cursor">editor agent</option>
-                <option value="codex">codex</option>
+                <option value="claude-code">Claude Code</option>
+                <option value="cursor">Cursor</option>
+                <option value="codex">Codex CLI</option>
               </select>
               <input id="setup-memory" placeholder="memory path" value=".rtrt/memory.sqlite">
             </div>
@@ -1520,17 +1506,38 @@
       </div>
     </section>
 
-    <!-- Environment info -->
-    <section id="page-env" class="page" hidden>
-        <div class="card">
-          <div class="head"><h2>Environment info</h2><span class="hint">Current binding / auth / cache / budget</span></div>
-          <table id="env-tbl"><tbody>
-            <tr><td>Dashboard bind</td><td><code id="env-bind">—</code></td></tr>
-            <tr><td>Auth token</td><td id="env-token">—</td></tr>
-            <tr><td>Response cache</td><td id="env-cache">—</td></tr>
-            <tr><td>Budget cap</td><td id="env-budget">—</td></tr>
-          </tbody></table>
+    <!-- Chat playground (Tools) — the live data source for the Overview
+         gateway cards. POST /api/chat routes through the rtrt gateway, so
+         every send feeds metrics / recent calls / budget. -->
+    <section id="page-chat" class="page" hidden>
+      <div class="section-head">
+        <div class="section-title">
+          <h1>Chat</h1>
+          <div class="lede">Send prompts through the rtrt gateway. Calls feed the Overview gateway cards live.</div>
         </div>
+      </div>
+      <div class="card">
+        <div class="head"><h2>Playground</h2><span class="hint">POST /api/chat · metered by the gateway</span></div>
+        <div id="chat-thread" class="chat-thread"><div class="empty">No messages yet. Pick a model and send a prompt.</div></div>
+        <form id="chat-form">
+          <div class="row">
+            <div class="ctrl-field">
+              <label for="chat-model">Model</label>
+              <select id="chat-model" required><option value="">Select a model…</option></select>
+            </div>
+            <div class="ctrl-field">
+              <label for="chat-max-tokens">Max tokens</label>
+              <input id="chat-max-tokens" type="number" min="1" max="32768" value="512">
+            </div>
+          </div>
+          <textarea id="chat-input" rows="3" placeholder="Prompt" required></textarea>
+          <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+            <button id="chat-send" class="primary" type="submit">Send</button>
+            <button id="chat-clear" class="ghost" type="button">Clear conversation</button>
+            <span id="chat-status" class="out-meta"></span>
+          </div>
+        </form>
+      </div>
     </section>
   </main>
 </div>

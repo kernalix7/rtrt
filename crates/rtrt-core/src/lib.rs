@@ -12,8 +12,8 @@ pub mod project;
 pub mod token;
 
 pub use config::{
-    AgentsConfig, Config, LimitsConfig, ProjectConfig, ProjectEntry, ProvidersConfig, TargetLimit,
-    default_memory_store_path,
+    AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, LimitsConfig, ProjectConfig, ProjectEntry,
+    ProvidersConfig, TargetLimit, default_memory_store_path, repo_root_from,
 };
 pub use detect::{
     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,

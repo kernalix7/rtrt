@@ -9,6 +9,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
+
+**Every dashboard surface now does something real: the Sessions decoy became a feature, Route merged into Router, the gateway cards got a live data source, and the last dead panels were removed or wired.**
+
+- **Memory › Sessions is real**: new `GET /api/memory/sessions` (per-session summary rows with count + first/last activity; `?session=<id>` returns that session's memories). The Sessions nav/subtab — previously an alias of Timeline — now renders a session table that drills into per-session memories (rows open the shared detail modal). Deep-linkable at `/memory/sessions`.
+- **Route merged into Router**: the near-duplicate Route page is gone; the Router's Routing Preview gained an optional task prompt (prompt → `GET /api/route` dry-run, empty → `GET /api/route/preview`). Old `/route` deep links redirect to `/router`.
+- **Chat playground (Tools › Chat)**: a minimal gateway playground over `POST /api/chat` — model select (shared `/api/models` cache), conversation thread, per-reply provider/token/latency meta. This gives the Overview gateway cards (Response Trend / Recent Calls / Budget) a first-party data source; until a call is made they collapse into one honest "Gateway inactive" empty state that links to the playground.
+- **Dead surfaces removed/wired**: unreachable Environment-info panel (never-populated auth-token row) deleted; Diagnose's hand-typed model id replaced with the same populated model select the rest of the UI uses; template cards gained a Scaffold action (the generate-project modal was previously unreachable).
+- **Navigation**: ⌘K palette now covers every page and subpage in both modes (Sessions, Router, Limits, Chat, Security subtabs included); `/security/scan|profiles` deep links activate the right subtab; Statusline + Capture/Config re-homed under a neutral "Settings" group; Setup page names the real clients (Claude Code / Cursor / Codex CLI).
+- **Polish**: installed-model dates use the browser locale (was hard-coded), the topbar Memory pill reflects the savings source's actual availability, and the Recent Calls empty state points at the playground.
+
 ### Highlights — interactive memory graph (no-LLM similarity by default)
 
 **The memory graph goes from scattered dots to an explorable map. The default mode needs no entity extraction and no generative LLM.**
@@ -200,6 +211,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **Headroom-aware routing everywhere**: MCP `agent_route` and the dashboard route preview/`/api/route` now rank candidates on the same ledger-overlaid usage snapshot as the CLI (`UsageSnapshot::load_for_routing()`, new shared helper), instead of routing blind on stale best-effort data.
+- **MCP detection parity**: `agent_route` detects targets with the effective (global ⊕ project `.rtrt/config.toml`) config via `detect_tools_with_config`, so per-project agent/provider enable maps apply to MCP routing; `agent_route`'s capability parser accepts `agentic`.
+- **Configurable API answer length**: the routed API-mode output-token ceiling is no longer a hardcoded 1024 — it resolves `RTRT_API_MAX_TOKENS` env → `[providers] api_max_tokens` (global or per-project) → a 4096 default. New `rtrt_core::repo_root_from` / `Config::load_effective_for_cwd()` helpers back the per-project resolution.
 - `rtrt-core`: `CompressionLevel` and `Config` switch to `#[derive(Default)]` with `#[default]` enum variant; manual impls removed (clippy `derivable_impls`).
 - `rtrt-providers` workspace deps add `eventsource-stream`, `futures-util`, `mockito`.
 - `Cargo.toml` adds workspace deps for `rmcp`, `schemars`, `criterion`, `fastembed`, `eventsource-stream`, `futures-util`, `mockito`, `tree-sitter`, `tree-sitter-rust`, `instant-distance`, `handlebars`.
@@ -207,12 +221,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **Router telemetry split-brain**: only the CLI recorded provider usage; MCP `provider_chat`, the dashboard chat handler, and every other gateway consumer were invisible to the headroom ledger. `Gateway::from_env` gateways now append each dispatched request to the provider-usage ledger (real API counts as exact `est=0` rows, chars/4 estimates with `est=1` when no usage block is returned, failures as `ok=0`); `Gateway::new` stays ledger-silent for embedded/test use, and the `rtrt route`/`call` API path opts out of gateway recording to keep its tool-name-attributed rows without double counting.
+- **Ledger trim race**: `trim_to_cap`'s read-rewrite could drop concurrently appended rows when multiple rtrt processes wrote the ledger at once. Writers now serialize behind a best-effort `provider-usage.tsv.lock` (`O_EXCL` create, bounded retries, 10s stale-steal); when the lock is contended the append still lands and only the trim is skipped.
+- `rtrt-compress`: the protection layer now stashes bare path-shaped (`docs/reference/api.md`) and filename/version-shaped (`main.rs`, `1.2.3`) tokens, so abbreviation and article rules can no longer corrupt identifiers outside backticks (`docs/reference/api.md` no longer becomes `docs/ref/api.md`).
+- `rtrt-compress`: pleasantry removal (`sure`, `let me`, …) is anchored to sentence starts — "Make sure you do not delete" keeps its "sure" instead of becoming "Make you do not delete".
+- `rtrt-compress`: word deduplication skips numeric tokens, so repeated data points ("10 10 10") are no longer collapsed to one.
+- `rtrt-compress`: the heuristic ML scorer hard-keeps negations (not / don't / never / without / unless / …), numerals, and error-code-shaped tokens (E0308, HTTP 500) — "do not delete the production database" at ratio 0.5 no longer compresses to "delete production database".
+- `rtrt-compress`: when whatlang misclassifies short technical English as another language, mostly-ASCII text (>=90%) still gets the English rule set instead of silently skipping all compression.
+- `rtrt-proxy`: the `gh` filter had its polarity inverted — it dropped `X `-prefixed FAILING check lines and kept `✓` pass lines. Failures are now always kept verbatim and pass lines collapse into a single `✓ N passed` summary.
 - `rtrt-memory`: punctuated natural-language recall queries (`don't`, `foo-bar`, `C++ (auth)`) no longer hard-fail with FTS5 errors ("fts5: syntax error" / "no such column"). `recall_bm25` / `recall_bm25_scoped` (and everything layered on them — hybrid, filtered, graph-blend recall) try the query verbatim first, then fall back to a shared `sanitize_fts_query` OR-join; a query with no usable term returns zero hits instead of an error. The `hook recall` prompt sanitizer now reuses the same shared function.
 - `rtrt-memory` / `rtrt-mcp`: `memory_consolidate` no longer silently deletes old rows. `archive_overflow_no_llm` writes an archival digest row first (kind `archival`, payload `archive=true`, one preview line per archived row, √n-scaled preview budget) and never re-consumes digests, and the MCP tool description now says exactly what happens (no LLM summarisation) and returns the digest row id.
 - Default memory store path unified across every surface via `rtrt_core::default_memory_store_path()` (`~/.rtrt/memory.sqlite`): CLI `memory save/recall/export/import/extract/compress/blocks`, `rtrt mcp`, the `rtrt-mcp` server, and the dashboard previously defaulted to a cwd-relative `.rtrt/memory.sqlite`, so a fresh install's recall silently queried a different, empty database than the one the hooks wrote to. Explicit `--store` / `--memory` / `RTRT_MEMORY_PATH` overrides keep working.
 - `rtrt-memory`: graph traversal (`memory_relations`) is bounded and project-scoped during the walk — the BFS visit budget scales as `√rows` with a floor instead of being unbounded, and rows from other projects can no longer act as traversal bridges (previously the project filter ran only after the full walk).
 - AIPS plugin workaround at init time: `lib/detect-project.sh` emits unquoted multi-word values (e.g. `DEPLOYMENT=GitHub Actions`), which breaks `lib/render-claude-md.sh`'s `eval` call. Worked around locally.
 - `rtrt-cli` clippy fixes on stable: `sort_by(|a,b| b.cmp(a))` → `sort_by_key(Reverse(...))`; manual `if zero { 0 } else { x*100/y }` → `checked_sub` + `checked_mul` + `checked_div` chain.
+- Install/uninstall hardening: uninstallers now unwire the Claude Code integration (MCP + hooks + statusline via `rtrt uninstall --agent claude --plugin --apply`) and fall back to direct service-unit cleanup; `rtrt uninstall --agent claude` drops the rtrt `statusLine` entry; `install.sh` gains pipefail (where supported), a fixed `--ref` clone fallback, working release-path `--dry-run`, and a hard error when a published SHA256 can't be verified; `install.ps1` forces TLS 1.2+ and safe PATH guidance (no `setx` truncation); docs drop the broken `irm | iex -Args` pattern.
 
 <!--
 Template for each new version section — copy this stanza when cutting a release.

@@ -285,6 +285,8 @@ wireSubtabs('memory-subtabs', (sub) => {
   // Stop the continuous physics sim when leaving the map so it doesn't burn CPU.
   memmapStopLayout();
   if (isGlobalScope()) { refreshMemoryScope(); return; }
+  // Sessions — memories grouped by agent session (GET /api/memory/sessions).
+  if (sub === 'memsessions' && project) loadMemSessions(project);
   // Stats tab now also hosts the merged-in Manage section, so load stats +
   // compression queue + the governance summary together when it activates.
   if (sub === 'memstats' && project) { loadMemStats(project); loadQueue(project); loadEmbeddingsProject(); loadGovStats(project); }

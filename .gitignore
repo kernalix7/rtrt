@@ -61,3 +61,10 @@ demo.png
 *.profraw
 /coverage/
 /tarpaulin-report.html
+
+# rtrt local state
+.rtrt/*.sqlite
+.rtrt/*.sqlite-journal
+.rtrt/*.sqlite-wal
+.rtrt/*.sqlite-shm
+.claude/settings.local.json

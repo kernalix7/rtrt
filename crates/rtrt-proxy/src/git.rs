@@ -169,11 +169,11 @@ fn looks_like_untracked_file(line: &str) -> bool {
 /// Condense unified-diff output while staying lossless for understanding the
 /// change: every `diff --git` / `---` / `+++` / `@@` header and every `+` / `-`
 /// line survives byte-identical. Only runs of unchanged context lines collapse
-/// (first + last kept, middle replaced by a `… N lines unchanged` marker) and
-/// pure metadata (`index`, `similarity index`) is dropped. Mode changes,
-/// renames, and binary markers are kept. Anything we cannot parse with
-/// certainty falls back to the raw diff — hiding a changed line is never
-/// acceptable.
+/// — change-adjacent boundary lines are kept and the rest becomes a
+/// `… N lines unchanged` marker (see [`flush_context_run`]) — and pure
+/// metadata (`index`, `similarity index`) is dropped. Mode changes, renames,
+/// and binary markers are kept. Anything we cannot parse with certainty falls
+/// back to the raw diff — hiding a changed line is never acceptable.
 pub(crate) fn git_diff(input: &str) -> String {
     // `--stat` / `--name-only` / empty diffs carry no hunks — already compact.
     if !input.lines().any(|line| line.starts_with("@@")) {

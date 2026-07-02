@@ -9,6 +9,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — descriptive memory-map cluster labels + zoom-to-drill
+
+**Cluster bubbles now say what's actually inside them, and zooming into the map reveals detail automatically instead of staying a flat blob at any depth.**
+
+- **c-TF-IDF cluster labels** (`rtrt-memory`): every cluster bubble's label is now its top 2-4 DISTINCTIVE tokens (in-cluster frequency × inverse cluster frequency across the index), not an arbitrary member's first 60 chars. Shared by both the lexical and vector (embedding) clustering paths and every LOD depth (`subcluster`); a single linear pass over token sets (no O(n²)); non-English tokens survive (Unicode word-like, not an ASCII-only filter).
+- **Zoom-to-drill** (dashboard Memory map): crossing a zoom threshold over a cluster bubble auto-drills into it — the same call the click handler already makes — and rendering the children in place; zooming back out re-aggregates one level. Debounced so a continuous wheel/trackpad gesture settles once instead of spamming the API. Click-drill and the leaf preview text are unchanged.
+
 ### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
 
 **Every dashboard surface now does something real: the Sessions decoy became a feature, Route merged into Router, the gateway cards got a live data source, and the last dead panels were removed or wired.**

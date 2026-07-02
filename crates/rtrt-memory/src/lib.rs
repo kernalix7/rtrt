@@ -225,7 +225,11 @@ pub struct ClusterSummary {
     pub id: i64,
     /// Number of memories in the cluster.
     pub size: usize,
-    /// Representative member preview (the root member's preview).
+    /// Descriptive label: the top 2-4 DISTINCTIVE tokens for this cluster,
+    /// scored c-TF-IDF-style (in-cluster frequency × inverse cluster
+    /// frequency — see [`MemoryStore::cluster_from_peers`]), space-joined.
+    /// Falls back to the root member's preview when fewer than 2 tokens
+    /// clear the topical-salience filter (e.g. a singleton cluster).
     pub label: String,
     /// `"main"` / `"subagent"` when a single source dominates, else `"mixed"`.
     pub dominant_source: String,
@@ -620,6 +624,75 @@ static STOP_WORDS: &[&str] = &[
 /// being sorted; a `cfg(test)` test asserts that invariant.
 fn is_stop_word(tok: &str) -> bool {
     STOP_WORDS.binary_search(&tok).is_ok()
+}
+
+/// `true` when `tok` is a usable TOPICAL candidate — for a concept node
+/// ([`MemoryStore::concept_graph`]) or a cluster's c-TF-IDF label
+/// ([`MemoryStore::cluster_from_peers`]). Three filters, cheapest first:
+/// not pure-digit noise (PR/issue numbers, counts — needs ≥1 non-digit
+/// char), ≥1 alphabetic char (Unicode-aware via `char::is_alphabetic`, so
+/// Hangul/CJK/Cyrillic/etc. tokens qualify exactly like ASCII ones — no
+/// ASCII-only assumption), and not a curated [`STOP_WORDS`] function word /
+/// dev-log verb. [`token_set`] already enforces ≥3 chars +
+/// alphanumeric/Hangul, so this only adds the topical-salience filter.
+fn is_topical_token(tok: &str) -> bool {
+    tok.chars().any(|c| !c.is_ascii_digit())
+        && tok.chars().any(char::is_alphabetic)
+        && !is_stop_word(tok)
+}
+
+/// c-TF-IDF-style DISTINCTIVE-TOKEN label for one cluster: score every
+/// candidate token by `(in-cluster member frequency) × ln(1 + n_clusters /
+/// cluster_document_frequency)` — the classic class-based TF-IDF used by
+/// topic-modeling tools (BERTopic etc.) to name a group of documents instead
+/// of picking one representative document. A token that shows up in most of
+/// this cluster's members AND in few other clusters scores highest; a token
+/// that is everywhere (present in every cluster) scores near zero no matter
+/// how frequent, because `ln(1 + n/df)` collapses toward `ln(2)` — never
+/// negative, so it never inverts the ranking, but flat-uninformative tokens
+/// still lose to genuinely rare ones.
+///
+/// Joins the top 2-4 highest-scoring tokens (deterministic tiebreak: score
+/// desc, then lexical asc) with a space. Falls back to `fallback` (the root
+/// member's preview, truncated to 60 chars) when fewer than 2 tokens clear
+/// the score-positive bar — e.g. a singleton cluster, or one whose only
+/// shared vocabulary is topically empty.
+///
+/// `member_tf` is this cluster's `token -> member count` map; `cluster_df` is
+/// `token -> number of DISTINCT clusters containing it`, shared across the
+/// whole index. Both are precomputed once by the caller
+/// ([`MemoryStore::cluster_from_peers`]) so labeling the whole index stays
+/// `O(total tokens)`, never `O(clusters × tokens)`.
+fn ctfidf_label(
+    member_tf: &FxHashMap<&str, u32>,
+    cluster_df: &FxHashMap<&str, u32>,
+    n_clusters: f64,
+    fallback: &str,
+) -> String {
+    let mut scored: Vec<(f64, &str)> = member_tf
+        .iter()
+        .map(|(&tok, &tf)| {
+            let df = cluster_df.get(tok).copied().unwrap_or(1).max(1) as f64;
+            let idf = (1.0 + n_clusters / df).ln();
+            (tf as f64 * idf, tok)
+        })
+        .filter(|&(score, _)| score > 0.0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(b.1))
+    });
+    let take = scored.len().min(4);
+    if take < 2 {
+        return fallback.chars().take(60).collect();
+    }
+    scored
+        .into_iter()
+        .take(take)
+        .map(|(_, tok)| tok)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Conservative single-step morphological base for merging surface variants
@@ -2944,9 +3017,10 @@ impl MemoryStore {
     ///    peers at/above `min_weight`.
     /// 5. Union-find those edges into clusters; the cluster root is the
     ///    **minimum member id** (deterministic).
-    /// 6. Build summaries (label = root member preview, dominant source from
-    ///    member source kinds) sorted by size desc, and aggregate inter-cluster
-    ///    edge weights capped at the strongest ~2000.
+    /// 6. Build summaries (label = c-TF-IDF distinctive tokens over member
+    ///    bodies, dominant source from member source kinds) sorted by size
+    ///    desc, and aggregate inter-cluster edge weights capped at the
+    ///    strongest ~2000.
     pub fn graph_clusters(
         &self,
         project: &str,
@@ -3127,14 +3201,20 @@ impl MemoryStore {
         // multi-pass singleton fold, the catch-all, and summary/edge building.
         // The lexical previews + sources come straight from the loaded rows.
         let previews: Vec<String> = rows.iter().map(|(node, _)| node.preview.clone()).collect();
+        // Cloned out of `rows` (not moved) alongside previews/sources — `rows`
+        // is still read below (blob-split signature tokens, source labels)
+        // after `cluster_from_peers` returns.
+        let token_sets: Vec<std::collections::HashSet<String>> =
+            rows.iter().map(|(_, tokens)| tokens.clone()).collect();
         let sources: Vec<Option<String>> = rows
             .iter()
             .map(|(node, _)| node.source_kind.clone())
             .collect();
         // pos -> id, kept for the edge remap below (id_of is moved into the core).
         let id_pos = id_of.clone();
-        let mut idx =
-            Self::cluster_from_peers(id_of, previews, sources, peers, best_peer, top_k, target);
+        let mut idx = Self::cluster_from_peers(
+            id_of, previews, token_sets, sources, peers, best_peer, top_k, target,
+        );
 
         // ── Split the dominant lexical "미분류" catch-all into topic bubbles ──
         // cluster_from_peers dumps every row it could not link into ONE bubble;
@@ -3283,26 +3363,36 @@ impl MemoryStore {
     }
 
     /// Pure clustering core shared by the lexical [`cluster_rows`](Self::cluster_rows)
-    /// and the vector [`graph_clusters_vec`](Self::graph_clusters_vec) paths.
+    /// and the vector [`graph_clusters_vec`](Self::graph_clusters_vec) paths
+    /// (also reused, with an all-empty `token_sets`, by the concept-community
+    /// clusterer — see [`cluster_concepts`], which discards this function's
+    /// `label` and derives its own from concept degree instead).
     ///
     /// Given, per position `i`:
-    /// * `ids[i]`     — its memory id,
-    /// * `previews[i]`— its label text,
-    /// * `sources[i]` — its `source_kind`,
-    /// * `peers[i]`   — `(other_pos, weight)` neighbours above the caller's
-    ///   similarity threshold (the union-find rails), and
-    /// * `best_peer[i]` — its single strongest neighbour regardless of threshold
-    ///   (the singleton-fold rails),
+    /// * `ids[i]`        — its memory id,
+    /// * `previews[i]`   — its label FALLBACK text (used only when too few
+    ///   distinctive tokens are found for a cluster),
+    /// * `token_sets[i]` — its salient [`token_set`], the c-TF-IDF label
+    ///   source (both the lexical and vector paths tokenise their rows the
+    ///   same way before calling in, so labeling is identical either way),
+    /// * `sources[i]`    — its `source_kind`,
+    /// * `peers[i]`      — `(other_pos, weight)` neighbours above the
+    ///   caller's similarity threshold (the union-find rails), and
+    /// * `best_peer[i]`  — its single strongest neighbour regardless of
+    ///   threshold (the singleton-fold rails),
     ///
     /// this runs the union-find over each node's `top_k` strongest peers, the
     /// multi-pass singleton fold + catch-all down to `target` bubbles, then
-    /// builds the deterministic summaries (root = min member id, size desc / id
-    /// asc) and aggregated inter-cluster edges. No database calls and no
+    /// builds the deterministic summaries — size, a c-TF-IDF distinctive-token
+    /// label ([`ctfidf_label`]), dominant source — sorted by size desc / id
+    /// asc, plus aggregated inter-cluster edges. No database calls and no
     /// dependence on *how* the peers were scored (lexical Jaccard or vector
     /// cosine), so both paths share it verbatim.
+    #[allow(clippy::too_many_arguments)]
     fn cluster_from_peers(
         ids: Vec<i64>,
         previews: Vec<String>,
+        token_sets: Vec<std::collections::HashSet<String>>,
         sources: Vec<Option<String>>,
         mut peers: Vec<Vec<(u32, f32)>>,
         best_peer: Vec<Option<(u32, f32)>>,
@@ -3495,14 +3585,14 @@ impl MemoryStore {
             node_cluster.insert(id_of[i], root_of_pos[i]);
         }
 
-        // 6a. Cluster summaries: size, label (root member preview), dominant
-        // source. Group member positions by cluster root id.
+        // 6a. Cluster summaries: size, a c-TF-IDF distinctive-token label,
+        // dominant source. Group member positions by cluster root id.
         let mut pos_by_root: std::collections::HashMap<i64, Vec<usize>> =
             std::collections::HashMap::new();
         for (i, &root_id) in root_of_pos.iter().enumerate() {
             pos_by_root.entry(root_id).or_default().push(i);
         }
-        // root id -> its member position (min id), for the label preview.
+        // root id -> its member position (min id), for the label FALLBACK.
         let mut root_pos: std::collections::HashMap<i64, usize> =
             std::collections::HashMap::with_capacity(pos_by_root.len());
         for (i, &root_id) in root_of_pos.iter().enumerate() {
@@ -3511,12 +3601,42 @@ impl MemoryStore {
             }
         }
 
+        // c-TF-IDF label stats, computed ONCE for every cluster (not per
+        // cluster) so the whole labeling pass stays O(total tokens) instead
+        // of O(clusters × tokens):
+        // * `cluster_tf[root][tok]`  — how many members of that cluster
+        //   contain `tok` (the in-cluster "term frequency" factor).
+        // * `cluster_df[tok]`        — how many DISTINCT clusters contain
+        //   `tok` at all (the shared inverse-cluster-frequency denominator).
+        // One linear pass over every position's token set; candidate tokens
+        // are filtered by [`is_topical_token`] (stop-words / pure-digit
+        // noise excluded, Unicode word-like tokens of any script kept).
+        let mut cluster_tf: FxHashMap<i64, FxHashMap<&str, u32>> = FxHashMap::default();
+        for (i, &root_id) in root_of_pos.iter().enumerate() {
+            let tf = cluster_tf.entry(root_id).or_default();
+            for tok in &token_sets[i] {
+                if !is_topical_token(tok) {
+                    continue;
+                }
+                *tf.entry(tok.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut cluster_df: FxHashMap<&str, u32> = FxHashMap::default();
+        for tf in cluster_tf.values() {
+            for &tok in tf.keys() {
+                *cluster_df.entry(tok).or_insert(0) += 1;
+            }
+        }
+        let n_clusters = cluster_tf.len().max(1) as f64;
+
         let mut clusters: Vec<ClusterSummary> = pos_by_root
             .iter()
             .map(|(root_id, positions)| {
-                // Label = preview of the root member (min id).
                 let rp = *root_pos.get(root_id).unwrap_or(&positions[0]);
-                let label = previews[rp].clone();
+                let label = cluster_tf.get(root_id).map_or_else(
+                    || previews[rp].chars().take(60).collect(),
+                    |tf| ctfidf_label(tf, &cluster_df, n_clusters, &previews[rp]),
+                );
                 // Dominant source: "main"/"subagent" if a single non-empty kind
                 // covers every labelled member; "mixed" otherwise.
                 let mut seen_source: Option<&str> = None;
@@ -3675,13 +3795,16 @@ impl MemoryStore {
         let vec_min_sim: f32 = VEC_MIN_SIM;
         const VEC_MIN_SIM: f32 = 0.82;
 
-        // 1. Load every embedded row's (id, preview, source_kind) + its vector,
+        // 1. Load every embedded row's (id, body, source_kind) + its vector,
         //    newest first and capped at `max_nodes`. JOIN drops rows without an
         //    embedding so the HNSW map only ever sees points we can cluster.
+        //    The full body (not just a 60-char substr) is loaded so this path
+        //    can tokenise it the same way as the lexical path — feeding
+        //    `cluster_from_peers` the token sets its c-TF-IDF labeling needs.
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT m.id, substr(m.body, 1, 60), \
+                "SELECT m.id, m.body, \
                         json_extract(m.metadata, '$.source_kind'), e.vector \
                    FROM memories m \
                    JOIN embeddings e ON e.memory_id = m.id \
@@ -3693,24 +3816,26 @@ impl MemoryStore {
         struct VecRow {
             id: i64,
             preview: String,
+            tokens: std::collections::HashSet<String>,
             source: Option<String>,
             vector: Vec<f32>,
         }
         let loaded: Vec<VecRow> = stmt
             .query_map(rusqlite::params![project, max_nodes as i64], |r| {
                 let id: i64 = r.get(0)?;
-                let preview: String = r.get(1)?;
+                let body: String = r.get(1)?;
                 let source: Option<String> = r.get(2)?;
                 let blob: Vec<u8> = r.get(3)?;
-                Ok((id, preview, source, blob))
+                Ok((id, body, source, blob))
             })
             .map_err(|e| Error::Memory(e.to_string()))?
             .map(|row| {
-                let (id, preview, source, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
+                let (id, body, source, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
                 let vector = vector_from_blob(&blob)?;
                 Ok(VecRow {
                     id,
-                    preview,
+                    preview: body.chars().take(60).collect(),
+                    tokens: token_set(&body),
                     source,
                     vector,
                 })
@@ -3730,6 +3855,8 @@ impl MemoryStore {
         //    convert neighbour ids back to compact positions.
         let ids: Vec<i64> = loaded.iter().map(|r| r.id).collect();
         let previews: Vec<String> = loaded.iter().map(|r| r.preview.clone()).collect();
+        let token_sets: Vec<std::collections::HashSet<String>> =
+            loaded.iter().map(|r| r.tokens.clone()).collect();
         let sources: Vec<Option<String>> = loaded.iter().map(|r| r.source.clone()).collect();
         let mut pos_of: std::collections::HashMap<i64, u32> =
             std::collections::HashMap::with_capacity(n);
@@ -3784,8 +3911,9 @@ impl MemoryStore {
             }
         }
 
-        let mut idx =
-            Self::cluster_from_peers(ids, previews, sources, peers, best_peer, top_k, target);
+        let mut idx = Self::cluster_from_peers(
+            ids, previews, token_sets, sources, peers, best_peer, top_k, target,
+        );
 
         // Cluster-level backbone: connect each cluster to its 2 nearest OTHER
         // clusters by CENTROID cosine. The per-node peer aggregation alone leaves
@@ -4504,21 +4632,16 @@ impl MemoryStore {
                             id
                         }
                     };
-                    // Candidate tokens only. Three filters, cheapest first:
-                    //   - word-like: at least one non-digit char, so "1234" /
-                    //     "#42" never becomes a node (all-digit tokens dropped);
-                    //   - not a curated STOP_WORD (function word / dev-log verb)
-                    //     — excluded from BOTH concepts and co-occurrence, so a
-                    //     stop-word can never even contribute an edge;
-                    //   - ≥1 alphabetic char so pure-symbol noise can't slip in.
-                    // token_set already enforces ≥3 chars + alphanumeric/Hangul.
+                    // Candidate tokens only — [`is_topical_token`]: word-like
+                    // (not all-digit "1234"/"#42"), ≥1 alphabetic char, not a
+                    // curated STOP_WORD (function word / dev-log verb),
+                    // excluded from BOTH concepts and co-occurrence so a
+                    // stop-word can never even contribute an edge. Shared with
+                    // the cluster-label c-TF-IDF scoring so concepts and
+                    // labels agree on what counts as topical.
                     let mut ids: Vec<u32> = token_set(&body)
                         .into_iter()
-                        .filter(|t| {
-                            t.chars().any(|c| !c.is_ascii_digit())
-                                && t.chars().any(char::is_alphabetic)
-                                && !is_stop_word(t)
-                        })
+                        .filter(|t| is_topical_token(t))
                         .map(|t| match tok_intern.get(t.as_str()) {
                             Some(&id) => id,
                             None => {
@@ -5025,9 +5148,12 @@ fn cluster_concepts(graph: &ConceptGraph) -> (Vec<i64>, ConceptHierarchy) {
     // Positional arrays for cluster_from_peers: the concept INDEX is the id, so
     // each community's root (min member id) is the min member concept index — a
     // stable, deterministic community id. Previews carry the concept name only
-    // for completeness; we derive the community label from degree below.
+    // for completeness; we derive the community label from degree below, so
+    // `cluster_from_peers`'s own c-TF-IDF label is unused here — token_sets is
+    // left empty for every position (no per-cluster label cost paid).
     let ids: Vec<i64> = (0..n as i64).collect();
     let previews: Vec<String> = graph.nodes.iter().map(|node| node.name.clone()).collect();
+    let token_sets: Vec<std::collections::HashSet<String>> = vec![Default::default(); n];
     let sources: Vec<Option<String>> = vec![None; n];
 
     // DYNAMIC community target: ~√concepts, clamped to a readable band. Never a
@@ -5047,6 +5173,7 @@ fn cluster_concepts(graph: &ConceptGraph) -> (Vec<i64>, ConceptHierarchy) {
     let index = MemoryStore::cluster_from_peers(
         ids,
         previews,
+        token_sets,
         sources,
         peers,
         best_peer,
@@ -6568,6 +6695,190 @@ mod tests {
             biggest.size > 1,
             "the catch-all absorbed many singletons, got size {}",
             biggest.size
+        );
+    }
+
+    /// The pure [`ctfidf_label`] scorer, tested directly (no store): a token
+    /// present in every member of the cluster and absent from every other
+    /// cluster must outrank one present in only one member, and a cluster
+    /// with fewer than 2 topical candidates must fall back to the caller's
+    /// preview text (truncated to 60 chars).
+    #[test]
+    fn ctfidf_label_ranks_distinctive_over_rare_and_falls_back() {
+        let mut member_tf: FxHashMap<&str, u32> = FxHashMap::default();
+        member_tf.insert("router", 3); // in every member of this cluster
+        member_tf.insert("onceword", 1); // only one member mentions it
+        let mut cluster_df: FxHashMap<&str, u32> = FxHashMap::default();
+        cluster_df.insert("router", 1); // unique to THIS cluster
+        cluster_df.insert("onceword", 1);
+        let label = ctfidf_label(&member_tf, &cluster_df, 4.0, "fallback preview text");
+        assert_eq!(
+            label, "router onceword",
+            "both candidates qualify (>=2 topical tokens); sorted by score desc — router \
+             (tf 3, same idf as onceword) outscores onceword (tf 1) so it sorts first"
+        );
+
+        // Fewer than 2 topical candidates -> the fallback preview, truncated
+        // to 60 chars same as the pre-c-TF-IDF preview-based label.
+        let mut lone: FxHashMap<&str, u32> = FxHashMap::default();
+        lone.insert("only", 1);
+        let empty_df: FxHashMap<&str, u32> = FxHashMap::default();
+        let fallback_label = ctfidf_label(&lone, &empty_df, 1.0, "the quick brown fox jumps");
+        assert_eq!(fallback_label, "the quick brown fox jumps");
+    }
+
+    /// Running the SAME data through `graph_clusters` twice must yield
+    /// byte-identical labels for every cluster id — the c-TF-IDF scoring
+    /// sorts its candidates (score desc, then lexical asc) before joining, so
+    /// the result cannot depend on HashMap iteration order.
+    #[test]
+    fn cluster_labels_are_deterministic() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .save(
+                    "p1",
+                    "note",
+                    &format!("router failover headroom variant{i}"),
+                )
+                .unwrap();
+        }
+        for i in 0..5 {
+            store
+                .save(
+                    "p1",
+                    "note",
+                    &format!("compress regex rule engine variant{i}"),
+                )
+                .unwrap();
+        }
+        let idx1 = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+        let idx2 = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+        let mut labels1: Vec<(i64, String)> = idx1
+            .clusters
+            .iter()
+            .map(|c| (c.id, c.label.clone()))
+            .collect();
+        let mut labels2: Vec<(i64, String)> = idx2
+            .clusters
+            .iter()
+            .map(|c| (c.id, c.label.clone()))
+            .collect();
+        labels1.sort();
+        labels2.sort();
+        assert_eq!(
+            labels1, labels2,
+            "identical input must yield identical labels every run"
+        );
+    }
+
+    /// The whole point of the c-TF-IDF label: two unrelated families must get
+    /// labels built from their OWN domain vocabulary ("router"/"failover"/
+    /// "headroom" vs. "compress"/"regex"/"rule"/"engine"), never the generic
+    /// dev-log-verb noise ("checked"/"again"/"fixed") every member also
+    /// carries — proving the label is genuinely distinctive-token scoring,
+    /// not "whatever's in the first 60 chars of the root member's body".
+    #[test]
+    fn cluster_labels_are_distinctive_not_generic() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // Family A: a router/failover/headroom domain.
+        store
+            .save("p1", "note", "router failover headroom checked")
+            .unwrap();
+        store
+            .save("p1", "note", "failover headroom router checked again")
+            .unwrap();
+        store
+            .save("p1", "note", "headroom checked router failover")
+            .unwrap();
+        // Family B: an unrelated compress/regex/rule-engine domain.
+        store
+            .save("p1", "note", "compress regex rule engine fixed")
+            .unwrap();
+        store
+            .save("p1", "note", "regex rule compress engine fixed")
+            .unwrap();
+        store
+            .save("p1", "note", "engine compress regex rule fixed")
+            .unwrap();
+
+        let idx = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+        assert!(
+            idx.clusters.len() >= 2,
+            "the two unrelated families must land in separate clusters, got {:?}",
+            idx.clusters
+        );
+
+        let router_cluster = idx
+            .clusters
+            .iter()
+            .find(|c| {
+                c.label.contains("router")
+                    || c.label.contains("failover")
+                    || c.label.contains("headroom")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a router/failover/headroom cluster label exists, got {:?}",
+                    idx.clusters
+                )
+            });
+        let compress_cluster = idx
+            .clusters
+            .iter()
+            .find(|c| {
+                c.label.contains("compress")
+                    || c.label.contains("regex")
+                    || c.label.contains("engine")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a compress/regex/engine cluster label exists, got {:?}",
+                    idx.clusters
+                )
+            });
+        assert_ne!(
+            router_cluster.id, compress_cluster.id,
+            "the two domains must not collapse into one cluster"
+        );
+        for stop in ["checked", "again", "fixed"] {
+            assert!(
+                !router_cluster.label.contains(stop),
+                "label {:?} must not contain the generic dev-log stop word {stop:?}",
+                router_cluster.label
+            );
+            assert!(
+                !compress_cluster.label.contains(stop),
+                "label {:?} must not contain the generic dev-log stop word {stop:?}",
+                compress_cluster.label
+            );
+        }
+    }
+
+    /// Non-English (Korean) domain tokens must survive the labeling pipeline
+    /// exactly like ASCII ones — `token_set` splits on Unicode alphanumeric
+    /// boundaries and [`is_topical_token`] uses `char::is_alphabetic` (not an
+    /// ASCII range check), so Hangul tokens are candidates same as English.
+    #[test]
+    fn cluster_labels_survive_non_english_tokens() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // 라우터 = "router", 장애조치 = "failover" (shared, tf 3); one unique
+        // filler word per row so the bodies aren't byte-identical.
+        store.save("p1", "note", "라우터 장애조치 재시도").unwrap();
+        store.save("p1", "note", "장애조치 라우터 확인중").unwrap();
+        store.save("p1", "note", "라우터 장애조치 점검중").unwrap();
+
+        let idx = store.graph_clusters("p1", 100_000, 6, 0.1).unwrap();
+        assert!(!idx.clusters.is_empty());
+        let joined: String = idx
+            .clusters
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("라우터") || joined.contains("장애조치"),
+            "non-English distinctive tokens must survive into a cluster label, got: {joined:?}"
         );
     }
 

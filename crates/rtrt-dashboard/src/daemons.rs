@@ -85,8 +85,14 @@ pub(crate) fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>
                     continue;
                 }
                 match guard.archive_overflow_no_llm(&project, keep) {
-                    Ok(removed) if removed > 0 => {
-                        tracing::info!(project = %project, removed, kept = keep, "consolidated");
+                    Ok((removed, digest_id)) if removed > 0 => {
+                        tracing::info!(
+                            project = %project,
+                            removed,
+                            kept = keep,
+                            digest_id = digest_id.unwrap_or_default(),
+                            "consolidated into archival digest"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("consolidate {project}: {e}"),

@@ -118,6 +118,61 @@ pub struct UniqueIngest {
     pub skipped: usize,
 }
 
+/// Stopwords dropped by [`sanitize_fts_query`] — common English function
+/// words that add noise without narrowing a BM25 match.
+const FTS_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "this", "that", "how", "does", "what", "why", "you", "are", "was",
+    "were", "can", "should", "would", "could", "from", "into", "have", "has",
+];
+
+/// Maximum number of content words kept by [`sanitize_fts_query`].
+const FTS_MAX_TERMS: usize = 32;
+
+/// Kind used for consolidation digest rows (both the LLM summary written by
+/// [`MemoryStore::compress_project`] and the no-LLM digest written by
+/// [`MemoryStore::archive_overflow_no_llm`]).
+const ARCHIVAL_KIND: &str = "archival";
+
+/// Preview-budget parameters for the no-LLM archival digest: the total digest
+/// scales with the square root of the batch (per-row budget = `BASE / √n`,
+/// floored at `FLOOR` chars) instead of growing linearly with every row.
+const ARCHIVE_PREVIEW_BASE: f64 = 480.0;
+const ARCHIVE_PREVIEW_FLOOR: usize = 48;
+
+/// Floor for the graph-walk visit cap in
+/// [`MemoryStore::recall_via_graph_scoped`]: the cap scales as `√rows` with
+/// store size but never starves a small store of its whole neighbourhood.
+const GRAPH_VISIT_FLOOR: usize = 64;
+
+/// Sanitizes a natural-language query into a safe FTS5 `MATCH` expression.
+///
+/// Raw prompts routinely contain FTS5 operator characters (`don't`,
+/// `foo-bar`, `C++ (auth)`) that either hard-fail the parser
+/// ("fts5: syntax error") or get misread as column filters
+/// ("no such column: bar"). This tokenizer keeps alphanumeric runs only,
+/// lowercases them, drops stopwords and sub-3-char tokens, and OR-joins the
+/// survivors: a natural-language prompt joined with spaces is implicit AND
+/// in FTS5, which almost never matches a terse memory row, while OR ranks
+/// any row sharing a term — which is what recall wants.
+///
+/// Returns `None` when no usable term survives.
+pub fn sanitize_fts_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 3 && !FTS_STOPWORDS.contains(&w.as_str()))
+        .take(FTS_MAX_TERMS)
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
 /// A memory node in the bipartite entity graph.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemNode {
@@ -1721,14 +1776,54 @@ impl MemoryStore {
 
     /// Breadth-first neighbour walk starting from `seed_ids`, traversing up to
     /// `depth` edges. Returns every reachable [`MemoryRecord`] (including the
-    /// seeds themselves) in BFS order.
+    /// seeds themselves) in BFS order. Unscoped variant of
+    /// [`recall_via_graph_scoped`](Self::recall_via_graph_scoped).
     pub fn recall_via_graph(&self, seed_ids: &[i64], depth: u32) -> Result<Vec<MemoryRecord>> {
+        self.recall_via_graph_scoped(seed_ids, depth, None)
+    }
+
+    /// [`recall_via_graph`](Self::recall_via_graph) with two guard rails:
+    ///
+    /// * **Project scoping** — when `project` is `Some`, only that project's
+    ///   rows are traversed (seeds included), so foreign records never enter
+    ///   the walk instead of being filtered out after the fact.
+    /// * **Visit cap** — the walk visits at most `√(store rows in scope)`
+    ///   nodes (floored so small stores still return useful neighbourhoods,
+    ///   and never below the seed count), keeping a densely connected graph
+    ///   from ballooning into an unbounded traversal.
+    pub fn recall_via_graph_scoped(
+        &self,
+        seed_ids: &[i64],
+        depth: u32,
+        project: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>> {
         use std::collections::{HashSet, VecDeque};
+        // Scale the visit budget with the amount of data actually reachable.
+        let in_scope: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR project = ?1)",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let cap = ((in_scope as f64).sqrt().ceil() as usize)
+            .max(GRAPH_VISIT_FLOOR)
+            .max(seed_ids.len());
         let mut visited: HashSet<i64> = HashSet::new();
         let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
         let mut order: Vec<i64> = Vec::new();
+        // Seeds outside the requested project are dropped up front so the
+        // walk cannot start from (or pass through) another project.
+        let mut seed_stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM memories WHERE id = ?1 AND (?2 IS NULL OR project = ?2)")
+            .map_err(|e| Error::Memory(e.to_string()))?;
         for &id in seed_ids {
-            if visited.insert(id) {
+            let in_project: i64 = seed_stmt
+                .query_row(rusqlite::params![id, project], |r| r.get(0))
+                .map_err(|e| Error::Memory(e.to_string()))?;
+            if in_project > 0 && visited.insert(id) && order.len() < cap {
                 queue.push_back((id, 0));
                 order.push(id);
             }
@@ -1736,19 +1831,25 @@ impl MemoryStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT dst_id FROM edges WHERE src_id = ?1 \
-                 UNION SELECT src_id FROM edges WHERE dst_id = ?1",
+                "SELECT e.dst_id FROM edges e JOIN memories m ON m.id = e.dst_id \
+                  WHERE e.src_id = ?1 AND (?2 IS NULL OR m.project = ?2) \
+                  UNION \
+                 SELECT e.src_id FROM edges e JOIN memories m ON m.id = e.src_id \
+                  WHERE e.dst_id = ?1 AND (?2 IS NULL OR m.project = ?2)",
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
-        while let Some((id, hop)) = queue.pop_front() {
+        'walk: while let Some((id, hop)) = queue.pop_front() {
             if hop >= depth {
                 continue;
             }
             let rows = stmt
-                .query_map(rusqlite::params![id], |row| row.get::<_, i64>(0))
+                .query_map(rusqlite::params![id, project], |row| row.get::<_, i64>(0))
                 .map_err(|e| Error::Memory(e.to_string()))?;
             for next in rows {
                 let next = next.map_err(|e| Error::Memory(e.to_string()))?;
+                if order.len() >= cap {
+                    break 'walk;
+                }
                 if visited.insert(next) {
                     queue.push_back((next, hop + 1));
                     order.push(next);
@@ -1815,7 +1916,30 @@ impl MemoryStore {
         Ok(id)
     }
 
+    /// BM25 recall over the project's FTS5 index. The query is tried verbatim
+    /// first so explicit FTS5 syntax (`secret OR preference`, `"a phrase"`)
+    /// keeps working; when FTS5 rejects it (punctuated natural language such
+    /// as `don't`, `foo-bar`, or `C++ (auth)`), it is re-run through
+    /// [`sanitize_fts_query`]. A query with no usable term yields zero hits
+    /// instead of an error.
     pub fn recall_bm25(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>> {
+        match self.recall_bm25_exact(project, query, limit) {
+            Ok(hits) => Ok(hits),
+            Err(_) => match sanitize_fts_query(query) {
+                Some(safe) => self.recall_bm25_exact(project, &safe, limit),
+                None => Ok(Vec::new()),
+            },
+        }
+    }
+
+    /// The raw FTS5 `MATCH` pass behind [`recall_bm25`](Self::recall_bm25):
+    /// errors when `query` is not valid FTS5 syntax.
+    fn recall_bm25_exact(
         &self,
         project: &str,
         query: &str,
@@ -1850,7 +1974,8 @@ impl MemoryStore {
 
     /// BM25 recall filtered by scope. When `include_user` is true, results
     /// from the global `user` scope are mixed in alongside the project-scoped
-    /// hits (mem0-style tiered recall).
+    /// hits (mem0-style tiered recall). Falls back to [`sanitize_fts_query`]
+    /// exactly like [`recall_bm25`](Self::recall_bm25).
     pub fn recall_bm25_scoped(
         &self,
         project: &str,
@@ -1861,6 +1986,24 @@ impl MemoryStore {
         if scopes.is_empty() {
             return self.recall_bm25(project, query, limit);
         }
+        match self.recall_bm25_scoped_exact(project, query, limit, scopes) {
+            Ok(hits) => Ok(hits),
+            Err(_) => match sanitize_fts_query(query) {
+                Some(safe) => self.recall_bm25_scoped_exact(project, &safe, limit, scopes),
+                None => Ok(Vec::new()),
+            },
+        }
+    }
+
+    /// The raw FTS5 `MATCH` pass behind
+    /// [`recall_bm25_scoped`](Self::recall_bm25_scoped).
+    fn recall_bm25_scoped_exact(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+        scopes: &[MemoryScope],
+    ) -> Result<Vec<MemoryRecord>> {
         let placeholders = std::iter::repeat_n("?", scopes.len())
             .collect::<Vec<_>>()
             .join(",");
@@ -3522,7 +3665,7 @@ impl MemoryStore {
     ) -> Result<ClusterIndex> {
         // Cosine-similarity union threshold for vectors. Tuned empirically on a
         // real embedded project (nomic-embed-text, 768-dim). See the tuning
-        // notes / `graph_clusters_vec_speechpad_tune`.
+        // notes / `graph_clusters_vec_large_store_tune`.
         #[cfg(test)]
         let vec_min_sim: f32 = std::env::var("RTRT_VEC_MIN_SIM")
             .ok()
@@ -4057,19 +4200,56 @@ impl MemoryStore {
         self.compress_project(project, summariser, hot_limit).await
     }
 
-    /// LLM-free consolidation: deletes the oldest rows beyond `keep_recent`,
-    /// returns how many were removed. Used by the hourly background daemon
-    /// when no summariser is wired and by the `memory_consolidate` MCP tool.
-    pub fn archive_overflow_no_llm(&self, project: &str, keep_recent: usize) -> Result<usize> {
+    /// LLM-free consolidation: rolls the oldest rows beyond `keep_recent`
+    /// into a single archival digest row (kind `archival`, payload
+    /// `archive=true`, concatenated one-line previews), then deletes the
+    /// originals — nothing silently vanishes. Rows already tagged `archival`
+    /// are never consolidation candidates, so digests survive later sweeps
+    /// instead of eating each other. Returns `(removed, digest_id)`. Used by
+    /// the hourly background daemon when no summariser is wired and by the
+    /// `memory_consolidate` MCP tool.
+    pub fn archive_overflow_no_llm(
+        &self,
+        project: &str,
+        keep_recent: usize,
+    ) -> Result<(usize, Option<i64>)> {
         let all = self.list_by_project(project, 100_000)?;
-        if all.len() <= keep_recent {
-            return Ok(0);
+        // Digest rows are terminal: consolidating a digest into another
+        // digest would degrade previews-of-previews and make every sweep
+        // churn one row for one digest forever.
+        let candidates: Vec<&MemoryRecord> =
+            all.iter().filter(|m| m.kind != ARCHIVAL_KIND).collect();
+        if candidates.len() <= keep_recent {
+            return Ok((0, None));
         }
-        let to_remove = &all[..all.len() - keep_recent];
+        let to_remove = &candidates[..candidates.len() - keep_recent];
+        let n = to_remove.len();
+        // Per-row preview budget shrinks as the batch grows so the digest
+        // scales with √n rather than n: per-row = BASE/√n, floored so even a
+        // huge sweep keeps a recognisable snippet per row.
+        let per_row =
+            ((ARCHIVE_PREVIEW_BASE / (n as f64).sqrt()).ceil() as usize).max(ARCHIVE_PREVIEW_FLOOR);
+        let previews = to_remove
+            .iter()
+            .map(|m| {
+                let first_line = m.body.lines().next().unwrap_or("");
+                let clipped: String = first_line.chars().take(per_row).collect();
+                format!("- [{}] {}", m.kind, clipped)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("archive".to_string(), "true".to_string());
+        let digest_id = self.save_with_metadata(
+            project,
+            ARCHIVAL_KIND,
+            &format!("[archived × {n}]\n{previews}"),
+            &meta,
+        )?;
         for m in to_remove {
             self.delete(m.id)?;
         }
-        Ok(to_remove.len())
+        Ok((n, Some(digest_id)))
     }
 
     /// Compresses the oldest memories in `project`: keeps the most recent
@@ -4095,7 +4275,7 @@ impl MemoryStore {
         let summary = summariser.summarise(&joined).await?;
         let archival_id = self.save(
             project,
-            "archival",
+            ARCHIVAL_KIND,
             &format!("[compressed × {}]\n{summary}", to_summarise.len()),
         )?;
         for m in to_summarise {
@@ -5020,6 +5200,80 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_fts_query_tokenizes_and_or_joins() {
+        // Apostrophes split; the sub-3-char fragment `t` is dropped.
+        assert_eq!(sanitize_fts_query("don't"), Some("don".to_string()));
+        // Hyphens would be parsed as a column filter by FTS5.
+        assert_eq!(
+            sanitize_fts_query("foo-bar"),
+            Some("foo OR bar".to_string())
+        );
+        // Operator characters are stripped; short tokens (`c`) are dropped.
+        assert_eq!(sanitize_fts_query("C++ (auth)"), Some("auth".to_string()));
+        // Stopwords and short tokens only → nothing usable.
+        assert_eq!(sanitize_fts_query("what does the"), None);
+        assert_eq!(sanitize_fts_query("+++ ( )"), None);
+        assert_eq!(sanitize_fts_query(""), None);
+    }
+
+    /// Punctuated natural-language queries must degrade to sanitized OR
+    /// recall instead of surfacing FTS5 parse errors
+    /// ("fts5: syntax error" / "no such column").
+    #[test]
+    fn recall_bm25_survives_punctuated_queries() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save("p1", "note", "we don't retry failed jobs")
+            .unwrap();
+        store.save("p1", "note", "foo bar baz wiring").unwrap();
+        store.save("p1", "note", "auth module rewrite").unwrap();
+
+        let hits = store.recall_bm25("p1", "don't", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].body.contains("don't"));
+
+        let hits = store.recall_bm25("p1", "foo-bar", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].body.contains("foo bar"));
+
+        let hits = store.recall_bm25("p1", "C++ (auth)", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].body.contains("auth"));
+
+        // Nothing usable after sanitizing → empty result, not an error.
+        let hits = store.recall_bm25("p1", "+++", 5).unwrap();
+        assert!(hits.is_empty());
+
+        // Clean queries and explicit FTS5 operators still work verbatim.
+        let hits = store.recall_bm25("p1", "auth OR wiring", 5).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    #[test]
+    fn recall_bm25_scoped_survives_punctuated_queries() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .save_scoped(
+                "p1",
+                "note",
+                "we don't retry failed jobs",
+                MemoryScope::User,
+            )
+            .unwrap();
+        let scopes = [MemoryScope::User];
+        let hits = store
+            .recall_bm25_scoped("other", "don't (retry)", 5, &scopes)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            store
+                .recall_bm25_scoped("other", "+++", 5, &scopes)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn concept_graph_links_cooccurring_tokens() {
         let store = MemoryStore::open_in_memory().unwrap();
         // "alpha" + "bravo" co-occur in 4 memories → must form an edge.
@@ -5626,6 +5880,51 @@ mod tests {
         assert_eq!(hits.len(), 3);
     }
 
+    /// Project scoping is enforced *during* traversal: foreign rows neither
+    /// appear in the result nor act as bridges, and foreign seeds are dropped.
+    #[test]
+    fn graph_walk_scoped_stays_in_project() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = store.save("p1", "fact", "alpha").unwrap();
+        let bridge = store.save("p2", "fact", "foreign bridge").unwrap();
+        let c = store.save("p1", "fact", "gamma").unwrap();
+        // a — bridge — c: reachable only through the p2 row.
+        store.add_edge(a, bridge, "linked").unwrap();
+        store.add_edge(bridge, c, "linked").unwrap();
+
+        let unscoped = store.recall_via_graph(&[a], 5).unwrap();
+        assert_eq!(unscoped.len(), 3, "{unscoped:?}");
+
+        let scoped = store.recall_via_graph_scoped(&[a], 5, Some("p1")).unwrap();
+        let ids: Vec<i64> = scoped.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![a], "p2 must not appear or act as a bridge");
+
+        // A seed from another project is dropped up front.
+        let foreign_seed = store
+            .recall_via_graph_scoped(&[bridge], 5, Some("p1"))
+            .unwrap();
+        assert!(foreign_seed.is_empty(), "{foreign_seed:?}");
+    }
+
+    /// The BFS visit budget scales as `√rows` (floored), so a long chain in a
+    /// large store cannot balloon into an unbounded traversal.
+    #[test]
+    fn graph_walk_visit_cap_bounds_traversal() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let n = 200usize;
+        let ids: Vec<i64> = (0..n)
+            .map(|i| store.save("p", "fact", &format!("node {i}")).unwrap())
+            .collect();
+        for w in ids.windows(2) {
+            store.add_edge(w[0], w[1], "next").unwrap();
+        }
+        let hits = store.recall_via_graph(&[ids[0]], n as u32).unwrap();
+        // cap = max(⌈√200⌉ = 15, GRAPH_VISIT_FLOOR) = GRAPH_VISIT_FLOOR.
+        assert_eq!(hits.len(), GRAPH_VISIT_FLOOR, "visit cap must bound BFS");
+        // BFS order is preserved and starts from the seed.
+        assert_eq!(hits[0].id, ids[0]);
+    }
+
     #[cfg(feature = "hnsw")]
     #[test]
     fn hnsw_returns_nearest() {
@@ -5864,7 +6163,8 @@ mod tests {
         assert_eq!(session_x_rows.len(), 1);
         assert_eq!(session_x_rows[0].body, "alpha");
 
-        // 5. archive_overflow_no_llm keeps the N newest
+        // 5. archive_overflow_no_llm keeps the N newest and rolls the rest
+        //    into one archival digest row.
         for i in 0..5 {
             let body = format!("extra-{i}");
             let id = store.save("p1", "note", &body).unwrap();
@@ -5874,10 +6174,27 @@ mod tests {
         }
         let total_before = store.count_by_project("p1").unwrap();
         assert_eq!(total_before, 7); // 2 originals + 5 extras
-        let removed = store.archive_overflow_no_llm("p1", 3).unwrap();
-        assert_eq!(removed, 4, "should drop the 4 oldest rows");
+        let (removed, digest_id) = store.archive_overflow_no_llm("p1", 3).unwrap();
+        assert_eq!(removed, 4, "should roll up the 4 oldest rows");
+        let digest_id = digest_id.expect("a digest row is written before deleting");
         let total_after = store.count_by_project("p1").unwrap();
-        assert_eq!(total_after, 3);
+        assert_eq!(total_after, 4, "3 kept + 1 digest");
+        // The digest carries a preview of every archived row + archive=true.
+        let digest = store.list_by_project("p1", 10).unwrap();
+        let digest = digest.iter().find(|m| m.id == digest_id).unwrap();
+        assert_eq!(digest.kind, "archival");
+        assert!(digest.body.contains("archived × 4"), "{}", digest.body);
+        // Archived (oldest 4): alpha, beta, extra-0, extra-1.
+        assert!(digest.body.contains("alpha"), "{}", digest.body);
+        assert!(digest.body.contains("extra-1"), "{}", digest.body);
+        assert!(!digest.body.contains("extra-2"), "{}", digest.body);
+        let meta = store.get_metadata(digest_id).unwrap();
+        assert_eq!(meta.get("archive").map(String::as_str), Some("true"));
+        // A second sweep must not eat the digest itself: only real rows
+        // beyond `keep_recent` are candidates.
+        let (removed_again, digest_again) = store.archive_overflow_no_llm("p1", 3).unwrap();
+        assert_eq!(removed_again, 0, "digest rows are not re-consolidated");
+        assert!(digest_again.is_none());
     }
 
     /// Building blocks for the LLM auto-compress background worker.
@@ -6254,35 +6571,39 @@ mod tests {
         );
     }
 
+    /// Project bucket for the ignored on-disk perf probes below. Point
+    /// `RTRT_BENCH_PROJECT` at a large local project before running them.
+    fn bench_project() -> String {
+        std::env::var("RTRT_BENCH_PROJECT").unwrap_or_else(|_| "default".to_string())
+    }
+
     /// Performance probe against the real on-disk store. Ignored by default;
     /// run with `--ignored` after setting `RTRT_MEMORY_PATH` (defaults to
-    /// `~/.rtrt/memory.sqlite`). The 18k-row `00G_winpodx` project timed the old
-    /// O(n²) path out at >30s; the LOD path must clear it in well under a second.
+    /// `~/.rtrt/memory.sqlite`) and `RTRT_BENCH_PROJECT`. An 18k-row project
+    /// timed the old O(n²) path out at >30s; the LOD path must clear it in
+    /// well under a second.
     ///
-    /// We run once to warm the OS page cache (the 95 MB sqlite file's first read
-    /// is one-time disk I/O, not algorithmic), then time the steady-state build
-    /// — which is what the dashboard's per-project cache actually serves.
+    /// We run once to warm the OS page cache (a ~100 MB sqlite file's first
+    /// read is one-time disk I/O, not algorithmic), then time the steady-state
+    /// build — which is what the dashboard's per-project cache actually serves.
     #[test]
     #[ignore = "needs the real on-disk memory store"]
-    fn graph_clusters_winpodx_perf() {
+    fn graph_clusters_large_store_perf() {
         let path = std::env::var("RTRT_MEMORY_PATH").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap();
             format!("{home}/.rtrt/memory.sqlite")
         });
+        let project = bench_project();
         let store = MemoryStore::open(&path).unwrap();
         // Warm-up (page cache + query plan); not measured.
-        let _ = store
-            .graph_clusters("00G_winpodx", 100_000, 6, 0.1)
-            .unwrap();
+        let _ = store.graph_clusters(&project, 100_000, 6, 0.1).unwrap();
 
         let t0 = std::time::Instant::now();
-        let idx = store
-            .graph_clusters("00G_winpodx", 100_000, 6, 0.1)
-            .unwrap();
+        let idx = store.graph_clusters(&project, 100_000, 6, 0.1).unwrap();
         let elapsed = t0.elapsed();
         let singletons = idx.clusters.iter().filter(|c| c.size == 1).count();
         eprintln!(
-            "graph_clusters(00G_winpodx): {} nodes -> {} clusters ({} singletons), {} cluster_edges in {:?}",
+            "graph_clusters({project}): {} nodes -> {} clusters ({} singletons), {} cluster_edges in {:?}",
             idx.node_cluster.len(),
             idx.clusters.len(),
             singletons,
@@ -6298,7 +6619,7 @@ mod tests {
         // Drill-down on the biggest cluster must also be fast.
         if let Some(top) = idx.clusters.first() {
             let dt0 = std::time::Instant::now();
-            let members = store.cluster_members("00G_winpodx", top.id, &idx).unwrap();
+            let members = store.cluster_members(&project, top.id, &idx).unwrap();
             eprintln!(
                 "cluster_members(root={}): {} nodes, {} edges in {:?}",
                 top.id,
@@ -6325,8 +6646,9 @@ mod tests {
             format!("{home}/.rtrt/memory.sqlite")
         });
         let store = MemoryStore::open(&path).unwrap();
+        let project = bench_project();
 
-        for scope in [Some("00G_winpodx"), None] {
+        for scope in [Some(project.as_str()), None] {
             // Warm-up (page cache + concept_graph build); not measured.
             let _ = store.concept_communities(scope, 2).unwrap();
             let t0 = std::time::Instant::now();
@@ -6374,26 +6696,24 @@ mod tests {
 
     /// Empirical tuning probe for `VEC_MIN_SIM` against the real on-disk store.
     /// Ignored by default; run with `--ignored` after setting `RTRT_MEMORY_PATH`
-    /// (defaults to `~/.rtrt/memory.sqlite`). Reports cluster count, biggest
-    /// cluster size + %, and elapsed for `00G_SpeechPad`.
+    /// (defaults to `~/.rtrt/memory.sqlite`) and `RTRT_BENCH_PROJECT` (an
+    /// embedded project). Reports cluster count, biggest cluster size + %,
+    /// and elapsed.
     #[cfg(feature = "hnsw")]
     #[test]
     #[ignore = "needs the real on-disk memory store"]
-    fn graph_clusters_vec_speechpad_tune() {
+    fn graph_clusters_vec_large_store_tune() {
         let path = std::env::var("RTRT_MEMORY_PATH").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap();
             format!("{home}/.rtrt/memory.sqlite")
         });
+        let project = bench_project();
         let store = MemoryStore::open(&path).unwrap();
-        let (embedded, total) = store.embedding_coverage("00G_SpeechPad").unwrap();
+        let (embedded, total) = store.embedding_coverage(&project).unwrap();
         // Warm-up (page cache); not measured.
-        let _ = store
-            .graph_clusters_vec("00G_SpeechPad", 200_000, 4, 320)
-            .unwrap();
+        let _ = store.graph_clusters_vec(&project, 200_000, 4, 320).unwrap();
         let t0 = std::time::Instant::now();
-        let idx = store
-            .graph_clusters_vec("00G_SpeechPad", 200_000, 4, 320)
-            .unwrap();
+        let idx = store.graph_clusters_vec(&project, 200_000, 4, 320).unwrap();
         let elapsed = t0.elapsed();
         let nodes = idx.node_cluster.len();
         let biggest = idx.clusters.first().map(|c| c.size).unwrap_or(0);
@@ -6404,7 +6724,7 @@ mod tests {
             0.0
         };
         eprintln!(
-            "SpeechPad: coverage {embedded}/{total}, {} nodes -> {} clusters ({} singletons), biggest {} ({:.1}%), {:?}",
+            "{project}: coverage {embedded}/{total}, {} nodes -> {} clusters ({} singletons), biggest {} ({:.1}%), {:?}",
             nodes,
             idx.clusters.len(),
             singletons,

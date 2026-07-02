@@ -239,11 +239,14 @@ impl AppState {
     }
 }
 
+/// Store path for every dashboard surface: `RTRT_MEMORY_PATH` override,
+/// otherwise the toolkit-wide default (`~/.rtrt/memory.sqlite`) shared with
+/// the CLI, hooks, and MCP server.
 pub(crate) fn memory_store_path() -> PathBuf {
     std::env::var("RTRT_MEMORY_PATH")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"))
+        .unwrap_or_else(rtrt_core::default_memory_store_path)
 }
 
 pub(crate) fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {

@@ -546,10 +546,7 @@ pub(crate) async fn memory_stats(
     axum::extract::Query(q): axum::extract::Query<MemoryStatsQuery>,
 ) -> std::result::Result<Json<MemoryStatsResponse>, (StatusCode, String)> {
     // Open a direct rusqlite connection to the same path used by open_memory_store().
-    let path = std::env::var("RTRT_MEMORY_PATH")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+    let path = crate::state::memory_store_path();
 
     let conn = rusqlite::Connection::open(&path).map_err(|e| {
         (
@@ -664,10 +661,7 @@ pub(crate) struct MemoryQueueQuery {
 pub(crate) async fn memory_queue(
     axum::extract::Query(q): axum::extract::Query<MemoryQueueQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = std::env::var("RTRT_MEMORY_PATH")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".rtrt/memory.sqlite"));
+    let path = crate::state::memory_store_path();
     let cfg = rtrt_core::Config::load().unwrap_or_default().auto_compress;
     let conn = rusqlite::Connection::open(&path).map_err(|e| {
         (

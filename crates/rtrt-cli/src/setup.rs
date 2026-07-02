@@ -440,7 +440,7 @@ fn expand_home(rel: &str) -> Result<PathBuf> {
     }
 }
 
-fn dirs_home() -> Result<PathBuf> {
+pub(crate) fn dirs_home() -> Result<PathBuf> {
     if let Some(h) = std::env::var_os("HOME") {
         return Ok(PathBuf::from(h));
     }
@@ -1206,6 +1206,205 @@ fn backup_if_needed(path: &Path) -> Result<()> {
         std::fs::copy(path, &bak).with_context(|| format!("backup {}", bak.display()))?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared health checks — used by `rtrt project status`/`health` and
+// `rtrt doctor` so the Claude Code integration / memory-store probes live in
+// exactly one place. Every check reads real local state; nothing here is
+// fabricated.
+// ---------------------------------------------------------------------------
+
+const CLAUDE_HOOK_NEEDLE: &str = "rtrt hook";
+const CLAUDE_STATUSLINE_NEEDLE: &str = "statusline --rich";
+
+/// Pass/warn/fail state for a single health-check row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl CheckState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
+
+pub struct ClaudeSettingsStatus {
+    pub hooks_state: CheckState,
+    pub hooks_detail: String,
+    pub statusline_state: CheckState,
+    pub statusline_detail: String,
+}
+
+/// Checks `~/.claude/settings.json` for rtrt-owned hook entries and the rich
+/// statusLine command. `health` escalates a read/parse failure from WARN to
+/// FAIL (used by `rtrt project health`); a missing file is always WARN since
+/// the Claude Code integration is opt-in.
+pub fn claude_settings_status(health: bool) -> ClaudeSettingsStatus {
+    let missing = ClaudeSettingsStatus {
+        hooks_state: CheckState::Warn,
+        hooks_detail: "settings file missing".into(),
+        statusline_state: CheckState::Warn,
+        statusline_detail: "settings file missing".into(),
+    };
+    let Some(settings_path) = dirs_home()
+        .ok()
+        .map(|home| home.join(".claude/settings.json"))
+    else {
+        return ClaudeSettingsStatus {
+            hooks_detail: "home directory unavailable".into(),
+            statusline_detail: "home directory unavailable".into(),
+            ..missing
+        };
+    };
+    if !settings_path.exists() {
+        return missing;
+    }
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            let state = if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("read failed: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("read failed: {err}"),
+            };
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let state = if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            };
+            return ClaudeSettingsStatus {
+                hooks_state: state,
+                hooks_detail: format!("invalid JSON: {err}"),
+                statusline_state: state,
+                statusline_detail: format!("invalid JSON: {err}"),
+            };
+        }
+    };
+    let hooks_present = parsed
+        .get("hooks")
+        .is_some_and(|hooks| json_contains_text(hooks, CLAUDE_HOOK_NEEDLE));
+    let statusline_present = parsed
+        .get("statusLine")
+        .is_some_and(|statusline| json_contains_text(statusline, CLAUDE_STATUSLINE_NEEDLE));
+    ClaudeSettingsStatus {
+        hooks_state: if hooks_present {
+            CheckState::Pass
+        } else {
+            CheckState::Warn
+        },
+        hooks_detail: if hooks_present {
+            "rtrt hook entries found".into()
+        } else {
+            "rtrt hook entries missing".into()
+        },
+        statusline_state: if statusline_present {
+            CheckState::Pass
+        } else {
+            CheckState::Warn
+        },
+        statusline_detail: if statusline_present {
+            "rtrt rich statusLine found".into()
+        } else {
+            "rtrt rich statusLine missing".into()
+        },
+    }
+}
+
+fn json_contains_text(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains(needle),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| json_contains_text(item, needle))
+        }
+        serde_json::Value::Object(map) => map.values().any(|item| json_contains_text(item, needle)),
+        _ => false,
+    }
+}
+
+/// Checks whether `~/.claude.json` registers the `rtrt` MCP server
+/// (`mcpServers.rtrt`) — the entry `rtrt setup --agent claude --apply` writes.
+pub fn claude_mcp_registered_status() -> (CheckState, String) {
+    let Some(path) = dirs_home().ok().map(|home| home.join(".claude.json")) else {
+        return (CheckState::Warn, "home directory unavailable".into());
+    };
+    if !path.exists() {
+        return (CheckState::Warn, format!("missing {}", path.display()));
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => return (CheckState::Warn, format!("read failed: {err}")),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => return (CheckState::Warn, format!("invalid JSON: {err}")),
+    };
+    let registered = parsed
+        .get("mcpServers")
+        .and_then(|servers| servers.get("rtrt"))
+        .is_some();
+    if registered {
+        (
+            CheckState::Pass,
+            format!("rtrt registered in {}", path.display()),
+        )
+    } else {
+        (
+            CheckState::Warn,
+            format!("rtrt not registered in {}", path.display()),
+        )
+    }
+}
+
+/// Opens the memory store read-only and confirms the `memories` table
+/// answers a query, reporting the row count on success. `health` escalates
+/// an existing-but-broken store from WARN to FAIL; a store that simply
+/// hasn't been created yet is always WARN.
+pub fn memory_reachable_status(health: bool) -> (CheckState, String) {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(rtrt_core::default_memory_store_path);
+    if !path.exists() {
+        return (CheckState::Warn, format!("missing {}", path.display()));
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match rusqlite::Connection::open_with_flags(&path, flags).and_then(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    }) {
+        Ok(count) => (
+            CheckState::Pass,
+            format!("reachable {} ({count} rows)", path.display()),
+        ),
+        Err(err) => (
+            if health {
+                CheckState::Fail
+            } else {
+                CheckState::Warn
+            },
+            format!("unreachable {}: {err}", path.display()),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed — Windows CLI startup crash (STATUS_STACK_OVERFLOW)
+
+- `rtrt` aborted on startup on Windows for *every* invocation — including `rtrt --version` — with `STATUS_STACK_OVERFLOW` (`0xC00000FD`). Windows' default main-thread stack is 1 MiB (vs 8 MiB on Linux/macOS), and clap's derive-generated `Command` builder for rtrt's ~40 subcommands overflows it while `Cli::parse()` builds the command tree, before any subcommand runs. The CLI now parses and dispatches on a worker thread with an explicit 8 MiB stack (matching the Unix default), so startup behaves identically on every platform. A `parse_fits_configured_worker_stack` regression test guards the stack budget. Surfaced by the new `assert_cmd` integration tests in #67, which were the first to execute the binary in CI.
+
 ### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
 
 **Every dashboard surface now does something real: the Sessions decoy became a feature, Route merged into Router, the gateway cards got a live data source, and the last dead panels were removed or wired.**

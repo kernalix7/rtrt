@@ -2370,13 +2370,51 @@ fn current_project_name() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Stack for the worker thread that runs the whole CLI.
+///
+/// Windows' default main-thread stack is 1 MiB (set by the linker), versus
+/// 8 MiB on Linux/macOS. clap's derive-generated `Command` builder for rtrt's
+/// ~40 subcommands compiles to one very large function whose (unoptimized,
+/// debug-build) frame — evaluated inside `Cli::parse()` before any subcommand
+/// dispatch — overflows a 1 MiB stack. On Windows that aborts *every*
+/// invocation, including `rtrt --version`, with STATUS_STACK_OVERFLOW
+/// (0xC00000FD); the roomier stacks on Linux/macOS simply hid it. Running the
+/// CLI on a thread whose stack matches the Unix default makes startup behave
+/// identically on every platform.
+const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("rtrt-main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(run_cli)
+        .context("spawn rtrt worker thread")?;
+    match worker.join() {
+        Ok(result) => result,
+        // The worker already printed its panic message; mirror Rust's default
+        // panic exit status instead of re-panicking on the small main stack.
+        Err(_) => std::process::exit(101),
+    }
+}
+
+/// Initialise tracing, parse the CLI, and drive the async dispatch on a
+/// manually built multi-thread Tokio runtime. Runs on the generous-stack
+/// worker thread spawned by `main` (see `MAIN_STACK_SIZE`).
+fn run_cli() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("rtrt=info")
         .init();
     let cli = Cli::parse();
-    match cli.command {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(run(cli.command))
+}
+
+/// Dispatch a parsed subcommand.
+async fn run(command: Cmd) -> Result<()> {
+    match command {
         Cmd::Compress {
             level,
             file,
@@ -7016,5 +7054,41 @@ mod statusline_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(format_agents_segment(&names, 24), "🤖 claude·codex·+2");
+    }
+}
+
+#[cfg(test)]
+mod startup_stack {
+    use super::*;
+
+    /// Regression guard for the Windows STATUS_STACK_OVERFLOW (0xC00000FD) that
+    /// aborted every `rtrt` invocation — including `rtrt --version` — on
+    /// Windows CI. clap's derive-generated `Command` builder for rtrt's ~40
+    /// subcommands compiles to a huge (unoptimized) frame that overflows a
+    /// 1 MiB stack, and Windows' default main-thread stack is exactly 1 MiB.
+    /// `main` now runs parse+dispatch on a `MAIN_STACK_SIZE` worker thread.
+    ///
+    /// This test builds and parses the `Command` on a thread sized to
+    /// `MAIN_STACK_SIZE` and asserts it completes. It runs on every platform:
+    /// clap's builder provably overflows a 1 MiB stack (see the crash this
+    /// fixed), so lowering `MAIN_STACK_SIZE` below what the builder needs would
+    /// make this test overflow here too — catching the regression before it
+    /// reaches Windows.
+    #[test]
+    fn parse_fits_configured_worker_stack() {
+        let worker = std::thread::Builder::new()
+            .stack_size(MAIN_STACK_SIZE)
+            .spawn(|| {
+                use clap::{Parser, error::ErrorKind};
+                // `try_parse_from` builds the full Command tree (the stack hog)
+                // and returns Err(DisplayVersion) instead of calling exit().
+                let err = Cli::try_parse_from(["rtrt", "--version"])
+                    .expect_err("--version short-circuits parsing");
+                assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+            })
+            .expect("spawn worker thread");
+        worker
+            .join()
+            .expect("clap parse must fit within MAIN_STACK_SIZE");
     }
 }

@@ -1,0 +1,936 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 613bc39..a3fb6a9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -200,6 +200,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+ 
+ ### Changed
+ 
++- **Headroom-aware routing everywhere**: MCP `agent_route` and the dashboard route preview/`/api/route` now rank candidates on the same ledger-overlaid usage snapshot as the CLI (`UsageSnapshot::load_for_routing()`, new shared helper), instead of routing blind on stale best-effort data.
++- **MCP detection parity**: `agent_route` detects targets with the effective (global ⊕ project `.rtrt/config.toml`) config via `detect_tools_with_config`, so per-project agent/provider enable maps apply to MCP routing; `agent_route`'s capability parser accepts `agentic`.
++- **Configurable API answer length**: the routed API-mode output-token ceiling is no longer a hardcoded 1024 — it resolves `RTRT_API_MAX_TOKENS` env → `[providers] api_max_tokens` (global or per-project) → a 4096 default. New `rtrt_core::repo_root_from` / `Config::load_effective_for_cwd()` helpers back the per-project resolution.
+ - `rtrt-core`: `CompressionLevel` and `Config` switch to `#[derive(Default)]` with `#[default]` enum variant; manual impls removed (clippy `derivable_impls`).
+ - `rtrt-providers` workspace deps add `eventsource-stream`, `futures-util`, `mockito`.
+ - `Cargo.toml` adds workspace deps for `rmcp`, `schemars`, `criterion`, `fastembed`, `eventsource-stream`, `futures-util`, `mockito`, `tree-sitter`, `tree-sitter-rust`, `instant-distance`, `handlebars`.
+@@ -207,6 +210,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
+ 
+ ### Fixed
+ 
++- **Router telemetry split-brain**: only the CLI recorded provider usage; MCP `provider_chat`, the dashboard chat handler, and every other gateway consumer were invisible to the headroom ledger. `Gateway::from_env` gateways now append each dispatched request to the provider-usage ledger (real API counts as exact `est=0` rows, chars/4 estimates with `est=1` when no usage block is returned, failures as `ok=0`); `Gateway::new` stays ledger-silent for embedded/test use, and the `rtrt route`/`call` API path opts out of gateway recording to keep its tool-name-attributed rows without double counting.
++- **Ledger trim race**: `trim_to_cap`'s read-rewrite could drop concurrently appended rows when multiple rtrt processes wrote the ledger at once. Writers now serialize behind a best-effort `provider-usage.tsv.lock` (`O_EXCL` create, bounded retries, 10s stale-steal); when the lock is contended the append still lands and only the trim is skipped.
+ - `rtrt-compress`: the protection layer now stashes bare path-shaped (`docs/reference/api.md`) and filename/version-shaped (`main.rs`, `1.2.3`) tokens, so abbreviation and article rules can no longer corrupt identifiers outside backticks (`docs/reference/api.md` no longer becomes `docs/ref/api.md`).
+ - `rtrt-compress`: pleasantry removal (`sure`, `let me`, …) is anchored to sentence starts — "Make sure you do not delete" keeps its "sure" instead of becoming "Make you do not delete".
+ - `rtrt-compress`: word deduplication skips numeric tokens, so repeated data points ("10 10 10") are no longer collapsed to one.
+diff --git a/crates/rtrt-cli/src/main.rs b/crates/rtrt-cli/src/main.rs
+index 6d19fe2..e6c4606 100644
+--- a/crates/rtrt-cli/src/main.rs
++++ b/crates/rtrt-cli/src/main.rs
+@@ -4036,10 +4036,10 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
+         mode: (mode != InvokeMode::Auto).then_some(mode),
+     };
+     let tools = rtrt_core::detect_tools_with_config(cfg);
+-    // Overlay the provider-usage ledger's rolling 24h window so ranking is
++    // Routing snapshot with the ledger's rolling 24h window so ranking is
+     // headroom-aware: exhausted `[limits]` targets are demoted and near-limit
+     // ones penalized (targets with no cap keep pure cost-tier order).
+-    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
++    let usage = UsageSnapshot::load_for_routing();
+     let decision = select_route(&req, &tools, &usage)?;
+ 
+     if opts.explain || opts.dry_run {
+@@ -4126,7 +4126,7 @@ fn ranked_targets_for_call(
+     };
+     let cfg = effective_config_for_cwd();
+     let tools = rtrt_core::detect_tools_with_config(cfg);
+-    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
++    let usage = UsageSnapshot::load_for_routing();
+     let req = RouteRequest {
+         capability: None,
+         prefer: Prefer::Cheapest,
+diff --git a/crates/rtrt-core/src/config.rs b/crates/rtrt-core/src/config.rs
+index e3f074e..6982fdf 100644
+--- a/crates/rtrt-core/src/config.rs
++++ b/crates/rtrt-core/src/config.rs
+@@ -122,10 +122,9 @@ impl ProjectConfig {
+         self.output_level.is_none()
+             && self.compression.is_none()
+             && self.agents.as_ref().is_none_or(|a| a.enabled.is_empty())
+-            && self
+-                .providers
+-                .as_ref()
+-                .is_none_or(|p| p.enabled.is_empty() && p.active.is_none())
++            && self.providers.as_ref().is_none_or(|p| {
++                p.enabled.is_empty() && p.active.is_none() && p.api_max_tokens.is_none()
++            })
+             && self.statusline.is_none()
+     }
+ }
+@@ -400,10 +399,19 @@ impl AgentsConfig {
+     }
+ }
+ 
++/// Default output-token ceiling for routed API-mode invocations when neither
++/// `[providers] api_max_tokens` nor `RTRT_API_MAX_TOKENS` is set.
++pub const DEFAULT_API_MAX_TOKENS: u32 = 4096;
++
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+ pub struct ProvidersConfig {
+     #[serde(default)]
+     pub active: Option<String>,
++    /// Max output tokens for routed API-mode invocations (`rtrt route` /
++    /// `rtrt call --mode api`, MCP `agent_call` / `agent_route`). `None`
++    /// falls back to [`DEFAULT_API_MAX_TOKENS`].
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub api_max_tokens: Option<u32>,
+     #[serde(flatten)]
+     pub enabled: BTreeMap<String, bool>,
+ }
+@@ -416,6 +424,22 @@ impl ProvidersConfig {
+     pub fn set_enabled(&mut self, name: &str, enabled: bool) {
+         self.enabled.insert(name.to_string(), enabled);
+     }
++
++    /// Effective output-token ceiling for API-mode invocations. Resolution
++    /// order mirrors the other provider knobs: `RTRT_API_MAX_TOKENS` env var
++    /// → `[providers] api_max_tokens` → [`DEFAULT_API_MAX_TOKENS`]. Zero and
++    /// unparseable values are ignored so a typo never truncates answers to 0.
++    pub fn effective_api_max_tokens(&self) -> u32 {
++        if let Ok(raw) = std::env::var("RTRT_API_MAX_TOKENS")
++            && let Ok(value) = raw.trim().parse::<u32>()
++            && value > 0
++        {
++            return value;
++        }
++        self.api_max_tokens
++            .filter(|&value| value > 0)
++            .unwrap_or(DEFAULT_API_MAX_TOKENS)
++    }
+ }
+ 
+ /// Optional daily usage ceilings by provider or target name.
+@@ -541,6 +565,18 @@ impl Config {
+         Ok(base)
+     }
+ 
++    /// The config effective for the current working directory: the global
++    /// config overlaid with the enclosing repo's `.rtrt/config.toml` when the
++    /// cwd is inside a repo, else the plain global config. Errors fall back to
++    /// the default config so a malformed per-project file never breaks the
++    /// caller (routing, MCP tool dispatch, hooks).
++    pub fn load_effective_for_cwd() -> Self {
++        let repo = std::env::current_dir()
++            .ok()
++            .and_then(|cwd| repo_root_from(&cwd));
++        Self::load_effective(repo.as_deref()).unwrap_or_default()
++    }
++
+     /// Overlay one project's customization overrides onto this config.
+     pub fn apply_project_overrides(&mut self, over: &ProjectConfig) {
+         if let Some(compression) = &over.compression {
+@@ -558,6 +594,9 @@ impl Config {
+             if providers.active.is_some() {
+                 self.providers.active = providers.active.clone();
+             }
++            if providers.api_max_tokens.is_some() {
++                self.providers.api_max_tokens = providers.api_max_tokens;
++            }
+         }
+     }
+ 
+@@ -581,6 +620,20 @@ impl Config {
+     }
+ }
+ 
++/// Walk up from `start` to the enclosing repo root — the first ancestor with a
++/// `.git` or `.rtrt` entry. Returns `None` when `start` is not inside a repo,
++/// so callers fall back to the plain global config.
++pub fn repo_root_from(start: &Path) -> Option<PathBuf> {
++    let mut cur = Some(start);
++    while let Some(dir) = cur {
++        if dir.join(".git").exists() || dir.join(".rtrt").exists() {
++            return Some(dir.to_path_buf());
++        }
++        cur = dir.parent();
++    }
++    None
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -737,6 +790,96 @@ mod tests {
+         assert_eq!(alpha.security_profile.as_deref(), Some("ai-default"));
+     }
+ 
++    #[test]
++    fn api_max_tokens_loads_and_defaults() {
++        // Absent → the safe default (no silent truncation to a tiny cap).
++        let c = Config::from_toml_str("").unwrap();
++        assert_eq!(c.providers.api_max_tokens, None);
++        assert_eq!(
++            c.providers.effective_api_max_tokens(),
++            DEFAULT_API_MAX_TOKENS
++        );
++
++        // Explicit value in [providers] wins; sibling flattened bool entries
++        // (the enable map) must keep loading next to the typed field.
++        let c = Config::from_toml_str(
++            r#"
++            [providers]
++            active = "openai"
++            api_max_tokens = 8192
++            openrouter = false
++            "#,
++        )
++        .unwrap();
++        assert_eq!(c.providers.api_max_tokens, Some(8192));
++        assert_eq!(c.providers.effective_api_max_tokens(), 8192);
++        assert_eq!(c.providers.enabled_override("openrouter"), Some(false));
++
++        // Zero is ignored — a typo must never truncate answers to nothing.
++        let zeroed = ProvidersConfig {
++            api_max_tokens: Some(0),
++            ..Default::default()
++        };
++        assert_eq!(zeroed.effective_api_max_tokens(), DEFAULT_API_MAX_TOKENS);
++    }
++
++    #[test]
++    fn project_override_carries_api_max_tokens() {
++        let mut base = Config::from_toml_str(
++            r#"
++            [providers]
++            api_max_tokens = 2048
++            "#,
++        )
++        .unwrap();
++        let over = ProjectConfig::from_toml_str(
++            r#"
++            [providers]
++            api_max_tokens = 512
++            "#,
++        )
++        .unwrap();
++        assert!(!over.is_empty());
++        base.apply_project_overrides(&over);
++        assert_eq!(base.providers.api_max_tokens, Some(512));
++
++        // An override without the field leaves the global value alone.
++        let mut base = Config::from_toml_str(
++            r#"
++            [providers]
++            api_max_tokens = 2048
++            "#,
++        )
++        .unwrap();
++        let over = ProjectConfig::from_toml_str(
++            r#"
++            [providers]
++            active = "openai"
++            "#,
++        )
++        .unwrap();
++        base.apply_project_overrides(&over);
++        assert_eq!(base.providers.api_max_tokens, Some(2048));
++    }
++
++    #[test]
++    fn repo_root_walks_up_to_rtrt_or_git_marker() {
++        let root = std::env::temp_dir().join(format!(
++            "rtrt-core-repo-root-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map(|d| d.as_nanos())
++                .unwrap_or_default()
++        ));
++        let nested = root.join("a").join("b");
++        std::fs::create_dir_all(&nested).unwrap();
++        assert_eq!(repo_root_from(&nested), None);
++        std::fs::create_dir_all(root.join(".rtrt")).unwrap();
++        assert_eq!(repo_root_from(&nested), Some(root.clone()));
++        std::fs::remove_dir_all(&root).unwrap();
++    }
++
+     #[test]
+     fn project_finds_and_none() {
+         let mut c = Config::default();
+diff --git a/crates/rtrt-core/src/lib.rs b/crates/rtrt-core/src/lib.rs
+index 09edc5b..e5009a1 100644
+--- a/crates/rtrt-core/src/lib.rs
++++ b/crates/rtrt-core/src/lib.rs
+@@ -12,7 +12,8 @@ pub mod project;
+ pub mod token;
+ 
+ pub use config::{
+-    AgentsConfig, Config, LimitsConfig, ProjectConfig, ProjectEntry, ProvidersConfig, TargetLimit,
++    AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, LimitsConfig, ProjectConfig, ProjectEntry,
++    ProvidersConfig, TargetLimit, repo_root_from,
+ };
+ pub use detect::{
+     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,
+diff --git a/crates/rtrt-dashboard/src/handlers/orch.rs b/crates/rtrt-dashboard/src/handlers/orch.rs
+index 506a857..2696755 100644
+--- a/crates/rtrt-dashboard/src/handlers/orch.rs
++++ b/crates/rtrt-dashboard/src/handlers/orch.rs
+@@ -117,7 +117,10 @@ pub(crate) async fn route_api(
+         mode: None,
+     };
+     let tools = detected_tools_with_config_overrides();
+-    let usage = UsageSnapshot::load_best_effort();
++    // Overlay the provider-usage ledger's rolling 24h window (same snapshot
++    // the CLI routes on) so the preview is headroom-aware, not blind to
++    // recent spend.
++    let usage = UsageSnapshot::load_for_routing();
+     let decision = match select_route(&request, &tools, &usage) {
+         Ok(decision) => decision,
+         Err(e) => return route_error(StatusCode::BAD_REQUEST, &e.to_string()),
+diff --git a/crates/rtrt-dashboard/src/handlers/scope.rs b/crates/rtrt-dashboard/src/handlers/scope.rs
+index 2522f11..8dbba65 100644
+--- a/crates/rtrt-dashboard/src/handlers/scope.rs
++++ b/crates/rtrt-dashboard/src/handlers/scope.rs
+@@ -484,8 +484,11 @@ pub(crate) async fn post_providers_config(
+         .map(str::trim)
+         .filter(|s| !s.is_empty())
+         .map(str::to_string);
++    // The UI form only carries `active` + the enable map; `api_max_tokens` is
++    // preserved from the layer being rewritten so saving here never wipes it.
+     let providers_cfg = rtrt_core::config::ProvidersConfig {
+         active,
++        api_max_tokens: None,
+         enabled: body.enabled.clone(),
+     };
+ 
+@@ -494,6 +497,8 @@ pub(crate) async fn post_providers_config(
+             Ok(p) => p,
+             Err(e) => return clear_field_error(e),
+         };
++        let mut providers_cfg = providers_cfg;
++        providers_cfg.api_max_tokens = project.providers.as_ref().and_then(|p| p.api_max_tokens);
+         project.providers = Some(providers_cfg);
+         if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+             return clear_field_error(e);
+@@ -514,6 +519,8 @@ pub(crate) async fn post_providers_config(
+         Ok(c) => c,
+         Err(e) => return clear_field_error(e),
+     };
++    let mut providers_cfg = providers_cfg;
++    providers_cfg.api_max_tokens = cfg.providers.api_max_tokens;
+     cfg.providers = providers_cfg;
+     if let Err((status, msg)) = write_config_file(&cfg) {
+         return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+diff --git a/crates/rtrt-dashboard/src/handlers/usage.rs b/crates/rtrt-dashboard/src/handlers/usage.rs
+index c642a5f..a4524de 100644
+--- a/crates/rtrt-dashboard/src/handlers/usage.rs
++++ b/crates/rtrt-dashboard/src/handlers/usage.rs
+@@ -170,7 +170,9 @@ pub(crate) async fn route_preview_api(
+         mode: None,
+     };
+     let tools = detected_tools_with_config_overrides();
+-    let usage = UsageSnapshot::load_best_effort();
++    // Ledger-aware snapshot, same as `/api/route` and the CLI — the preview
++    // must show the decision the router would actually make.
++    let usage = UsageSnapshot::load_for_routing();
+     let decision = match select_route(&request, &tools, &usage) {
+         Ok(decision) => decision,
+         Err(e) => return route_error(StatusCode::BAD_REQUEST, &e.to_string()),
+diff --git a/crates/rtrt-mcp/src/main.rs b/crates/rtrt-mcp/src/main.rs
+index 38352cc..9939f20 100644
+--- a/crates/rtrt-mcp/src/main.rs
++++ b/crates/rtrt-mcp/src/main.rs
+@@ -355,9 +355,13 @@ fn parse_agent_route_capability(value: Option<&str>) -> Result<Option<Capability
+         "reasoning" => Ok(Some(Capability::Reasoning)),
+         "vision" => Ok(Some(Capability::Vision)),
+         "embed" => Ok(Some(Capability::Embed)),
++        "agentic" => Ok(Some(Capability::Agentic)),
+         "cheap" => Ok(Some(Capability::CheapBulk)),
+         other => Err(McpError::invalid_params(
+-            format!("agent_route capability: unknown capability '{other}'"),
++            format!(
++                "agent_route capability: unknown capability '{other}' \
++                 (expected code, reasoning, vision, embed, agentic, or cheap)"
++            ),
+             None,
+         )),
+     }
+@@ -971,8 +975,13 @@ impl RtrtMcp {
+             model: args.model,
+             mode: None,
+         };
+-        let tools = rtrt_core::detect::detect_tools();
+-        let usage = UsageSnapshot::load_best_effort();
++        // Same routing inputs as the CLI: the effective (global ⊕ project
++        // `.rtrt/config.toml`) config drives the per-project enable map, and
++        // the usage snapshot carries the ledger's rolling 24h window so
++        // ranking is headroom-aware here too.
++        let cfg = rtrt_core::Config::load_effective_for_cwd();
++        let tools = rtrt_core::detect_tools_with_config(cfg);
++        let usage = UsageSnapshot::load_for_routing();
+         let decision = select_route(&req, &tools, &usage)
+             .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
+         let target = decision.target.clone();
+@@ -1473,4 +1482,28 @@ mod tests {
+         assert!(!constant_time_eq(b"abc", b"abcd"));
+         assert!(constant_time_eq(b"", b""));
+     }
++
++    #[test]
++    fn agent_route_capability_parses_every_label_including_agentic() {
++        let cases = [
++            ("code", Capability::Code),
++            ("reasoning", Capability::Reasoning),
++            ("vision", Capability::Vision),
++            ("embed", Capability::Embed),
++            ("agentic", Capability::Agentic),
++            ("cheap", Capability::CheapBulk),
++        ];
++        for (label, expected) in cases {
++            let parsed = parse_agent_route_capability(Some(label))
++                .unwrap_or_else(|e| panic!("'{label}' should parse: {e:?}"));
++            assert_eq!(parsed, Some(expected), "label '{label}'");
++        }
++        // Case/whitespace tolerant, None passthrough, unknown rejected.
++        assert_eq!(
++            parse_agent_route_capability(Some(" Agentic ")).unwrap(),
++            Some(Capability::Agentic)
++        );
++        assert_eq!(parse_agent_route_capability(None).unwrap(), None);
++        assert!(parse_agent_route_capability(Some("telepathy")).is_err());
++    }
+ }
+diff --git a/crates/rtrt-providers/src/gateway.rs b/crates/rtrt-providers/src/gateway.rs
+index ea37db5..9bf0ca8 100644
+--- a/crates/rtrt-providers/src/gateway.rs
++++ b/crates/rtrt-providers/src/gateway.rs
+@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
+ use rtrt_core::{Error, Result};
+ use serde::{Deserialize, Serialize};
+ 
+-use crate::{ChatRequest, ChatResponse, Provider, Role, Usage};
++use crate::{ChatRequest, ChatResponse, Provider, Role, Usage, usage_ledger};
+ 
+ /// One observation per chat call. Cheap to clone (`Arc`-free, all owned data).
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -244,6 +244,13 @@ pub struct Gateway {
+     retry: RetryPolicy,
+     next_metric_id: Arc<Mutex<u64>>,
+     cache: Option<Arc<Mutex<ResponseCache>>>,
++    /// When set, every dispatched request is also appended to the persistent
++    /// provider-usage ledger (`usage_ledger::record_invocation`), so gateway
++    /// callers (MCP `provider_chat`, dashboard chat/compress/memory daemons)
++    /// count toward the same windowed headroom the router balances on.
++    /// `Gateway::from_env` enables it; embedded/test gateways built via
++    /// `Gateway::new` stay ledger-silent unless opted in.
++    record_usage: bool,
+ }
+ 
+ /// Helicone-style response cache. The key hashes
+@@ -322,8 +329,10 @@ impl Default for Gateway {
+ impl Gateway {
+     /// Constructs a gateway from environment variables. The intent is "spin up
+     /// a usable gateway in one line" — primarily for the dashboard binary.
++    /// Ledger recording is on: from-env gateways serve real provider traffic,
++    /// which must count toward routing headroom.
+     pub fn from_env() -> Self {
+-        let mut gw = Gateway::new();
++        let mut gw = Gateway::new().with_usage_recording(true);
+         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+             gw = gw.register(
+                 "anthropic",
+@@ -369,9 +378,17 @@ impl Gateway {
+             retry: RetryPolicy::default(),
+             next_metric_id: Arc::new(Mutex::new(1)),
+             cache: None,
++            record_usage: false,
+         }
+     }
+ 
++    /// Toggle persistent provider-usage ledger recording for every dispatched
++    /// request. See the `record_usage` field for the default per constructor.
++    pub fn with_usage_recording(mut self, enabled: bool) -> Self {
++        self.record_usage = enabled;
++        self
++    }
++
+     /// Attach a fixed-capacity response cache. When `cap == 0` the cache is
+     /// disabled. Cache keys are derived from `(model, messages, max_tokens,
+     /// temperature)`.
+@@ -575,8 +592,18 @@ impl Gateway {
+             .map(|d| d.as_secs())
+             .unwrap_or(0);
+         let model = req.model.clone();
++        // Char count of the outbound messages, kept for the estimated ledger
++        // row when the provider fails (or reports no usage block).
++        let prompt_chars: String = if self.record_usage {
++            req.messages.iter().map(|m| m.content.as_str()).collect()
++        } else {
++            String::new()
++        };
+         let result = registration.provider.chat(req).await;
+         let latency_ms = started.elapsed().as_millis() as u64;
++        if self.record_usage {
++            record_dispatch_to_ledger(&name, &model, &prompt_chars, &result);
++        }
+         let id = {
+             let mut guard = self
+                 .next_metric_id
+@@ -646,6 +673,53 @@ impl MetricsBuffer {
+     }
+ }
+ 
++/// Append one dispatched request to the provider-usage ledger, following the
++/// ledger convention: real API [`Usage`] counts are recorded exactly with
++/// `est = 0`; when no usage is available (failure, or a backend that returns
++/// no usage block) tokens are estimated at chars/4 with `est = 1`. Best-effort
++/// by contract — `record_invocation` never propagates failures.
++fn record_dispatch_to_ledger(
++    target: &str,
++    model: &str,
++    prompt_chars: &str,
++    result: &Result<ChatResponse>,
++) {
++    match result {
++        Ok(resp) if resp.usage.total() > 0 => {
++            usage_ledger::record_invocation(
++                target,
++                model,
++                resp.usage.input_tokens,
++                resp.usage.output_tokens,
++                false,
++                true,
++            );
++        }
++        Ok(resp) => {
++            // Some OpenAI-compatible backends omit the usage block; estimate
++            // both sides so the request still counts toward headroom.
++            usage_ledger::record_invocation(
++                target,
++                model,
++                usage_ledger::estimate_tokens(prompt_chars),
++                usage_ledger::estimate_tokens(&resp.content),
++                true,
++                true,
++            );
++        }
++        Err(_) => {
++            usage_ledger::record_invocation(
++                target,
++                model,
++                usage_ledger::estimate_tokens(prompt_chars),
++                0,
++                true,
++                false,
++            );
++        }
++    }
++}
++
+ fn truncate(s: &str, max: usize) -> String {
+     if s.chars().count() <= max {
+         return s.to_string();
+diff --git a/crates/rtrt-providers/src/invoke.rs b/crates/rtrt-providers/src/invoke.rs
+index 3ff14a2..8378d71 100644
+--- a/crates/rtrt-providers/src/invoke.rs
++++ b/crates/rtrt-providers/src/invoke.rs
+@@ -13,7 +13,6 @@ use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage
+ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+ 
+ const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+-const API_MAX_TOKENS: u32 = 1024;
+ const PROMPT_PLACEHOLDER: &str = "{prompt}";
+ const MODEL_PLACEHOLDER: &str = "{model}";
+ const ASCII_SPINNER_CHARS: &[char] = &['|', '/', '-', '\\'];
+@@ -133,10 +132,17 @@ pub async fn invoke_agent(
+                     role: Role::User,
+                     content: prompt.to_string(),
+                 }],
+-                max_tokens: Some(API_MAX_TOKENS),
++                max_tokens: Some(api_max_tokens()),
+                 temperature: None,
+             };
+-            match Gateway::from_env().chat(req).await {
++            // This path keeps its own ledger rows (attributed to the detected
++            // tool name, including pre-dispatch failures), so the gateway's
++            // own recording is switched off to avoid double-counting.
++            match Gateway::from_env()
++                .with_usage_recording(false)
++                .chat(req)
++                .await
++            {
+                 Ok(resp) => {
+                     // API mode returns real token counts; record them exactly.
+                     usage_ledger::record_invocation(
+@@ -363,6 +369,16 @@ fn aggregated_error(attempts: &[FailoverAttempt]) -> Error {
+     ))
+ }
+ 
++/// Output-token ceiling for API-mode invocations: `RTRT_API_MAX_TOKENS` env
++/// var → the effective (global ⊕ project) `[providers] api_max_tokens` →
++/// [`rtrt_core::DEFAULT_API_MAX_TOKENS`]. Previously a hardcoded 1024, which
++/// silently truncated routed API answers.
++fn api_max_tokens() -> u32 {
++    rtrt_core::Config::load_effective_for_cwd()
++        .providers
++        .effective_api_max_tokens()
++}
++
+ /// Record an estimated-token ledger row from a prompt/output text pair
+ /// (`chars / 4`). Used for CLI shell-outs and for any failed invocation where
+ /// we have no real usage to report.
+diff --git a/crates/rtrt-providers/src/usage.rs b/crates/rtrt-providers/src/usage.rs
+index 9ac91f2..ac9271c 100644
+--- a/crates/rtrt-providers/src/usage.rs
++++ b/crates/rtrt-providers/src/usage.rs
+@@ -96,6 +96,15 @@ impl UsageSnapshot {
+         self
+     }
+ 
++    /// The snapshot every routing surface (CLI, MCP `agent_route`, dashboard
++    /// route preview) must use: best-effort sources overlaid with the
++    /// provider-usage ledger's rolling 24h window, so `select_route` ranks
++    /// candidates headroom-aware everywhere — never on stale token-log data
++    /// alone.
++    pub fn load_for_routing() -> Self {
++        Self::load_best_effort().with_ledger_window()
++    }
++
+     pub fn headroom(&self, target: &str) -> Option<QuotaHeadroom> {
+         let target = normalize_target(target);
+         let limit = self.limits_by_target.get(&target).copied();
+diff --git a/crates/rtrt-providers/src/usage_ledger.rs b/crates/rtrt-providers/src/usage_ledger.rs
+index 62dc96a..d7e9b90 100644
+--- a/crates/rtrt-providers/src/usage_ledger.rs
++++ b/crates/rtrt-providers/src/usage_ledger.rs
+@@ -31,6 +31,14 @@ const LEDGER_FILE_NAME: &str = "provider-usage.tsv";
+ const MAX_LEDGER_ROWS: usize = 5000;
+ /// CLI shell-outs return only text, so tokens are estimated at ~4 chars/token.
+ const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
++/// A `.lock` file older than this is treated as leftover from a crashed
++/// process and stolen — an append + trim takes milliseconds, never seconds.
++const LOCK_STALE_SECS: u64 = 10;
++/// How many times to retry lock acquisition (with [`LOCK_RETRY_WAIT`] between
++/// attempts) before falling back to an untrimmed append. Bounded so recording
++/// can never block a caller for long.
++const LOCK_RETRY_ATTEMPTS: u32 = 5;
++const LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+ 
+ /// Rolling windows surfaced by [`provider_usage_windows`], in seconds.
+ const WINDOW_5H_SECS: u64 = 5 * 60 * 60;
+@@ -161,14 +169,80 @@ pub fn record_invocation(
+         ok,
+     };
+     let path = ledger_path();
++    // Serialize writers across concurrent rtrt processes: trim_to_cap is a
++    // read-rewrite, so a concurrent append during a trim could be lost. The
++    // lock is best-effort — when it cannot be acquired within the bounded
++    // retries we still append (recording must never be dropped or block) and
++    // only skip the trim; the next successful writer trims the backlog.
++    let lock = LedgerLock::try_acquire(lock_path(&path), LOCK_STALE_SECS);
+     if append_row(&path, &row).is_err() {
+         return None;
+     }
+-    // Cap the file on a best-effort basis; ignore any trim failure.
+-    let _ = trim_to_cap(&path, MAX_LEDGER_ROWS);
++    if lock.is_some() {
++        // Cap the file on a best-effort basis; ignore any trim failure.
++        let _ = trim_to_cap(&path, MAX_LEDGER_ROWS);
++    }
+     Some(row)
+ }
+ 
++/// Best-effort advisory lock: an `O_EXCL`-created sibling `.lock` file, removed
++/// on drop. Dependency-light by design — no OS advisory-lock crate. A lock file
++/// whose mtime is older than `stale_secs` is treated as leftover from a crashed
++/// process and stolen.
++struct LedgerLock {
++    path: PathBuf,
++}
++
++impl LedgerLock {
++    fn try_acquire(path: PathBuf, stale_secs: u64) -> Option<Self> {
++        if let Some(parent) = path.parent() {
++            let _ = std::fs::create_dir_all(parent);
++        }
++        for attempt in 0..LOCK_RETRY_ATTEMPTS {
++            match OpenOptions::new().write(true).create_new(true).open(&path) {
++                Ok(_) => return Some(Self { path }),
++                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
++                    if lock_is_stale(&path, stale_secs) {
++                        // Steal the abandoned lock and retry the exclusive
++                        // create immediately (another process may win the
++                        // race — that is fine, we just keep retrying).
++                        let _ = std::fs::remove_file(&path);
++                        continue;
++                    }
++                    if attempt + 1 < LOCK_RETRY_ATTEMPTS {
++                        std::thread::sleep(LOCK_RETRY_WAIT);
++                    }
++                }
++                Err(_) => return None,
++            }
++        }
++        None
++    }
++}
++
++impl Drop for LedgerLock {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
++
++fn lock_is_stale(path: &Path, stale_secs: u64) -> bool {
++    std::fs::metadata(path)
++        .and_then(|meta| meta.modified())
++        .ok()
++        .and_then(|modified| modified.elapsed().ok())
++        .is_some_and(|age| age.as_secs() >= stale_secs)
++}
++
++fn lock_path(ledger: &Path) -> PathBuf {
++    let mut name = ledger
++        .file_name()
++        .map(|n| n.to_os_string())
++        .unwrap_or_else(|| std::ffi::OsString::from(LEDGER_FILE_NAME));
++    name.push(".lock");
++    ledger.with_file_name(name)
++}
++
+ /// Estimate token count for a CLI text body (`chars / 4`, rounded up).
+ pub fn estimate_tokens(text: &str) -> u64 {
+     (text.chars().count() as u64).div_ceil(ESTIMATED_CHARS_PER_TOKEN)
+@@ -385,6 +459,56 @@ mod tests {
+         assert!(!headroom.tokens_estimated);
+     }
+ 
++    fn temp_ledger_path(tag: &str) -> PathBuf {
++        std::env::temp_dir().join(format!(
++            "rtrt-ledger-{tag}-{}-{}.tsv",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map(|d| d.as_nanos())
++                .unwrap_or_default()
++        ))
++    }
++
++    #[test]
++    fn ledger_lock_is_exclusive_and_released_on_drop() {
++        let ledger = temp_ledger_path("lock");
++        let lock_file = lock_path(&ledger);
++
++        let held = LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS);
++        assert!(held.is_some(), "first acquire should succeed");
++        // Contended (and fresh, so not stealable): second acquire fails after
++        // its bounded retries instead of blocking or clobbering.
++        assert!(LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS).is_none());
++
++        drop(held);
++        assert!(!lock_file.exists(), "drop must remove the lock file");
++        let reacquired = LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS);
++        assert!(reacquired.is_some(), "released lock is acquirable again");
++    }
++
++    #[test]
++    fn stale_ledger_lock_is_stolen() {
++        let ledger = temp_ledger_path("stale");
++        let lock_file = lock_path(&ledger);
++        // Simulate a crashed process: a lock file nobody will ever remove.
++        std::fs::write(&lock_file, b"").unwrap();
++        // With a zero stale timeout the leftover file is immediately stale.
++        let stolen = LedgerLock::try_acquire(lock_file.clone(), 0);
++        assert!(stolen.is_some(), "stale lock must be stolen");
++        drop(stolen);
++        assert!(!lock_file.exists());
++    }
++
++    #[test]
++    fn lock_path_appends_lock_suffix() {
++        let ledger = PathBuf::from("/tmp/x/provider-usage.tsv");
++        assert_eq!(
++            lock_path(&ledger),
++            PathBuf::from("/tmp/x/provider-usage.tsv.lock")
++        );
++    }
++
+     #[test]
+     fn headroom_without_limits_does_not_fabricate_a_cap() {
+         let config = Config::default();
+diff --git a/crates/rtrt-providers/tests/gateway_ledger.rs b/crates/rtrt-providers/tests/gateway_ledger.rs
+new file mode 100644
+index 0000000..613d26c
+--- /dev/null
++++ b/crates/rtrt-providers/tests/gateway_ledger.rs
+@@ -0,0 +1,172 @@
++//! Gateway → provider-usage ledger recording.
++//!
++//! Every dispatched request on a recording gateway must land in the TSV
++//! ledger with the documented conventions: real API usage recorded exactly
++//! (`est = 0`), chars/4 estimates when no usage is available (`est = 1`),
++//! failures as `ok = 0`. Non-recording gateways must stay ledger-silent.
++//!
++//! One test function on purpose: the ledger path is selected via the
++//! process-global `RTRT_PROVIDER_USAGE_PATH` env var, so splitting into
++//! parallel tests would race on it.
++
++use async_trait::async_trait;
++use rtrt_providers::{ChatMessage, ChatRequest, ChatResponse, Gateway, Provider, Role, Usage};
++
++struct Scripted {
++    name: &'static str,
++    tokens: Option<(u64, u64)>,
++    fail: bool,
++}
++
++#[async_trait]
++impl Provider for Scripted {
++    fn name(&self) -> &str {
++        self.name
++    }
++    fn supported_models(&self) -> &[&'static str] {
++        &[]
++    }
++    async fn chat(&self, req: ChatRequest) -> rtrt_core::Result<ChatResponse> {
++        if self.fail {
++            return Err(rtrt_core::Error::Provider("simulated 503".into()));
++        }
++        let (input, output) = self.tokens.unwrap_or_default();
++        Ok(ChatResponse {
++            provider: self.name.to_string(),
++            model: req.model,
++            content: "12345678".to_string(), // 8 chars → 2 estimated tokens
++            usage: Usage {
++                input_tokens: input,
++                output_tokens: output,
++                ..Default::default()
++            },
++        })
++    }
++}
++
++fn req(model: &str) -> ChatRequest {
++    ChatRequest {
++        model: model.into(),
++        messages: vec![ChatMessage {
++            role: Role::User,
++            // 4 chars → exactly 1 estimated token at chars/4.
++            content: "abcd".into(),
++        }],
++        max_tokens: None,
++        temperature: None,
++    }
++}
++
++/// Parse the raw TSV rows: (target, model, input, output, est, ok).
++fn ledger_rows(path: &std::path::Path) -> Vec<(String, String, u64, u64, bool, bool)> {
++    let raw = std::fs::read_to_string(path).unwrap_or_default();
++    raw.lines()
++        .filter(|line| !line.trim().is_empty())
++        .map(|line| {
++            let f: Vec<&str> = line.split('\t').collect();
++            assert_eq!(f.len(), 7, "ledger row must have 7 fields: {line}");
++            (
++                f[1].to_string(),
++                f[2].to_string(),
++                f[3].parse().unwrap(),
++                f[4].parse().unwrap(),
++                f[5] != "0",
++                f[6] != "0",
++            )
++        })
++        .collect()
++}
++
++#[tokio::test]
++async fn recording_gateway_writes_ledger_rows_per_convention() {
++    let ledger = std::env::temp_dir().join(format!(
++        "rtrt-gateway-ledger-{}-{}.tsv",
++        std::process::id(),
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos())
++            .unwrap_or_default()
++    ));
++    // SAFETY: single-threaded at this point (one test fn in this binary), and
++    // the var is only read by this crate's ledger-path resolution.
++    unsafe { std::env::set_var("RTRT_PROVIDER_USAGE_PATH", &ledger) };
++
++    let gw = Gateway::new()
++        .with_usage_recording(true)
++        .register(
++            "real-usage",
++            Box::new(Scripted {
++                name: "real-usage",
++                tokens: Some((11, 22)),
++                fail: false,
++            }),
++            ["real-"],
++        )
++        .register(
++            "no-usage",
++            Box::new(Scripted {
++                name: "no-usage",
++                tokens: None,
++                fail: false,
++            }),
++            ["nousage-"],
++        )
++        .register(
++            "flaky",
++            Box::new(Scripted {
++                name: "flaky",
++                tokens: None,
++                fail: true,
++            }),
++            ["flaky-"],
++        );
++
++    // 1. Real API usage → exact counts, est = 0, ok = 1.
++    gw.chat(req("real-model")).await.expect("real-usage chat");
++    // 2. Success without a usage block → chars/4 estimate, est = 1, ok = 1.
++    gw.chat(req("nousage-model")).await.expect("no-usage chat");
++    // 3. Failure → estimated prompt tokens, 0 output, est = 1, ok = 0.
++    gw.chat(req("flaky-model")).await.expect_err("flaky chat");
++
++    let rows = ledger_rows(&ledger);
++    assert_eq!(rows.len(), 3, "one ledger row per dispatched request");
++    assert_eq!(
++        rows[0],
++        (
++            "real-usage".into(),
++            "real-model".into(),
++            11,
++            22,
++            false,
++            true
++        )
++    );
++    // Prompt "abcd" → 1 token; content "12345678" → 2 tokens.
++    assert_eq!(
++        rows[1],
++        ("no-usage".into(), "nousage-model".into(), 1, 2, true, true)
++    );
++    assert_eq!(
++        rows[2],
++        ("flaky".into(), "flaky-model".into(), 1, 0, true, false)
++    );
++
++    // 4. A non-recording gateway (the `Gateway::new` default) stays silent.
++    let silent = Gateway::new().register(
++        "real-usage",
++        Box::new(Scripted {
++            name: "real-usage",
++            tokens: Some((1, 1)),
++            fail: false,
++        }),
++        ["real-"],
++    );
++    silent.chat(req("real-model")).await.expect("silent chat");
++    assert_eq!(
++        ledger_rows(&ledger).len(),
++        3,
++        "non-recording gateway must not append"
++    );
++
++    let _ = std::fs::remove_file(&ledger);
++}

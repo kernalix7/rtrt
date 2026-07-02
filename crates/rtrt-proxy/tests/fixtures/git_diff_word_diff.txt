@@ -1,0 +1,12 @@
+diff --git a/cfg.py b/cfg.py
+index fb15fe2..4fa8459 100644
+--- a/cfg.py
++++ b/cfg.py
+@@ -1,7 +1,7 @@
+    a = 1
+    b = 2
+    c = 3
+    d = [-4-]{+40+}
+    e = 5
+    f = 6
+    g = 7

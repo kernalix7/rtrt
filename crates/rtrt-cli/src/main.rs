@@ -6319,24 +6319,19 @@ fn try_hybrid_recall(
     timeout: std::time::Duration,
 ) -> Option<Vec<rtrt_memory::MemoryRecord>> {
     let cfg = rtrt_core::Config::load().unwrap_or_default();
-    let ecfg = cfg.embeddings;
-    // Gate 1: embeddings must be enabled (honours RTRT_EMBED_ENABLED).
-    if !ecfg.is_enabled() {
-        return None;
-    }
-    // Gate 2: meaningful embedding coverage for this project. Probing coverage
-    // is a cheap local SQL read (no network), so do it before touching Ollama.
+    // Gates 1+2 (embeddings enabled, meaningful project coverage) are shared
+    // with the MCP server's `memory_recall` / `memory_smart_search` via
+    // `rtrt_memory::hybrid_recall_ready` — a cheap local config + SQL read, no
+    // network, so it's checked before touching Ollama at all.
     let coverage_store = MemoryStore::open(store_path).ok()?;
-    let (embedded, total) = coverage_store.embedding_coverage(project).ok()?;
-    if embedded == 0 || embedded.saturating_mul(2) < total {
+    if !rtrt_memory::hybrid_recall_ready(&coverage_store, project, &cfg) {
         return None;
     }
     drop(coverage_store);
 
-    // Gate 3: build the embedder (mirrors the dashboard daemon's resolution:
-    // embeddings.base_url → auto_compress.base_url → Ollama default).
-    let base_url = ecfg.resolved_base_url(cfg.auto_compress.base_url.as_deref());
-    let model = ecfg.effective_model();
+    // Gate 3: build the embedder (same shared resolution: embeddings.base_url
+    // → auto_compress.base_url → Ollama default).
+    let embedder = rtrt_memory::hybrid_embedder_from_config(&cfg);
 
     // Run the hybrid recall on a worker thread bounded by `timeout`. The thread
     // opens its OWN MemoryStore on the WAL db (concurrent reads are fine) and
@@ -6351,7 +6346,6 @@ fn try_hybrid_recall(
     std::thread::spawn(move || {
         let result = (|| {
             let store = MemoryStore::open(&store_path).ok()?;
-            let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
             let scored = store
                 .recall_hybrid(&project, &query, limit, &embedder)
                 .ok()?;
@@ -6368,6 +6362,38 @@ fn try_hybrid_recall(
         Ok(Some(hits)) => Some(hits),
         _ => None,
     }
+}
+
+/// Short bound for the opportunistic embed sweep triggered right after `memory
+/// save` — the CLI process exits shortly after printing its result, so this
+/// can't wait as long as an interactive recall; it's an "if it's fast, take
+/// the win" courtesy call, not a guarantee. Any rows embedded before the
+/// timeout are already committed (each is written as it's stored), so a
+/// partial sweep still makes real progress.
+const OPPORTUNISTIC_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Best-effort incremental embed sweep after `memory save`, so a project's
+/// embedding coverage climbs even without the dashboard's periodic auto-embed
+/// daemon running. No-op (immediately, zero Ollama traffic) when embeddings
+/// are disabled. Never fails the caller — `memory save` has already printed
+/// its result by the time this runs.
+fn try_opportunistic_embed_sweep(store_path: &std::path::Path, timeout: std::time::Duration) {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    if !cfg.embeddings.is_enabled() {
+        return;
+    }
+    let store_path = store_path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(1);
+    std::thread::spawn(move || {
+        let embedded = (|| -> Option<usize> {
+            let store = MemoryStore::open(&store_path).ok()?;
+            let embedder = rtrt_memory::hybrid_embedder_from_config(&cfg);
+            Some(store.opportunistic_embed_sweep(&embedder))
+        })()
+        .unwrap_or(0);
+        let _ = tx.send(embedded);
+    });
+    let _ = rx.recv_timeout(timeout);
 }
 
 fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize) -> Result<()> {
@@ -6651,10 +6677,10 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             project,
             kind,
             body,
-            store,
+            store: store_path,
             meta,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let store = MemoryStore::open(&store_path)?;
             let body = read_body_or_stdin(body)?;
             let id = if meta.is_empty() {
                 store.save(&project, &kind, &body)?
@@ -6663,6 +6689,11 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
                 store.save_with_metadata(&project, &kind, &body, &map)?
             };
             println!("saved id={id}");
+            drop(store);
+            // Grow embedding coverage opportunistically, bounded so it can't
+            // meaningfully delay this command's exit; no-op when embeddings
+            // are disabled.
+            try_opportunistic_embed_sweep(&store_path, OPPORTUNISTIC_EMBED_TIMEOUT);
         }
         MemoryCmd::Blocks { cmd } => match cmd {
             BlockCmd::Set {

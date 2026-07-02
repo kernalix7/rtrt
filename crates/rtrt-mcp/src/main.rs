@@ -27,7 +27,7 @@ use rmcp::{
 };
 use rtrt_compress::Compressor;
 use rtrt_core::{Capability, CompressionLevel};
-use rtrt_memory::MemoryStore;
+use rtrt_memory::{Embedder, MemoryStore};
 use rtrt_providers::{
     ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvokeOptions, Mode as InvokeMode,
     Prefer, Role, RouteRequest, UsageSnapshot, invoke_agent, select_route,
@@ -81,8 +81,32 @@ struct RtrtMcp {
     state: Arc<RtrtState>,
 }
 
+/// Bound on how long `memory_recall` / `memory_smart_search` will wait for a
+/// hybrid (BM25 + vector RRF) attempt before falling back to plain BM25 —
+/// same budget the CLI's `UserPromptSubmit` hook uses, so a slow/unreachable
+/// Ollama can't stall a tool call.
+const HYBRID_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Bound on the one-time startup probe that decides whether an embedder gets
+/// attached at all. Cheap TCP connect only — no HTTP round-trip, no embed
+/// call — so it doesn't meaningfully delay server startup either way.
+const EMBED_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(700);
+
 struct RtrtState {
     memory: Mutex<MemoryStore>,
+    /// Path the primary `memory` store was opened from. Kept so background
+    /// work (hybrid recall's bounded worker, the opportunistic embed sweep)
+    /// can open its OWN connection instead of contending with `memory`'s lock
+    /// for the duration of a possibly-slow Ollama call.
+    memory_path: PathBuf,
+    /// Config snapshot taken at startup (mirrors the dashboard's auto-embed
+    /// daemon, which also reads config once rather than per-cycle). A config
+    /// edit while the server is running takes effect on the next restart.
+    cfg: rtrt_core::Config,
+    /// Attached iff `[embeddings] enabled` (config/env) AND the startup probe
+    /// found Ollama reachable. `None` keeps every memory tool pure BM25 with
+    /// zero Ollama traffic.
+    embedder: Option<Arc<dyn Embedder>>,
     gateway: Arc<Gateway>,
     prompts: Option<Arc<PromptRegistry>>,
     auto_capture: bool,
@@ -93,6 +117,64 @@ struct RtrtState {
 }
 
 impl RtrtState {
+    /// Best-effort hybrid recall for `memory_recall` / `memory_smart_search`.
+    /// Mirrors the CLI hook's gate (`rtrt_memory::hybrid_recall_ready`:
+    /// embeddings enabled + meaningful project coverage) and timeout
+    /// discipline (bounded worker, `None` on any gate miss / error /
+    /// timeout — the caller's signal to fall back to `recall_bm25`).
+    /// Returns `None` immediately, with zero Ollama traffic, when no embedder
+    /// was attached at startup.
+    async fn try_hybrid_recall(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+    ) -> Option<Vec<rtrt_memory::MemoryRecord>> {
+        let embedder = self.embedder.clone()?;
+        let cfg = self.cfg.clone();
+        let memory_path = self.memory_path.clone();
+        let project = project.to_string();
+        let query = query.to_string();
+        let task =
+            tokio::task::spawn_blocking(move || -> Option<Vec<rtrt_memory::MemoryRecord>> {
+                let store = MemoryStore::open(&memory_path).ok()?;
+                if !rtrt_memory::hybrid_recall_ready(&store, &project, &cfg) {
+                    return None;
+                }
+                let scored = store
+                    .recall_hybrid(&project, &query, limit, embedder.as_ref())
+                    .ok()?;
+                Some(scored.into_iter().map(|s| s.record).collect())
+            });
+        match tokio::time::timeout(HYBRID_TIMEOUT, task).await {
+            Ok(Ok(hits)) => hits,
+            _ => None,
+        }
+    }
+
+    /// Fire-and-forget incremental embed sweep after a save, so a project's
+    /// embedding coverage climbs even when the dashboard's periodic
+    /// auto-embed daemon isn't running (bare MCP usage). No-op when no
+    /// embedder is attached. Unlike the CLI's bounded best-effort sweep (its
+    /// process exits right after the command), the MCP server keeps running,
+    /// so this can simply finish on its own time on a blocking task detached
+    /// from the tool call — never adds latency to `memory_save`'s response.
+    fn spawn_opportunistic_embed_sweep(&self) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        let memory_path = self.memory_path.clone();
+        tokio::task::spawn_blocking(move || match MemoryStore::open(&memory_path) {
+            Ok(store) => {
+                let embedded = store.opportunistic_embed_sweep(embedder.as_ref());
+                if embedded > 0 {
+                    tracing::info!(embedded, "mcp opportunistic embed sweep");
+                }
+            }
+            Err(e) => tracing::warn!("mcp opportunistic embed sweep: open store: {e}"),
+        });
+    }
+
     /// Best-effort capture mirroring the dashboard pipeline:
     /// `redact_secrets` → SHA-256 dedup → save → tag(session, sha).
     /// Skipped when `auto_capture` is off. Errors are swallowed so a memory
@@ -493,38 +575,54 @@ impl RtrtMcp {
         &self,
         Parameters(args): Parameters<MemorySaveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.state.memory.lock().await;
-        let id = store
-            .save(&args.project, &args.kind, &args.body)
-            .map_err(|e| McpError::internal_error(format!("memory.save: {e}"), None))?;
+        let id = {
+            let store = self.state.memory.lock().await;
+            store
+                .save(&args.project, &args.kind, &args.body)
+                .map_err(|e| McpError::internal_error(format!("memory.save: {e}"), None))?
+        };
+        // Grow embedding coverage opportunistically; no-op without an
+        // embedder, and never adds latency to this response either way.
+        self.state.spawn_opportunistic_embed_sweep();
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({ "id": id }).to_string(),
         )]))
     }
 
-    #[tool(description = "Recall memories by BM25 (FTS5) for a project.")]
+    #[tool(
+        description = "Recall memories for a project: hybrid (BM25 + vector RRF) when a local embedder is attached and project embedding coverage is meaningful, else plain BM25 (FTS5). An optional payload filter always uses BM25 (the hybrid + filter combo isn't implemented yet)."
+    )]
     async fn memory_recall(
         &self,
         Parameters(args): Parameters<MemoryRecallArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.state.memory.lock().await;
-        let hits = match args.filter.as_deref() {
-            Some(spec) if !spec.is_empty() => {
-                let filter = rtrt_memory::PayloadFilter::parse(spec).map_err(|e| {
-                    McpError::invalid_params(format!("memory.recall filter: {e}"), None)
-                })?;
+        if let Some(spec) = args.filter.as_deref().filter(|s| !s.is_empty()) {
+            let filter = rtrt_memory::PayloadFilter::parse(spec).map_err(|e| {
+                McpError::invalid_params(format!("memory.recall filter: {e}"), None)
+            })?;
+            let store = self.state.memory.lock().await;
+            let hits = store
+                .recall_bm25_with_filter(&args.project, &args.query, args.limit as usize, &filter)
+                .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?;
+            let body = serde_json::to_value(&hits).map_err(|e| {
+                McpError::internal_error(format!("memory.recall serialize: {e}"), None)
+            })?;
+            return Ok(CallToolResult::success(vec![Content::text(
+                body.to_string(),
+            )]));
+        }
+        let hits = match self
+            .state
+            .try_hybrid_recall(&args.project, &args.query, args.limit as usize)
+            .await
+        {
+            Some(hits) => hits,
+            None => {
+                let store = self.state.memory.lock().await;
                 store
-                    .recall_bm25_with_filter(
-                        &args.project,
-                        &args.query,
-                        args.limit as usize,
-                        &filter,
-                    )
+                    .recall_bm25(&args.project, &args.query, args.limit as usize)
                     .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?
             }
-            _ => store
-                .recall_bm25(&args.project, &args.query, args.limit as usize)
-                .map_err(|e| McpError::internal_error(format!("memory.recall: {e}"), None))?,
         };
         let body = serde_json::to_value(&hits)
             .map_err(|e| McpError::internal_error(format!("memory.recall serialize: {e}"), None))?;
@@ -605,19 +703,27 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Hybrid (BM25 + vector RRF) search. Falls back to plain BM25 when no embedder is attached. Returns the top `limit` records."
+        description = "Hybrid (BM25 + vector RRF) search when a local embedder is attached and project embedding coverage is meaningful. Falls back to plain BM25 otherwise. Returns the top `limit` records."
     )]
     async fn memory_smart_search(
         &self,
         Parameters(args): Parameters<MemorySmartSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.state.memory.lock().await;
-        // Plain BM25 here — the heavy hybrid path needs an embedder handle
-        // which the MCP server doesn't ship by default. Embedder-backed
-        // builds can override via `MemoryStore::with_embedder` at startup.
-        let hits = store
-            .recall_bm25(&args.project, &args.query, args.limit as usize)
-            .map_err(|e| McpError::internal_error(format!("memory.smart_search: {e}"), None))?;
+        let hits = match self
+            .state
+            .try_hybrid_recall(&args.project, &args.query, args.limit as usize)
+            .await
+        {
+            Some(hits) => hits,
+            None => {
+                let store = self.state.memory.lock().await;
+                store
+                    .recall_bm25(&args.project, &args.query, args.limit as usize)
+                    .map_err(|e| {
+                        McpError::internal_error(format!("memory.smart_search: {e}"), None)
+                    })?
+            }
+        };
         let body = serde_json::to_value(&hits)
             .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -1112,19 +1218,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[tool_handler]
 impl ServerHandler for RtrtMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .enable_resources()
-                .build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions(
-            "RTRT MCP server. Memory tools: memory_save / memory_recall (BM25 + payload filter) / \
+        // Honest, runtime-accurate framing: hybrid recall is only live when an
+        // embedder actually got attached at startup (embeddings enabled AND
+        // Ollama reachable) — otherwise every memory tool is pure BM25.
+        let recall_mode = if self.state.embedder.is_some() {
+            "hybrid (BM25 + vector RRF) when project embedding coverage is meaningful, else BM25"
+        } else {
+            "BM25 (FTS5) — no embedder attached"
+        };
+        let instructions = format!(
+            "RTRT MCP server. Memory tools: memory_save (also opportunistically embeds new backlog when an embedder is attached) / \
+                 memory_recall ({recall_mode}; payload filter always uses BM25) / \
                  memory_timeline (paginated history) / memory_profile (per-project stats) / \
-                 memory_smart_search (BM25 today, hybrid when embedder attached) / \
+                 memory_smart_search ({recall_mode}) / \
                  memory_relations (graph BFS from seed ids) / memory_export (JSONL) / \
                  memory_consolidate (archive oldest, keep most recent N) / \
                  memory_sessions (group rows by session_id, or list rows in one session) / \
@@ -1136,8 +1242,18 @@ impl ServerHandler for RtrtMcp {
                  LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible) / agent_call (detected CLI/API agent bridge). \
                  Security tools: security_scan (profile-driven secrets / license / dependency / pattern / AI-artifact scan; profiles map to CWE/OWASP/NIST/CIS/SLSA/EU-AI-Act). \
                  Prompts: every entry in the local PromptRegistry (~/.rtrt/prompts) is exposed via prompts/list + prompts/get with handlebars argument substitution. \
-                 Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block.",
+                 Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block."
+        );
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
         )
+        .with_server_info(Implementation::from_build_env())
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(instructions)
     }
 
     async fn list_prompts(
@@ -1349,6 +1465,66 @@ fn parse_memory_uri(uri: &str) -> Option<MemoryUri> {
     }
 }
 
+/// Cheap reachability probe for an `http(s)://host:port[/path]` embeddings
+/// endpoint: a bare TCP connect with a short timeout. Deliberately NOT a full
+/// HTTP round-trip or an actual embed call — startup shouldn't pay for that
+/// just to decide whether hybrid recall is worth wiring up, and a per-call
+/// embed failure falls back to BM25 regardless.
+fn ollama_reachable(base_url: &str, timeout: std::time::Duration) -> bool {
+    let host_port = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    if host_port.is_empty() {
+        return false;
+    }
+    use std::net::ToSocketAddrs;
+    match host_port.to_socket_addrs() {
+        Ok(mut addrs) => addrs
+            .next()
+            .is_some_and(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()),
+        Err(_) => false,
+    }
+}
+
+/// Builds the embedder attached to `RtrtState`, if any. `None` when
+/// embeddings are disabled in `cfg` (config/env) or the one-time reachability
+/// probe can't reach the resolved Ollama endpoint — in either case every
+/// memory tool stays pure BM25 with zero Ollama traffic for the rest of the
+/// server's lifetime (a config edit or a newly-started Ollama takes effect on
+/// the next restart, matching the dashboard's auto-embed daemon).
+async fn build_embedder(cfg: &rtrt_core::Config) -> Option<Arc<dyn Embedder>> {
+    if !cfg.embeddings.is_enabled() {
+        tracing::info!(
+            "embeddings disabled (set RTRT_EMBED_ENABLED=1 or [embeddings] enabled=true); memory_recall/memory_smart_search stay BM25-only"
+        );
+        return None;
+    }
+    let base_url = cfg
+        .embeddings
+        .resolved_base_url(cfg.auto_compress.base_url.as_deref());
+    let reachable = {
+        let base_url = base_url.clone();
+        tokio::task::spawn_blocking(move || ollama_reachable(&base_url, EMBED_PROBE_TIMEOUT))
+            .await
+            .unwrap_or(false)
+    };
+    if !reachable {
+        tracing::info!(
+            "embeddings enabled but Ollama at {base_url} unreachable; memory_recall/memory_smart_search stay BM25-only"
+        );
+        return None;
+    }
+    let embedder = rtrt_memory::hybrid_embedder_from_config(cfg);
+    tracing::info!(
+        "hybrid recall ready: embedder model={} base_url={base_url}",
+        embedder.model_name()
+    );
+    Some(Arc::new(embedder) as Arc<dyn Embedder>)
+}
+
 fn open_prompt_registry() -> Option<Arc<PromptRegistry>> {
     let root = std::env::var("RTRT_PROMPTS_DIR")
         .ok()
@@ -1372,6 +1548,8 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let memory = MemoryStore::open(&cli.memory)?;
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let embedder = build_embedder(&cfg).await;
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
     let auto_capture = std::env::var("RTRT_AUTO_CAPTURE")
@@ -1396,6 +1574,9 @@ async fn main() -> Result<()> {
     let session_id = Uuid::new_v4().to_string();
     let shared_state = Arc::new(RtrtState {
         memory: Mutex::new(memory),
+        memory_path: cli.memory.clone(),
+        cfg,
+        embedder,
         gateway,
         prompts,
         auto_capture,
@@ -1506,5 +1687,165 @@ mod tests {
         );
         assert_eq!(parse_agent_route_capability(None).unwrap(), None);
         assert!(parse_agent_route_capability(Some("telepathy")).is_err());
+    }
+
+    #[test]
+    fn ollama_reachable_returns_false_for_a_closed_port() {
+        // Port 1 is a well-known reserved port almost never listened on: the
+        // connection is refused outright (not merely slow), so this returns
+        // fast even with a short timeout.
+        assert!(!ollama_reachable(
+            "http://127.0.0.1:1",
+            std::time::Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn ollama_reachable_returns_false_for_malformed_or_empty_url() {
+        assert!(!ollama_reachable("", std::time::Duration::from_millis(200)));
+        assert!(!ollama_reachable(
+            "not a url",
+            std::time::Duration::from_millis(200)
+        ));
+    }
+
+    /// Deterministic, network-free embedder for exercising the hybrid-vs-BM25
+    /// selection logic without a real Ollama.
+    struct MockEmbedder;
+
+    impl Embedder for MockEmbedder {
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn model_name(&self) -> &str {
+            "mock-test-embedder"
+        }
+        fn embed(&self, texts: &[&str]) -> rtrt_core::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| vec![t.len() as f32, 1.0]).collect())
+        }
+    }
+
+    /// Fresh on-disk temp store path — hybrid recall reopens its own
+    /// connection by path (see `RtrtState::try_hybrid_recall`), so an
+    /// in-memory `:memory:` db won't do: each reopen would see an empty
+    /// database. Callers should remove the returned path (+ `-wal`/`-shm`
+    /// sidecars) when done.
+    fn temp_store_path(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("rtrt-mcp-test-{tag}-{}.sqlite", Uuid::new_v4()));
+        p
+    }
+
+    fn cleanup_store(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    fn test_state(
+        path: PathBuf,
+        cfg: rtrt_core::Config,
+        embedder: Option<Arc<dyn Embedder>>,
+    ) -> RtrtState {
+        let memory = MemoryStore::open(&path).expect("open temp store");
+        RtrtState {
+            memory: Mutex::new(memory),
+            memory_path: path,
+            cfg,
+            embedder,
+            gateway: Arc::new(Gateway::new()),
+            prompts: None,
+            auto_capture: false,
+            auto_redact: true,
+            default_project: "test".to_string(),
+            session_id: "test-session".to_string(),
+            dedup_window_sec: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_hybrid_recall_returns_none_without_an_embedder() {
+        let path = temp_store_path("no-embedder");
+        let mut cfg = rtrt_core::Config::default();
+        cfg.embeddings.enabled = true;
+        let state = test_state(path.clone(), cfg, None);
+
+        // No embedder attached at startup -> None immediately, regardless of
+        // config or store state (zero Ollama traffic for the BM25-only user).
+        assert!(state.try_hybrid_recall("p", "rust", 5).await.is_none());
+        cleanup_store(&path);
+    }
+
+    #[tokio::test]
+    async fn try_hybrid_recall_falls_back_when_coverage_is_too_low() {
+        let path = temp_store_path("low-coverage");
+        let mut cfg = rtrt_core::Config::default();
+        cfg.embeddings.enabled = true;
+        let state = test_state(path.clone(), cfg, Some(Arc::new(MockEmbedder)));
+
+        {
+            let store = state.memory.lock().await;
+            store.save("p", "note", "rust cargo workspace").unwrap();
+            store.save("p", "note", "python pip dependencies").unwrap();
+            // 0 of 2 rows embedded: below the 50% coverage floor.
+        }
+
+        assert!(state.try_hybrid_recall("p", "rust", 5).await.is_none());
+        cleanup_store(&path);
+    }
+
+    #[tokio::test]
+    async fn try_hybrid_recall_returns_hits_once_gates_pass() {
+        let path = temp_store_path("ready");
+        let mut cfg = rtrt_core::Config::default();
+        cfg.embeddings.enabled = true;
+        let state = test_state(path.clone(), cfg, Some(Arc::new(MockEmbedder)));
+
+        {
+            let store = state.memory.lock().await;
+            let a = store.save("p", "note", "rust cargo workspace").unwrap();
+            store.save("p", "note", "python pip dependencies").unwrap();
+            // Embed exactly half (1/2): embedded*2 >= total -> ready.
+            store
+                .store_embedding(a, MockEmbedder.model_name(), &[3.0, 1.0])
+                .unwrap();
+        }
+
+        let hits = state
+            .try_hybrid_recall("p", "rust", 5)
+            .await
+            .expect("gates should pass and hybrid recall should succeed");
+        assert!(!hits.is_empty());
+        assert!(hits.iter().any(|h| h.body.contains("rust")), "{hits:?}");
+        cleanup_store(&path);
+    }
+
+    #[tokio::test]
+    async fn memory_save_triggers_opportunistic_sweep_only_with_an_embedder() {
+        let path = temp_store_path("sweep");
+        let cfg = rtrt_core::Config::default();
+        let state = test_state(path.clone(), cfg, Some(Arc::new(MockEmbedder)));
+
+        {
+            let store = state.memory.lock().await;
+            store.save("p", "note", "alpha").unwrap();
+            store.save("p", "note", "beta").unwrap();
+        }
+        assert_eq!(
+            state.memory.lock().await.unembedded_count().unwrap(),
+            2,
+            "nothing embedded yet"
+        );
+
+        state.spawn_opportunistic_embed_sweep();
+        // The sweep runs on a detached blocking task; give it a moment to
+        // finish rather than asserting on an unpredictable race.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let remaining = state.memory.lock().await.unembedded_count().unwrap();
+        // Backlog of 2 -> batch size sqrt(2).ceil() == 2, so the sweep should
+        // have cleared the whole backlog in one hop.
+        assert_eq!(remaining, 0);
+        cleanup_store(&path);
     }
 }

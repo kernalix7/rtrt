@@ -9,17 +9,82 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Highlights — dashboard URL routing / deep-linking
+
+**Every dashboard page is now a real URL.**
+
+- History-API routing: each page (and subtab) maps to a path, so refresh, back/forward, and deep links land on the right view; unknown paths fall back to the SPA shell (#56).
+- The Memory page's double navigation (sidebar entry + in-page subtabs) is reconciled into a single navigation model (#55).
+
+### Highlights — usage-aware provider routing: ledger → headroom → failover
+
+**The router now knows how much each provider has been used and how much quota is left, prefers targets with headroom, and falls over automatically when a target is exhausted or erroring.**
+
+- **Provider usage ledger** (#52): every provider invocation appends `epoch_ts / target / model / input_tokens / output_tokens / est / ok` to `~/.rtrt/provider-usage.tsv` (`RTRT_PROVIDER_USAGE_PATH` override; capped at the most-recent 5000 rows; writes are best-effort and never fail the call). CLI shell-outs report no real usage, so their token counts are ~chars/4 estimates and stay marked `est` end to end.
+- Rolling **5h / 24h / 7d windows** per target; new `rtrt usage` prints the per-target table (estimated rows marked `~`). Headroom = 24h usage against the `[limits.<target>] daily_tokens / daily_requests` caps in `~/.rtrt/config.toml`; targets without a `[limits]` entry report no cap — never a fabricated ceiling.
+- **Headroom-weighted selection** (#53): within the local-free → subscription-flat → API-metered cost ordering, a candidate whose scarcest dimension is under ~15% remaining is penalized inside its cost tier, and a fully exhausted target sinks to last resort regardless of tier; ties break toward the roomiest target. `rtrt route --explain` shows the decision, ranked alternatives, and the headroom that drove it.
+- **Automatic failover** (#53): `rtrt route --failover` / `rtrt call --failover` walk the ranked candidate list, falling over on retryable failures (rate-limit / quota / 429 / 5xx / timeout) and stopping on terminal errors; the result summarises which targets fell over and why.
+- **Dashboard gauges + routing preview** (#54): `GET /api/usage` (windowed usage + headroom per target) and `GET /api/route/preview` (the load-balancing decision for the *next* request, no prompt needed) power usage/headroom gauges and a routing preview on the Tools side.
+
+### Highlights — two-tier config: global base kernel + per-project overrides
+
+**One global base (hooks / MCP / statusline wiring in `~/.rtrt/config.toml`, managed by `rtrt setup`) plus a thin per-project customization file. Effective config = global ⊕ project.**
+
+- `ProjectConfig` at `<repo>/.rtrt/config.toml` (#34, #44): optional overrides for output level (`off`/`lite`/`full`/`ultra`), compression, per-project agent and provider enablement, and the statusline. Absent fields inherit the global value; an all-default override file is deleted so the repo stays clean. `Config::load_effective(repo)` layers the overlay onto the global base.
+- Dashboard: every per-project settings surface gained a **Follow global / Custom** scope toggle — statusline (#42), Output Optimizer level (#43), providers / compression / agents (#45).
+- `rtrt migrate` (dry-run by default; `--apply` to write) migrates an existing repo to the rtrt project standard; `rtrt project refresh` is the one-command alias (render the project contract → activate canonical settings → audit whole-project consistency). Both detect and strip project-level rtrt-owned key shadows — e.g. a project `.claude/settings.json` re-declaring `statusLine` — with a `.bak` backup, so projects defer to the global base kernel (#34).
+- `rtrt project status / health / repair` inspect and repair the standardization contract; team agents install alongside (#32).
+
+### Highlights — per-pillar statusline savings model
+
+**Line 3 of the rich statusline reports per-project savings per pillar, each with an honest unit — never a blended or fabricated percentage.**
+
+- `📝opt:<level>` — Output Optimizer shown as its active terse level (prompt-injection has no before/after to measure, so no percent); `🧠mem:X%` — Memory storage reduction (original vs stored body; internal efficiency, its own pillar); `⚡cmd:Y%` — Command Optimizer EFFECTIVE reduction over runs that actually filtered (passthroughs excluded so they don't dilute); `💯Σ:Z%` — agent-token savings: tokens kept out of the model context (command filtering + recall reuse; storage compression and terse mode excluded) (#37, #38, #39).
+- Statusline ctx% corrected and rate-limit windows now reflect the real 5h / weekly windows (#36); labels are rtrt-native (#41); per-project statusline inherit/override, following global by default (#42).
+
+### Highlights — dashboard restructure (Project / Tools)
+
+- Top bar split into **Project / Tools** modes (#51); Overview / Environment / Route pages restructured around the data model (#49); Overview Σ now uses the agent-token model instead of the blended total (#50).
+- All remaining config became editable in the web UI (#48).
+- Frontend modularized into an HTML shell + `styles.css` + classic-JS modules (#46); backend `main.rs` split into a state / routes / handlers module tree (#47); UI overhauled around a function-grouped IA with unified pages (#40); dashboard v2: 6-section IA, time windows, effective% / coverage, accurate Output Optimizer reporting (#28, #29).
+
+### Highlights — orchestrator: detect → invoke → route
+
+- `rtrt detect` scans the environment for local AI CLIs / APIs / servers and reports what is available, with per-tool opt-in/out surfaced in the dashboard Environment tab (#19, #22).
+- `rtrt call <target>` cross-tool invoke bridge: run any detected agent or provider through one prompt interface with `--mode` cli / api / auto selection; also exposed as the MCP `agent_call` tool (#21, #24).
+- `rtrt route` cost-aware route selection: pick the cheapest useful target (local-free → subscription → API-metered) for a capability, with `--explain` / `--dry-run`; MCP `agent_route` tool; Orchestration view in the dashboard (#23, #24, #26).
+- Rich customizable statusline `rtrt statusline --rich` (model / ctx% / rate-limit windows / per-project savings), customizable from the web UI (#25, #27).
+
+### Highlights — templates, project lifecycle, standardization
+
+- Visual template editor + custom-template CRUD in the dashboard (#30); Template page overhaul — grouped library + polished editor (#33).
+- New standardization template + `rtrt init` project bootstrap (#31); `rtrt project` lifecycle (status / health / repair) + team agents (#32).
+
+### Highlights — Output Optimizer + Command Optimizer
+
+- **Output Optimizer** (#10): compression as a persistent terse mode with a level (`off` / `lite` / `full` / `ultra`) instead of one-off compress calls; multilingual rules + auxiliary skills (#12); compressed-output crew subagents (#13); skills/agents load from user-level dirs with per-agent terse rules (#14); level toggle in the web UI (#15).
+- **Command Optimizer** (#17): broad command-output filters (git / cargo / filesystem / search / HTTP / GitHub / containers / Kubernetes / Python / Go / Node / TypeScript / linters); `rtrt proxy-run <cmd>` executes a command and filters its output while preserving the exit code; transparent Claude Code `PreToolUse` hook (`rtrt hook proxy-rewrite`) rewrites shrinkable commands automatically; `rtrt gain` savings analytics from `~/.rtrt/proxy-stats.sqlite` (#20); `rtrt discover` scans Claude Code transcripts for shrinkable commands.
+- Real-time per-project token savings across all three optimizers in the dashboard (#18); percent-reduction headline + Environment tab (#22).
+- rtrt rebranded as **Retort** — "distills AI agent context" (#16).
+
+### Fixed — since the June sweep
+
+- Memory captures are attributed by git repo root, not cwd basename (#9).
+- Dashboard: user-facing third-party agent names dropped from the statusline; defaults synced to agents (#41); Output Optimizer led by its level, not a misleading % (#28).
+- CI: clippy 1.96 `sort_by_key` + Windows unused-path fixes (#35).
+- Release pipeline: the crates.io publish loop in `release.yml` now covers all 11 workspace crates in dependency order and fails loudly on a real publish error (previously 9 crates were listed — omitting `rtrt-security` / `rtrt-eval` — and every failure was swallowed); an idempotent already-published skip is kept. `coverage.yml` enforces a line-coverage floor (`--fail-under-lines 35`); `cargo audit` in CI is blocking.
+
 ### Highlights — interactive memory graph (no-LLM similarity by default)
 
 **The memory graph goes from scattered dots to an explorable map. The default mode needs no entity extraction and no generative LLM.**
 
-- **Similarity mode (default)**: `graph_similarity` links each memory to its most-similar peers with weighted edges — cosine over already-stored embeddings (no inference call) or, when none exist, BM25 lexical overlap via FTS5 (fully model-free). `GET /api/memory/graph` returns `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. The UI defaults to this — the graph populates immediately, no 추출 step.
+- **Similarity mode (default)**: `graph_similarity` links each memory to its most-similar peers with weighted edges — cosine over already-stored embeddings (no inference call) or, when none exist, BM25 lexical overlap via FTS5 (fully model-free). `GET /api/memory/graph` returns `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. The UI defaults to this — the graph populates immediately, no extraction step.
 - **Entity mode (opt-in, `mode=entity`)**: the bipartite memory↔entity graph (entities as first-class nodes), built by the LLM entity-extraction pass for users who want concept-level structure.
-- UI: a 유사도/엔티티 mode toggle; similarity edges scaled by weight with a basis caption; the 엔티티 추출 button lives only in entity mode.
+- UI: a similarity / entity mode toggle; similarity edges scaled by weight with a basis caption; the entity-extraction button lives only in entity mode.
 
 - `rtrt-memory` schema v7 adds `entities(project, name)` + `memory_entities(memory_id, entity_id)` so extracted entities are first-class nodes (the old memory-to-memory `edges` path is kept, additive). New `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, and `graph_bipartite` (returns memory nodes, entity nodes with degree, and memory→entity links, with each memory's `source_kind`).
 - `GET /api/memory/graph` emits a bipartite `{nodes, edges}` (memory nodes `m<id>` with kind + source_kind, entity nodes `e<id>` with degree); `POST /api/memory/entities` now builds the bipartite graph.
-- UI: entities render as large green nodes (radius by degree), memories as small nodes (blue main / purple subagent); force-directed layout with node drag/pin, wheel zoom, and pan; clicking a node opens a detail panel and highlights its neighbors; 메모리/엔티티 + 메인/서브 filters and a search box; an empty graph shows a call-to-action to run 엔티티 추출.
+- UI: entities render as large green nodes (radius by degree), memories as small nodes (blue main / purple subagent); force-directed layout with node drag/pin, wheel zoom, and pan; clicking a node opens a detail panel and highlights its neighbors; memory/entity + main/subagent filters and a search box; an empty graph shows a call-to-action to run entity extraction.
 
 ### Highlights — capture teammate/subagent work, grouped under the parent project
 
@@ -29,7 +94,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Subagent rows are attributed to the **parent session's project**, resolved from the parent transcript's cwd — stable even when the subagent ran in a git worktree (whose own cwd basename is a branch name like `p18-gap`, not the repo). Each row is tagged `source_kind = main | subagent`.
 - `rtrt-memory`: `reattribute(id, source_kind, project?)` (one `json_set` UPDATE) + `reattribution_candidates()`; a boot-time migration folds pre-existing stray subagent/worktree buckets under their parent and classifies main/subagent (idempotent).
 - `/api/projects` hides stray buckets (`agent-*` / `p<n>-*` / hex session hashes) from the project selector (registered projects always show); the selector dropped from 105 to the real project set.
-- Timeline API exposes `source_kind`; the memory page shows 🧠 메인 / 🤖 서브 badges and a 전체 / 메인 / 서브 filter.
+- Timeline API exposes `source_kind`; the memory page shows 🧠 main / 🤖 subagent badges and an all / main / subagent filter.
 
 ### Highlights — project-centric dashboard + per-project security
 
@@ -37,8 +102,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - New project registry in `rtrt-core`: `ProjectEntry { name, path, security_profile }` + `Config.projects` with `project()` / `upsert_project()` helpers. Persisted to `~/.rtrt/config.toml` as `[[projects]]`.
 - Dashboard API: `GET /api/projects` (config registry unioned with memory buckets → name / path / bound profile / mem_count), `PUT /api/projects` (upsert + config write-back), `POST /api/security/profile` (validate + save a custom profile to `~/.rtrt/security/profiles/`).
-- UI: a global project selector in the sidebar (remembered via localStorage) with an add/edit-project modal; the nav is split into a **프로젝트** scope group (개요 / 메모리 / 보안 / 코드맵 / 진단) and a **도구** group (압축 / 로컬 LLM / 프롬프트 / 템플릿 / 연결 / 설정). Scope pages read one `currentProject()` instead of each carrying its own project picker.
-- Security page is project-aware: it scans the selected project's path, defaults to that project's bound profile, an "이 프로젝트에 적용" control binds a profile to the project, and a "프로파일 설정" subtab lists / views (rules + standards) / clones / saves profiles.
+- UI: a global project selector in the sidebar (remembered via localStorage) with an add/edit-project modal; the nav is split into a **Project** scope group (Overview / Memory / Security / Code Map / Diagnose) and a **Tools** group (Compress / Local LLM / Prompts / Templates / Connections / Settings). Scope pages read one `currentProject()` instead of each carrying its own project picker.
+- Security page is project-aware: it scans the selected project's path, defaults to that project's bound profile, an "Apply to this project" control binds a profile to the project, and a "Profile settings" subtab lists / views (rules + standards) / clones / saves profiles.
 
 ### Highlights — security & license profiles for AI-generated artifacts
 
@@ -47,7 +112,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Five scan engines: `secrets` (builtin pattern set + Shannon-entropy gate + redacted excerpts), `licenses` (SPDX manifest policy, allow/forbid lists, optional header check, workspace-inheritance aware), `deps` (Cargo.lock / package-lock hygiene — git/wildcard/yanked — plus optional offline RustSec advisory match), `patterns` (regex source scanner with lang + path filters), and `ai` (AI-artifact-specific: hallucinated-import / slopsquatting, base64-blob, eval-usage, todo-secret, unsafe-block — each source file judged against its nearest crate manifest so monorepo members don't false-positive).
 - Six built-in profiles: `ai-default` (recommended baseline, 10 rules), `ai-strict` (16), `owasp-top-10` (15), `asvs-l2` (13), `cis-baseline` (13), `nist-ssdf` (12). Declarative TOML — users drop their own under `~/.rtrt/security/profiles/` to override built-ins or add new ones. Every rule carries a `standards` mapping so findings cite the control they enforce.
 - CLI: `rtrt security scan --profile <name> [--path] [--json]`, `profile list`, `profile show <name>`, `gate` (non-zero exit at/above the profile threshold — CI gate), `init` (copy built-ins to the user dir for customizing).
-- Dashboard: a 보안 page (profile picker, scan, severity-grouped findings with standards chips, engines run/skipped) backed by `GET /api/security/profiles`, `GET /api/security/profile/{name}`, `POST /api/security/scan`.
+- Dashboard: a Security page (profile picker, scan, severity-grouped findings with standards chips, engines run/skipped) backed by `GET /api/security/profiles`, `GET /api/security/profile/{name}`, `POST /api/security/scan`.
 - MCP: `security_scan(profile, path?)` returns the full ScanReport so an agent can self-check its own output before committing.
 
 ### Highlights — dashboard auto-starts as a background service
@@ -63,7 +128,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 **The dashboard now reports compression savings as a percentage everywhere, and a new page manages local Ollama models end to end.**
 
 - Every compression surface returns `saved_pct` (1-decimal): `POST /api/compress`, `POST /api/proxy`, `POST /api/memory/compress`, plus `GET /api/memory/stats` (`saved_pct` aggregate over compressed rows) and the timeline rows (per-row `saved_pct`, null when uncompressed). The UI shows the percentage on the compress/proxy result, a stats KPI tile, and per-row badges.
-- New **로컬 LLM** dashboard page backed by `GET /api/ollama/models`, `GET /api/ollama/ps`, `POST /api/ollama/pull`, and `DELETE /api/ollama/models`: list installed models with size, see currently-loaded models, pull a new model (blocking), delete a model (with confirm), and set any model as the compression or embedding default in one click. Ollama base URL resolves from config (`embeddings` → `auto_compress` → localhost, trailing `/v1` stripped).
+- New **Local LLM** dashboard page backed by `GET /api/ollama/models`, `GET /api/ollama/ps`, `POST /api/ollama/pull`, and `DELETE /api/ollama/models`: list installed models with size, see currently-loaded models, pull a new model (blocking), delete a model (with confirm), and set any model as the compression or embedding default in one click. Ollama base URL resolves from config (`embeddings` → `auto_compress` → localhost, trailing `/v1` stripped).
 
 ### Highlights — dense-vector semantic recall, entity linking, SessionStart injection
 
@@ -164,7 +229,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - `rtrt-compress` `criterion` benchmark harness — the README's compression-savings claim is now testable. New `Extreme` level. Rule pack extended with hedging (`I think`, `perhaps`, …), discourse markers (`moreover`, `however`, …), meta-phrases (`it is important to note that`, …), and verbose-qualifier removal at the extreme level. `secrets::redact_secrets` pre-pass scrubs AWS / GitHub / OpenAI / Anthropic / Slack / Bearer / `api_key=…` / PEM private-key blocks before any rule fires. `LlmCompressor` (behind `llm-compress` feature) routes through any provider — Anthropic, OpenAI, or local Ollama — for caveman-class 50–75% savings. Tree-sitter signature extractor for Rust under the `treesitter` feature; 78% byte reduction measured on a real `rtrt-providers` source file. (inspired by [caveman](https://github.com/JuliusBrussee/caveman), [repomix](https://github.com/yamadashy/repomix), [aider](https://github.com/Aider-AI/aider))
 - `rtrt-templates` switches `{{var}}` substitution to `handlebars` so templates can use conditionals (`{{#if foo}}…{{/if}}`) and loops (`{{#each items}}…{{/each}}`) on top of the existing variable pass. New `prompts` module + `PromptRegistry` stores versioned prompts under `<root>/<name>/<NNNN>.toml`; CLI surfaces it as `rtrt prompt {save,get,list,versions}`. (inspired by [code2prompt](https://github.com/mufeedvh/code2prompt), [langfuse](https://github.com/langfuse/langfuse))
 - `rtrt-cli` gains `rtrt discover`, `rtrt repo-map`, `rtrt signatures`, `rtrt setup`, `rtrt docs`, `rtrt prompt`. `discover` scans `~/.zsh_history` / `~/.bash_history` for commands that match a `rtrt_proxy` filter and reports top-N matches. `repo-map` walks a directory and emits a compressed tree-sitter signature map sorted by signature size. `setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf with a `.bak` safety net. (inspired by [rtk](https://github.com/rtk-ai/rtk), [aider](https://github.com/Aider-AI/aider))
-- `install.sh` + `install.ps1` one-liners wired to GitHub Releases with SHA256 verification; `release.yml` builds 5 targets (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), attaches them to the GitHub Release, and publishes all 9 crates to crates.io on a `REL-vX.Y.Z` marker tag.
+- `install.sh` + `install.ps1` one-liners wired to GitHub Releases with SHA256 verification; `release.yml` builds 5 targets (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), attaches them to the GitHub Release, and publishes every workspace crate to crates.io on a `REL-vX.Y.Z` marker tag.
 - `cargo-deny` license + advisory + bans + sources gate, blocking on PRs to `main` and on a weekly cron.
 - New [`docs/INSPIRATION.md`](docs/INSPIRATION.md) — 50+ borrow ideas from 18 reference projects mapped to specific RTRT crates with priority.
 

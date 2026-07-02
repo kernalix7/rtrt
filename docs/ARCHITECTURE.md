@@ -15,13 +15,16 @@
 |                                rtrt-core                                   |
 |     plugin trait · config · errors · token accounting · telemetry          |
 +----------------------------------------------------------------------------+
-   |              |               |                |                 |
-   v              v               v                v                 v
-+--------+   +---------+    +----------+    +-------------+    +---------+
-| rtrt-  |   | rtrt-   |    | rtrt-    |    | rtrt-       |    | rtrt-   |
-| compr. |   | proxy   |    | memory   |    | providers   |    | templ.  |
-+--------+   +---------+    +----------+    +-------------+    +---------+
+   |           |           |            |              |           |
+   v           v           v            v              v           v
++--------+ +--------+ +----------+ +------------+ +----------+ +----------+
+| rtrt-  | | rtrt-  | | rtrt-    | | rtrt-      | | rtrt-    | | rtrt-    |
+| compr. | | proxy  | | memory   | | providers  | | templ.   | | security |
++--------+ +--------+ +----------+ +------------+ +----------+ +----------+
 ```
+
+`rtrt-eval` (opt-in evaluation harness, own `rtrt-eval` binary) sits beside the
+library crates and consumes `rtrt-core` + `rtrt-compress` + `rtrt-memory`.
 
 ## Crate boundaries
 
@@ -33,9 +36,11 @@
 | `rtrt-memory` | `MemoryStore` (`open`, `open_in_memory`, `save`, `save_embedded`, `recall_bm25`, `recall_vector`, `recall_hybrid`, `list_by_project`, `delete`, `extract_and_save`, `compress_project`), `Embedder` trait (+ `FastEmbedder` under `embeddings`), `Summariser` trait (+ `LlmSummariser` under `llm`), `MemoryRecord`, `ScoredRecord` | `rtrt-core`, `rusqlite` (bundled), `serde`, `serde_json`, `tokio`, `tracing`; optional: `fastembed` (`embeddings`), `rtrt-providers` (`llm`) |
 | `rtrt-providers` | `Provider`, `ChatMessage`, `ChatRequest`, `ChatResponse`, `Role`, `AnthropicProvider`, `OpenAIProvider`, `OpenAICompatibleProvider` | `rtrt-core`, `reqwest`, `serde`, `serde_json`, `tokio`, `async-trait`, `tracing` |
 | `rtrt-templates` | `Template`, `TemplateFile`, `TemplateVariable`, `RenderPlan`, `RenderedFile`, `builtin::ALL`, `custom::scan_default_dir`, `render::plan`, `render::write`, `list_all`, `find` | `rtrt-core`, `toml`, `walkdir`, `dirs`, `once_cell`, `serde`, `serde_json` |
-| `rtrt-mcp` | bin `rtrt-mcp` | `rtrt-core`, `rtrt-compress`, `rtrt-memory`, `rtrt-providers`, `tokio`, `tracing-subscriber` |
-| `rtrt-dashboard` | bin `rtrt-dashboard` | `rtrt-core`, `rtrt-templates`, `axum`, `tower`, `tower-http`, `tokio`, `tracing-subscriber` |
-| `rtrt-cli` | bin `rtrt` | every other crate, `clap`, `tokio`, `tracing-subscriber` |
+| `rtrt-security` | `Profile`, `Rule`, `Finding`, `ScanReport`, `Severity`, `Standards`, `Engine` trait, `run`, `BUILTIN_PROFILES`, `list_profiles`, `load_profile` | `rtrt-core`, `regex`, `walkdir`, `toml`, `dirs`, `once_cell` |
+| `rtrt-eval` | bin `rtrt-eval` + `evaluate_recall`, `evaluate_compression`, fixture loaders (opt-in `bertscore` feature) | `rtrt-core`, `rtrt-compress`, `rtrt-memory` |
+| `rtrt-mcp` | bin `rtrt-mcp` | `rtrt-core`, `rtrt-compress`, `rtrt-memory`, `rtrt-proxy`, `rtrt-providers`, `rtrt-templates`, `rtrt-security`, `tokio`, `tracing-subscriber` |
+| `rtrt-dashboard` | bin `rtrt-dashboard` | `rtrt-core`, `rtrt-compress`, `rtrt-memory`, `rtrt-proxy`, `rtrt-providers`, `rtrt-templates`, `rtrt-security`, `axum`, `tower`, `tower-http`, `tokio`, `tracing-subscriber` |
+| `rtrt-cli` | bin `rtrt` | every other library crate (incl. `rtrt-security`), `clap`, `tokio`, `tracing-subscriber` |
 
 ## Source tree
 
@@ -91,6 +96,14 @@
 │   │       ├── builtin.rs
 │   │       ├── custom.rs
 │   │       └── render.rs
+│   ├── rtrt-security/
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── profile.rs            # declarative TOML profiles + built-ins
+│   │       ├── finding.rs            # Finding / ScanReport / Severity / Standards
+│   │       ├── runner.rs
+│   │       └── engines/              # secrets, licenses, deps, patterns, ai
+│   ├── rtrt-eval/src/                # opt-in eval harness (lib + bin)
 │   ├── rtrt-mcp/src/main.rs
 │   ├── rtrt-dashboard/src/main.rs
 │   └── rtrt-cli/src/main.rs

@@ -10,6 +10,9 @@
 - ML 압축: `rtrt compress --ml --ratio 0.4`
 - LLM 압축: `rtrt compress --llm --provider openai-compat --model llama3.2`
 - 메모리 리콜: `rtrt memory recall --project rtrt --query auth --filter "source=claude"`
+- 비용 인지 라우팅: `rtrt route --explain "prompt"` / 사용량·헤드룸: `rtrt usage`
+- 보안 스캔: `rtrt security scan --profile ai-default`
+- 프로젝트 표준화: `rtrt migrate --apply` / `rtrt project refresh --apply`
 - MCP HTTP: `rtrt mcp --transport http --http-token "$TOKEN"`
 - 벤치: `rtrt benchmark`
 
@@ -131,6 +134,70 @@ rtrt discover --project rtrt
 rtrt discover --all --since 2026-06-01
 rtrt discover --format json
 ```
+
+### `rtrt route`
+
+프롬프트에 가장 저렴하면서 쓸모 있는 라우트를 고르고(옵션으로 호출까지). 랭킹은 비용 계층 우선(로컬-무료 → 구독-정액 → API-종량), 계층 내부는 헤드룸 가중: `[limits]` 잔여 헤드룸이 ~15% 미만인 후보는 감점, 소진된 타깃은 최후 폴백으로 강등됩니다.
+
+```bash
+rtrt route --dry-run "summarise this diff"          # 호출 없이 결정만
+rtrt route --explain "summarise this diff"          # 결정 + 랭크된 대안 + 헤드룸
+rtrt route --prefer local "quick sanity check"      # --prefer cheapest|quality|local
+rtrt route --failover "must succeed"                # 재시도 가능 오류 시 랭크 순회
+rtrt route --target ollama --model llama3.2 "hi"    # 명시적 타깃 지정
+```
+
+### `rtrt call`
+
+크로스-툴 브리지로 감지된 로컬 에이전트/프로바이더를 호출합니다.
+
+```bash
+rtrt call claude "explain this error"               # 타깃은 `rtrt detect` 결과
+rtrt call ollama --model llama3.2 "ping"
+rtrt call codex --mode cli --timeout 60 "review"    # --mode auto|cli|api
+rtrt call claude --failover "must succeed"          # 다음 랭크 타깃으로 페일오버
+rtrt call claude --format json "ping"
+```
+
+`--failover`는 재시도 가능 실패(rate-limit / quota / 429 / 5xx / 타임아웃)에서 다음 랭크 타깃으로 넘어갑니다.
+
+### `rtrt usage`
+
+타깃별 윈도우 사용량(5h / 24h / 7d)과 `[limits]` 일일 상한 대비 잔여 헤드룸을 표시합니다([설정 파일](#설정-파일) 참고). 추정 토큰 수(CLI 셸-아웃, ~chars/4) 행은 `~`로 표시됩니다.
+
+```bash
+rtrt usage
+rtrt usage --format json
+```
+
+원장은 `~/.rtrt/provider-usage.tsv`(경로 재정의: `RTRT_PROVIDER_USAGE_PATH`), 최근 5000행 상한.
+
+### `rtrt security`
+
+프로파일 기반 보안 + 라이선스 스캔(secrets / licenses / deps / patterns / AI-artifact 엔진). 엔진 · 프로파일 상세는 [FEATURES.ko.md](FEATURES.ko.md#보안--라이선스-스캔) 참고.
+
+```bash
+rtrt security scan --profile ai-default --path . --json
+rtrt security profile list
+rtrt security profile show owasp-top-10
+rtrt security gate --profile ai-default    # CI 게이트: 임계 이상이면 non-zero 종료
+rtrt security init                         # 빌트인 프로파일을 ~/.rtrt/security/profiles/로 복사
+```
+
+### `rtrt migrate` / `rtrt project`
+
+기존 저장소를 rtrt 프로젝트 표준으로 이관하고 일관성을 유지합니다. `migrate`와 `project refresh`는 기본 dry-run — `--apply`로 실제 기록합니다.
+
+```bash
+rtrt migrate                        # 계획만 (dry-run)
+rtrt migrate --apply                # 이관 적용
+rtrt project refresh --apply        # 원커맨드 별칭: 컨트랙트 렌더 → 표준 설정 → 감사
+rtrt project status                 # 컨트랙트 · 에이전트 · 훅 · 스테이터스라인 · 메모리 연결 상태
+rtrt project health                 # status + 더 깊은 라이프사이클 일관성 검사
+rtrt project repair --dry-run       # 누락된 관리 섹션 추가 / 누락 에이전트 설치
+```
+
+`migrate` / `project refresh`는 프로젝트 레벨의 rtrt 소유 키 섀도(예: 프로젝트 `.claude/settings.json`의 `statusLine` 재선언)를 `.bak` 백업과 함께 제거해 프로젝트가 글로벌 베이스 커널을 따르게 합니다.
 
 ### `rtrt templates`
 
@@ -322,4 +389,22 @@ cargo run --release -p rtrt-eval --features bertscore -- bertscore \
 
 ## 설정 파일
 
-예정(`~/.rtrt/config.toml`). 스키마는 `crates/rtrt-core/src/config.rs`에 있으며 현재는 `Config::default()`만 동작합니다.
+설정은 2단 구조입니다:
+
+1. **글로벌** — `~/.rtrt/config.toml`(경로 재정의: `RTRT_CONFIG`). `rtrt config init`으로 생성, `rtrt config path`로 경로 확인. 베이스 커널(훅 · MCP 배선 · 스테이터스라인 커맨드 바인딩)이 여기 있으며 `rtrt setup`이 관리합니다.
+2. **프로젝트별** — `<repo>/.rtrt/config.toml`. 오버라이드 전용: 출력 레벨(`off` / `lite` / `full` / `ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인. 비어 있는 필드는 글로벌 값을 상속; 유효 설정 = 글로벌 ⊕ 프로젝트. 모든 오버라이드가 "글로벌 따름"으로 돌아가면 파일을 삭제해 저장소를 깨끗하게 유지합니다. 대시보드의 **글로벌 따름 / 커스텀** 스코프 토글이 이 층을 편집합니다.
+
+주요 글로벌 섹션 예:
+
+```toml
+# 라우팅 타깃별 옵션 일일 상한 — `rtrt usage` 헤드룸과 라우터의
+# 헤드룸 가중 선택에 사용. 항목이 없는 타깃은 상한 없음(지어내지 않음).
+[limits.openai]
+daily_tokens = 1_000_000
+daily_requests = 2_000
+
+[limits.ollama]
+daily_tokens = 250_000
+```
+
+전체 스키마는 `crates/rtrt-core/src/config.rs` 참고(`[compression]`, `[memory]`, `[dashboard]`, `[providers]`, `[agents]`, `[capture]`, `[auto_compress]`, `[embeddings]`, `[security]`, `[limits]`, `[[projects]]`).

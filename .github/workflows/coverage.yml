@@ -27,9 +27,14 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install --locked cargo-llvm-cov
       - name: Run coverage (default features)
+        # --fail-under-lines enforces a regression floor. Measured line
+        # coverage was ~38% when the floor was introduced; keep the floor a
+        # few points below the last measured value and ratchet it up as
+        # coverage improves — never down.
         run: |
           cargo llvm-cov --workspace \
             --lcov --output-path lcov.info \
+            --fail-under-lines 35 \
             --ignore-filename-regex '(benches|tests|examples)/'
       - name: Summary
         run: cargo llvm-cov report

@@ -235,7 +235,88 @@ pub trait Provider: Send + Sync {
 - `OpenAIProvider` — 기본 URL `https://api.openai.com/v1`. 모델: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`.
 - `OpenAICompatibleProvider` — 사용자 지정 베이스 URL. Ollama, llama.cpp, vLLM, LM Studio 등 OpenAI 호환 엔드포인트 대상.
 
-v0.1.0의 `chat` 구현은 모두 `Error::Provider("... not implemented yet")`을 반환합니다. 실제 채팅 라우팅은 로드맵 항목입니다.
+`chat` / `chat_stream`은 세 어댑터 모두 실제 HTTP API로 구현되어 있으며, `Gateway`가 요청별 메트릭 · 옵션 예산 캡 · 응답 캐시 · 재시도/폴백을 얹어 모든 프로바이더를 감쌉니다.
+
+### 사용량 원장 + 윈도우 헤드룸 (`rtrt usage`)
+
+모든 프로바이더 호출은 로컬 사용량 원장 `~/.rtrt/provider-usage.tsv`에 한 줄씩 기록됩니다(`RTRT_PROVIDER_USAGE_PATH`로 경로 재정의):
+
+```text
+epoch_ts \t target \t model \t input_tokens \t output_tokens \t est \t ok
+```
+
+- 파일은 최근 5000행으로 상한; 기록은 best-effort라 호출을 실패시키지 않습니다.
+- CLI 셸-아웃은 텍스트만 반환하므로 토큰 수는 추정치(~chars/4)이며 끝까지 `est`로 표시 — 추정 행은 `~`로 렌더링됩니다.
+- 사용량은 타깃별 롤링 **5h / 24h / 7d** 윈도우로 집계; `rtrt usage`가 표를 출력합니다(`--format json` 지원).
+- **헤드룸**은 24h 윈도우를 `~/.rtrt/config.toml`의 옵션 일일 상한과 비교합니다:
+
+```toml
+[limits.openai]
+daily_tokens = 1_000_000
+daily_requests = 2_000
+
+[limits.ollama]
+daily_tokens = 250_000
+```
+
+`[limits]` 항목이 없는 타깃은 상한 없음으로 보고 — RTRT는 상한을 지어내지 않습니다.
+
+### 헤드룸 가중 라우팅 + 자동 페일오버 (`rtrt route`)
+
+`rtrt route`는 프롬프트에 가장 저렴하면서 쓸모 있는 타깃을 고릅니다. 랭킹은 비용 계층 우선 — 로컬-무료 → 구독-정액 → API-종량 → 미상 — 그리고 계층 내부에서 헤드룸을 반영합니다:
+
+- 제한된 차원(토큰 또는 요청) 중 가장 빠듯한 쪽이 **~15% 미만** 남은 후보는 같은 비용 계층 안에서 감점.
+- 어느 한 차원이라도 완전히 **소진**(잔여 0)된 타깃은 계층과 무관하게 맨 밑으로 강등 — 최후의 폴백으로만 사용.
+- 동률은 잔여 헤드룸 비율이 큰 타깃이 승리.
+
+`rtrt route --explain`은 결정 · 랭크된 대안 · 판단에 쓰인 사용량/헤드룸을 출력; `--dry-run`은 호출 없이 결정만 출력합니다.
+
+`--failover` 지정 시 `rtrt route`(그리고 `rtrt call --failover`)는 랭크된 후보 목록을 순회합니다: **재시도 가능** 실패(rate-limit / quota / 429 / 5xx / 타임아웃)는 다음 랭크 타깃으로 넘어가고, 종결성 오류는 순회를 멈추며, 결과에 어떤 타깃이 왜 넘어갔는지 요약이 담깁니다.
+
+대시보드는 `GET /api/usage`(타깃별 윈도우 사용량 + 헤드룸)와 `GET /api/route/preview`(프롬프트 없이 *다음* 요청의 로드밸런싱 결정)를 사용량/헤드룸 게이지와 라우팅 프리뷰(Tools 쪽)로 렌더링합니다.
+
+## 보안 & 라이선스 스캔
+
+`rtrt-security`는 AI 생성 산출물을 위한 프로파일 기반 스캐너로, OpenSCAP식 선언적 프로파일을 모델로 합니다. 스캔마다 다섯 엔진이 실행됩니다:
+
+| 엔진 | 검사 내용 |
+|------|-----------|
+| `secrets` | 빌트인 시크릿 패턴 + Shannon 엔트로피 게이트; 발췌는 마스킹 |
+| `licenses` | SPDX 매니페스트 정책(허용/금지 목록), 옵션 헤더 검사, 워크스페이스 상속 인지 |
+| `deps` | Cargo.lock / package-lock 위생(git / 와일드카드 / yanked) + 옵션 오프라인 RustSec advisory 매칭 |
+| `patterns` | 언어 + 경로 필터를 갖춘 정규식 소스 스캐너 |
+| `ai` | AI 산출물 특화: 환각-임포트 / slopsquatting, base64 블롭, eval 사용, TODO-시크릿, unsafe 블록 |
+
+빌트인 프로파일 6종(`ai-default`, `ai-strict`, `owasp-top-10`, `asvs-l2`, `cis-baseline`, `nist-ssdf`)은 모든 룰을 산업 표준(CWE / OWASP / NIST / CIS / SLSA / EU AI Act)에 매핑합니다. 프로파일은 선언적 TOML — `~/.rtrt/security/profiles/`에 직접 넣어 빌트인을 재정의하거나 추가할 수 있습니다.
+
+```bash
+rtrt security scan --profile ai-default [--path DIR] [--json]
+rtrt security profile list
+rtrt security profile show ai-strict
+rtrt security gate --profile ai-default        # 임계 이상이면 non-zero 종료 — CI 게이트
+rtrt security init                             # 빌트인을 ~/.rtrt/security/profiles/로 복사
+```
+
+같은 스캐너가 대시보드 보안 페이지(프로젝트 인지: 선택된 프로젝트 경로를 바인딩된 프로파일로 스캔)와 MCP `security_scan` 도구를 지탱합니다.
+
+## 2단 설정 & 프로젝트 라이프사이클
+
+설정은 두 층으로 나뉩니다:
+
+1. **글로벌 베이스 커널** — `~/.rtrt/config.toml` + 에이전트 배선(훅 / MCP / 스테이터스라인 커맨드 바인딩). `rtrt setup`이 관리하며 프로젝트가 재정의할 수 없습니다.
+2. **프로젝트별 오버라이드** — `<repo>/.rtrt/config.toml`(`ProjectConfig`): 출력 레벨(`off` / `lite` / `full` / `ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인 — 모두 옵션. 비어 있는 필드는 글로벌 값을 상속; 유효 설정 = 글로벌 ⊕ 프로젝트(`Config::load_effective`). 오버라이드가 전부 기본값이면 파일을 삭제해 저장소를 깨끗하게 유지합니다.
+
+대시보드는 프로젝트별 표면마다 **글로벌 따름 / 커스텀** 스코프 토글을 제공합니다.
+
+라이프사이클 명령:
+
+```bash
+rtrt migrate [--path DIR] [--apply]      # 기존 저장소를 rtrt 프로젝트 표준으로 이관 (기본 dry-run)
+rtrt project refresh [--apply]           # 원커맨드 별칭: 컨트랙트 렌더 → 표준 설정 활성화 → 일관성 감사
+rtrt project status | health | repair    # 표준화 컨트랙트 점검 / 검증 / 복구
+```
+
+`rtrt migrate` / `rtrt project refresh`는 프로젝트 레벨의 rtrt 소유 키 섀도(예: 프로젝트 `.claude/settings.json`이 `statusLine`을 재선언)를 감지해 `.bak` 백업과 함께 제거하고, 프로젝트가 글로벌 베이스 커널을 따르게 합니다.
 
 ## 프로젝트 스캐폴드
 
@@ -295,7 +376,7 @@ source = "src/main.rs.tmpl"
 
 ## MCP와 대시보드
 
-`rtrt-mcp`는 현재 스텁이며 예정 도구(`compress`, `memory.save`, `memory.recall`, `provider.chat`) 목록만 출력합니다. stdio 전송 계층은 로드맵.
+`rtrt-mcp`는 stdio + Streamable HTTP를 지원하는 실제 rmcp 기반 MCP 서버로, 메모리 / 압축 / 프록시 / 템플릿 / 프로바이더 / 보안 도구 표면을 노출합니다(전체 도구 표는 [USAGE.ko.md](USAGE.ko.md) 참고).
 
 `rtrt-dashboard`는 기본적으로 `127.0.0.1:7311`에 바인딩하는 axum 서버입니다.
 

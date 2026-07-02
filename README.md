@@ -120,6 +120,13 @@ rtrt prompt save greet "say hi" --meta env=dev
 rtrt prompt get greet
 rtrt docs facebook/react --topic hooks          # context7 library docs
 rtrt provider chat --model claude-haiku-4-5 "ping"
+rtrt detect                                     # scan for local AI CLIs / APIs / servers
+rtrt call ollama --model llama3.2 "ping"        # cross-tool invoke bridge (--failover available)
+rtrt route --explain "summarise this diff"      # cost + headroom-aware route pick
+rtrt usage                                      # windowed provider usage + [limits] headroom
+rtrt security scan --profile ai-default         # profile-driven security / license scan
+rtrt migrate --apply                            # migrate a repo to the rtrt project standard
+rtrt project refresh --apply                    # contract render + canonical settings + audit
 rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
 rtrt benchmark                                  # cargo bench wrapper
 rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 12 tools, bearer-token guard
@@ -170,8 +177,29 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 - OpenAI-compatible base URL covers Ollama, llama.cpp, vLLM, LM Studio
 - `Gateway` fronts every provider behind one entry; per-request `RequestMetric` (id / parent_id / cost / latency) feeds the dashboard `/api/metrics`
 - `Budget::new(usd)` fails-fast when the cumulative cost cap is hit
+- Usage ledger (`~/.rtrt/provider-usage.tsv`) with rolling 5h / 24h / 7d windows; `rtrt usage` shows headroom against `[limits]` daily caps
+- `rtrt route` picks the cheapest useful target (local-free → subscription → metered), headroom-weighted; `--failover` walks ranked candidates on rate-limit / quota / 429 / 5xx / timeout; dashboard gauges at `/api/usage` + `/api/route/preview`
 - `Context7Client` fetches version-pinned library docs (`rtrt docs facebook/react --topic hooks`)
 - [Details →](docs/FEATURES.md#multi-provider-routing)
+
+</td></tr>
+<tr><td width="50%">
+
+**Security & license scanning**
+- `rtrt-security`: profile-driven scanner for AI-generated artifacts — five engines (secrets / licenses / deps / patterns / ai)
+- Six built-in profiles (`ai-default`, `ai-strict`, `owasp-top-10`, `asvs-l2`, `cis-baseline`, `nist-ssdf`); every rule maps to CWE / OWASP / NIST / CIS / SLSA / EU AI Act
+- Custom profiles are plain TOML under `~/.rtrt/security/profiles/`
+- `rtrt security scan | profile | gate | init`; `gate` exits non-zero at/above the threshold (CI gate); also in the dashboard Security page and MCP `security_scan`
+- [Details →](docs/FEATURES.md#security--license-scanning)
+
+</td><td width="50%">
+
+**Two-tier config & project lifecycle**
+- Global base kernel (`~/.rtrt/config.toml`, hooks / MCP / statusline wiring via `rtrt setup`) + per-project overrides in `<repo>/.rtrt/config.toml`; effective config = global ⊕ project
+- Per-project overrides: output level, compression, agent / provider enablement, statusline — each behind a **Follow global / Custom** toggle in the dashboard
+- `rtrt migrate` / `rtrt project refresh` (dry-run by default, `--apply` to write) standardize a repo and strip rtrt-owned key shadows with a `.bak` backup
+- `rtrt project status / health / repair` keep the contract consistent
+- [Details →](docs/FEATURES.md#two-tier-configuration--project-lifecycle)
 
 </td></tr>
 <tr><td width="50%">
@@ -220,8 +248,10 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | `rtrt-compress` | Rule rewriter + secret redactor + tree-sitter signature extractor + LLM compression mode |
 | `rtrt-proxy` | Command-output filter (rtk-style) |
 | `rtrt-memory` | SQLite + FTS5 BM25 + vector + graph + HNSW + LLM-driven extract/compress |
-| `rtrt-providers` | Multi-provider chat trait + Gateway + Budget + Context7 doc fetcher |
+| `rtrt-providers` | Multi-provider chat trait + Gateway + Budget + usage ledger / headroom router + invoke bridge + Context7 doc fetcher |
 | `rtrt-templates` | Built-in + custom scaffolds + handlebars rendering + `PromptRegistry` |
+| `rtrt-security` | Profile-driven security & license scanning (secrets / licenses / deps / patterns / ai engines, standards-mapped profiles) |
+| `rtrt-eval` | Opt-in evaluation harness — recall R@K / MRR + compression ratio + BERTScore (feature-gated) |
 | `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 11 tools, bearer-token guard |
 | `rtrt-dashboard` | Axum web dashboard + REST API (`/api/{chat,metrics,templates,stats}`) |
 | `rtrt-cli` | `rtrt` command-line entry point |
@@ -239,7 +269,7 @@ CI runs the same three gates on every push and pull request to `main`.
 
 ## Roadmap
 
-- [x] Workspace scaffold (9 crates, edition 2024)
+- [x] Workspace scaffold (11 crates, edition 2024)
 - [x] `rtrt-compress` rule engine + extreme level + secret redactor + tree-sitter signatures + LLM mode
 - [x] `rtrt-proxy` filters for git + cargo
 - [x] `rtrt-memory` SQLite + FTS5 BM25 + dense-vector + RRF hybrid + edges graph + HNSW + memory tiers
@@ -255,6 +285,9 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] LLMLingua-style `MlCompressor` scaffold (heuristic backend; ONNX backend deferred)
 - [x] `recall_via_graph` driven by LLM entity extraction (mem0 entity linking)
 - [x] Helicone-style retry / fallback routing across providers
+- [x] Provider usage ledger + windowed headroom + headroom-weighted `rtrt route` with automatic failover (`rtrt usage` / `/api/usage` / `/api/route/preview`)
+- [x] `rtrt-security` profile-driven security & license scanning (5 engines, 6 standards-mapped profiles, CI `gate`)
+- [x] Two-tier config (global base kernel + per-project `.rtrt/config.toml` overrides) + `rtrt migrate` / `rtrt project refresh`
 - [x] `rtrt-eval` opt-in crate — `R@K` / `MRR` over a labelled fixture + `compress` ratio per level + JSON output
 - [x] LLM auto-compress background daemon (opt-in via `RTRT_AUTO_COMPRESS_LLM=1`)
 - [x] `scripts/smoke.sh` — live-key smoke harness, the pre-tag gate

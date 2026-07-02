@@ -86,6 +86,13 @@ rtrt prompt save greet "say hi"
 rtrt prompt get greet
 rtrt docs facebook/react --topic hooks
 rtrt provider chat --model claude-haiku-4-5 "ping"
+rtrt detect                                     # 로컬 AI CLI / API / 서버 감지
+rtrt call ollama --model llama3.2 "ping"        # 크로스-툴 호출 브리지 (--failover 지원)
+rtrt route --explain "summarise this diff"      # 비용 + 헤드룸 인지 라우트 선택
+rtrt usage                                      # 윈도우 사용량 + [limits] 헤드룸
+rtrt security scan --profile ai-default         # 프로파일 기반 보안 / 라이선스 스캔
+rtrt migrate --apply                            # 저장소를 rtrt 프로젝트 표준으로 이관
+rtrt project refresh --apply                    # 컨트랙트 렌더 + 표준 설정 + 감사
 rtrt-dashboard
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
 ```
@@ -96,7 +103,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 - **토큰 절감** — `lite` / `full` / `ultra` / `extreme` 룰 압축 + 코드 블록 보호 + 시크릿 자동 검열 + 토큰-중요도 ML 압축 (휴리스틱 스코어러, ONNX 백엔드 추후) + tree-sitter 시그니처 (Rust / Python / TypeScript) + `git` / `cargo` 명령 출력 필터.
 - **영구 프로젝트 메모리** — SQLite + FTS5 BM25 + 벡터 + 그래프 + HNSW + Reciprocal Rank Fusion 하이브리드 + qdrant 스타일 페이로드 필터 DSL + Letta 블록 (persona / human / context) + JSONL export/import. **자동 캡처가 기본**: `/api/*` 호출과 모든 Claude Code 훅(12종) 발화가 `redact_secrets` → SHA-256 dedup (5분 윈도우) → save → `session_id` 태깅 파이프라인을 거침. 시간당 콘솔리데이션 데몬이 프로젝트별 row 캡 유지 (`RTRT_CONSOLIDATE_KEEP`).
-- **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환 (Ollama / vLLM / LM Studio / llama.cpp) — 로컬 우선. `Gateway` + 예산 + 응답 캐시 (Helicone 스타일) + exponential 재시도 + Anthropic 프롬프트 캐시 휴리스틱. `Context7Client` 라이브러리 문서 페치. 자동 캡처 + 콘솔리데이션은 옵트인 LLM 압축 모드와 결합 가능.
+- **멀티 프로바이더 라우팅** — Anthropic / OpenAI / OpenAI 호환 (Ollama / vLLM / LM Studio / llama.cpp) — 로컬 우선. `Gateway` + 예산 + 응답 캐시 (Helicone 스타일) + exponential 재시도 + Anthropic 프롬프트 캐시 휴리스틱. 사용량 원장(`~/.rtrt/provider-usage.tsv`, 5h / 24h / 7d 윈도우) + `[limits]` 상한 대비 헤드룸(`rtrt usage`); `rtrt route`가 로컬-무료 → 구독 → 종량 순서에 헤드룸 가중치를 더해 선택, `--failover`로 랭크 순회 자동 페일오버. `Context7Client` 라이브러리 문서 페치. 자동 캡처 + 콘솔리데이션은 옵트인 LLM 압축 모드와 결합 가능.
 
 세 기둥을 감싸는 표면:
 
@@ -104,6 +111,8 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - **`rtrt-dashboard`** — axum 10탭 (Metrics SVG 스파크라인 / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup). `/api/stream` SSE 라이브 활동, `/api/tokens/summary` 게이트웨이 시간/일 집계, `/api/memory/{projects,timeline}` 페이지네이션. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
 - **Claude Code 플러그인** — `plugins/claude-code/rtrt/` 훅 12종 (PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd). CLI 우선, 대시보드 POST 폴백.
 - **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/aider --apply`.
+- **보안 & 라이선스 스캔** — `rtrt-security`: 프로파일 기반 5 엔진(secrets / licenses / deps / patterns / ai), 표준 매핑 빌트인 프로파일 6종(CWE / OWASP / NIST / CIS / SLSA / EU AI Act), `rtrt security scan | profile | gate | init` + 대시보드 보안 페이지 + MCP `security_scan`.
+- **2단 설정 & 프로젝트 라이프사이클** — 글로벌 베이스 커널(`~/.rtrt/config.toml`, `rtrt setup` 관리) + 프로젝트별 `<repo>/.rtrt/config.toml` 오버라이드(유효 설정 = 글로벌 ⊕ 프로젝트, 대시보드 글로벌 따름/커스텀 토글); `rtrt migrate` / `rtrt project refresh`(기본 dry-run, `--apply`) + `rtrt project status/health/repair`.
 - **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`, `rtrt benchmark`.
 
 ## 문서
@@ -124,7 +133,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 ## 로드맵
 
-- [x] 워크스페이스 스캐폴드 (9 크레이트, edition 2024)
+- [x] 워크스페이스 스캐폴드 (11 크레이트, edition 2024)
 - [x] `rtrt-compress` 규칙 + extreme + 시크릿 검열 + tree-sitter 시그니처 (Rust / Python / TypeScript) + LLM 압축 모드 + 토큰-중요도 ML 압축
 - [x] `rtrt-proxy` git / cargo 필터 (MCP 도구 노출)
 - [x] `rtrt-memory` BM25 + 벡터 + HNSW + RRF 하이브리드 + 그래프 + 메모리 스코프 + 페이로드 필터 DSL + Letta 블록 + JSONL export/import
@@ -145,6 +154,9 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - [x] ONNX token-importance 백엔드 (`MlCompressor` 옵트인 `--features onnx`; 사용자 제공 모델 + 토크나이저)
 - [x] `rtrt-eval` BERTScore 평가기 (옵트인 `--features bertscore`; 사용자 제공 인코더 + 토크나이저)
 - [x] MCP Prompts + Resources — 로컬 PromptRegistry 기반 `prompts/list` / `prompts/get` (handlebars 인자) + 프로젝트 타임라인 + Letta 블록 기반 `resources/list` / `resources/read`
+- [x] 프로바이더 사용량 원장 + 윈도우 헤드룸 + 헤드룸 가중 `rtrt route` + 자동 페일오버 (`rtrt usage` / `/api/usage` / `/api/route/preview`)
+- [x] `rtrt-security` 프로파일 기반 보안 & 라이선스 스캔 (엔진 5종, 표준 매핑 프로파일 6종, CI `gate`)
+- [x] 2단 설정 (글로벌 베이스 커널 + 프로젝트별 `.rtrt/config.toml` 오버라이드) + `rtrt migrate` / `rtrt project refresh`
 - [ ] 옵션 멀티 에이전트 코디네이션 크레이트 (DESIGN.md 명시 deferred)
 - [ ] 첫 정식 태그 릴리스 — 라이브 키 스모크 + 브라우저 투어 통과 후, 사용자 승인 받고 진행. 그때까지 버전 라벨은 `0.1.0` 유지
 

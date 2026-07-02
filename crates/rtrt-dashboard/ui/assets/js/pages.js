@@ -1519,6 +1519,25 @@ let memmapDepth = 0;                 // depth: drill leaf cutoff (0 = auto)
 let memmapMode = 'overview';         // 'overview' | 'group' | 'leaf' (current level kind)
 let memmapCy = null;                 // the single Cytoscape instance, lazily created
 let memmapLayout = null;             // the running layout (cola is continuous; stop before re-running)
+// Zoom-LOD (semantic zoom): crossing a zoom threshold over a bubble drills it
+// automatically — the exact same call the click handler makes — so zooming in
+// progressively reveals detail instead of staying a flat blob at any depth;
+// zooming back out re-aggregates. `memmapLevelFitZoom` is the cy.zoom() value
+// right after the CURRENT level's fit-to-screen, so the "zoom out" check is
+// relative (how far the user backed away from this level), while the "zoom
+// in" check is an absolute on-screen pixel size (how big a specific bubble
+// visually is right now) — both are read, never written, outside this block.
+let memmapLevelFitZoom = 1;
+let memmapZoomLodTimer = null;
+let memmapZoomLodBusy = false;
+// A bubble whose ON-SCREEN diameter (data-size × cy.zoom()) exceeds this many
+// CSS px has visually "filled the viewport" — drill it, same as a click.
+const MEMMAP_ZOOM_IN_PX = 240;
+// Zoomed out to this fraction (or less) of the level's own fit zoom -> the
+// user backed away from the current level's detail -> re-aggregate one level.
+const MEMMAP_ZOOM_OUT_RATIO = 0.6;
+// Debounce pan/zoom so continuous wheel/trackpad gestures don't spam the API.
+const MEMMAP_ZOOM_LOD_DEBOUNCE_MS = 220;
 // map mode: 'brain' (concept graph, default) vs 'cluster' (legacy bundle view). The toggle swaps
 // which loader runs; the cy instance, styling, layout + tooltip are shared.
 let memmapViewMode = 'brain';
@@ -1704,6 +1723,74 @@ function memmapRegisterCola() {
   return memmapColaReady;
 }
 
+// Record the zoom level right after the CURRENT level finished its
+// fit-to-screen — the baseline the zoom-out re-aggregate check measures
+// against. Called once per level render (see memmapRunLayout + the
+// 'layoutstop' listener registered in memmapEnsureCy).
+function memmapMarkLevelFitZoom() {
+  if (memmapCy) memmapLevelFitZoom = memmapCy.zoom() || 1;
+}
+
+// The cluster bubble nearest the current viewport centre — the bubble the
+// user has effectively "zoomed into". Only considers drillable cluster
+// bubbles (bubble levels only; a leaf's memory nodes aren't drill targets).
+function memmapZoomCandidate() {
+  if (!memmapCy) return null;
+  let ext;
+  try { ext = memmapCy.extent(); } catch (_) { return null; }
+  const cx = (ext.x1 + ext.x2) / 2;
+  const cyMid = (ext.y1 + ext.y2) / 2;
+  let best = null;
+  let bestDist = Infinity;
+  memmapCy.nodes('[kindType = "cluster"]').forEach((n) => {
+    const d = n.data();
+    if (d.drillable === false || !d.token) return;
+    const pos = n.position();
+    const dist = Math.hypot(pos.x - cx, pos.y - cyMid);
+    if (dist < bestDist) { bestDist = dist; best = n; }
+  });
+  return best;
+}
+
+// The actual zoom-LOD decision, run after the debounce settles: zoom OUT
+// past the current level's fit baseline re-aggregates (pops one breadcrumb
+// level, from cache — instant, no fetch); zoom IN past a bubble's on-screen
+// size threshold drills it via the SAME memmapDrill() the click handler uses.
+function memmapHandleZoomLod() {
+  if (!memmapCy || memmapZoomLodBusy) return;
+  if (memmapViewMode !== 'cluster') return;   // brain mode stays click-only drill
+  if (memmapMode !== 'overview' && memmapMode !== 'group' && memmapMode !== 'leaf') return;
+  const zoom = memmapCy.zoom();
+
+  // Zoom OUT: re-aggregate one level (only when not already at the root).
+  if (memmapStack.length > 0 && memmapLevelFitZoom > 0 && zoom <= memmapLevelFitZoom * MEMMAP_ZOOM_OUT_RATIO) {
+    memmapGoToDepth(memmapStack.length - 1);
+    return;
+  }
+
+  // Zoom IN: only bubble levels have anything left to drill.
+  if (memmapMode !== 'overview' && memmapMode !== 'group') return;
+  const node = memmapZoomCandidate();
+  if (!node) return;
+  const onScreenPx = Number(node.data('size') || 0) * zoom;
+  if (onScreenPx < MEMMAP_ZOOM_IN_PX) return;
+  const d = node.data();
+  memmapZoomLodBusy = true;
+  memmapDrill(String(d.token), String(d.rawLabel || d.token))
+    .catch(() => { /* memmapDrill already surfaces its own toast on failure */ })
+    .finally(() => { memmapZoomLodBusy = false; });
+}
+
+// Debounced pan/zoom -> memmapHandleZoomLod, so a continuous wheel/trackpad
+// gesture settles once instead of firing a drill/aggregate per tick.
+function memmapScheduleZoomLod() {
+  if (memmapZoomLodTimer) clearTimeout(memmapZoomLodTimer);
+  memmapZoomLodTimer = setTimeout(() => {
+    memmapZoomLodTimer = null;
+    memmapHandleZoomLod();
+  }, MEMMAP_ZOOM_LOD_DEBOUNCE_MS);
+}
+
 function memmapEnsureCy() {
   if (memmapCy) return memmapCy;
   if (!memmapHasCy()) return null;
@@ -1762,9 +1849,14 @@ function memmapEnsureCy() {
   });
   // Track the cursor so the card follows it.
   memmapCy.on('mousemove', 'node', (ev) => memmapMoveTooltip(ev));
-  // Any pan/zoom/tap-on-background dismisses the card so it never sticks.
-  memmapCy.on('pan zoom', () => memmapHideTooltip());
+  // Any pan/zoom/tap-on-background dismisses the card so it never sticks, and
+  // (debounced) re-evaluates the zoom-LOD auto drill/re-aggregate.
+  memmapCy.on('pan zoom', () => { memmapHideTooltip(); memmapScheduleZoomLod(); });
   memmapCy.on('tap', (ev) => { if (ev.target === memmapCy) memmapHideTooltip(); });
+  // Fires after every one-shot layout (fcose/cose/concentric) settles; cola's
+  // continuous layout marks its own baseline right after its explicit fit()
+  // in memmapRunLayout (its 'layoutstop' only fires when later stopped).
+  memmapCy.on('layoutstop', () => memmapMarkLevelFitZoom());
   return memmapCy;
 }
 
@@ -2012,7 +2104,10 @@ function memmapRunLayout() {
         userConstIter: 10,
       });
       memmapLayout = layout;
-      layout.one('layoutready', () => { try { memmapCy.fit(undefined, 36); } catch (_) { /* ignore */ } });
+      layout.one('layoutready', () => {
+        try { memmapCy.fit(undefined, 36); } catch (_) { /* ignore */ }
+        memmapMarkLevelFitZoom();   // cola runs forever, so mark the baseline here (not layoutstop)
+      });
       layout.run();
       return;
     } catch (_) { memmapStopLayout(); /* fall through */ }

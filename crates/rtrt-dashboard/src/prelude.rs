@@ -40,12 +40,12 @@ pub(crate) use crate::handlers::memory::{
     DayCount, DeleteBatchRequest, DeleteBatchResponse, DeleteOneResponse, GetBlockQuery, KindCount,
     ListBlocksQuery, MemoryCompressRequest, MemoryCompressResponse, MemoryCoverageQuery,
     MemoryEmbedRequest, MemoryEntitiesRequest, MemoryExportQuery, MemoryQueueQuery,
-    MemoryRecallRequest, MemorySaveRequest, MemoryStatsQuery, MemoryStatsResponse,
-    MemoryTimelineQuery, SetBlockRequest, default_kind, default_recall_limit,
-    default_timeline_limit, get_block, list_blocks, memory_compress, memory_coverage,
-    memory_delete_batch, memory_delete_one, memory_detail, memory_embed, memory_entities,
-    memory_export, memory_projects, memory_queue, memory_recall, memory_save, memory_stats,
-    memory_timeline, set_block,
+    MemoryRecallRequest, MemorySaveRequest, MemorySessionsQuery, MemoryStatsQuery,
+    MemoryStatsResponse, MemoryTimelineQuery, SetBlockRequest, default_kind, default_recall_limit,
+    default_session_rows_limit, default_timeline_limit, get_block, list_blocks, memory_compress,
+    memory_coverage, memory_delete_batch, memory_delete_one, memory_detail, memory_embed,
+    memory_entities, memory_export, memory_projects, memory_queue, memory_recall, memory_save,
+    memory_sessions, memory_stats, memory_timeline, set_block,
 };
 pub(crate) use crate::handlers::ollama::{
     OllamaNameRequest, ollama_base, ollama_delete, ollama_models, ollama_ps, ollama_pull,

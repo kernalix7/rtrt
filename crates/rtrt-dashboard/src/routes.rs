@@ -84,6 +84,7 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
         .route("/api/budget", get(budget))
         .route("/api/memory/projects", get(memory_projects))
         .route("/api/memory/timeline", get(memory_timeline))
+        .route("/api/memory/sessions", get(memory_sessions))
         .route("/api/memory/recall", post(memory_recall))
         .route("/api/memory/graph", get(memory_graph))
         .route("/api/memory/export", get(memory_export))

@@ -1012,6 +1012,74 @@ pub(crate) async fn memory_entities(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/memory/sessions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemorySessionsQuery {
+    project: String,
+    /// When present, return the memory rows saved during this one session
+    /// instead of the summary list. The empty string selects legacy rows that
+    /// were captured before session tagging existed.
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default = "default_session_rows_limit")]
+    limit: usize,
+}
+
+pub(crate) fn default_session_rows_limit() -> usize {
+    200
+}
+
+/// `GET /api/memory/sessions?project=X` — one summary row per agent session
+/// (`session_id`, count, first/last timestamps), most-recent activity first.
+/// `GET /api/memory/sessions?project=X&session=<id>` — the memory rows saved
+/// during that session, newest first.
+pub(crate) async fn memory_sessions(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<MemorySessionsQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+
+    if let Some(session) = q.session.as_deref() {
+        let rows = guard
+            .session_records(&q.project, session, q.limit)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total = rows.len();
+        return Ok(Json(serde_json::json!({
+            "project": q.project,
+            "session_id": session,
+            "items": rows,
+            "total": total,
+        })));
+    }
+
+    let rows = guard
+        .sessions(&q.project)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let sessions: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(session_id, count, first_ts, last_ts)| {
+            serde_json::json!({
+                "session_id": session_id,
+                "count": count,
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "project": q.project,
+        "total": sessions.len(),
+        "sessions": sessions,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Ollama model management  (/api/ollama/*)
 //
 // All endpoints resolve the Ollama base URL via `ollama_base()`:

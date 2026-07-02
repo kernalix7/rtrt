@@ -22,6 +22,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - **c-TF-IDF cluster labels** (`rtrt-memory`): every cluster bubble's label is now its top 2-4 DISTINCTIVE tokens (in-cluster frequency × inverse cluster frequency across the index), not an arbitrary member's first 60 chars. Shared by both the lexical and vector (embedding) clustering paths and every LOD depth (`subcluster`); a single linear pass over token sets (no O(n²)); non-English tokens survive (Unicode word-like, not an ASCII-only filter).
 - **Zoom-to-drill** (dashboard Memory map): crossing a zoom threshold over a cluster bubble auto-drills into it — the same call the click handler already makes — and rendering the children in place; zooming back out re-aggregates one level. Debounced so a continuous wheel/trackpad gesture settles once instead of spamming the API. Click-drill and the leaf preview text are unchanged.
+### Fixed — Windows CLI startup crash (STATUS_STACK_OVERFLOW)
+
+- `rtrt` aborted on startup on Windows for *every* invocation — including `rtrt --version` — with `STATUS_STACK_OVERFLOW` (`0xC00000FD`). Windows' default main-thread stack is 1 MiB (vs 8 MiB on Linux/macOS), and clap's derive-generated `Command` builder for rtrt's ~40 subcommands overflows it while `Cli::parse()` builds the command tree, before any subcommand runs. The CLI now parses and dispatches on a worker thread with an explicit 8 MiB stack (matching the Unix default), so startup behaves identically on every platform. A `parse_fits_configured_worker_stack` regression test guards the stack budget. Surfaced by the new `assert_cmd` integration tests in #67, which were the first to execute the binary in CI.
 
 ### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
 

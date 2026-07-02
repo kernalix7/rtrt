@@ -1567,6 +1567,20 @@
       </select>
       <button class="primary" type="submit">Save</button>
     </form>
+    <!-- Orphaned capture buckets: session-hash / agent- / p<n>- named memory
+         buckets that automatic reattribution couldn't fold under a real
+         project (usually because their source transcript is gone). Hidden
+         from the selector, but their rows stay in the store — this lets a
+         person manually fold one into the right project. -->
+    <div id="orphan-buckets-section" class="orphan-buckets" hidden>
+      <p class="orphan-buckets-note" id="orphan-buckets-note"></p>
+      <div class="orphan-buckets-row">
+        <select id="orphan-bucket-select" title="Orphaned capture bucket"></select>
+        <span aria-hidden="true">→</span>
+        <select id="orphan-target-select" title="Fold into project"></select>
+        <button id="orphan-reassign-btn" class="ghost" type="button">Fold in</button>
+      </div>
+    </div>
   </div>
 </div>
 

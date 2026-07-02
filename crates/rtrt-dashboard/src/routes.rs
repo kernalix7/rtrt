@@ -121,6 +121,8 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
         .route("/api/security/scan", post(security_scan))
         .route("/api/security/profile", post(security_profile_save))
         .route("/api/projects", get(list_projects).put(upsert_project))
+        .route("/api/projects/hidden", get(list_hidden_buckets))
+        .route("/api/projects/reassign", post(reassign_project))
         .route(
             "/api/memory/{id}",
             get(memory_detail).delete(memory_delete_one),

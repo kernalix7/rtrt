@@ -324,6 +324,11 @@
   .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
   .modal-head h2 { margin: 0; font-size: 1.1rem; }
   .modal-head button { background: transparent; border: 0; cursor: pointer; font-size: 1.1rem; }
+  .orphan-buckets { margin-top: 0.9rem; padding-top: 0.75rem; border-top: 1px solid var(--border); display: grid; gap: 0.5rem; }
+  .orphan-buckets[hidden] { display: none; }
+  .orphan-buckets-note { color: var(--muted); font-size: 0.85em; margin: 0; }
+  .orphan-buckets-row { display: flex; align-items: center; gap: 0.4rem; }
+  .orphan-buckets-row select { flex: 1; min-width: 0; }
 
   /* Command palette */
   .palette-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.4); display: none; align-items: flex-start; justify-content: center; padding-top: 10vh; z-index: 100; }

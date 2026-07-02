@@ -45,11 +45,33 @@ pub(crate) struct ProjectView {
     mem_count: usize,
 }
 
+/// `GET /api/projects` response: the visible project list plus an honest
+/// count of what was hidden from it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProjectsResponse {
+    projects: Vec<ProjectView>,
+    /// Memory buckets whose name is unambiguously machine-generated (see
+    /// [`rtrt_memory::is_capture_bucket_name`]) and that never made it into
+    /// the config registry — excluded from `projects` so the selector stays
+    /// readable, but never dropped from the store. Usually these get folded
+    /// under their real project by the automatic reattribution pass; a
+    /// nonzero count here means at least one couldn't be resolved that way
+    /// (most commonly because its source transcript was deleted) and is
+    /// waiting on a manual `/api/projects/reassign`.
+    hidden_capture_buckets: usize,
+    /// Total row count summed across every hidden bucket above — so the UI
+    /// can say "N buckets / M rows hidden" instead of just a bucket count.
+    hidden_capture_bucket_rows: usize,
+}
+
 /// `GET /api/projects` — union of registered config entries (path /
 /// security_profile) and memory buckets (mem_count), merged by name.
+/// Machine-generated capture-bucket names (`agent-*`, `p<n>-*`, bare 32-hex,
+/// `32hex-40hex`) are excluded from the visible list UNLESS they were
+/// explicitly registered in the config — see [`rtrt_memory::is_capture_bucket_name`].
 pub(crate) async fn list_projects(
     State(state): State<AppState>,
-) -> std::result::Result<Json<Vec<ProjectView>>, (StatusCode, String)> {
+) -> std::result::Result<Json<ProjectsResponse>, (StatusCode, String)> {
     use std::collections::BTreeMap;
 
     let mut views: BTreeMap<String, ProjectView> = BTreeMap::new();
@@ -57,6 +79,8 @@ pub(crate) async fn list_projects(
     // Registered config entries first.
     let cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let registered: std::collections::HashSet<&str> =
+        cfg.projects.iter().map(|p| p.name.as_str()).collect();
     for entry in &cfg.projects {
         views.insert(
             entry.name.clone(),
@@ -70,6 +94,9 @@ pub(crate) async fn list_projects(
         );
     }
 
+    let mut hidden_capture_buckets = 0usize;
+    let mut hidden_capture_bucket_rows = 0usize;
+
     // Memory buckets contribute counts (and may introduce memory-only names).
     if let Some(mem) = &state.memory {
         let guard = mem.lock().await;
@@ -78,10 +105,19 @@ pub(crate) async fn list_projects(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         drop(guard);
         for (name, count, _last) in projects {
-            // No name-pattern filtering: a row's project is decided by the
-            // reattribution pass (transcript parent cwd), which folds stray
-            // subagent / workflow captures under their real project, leaving
-            // those buckets empty so they don't appear here at all.
+            // A row's project is normally decided by the reattribution pass
+            // (transcript parent cwd), which folds stray subagent / workflow
+            // captures under their real project, leaving those buckets empty
+            // so they don't appear here at all. But reattribution needs the
+            // source transcript on disk — once that's gone, a stray bucket
+            // can never resolve a parent and would clutter the selector
+            // forever. Hide ONLY the unambiguously machine-shaped names that
+            // never got registered as a real project.
+            if !registered.contains(name.as_str()) && rtrt_memory::is_capture_bucket_name(&name) {
+                hidden_capture_buckets += 1;
+                hidden_capture_bucket_rows += count;
+                continue;
+            }
             views
                 .entry(name.clone())
                 .and_modify(|v| v.mem_count = count)
@@ -96,7 +132,114 @@ pub(crate) async fn list_projects(
     }
 
     // BTreeMap iteration is already sorted by name.
-    Ok(Json(views.into_values().collect()))
+    Ok(Json(ProjectsResponse {
+        projects: views.into_values().collect(),
+        hidden_capture_buckets,
+        hidden_capture_bucket_rows,
+    }))
+}
+
+/// A capture bucket hidden from `GET /api/projects`, surfaced separately so
+/// the UI can offer a manual fold-in via `POST /api/projects/reassign`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HiddenBucketView {
+    name: String,
+    mem_count: usize,
+}
+
+/// `GET /api/projects/hidden` — the capture buckets excluded from
+/// `list_projects`, with their row counts, so the UI can populate a
+/// "fold into project" picker without re-deriving the classification client
+/// side.
+pub(crate) async fn list_hidden_buckets(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<HiddenBucketView>>, (StatusCode, String)> {
+    let cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let registered: std::collections::HashSet<&str> =
+        cfg.projects.iter().map(|p| p.name.as_str()).collect();
+
+    let Some(mem) = &state.memory else {
+        return Ok(Json(Vec::new()));
+    };
+    let guard = mem.lock().await;
+    let projects = guard
+        .projects()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(guard);
+
+    let hidden = projects
+        .into_iter()
+        .filter(|(name, _, _)| {
+            !registered.contains(name.as_str()) && rtrt_memory::is_capture_bucket_name(name)
+        })
+        .map(|(name, count, _last)| HiddenBucketView {
+            name,
+            mem_count: count,
+        })
+        .collect();
+    Ok(Json(hidden))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReassignProjectReq {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReassignProjectResp {
+    moved: usize,
+    from: String,
+    to: String,
+}
+
+/// `POST /api/projects/reassign` — folds every row in bucket `from` into
+/// project `to`. Manual analogue of the automatic reattribution pass, for
+/// orphan capture buckets it can never resolve on its own (source transcript
+/// deleted). Parameterized bulk `UPDATE`; no rows are deleted, only
+/// re-labelled — see [`rtrt_memory::MemoryStore::reassign_project`].
+pub(crate) async fn reassign_project(
+    State(state): State<AppState>,
+    Json(req): Json<ReassignProjectReq>,
+) -> std::result::Result<Json<ReassignProjectResp>, (StatusCode, String)> {
+    let from = req.from.trim();
+    let to = req.to.trim();
+    if from.is_empty() || to.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "both `from` and `to` are required".to_string(),
+        ));
+    }
+    if from == to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`from` and `to` must differ".to_string(),
+        ));
+    }
+    let store = state
+        .memory
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
+    let guard = store.lock().await;
+    let moved = guard
+        .reassign_project(from, to)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop(guard);
+    broadcast_event(
+        &state.events,
+        serde_json::json!({
+            "type": "projects.reassign",
+            "from": from,
+            "to": to,
+            "moved": moved,
+        }),
+    );
+    Ok(Json(ReassignProjectResp {
+        moved,
+        from: from.to_string(),
+        to: to.to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

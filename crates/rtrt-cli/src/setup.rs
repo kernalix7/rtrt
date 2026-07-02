@@ -268,6 +268,14 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             .clone()
             .unwrap_or_else(rtrt_core::default_memory_store_path),
     );
+    // Semantic (hybrid) recall on-by-default when a local Ollama with an
+    // embedding-capable model is already there — same spirit as the rest of
+    // `rtrt setup` wiring itself up rather than asking for manual config.
+    // Independent of which agent is being set up, so it runs once per
+    // invocation regardless of the branch below.
+    if let Err(e) = maybe_enable_embeddings_from_ollama(plan.apply) {
+        println!("embeddings: skipped ({e})");
+    }
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
     }
@@ -310,6 +318,100 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             apply_codex_toml(&plan, &binary, &memory_path)
         }
     }
+}
+
+/// Ollama model name substrings that mark it as embedding-capable — matches
+/// the common embedding model families available on Ollama's registry (not
+/// exhaustive). Used only to decide whether `rtrt setup` can safely default
+/// hybrid recall on; an explicit `[embeddings]` setting in the user's config
+/// always wins over this heuristic.
+const OLLAMA_EMBED_MODEL_HINTS: &[&str] =
+    &["embed", "bge", "nomic", "minilm", "gte-", "e5-", "mxbai"];
+
+fn is_embedding_capable_model(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    OLLAMA_EMBED_MODEL_HINTS
+        .iter()
+        .any(|hint| lower.contains(hint))
+}
+
+/// Best embedding-capable model pulled into a locally reachable Ollama, if
+/// any. `None` when Ollama isn't running or has no embedding model pulled —
+/// in that case `rtrt setup` leaves hybrid recall off, same as if Ollama were
+/// never installed.
+fn detect_ollama_embedding_model() -> Option<String> {
+    rtrt_core::detect_tools()
+        .into_iter()
+        .find(|t| t.name == "ollama" && t.server_running == Some(true))
+        .and_then(|t| t.models.into_iter().find(|m| is_embedding_capable_model(m)))
+}
+
+/// Whether `[embeddings].<key>` is explicitly present in the raw config TOML
+/// text — the signal that the user has already made their own choice, which
+/// `rtrt setup` must never override. A missing file, missing section, or
+/// missing key are all "not explicit" and safe to default.
+fn embeddings_key_explicit(raw: &str, key: &str) -> bool {
+    raw.parse::<toml::Value>()
+        .ok()
+        .and_then(|v| v.get("embeddings").and_then(|e| e.get(key)).map(|_| ()))
+        .is_some()
+}
+
+/// When a local Ollama with an embedding-capable model is detected, turns on
+/// hybrid (semantic) recall by default — `[embeddings] enabled = true` in the
+/// global `~/.rtrt/config.toml` — unless the user already made an explicit
+/// choice for that key (never flips an explicit `enabled = false`). Also
+/// fills in `model` when the user hasn't pinned one, so the default actually
+/// points at a model that's really pulled. A no-op (besides a status line)
+/// when Ollama or an embedding model isn't found, or `enabled` is already
+/// explicit in the file.
+fn maybe_enable_embeddings_from_ollama(apply: bool) -> Result<()> {
+    let Some(model) = detect_ollama_embedding_model() else {
+        println!(
+            "embeddings: no local Ollama embedding model detected; hybrid recall stays off (BM25 only)"
+        );
+        return Ok(());
+    };
+    let path = rtrt_core::Config::default_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config path"))?;
+    let raw = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if embeddings_key_explicit(&raw, "enabled") {
+        println!(
+            "embeddings: Ollama model '{model}' detected, but [embeddings] enabled is already set in {} — leaving it as-is",
+            path.display()
+        );
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "[dry-run] embeddings: would enable hybrid recall in {} (Ollama model '{model}' detected)",
+            path.display()
+        );
+        return Ok(());
+    }
+    let mut cfg = rtrt_core::Config::load()?;
+    cfg.embeddings.enabled = true;
+    if !embeddings_key_explicit(&raw, "model") {
+        cfg.embeddings.model = model.clone();
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    if path.exists() {
+        backup_if_needed(&path)?;
+    }
+    let rendered =
+        toml::to_string_pretty(&cfg).map_err(|e| anyhow::anyhow!("serialize config: {e}"))?;
+    std::fs::write(&path, rendered).with_context(|| format!("write {}", path.display()))?;
+    println!(
+        "embeddings: enabled hybrid recall in {} (Ollama model '{model}' detected)",
+        path.display()
+    );
+    Ok(())
 }
 
 fn apply_json(
@@ -1211,6 +1313,42 @@ fn backup_if_needed(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_embedding_capable_model_matches_known_families_case_insensitively() {
+        assert!(is_embedding_capable_model("bge-m3"));
+        assert!(is_embedding_capable_model("BGE-M3:LATEST"));
+        assert!(is_embedding_capable_model("nomic-embed-text"));
+        assert!(is_embedding_capable_model("mxbai-embed-large"));
+        assert!(is_embedding_capable_model("all-minilm"));
+        assert!(!is_embedding_capable_model("llama3.2"));
+        assert!(!is_embedding_capable_model("qwen2.5-coder"));
+    }
+
+    #[test]
+    fn embeddings_key_explicit_detects_presence_not_value() {
+        // No file / empty text: never explicit.
+        assert!(!embeddings_key_explicit("", "enabled"));
+        // Section present but key absent: not explicit.
+        assert!(!embeddings_key_explicit(
+            "[embeddings]\nmodel = \"bge-m3\"\n",
+            "enabled"
+        ));
+        // Key present and false: still explicit — this is exactly the case
+        // `rtrt setup` must never override.
+        assert!(embeddings_key_explicit(
+            "[embeddings]\nenabled = false\n",
+            "enabled"
+        ));
+        // Key present and true: explicit too.
+        assert!(embeddings_key_explicit(
+            "[embeddings]\nenabled = true\n",
+            "enabled"
+        ));
+        // Malformed TOML: treated as not explicit (never panics, never blocks
+        // setup on an unrelated parse error).
+        assert!(!embeddings_key_explicit("not valid toml {{{", "enabled"));
+    }
 
     #[test]
     fn claude_statusline_entry_uses_rich_command() {

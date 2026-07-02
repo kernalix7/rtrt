@@ -227,6 +227,63 @@ rtrt new rust-cli ./hello \
 
 버전과 워크스페이스 크레이트 목록을 출력합니다.
 
+## 게이트웨이 (`rtrt gateway serve`)
+
+OpenAI 호환 클라이언트를 `http://127.0.0.1:7412/v1`에 연결하면, rtrt가 감지된
+프로바이더들 사이로 요청을 자동 라우팅합니다. 환경 변수 하나로 Cursor, OpenAI
+SDK, `llm`, Continue, 임의의 curl 스크립트가 rtrt 클라이언트가 됩니다. 기본은
+루프백 바인딩입니다.
+
+```bash
+rtrt gateway serve --port 7412 --host 127.0.0.1
+export OPENAI_BASE_URL=http://127.0.0.1:7412/v1
+export OPENAI_API_KEY=unused      # 또는 설정한 RTRT_GATEWAY_TOKEN
+```
+
+엔드포인트:
+
+- `POST /v1/chat/completions` — OpenAI Chat Completions(요청 + 응답; `stream:true`면 `chat.completion.chunk` SSE 스트림, 마지막에 `data: [DONE]`).
+- `GET /v1/models` — 라우팅용 의사(pseudo) 모델과 감지된 모든 타깃/모델.
+- `GET /healthz` — 라이브니스 프로브(토큰이 설정돼 있어도 항상 열림).
+
+`model` 필드가 라우팅 전략을 고릅니다:
+
+| `model` | 동작 |
+|---------|------|
+| `auto` / `""` / `rtrt/auto` | 전체 라우팅: 요청에서 능력(capability)을 추론한 뒤 헤드룸 인지 `select_route` + 랭크된 타깃에 대한 자동 페일오버. |
+| `rtrt/cheapest` | 같은 랭크 목록, 가장 저렴한 비용 티어 우선. |
+| `rtrt/best` | 같은 랭크 목록, 능력이 가장 높은 티어 우선. |
+| `anthropic/claude-…`, `openai/gpt-…`, `ollama/…`, 또는 순수 모델 id | 모델 id 접두사로 기존 프로바이더 게이트웨이를 통해 디스패치. |
+
+`auto` 계열의 능력 추론은 의도적으로 단순합니다: 코드 펜스(```` ``` ````)는
+**code**, 그 외 긴 요청(약 2000자 초과)은 **reasoning**, 나머지는 일반 **chat**.
+
+모든 디스패치는 라우터가 균형을 잡는 것과 동일한 사용량 원장(ledger)에
+(재사용하는 기존 경로를 통해) 기록되므로, 별도 회계나 이중 기록이 없습니다.
+
+보안:
+
+- 기본 바인딩은 `127.0.0.1`. 토큰 없이 비루프백으로 바인딩하면 경고를 로깅합니다.
+- `--token <T>` / `RTRT_GATEWAY_TOKEN`을 설정하면 `/v1/*`에 `Authorization: Bearer <T>`가 필요합니다(누락 시 401 + `WWW-Authenticate`; 상수 시간 비교). `/healthz`는 계속 열려 있습니다.
+
+한계(정직하게): 텍스트 전용 브리지입니다. 라우팅 경로에서는 요청이 단일 프롬프트로
+평탄화되므로, 툴 콜링 / 함수 콜링 / 비전 콘텐츠는 아직 전달되지 않습니다.
+스트리밍은 버퍼링 방식입니다 — 라우팅된 답변을 전부 계산한 뒤 SSE 청크로
+내보냅니다(CLI 모드 타깃은 전체 텍스트만 반환). 즉 `stream:true`는 와이어
+호환이지만 토큰 단위 스트리밍은 아닙니다.
+
+```bash
+# 자동 라우팅, 비스트리밍
+curl http://127.0.0.1:7412/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+
+# 명시적 로컬 모델, 스트리밍
+curl -N http://127.0.0.1:7412/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"ollama/gemma3:4b","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
 ## MCP 서버 (`rtrt-mcp`)
 
 ```bash

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod doctor;
 mod proxy_stats;
 mod security;
 mod service;
@@ -28,18 +29,46 @@ use rtrt_providers::{
     provider_usage_windows, record_invocation, select_route, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
-use setup::{AgentKind, SetupPlan};
+use setup::{
+    AgentKind, CheckState as ProjectCheckState, ClaudeSettingsStatus, SetupPlan,
+    claude_settings_status, memory_reachable_status,
+};
+
+/// Grouped command overview shown at the bottom of `rtrt --help`. Every
+/// top-level command is hidden from clap's default flat listing
+/// (`#[command(hide = true)]`) so this hand-curated, screen-fitting summary
+/// is the only command index — `rtrt <command> --help` still shows each
+/// command's full about/long_about individually.
+const CLI_AFTER_HELP: &str = "\
+Command groups (run `rtrt <command> --help` for details):
+  Savings & Analytics  compress, stats, gain, proxy, proxy-run, discover,
+                       benchmark, repo-map, run, context
+  Memory               memory
+  Routing & Providers  provider, call, route, usage, diagnose
+  Project              templates, new, init, migrate, project, docs, security
+  Setup & Install      setup, uninstall, mcp, service, detect, config, info,
+                       doctor, prompt
+
+Quickstart: rtrt setup --agent claude --apply --plugin  ->  rtrt doctor  ->  rtrt gain";
 
 #[derive(Debug, Parser)]
-#[command(name = "rtrt", version, about = "Retort — a Rust toolkit that distills AI agent context (memory, compression, proxy, routing)", long_about = None)]
+#[command(
+    name = "rtrt",
+    version,
+    about = "Retort — a Rust toolkit that distills AI agent context (memory, compression, proxy, routing)",
+    long_about = None,
+    override_usage = "rtrt <COMMAND> [ARGS]...",
+    after_help = CLI_AFTER_HELP
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Compress text read from stdin or --file.
+    #[command(hide = true)]
     Compress {
         /// Compression level. When omitted, defaults to the repo's effective
         /// per-project `[compression] level` (`<repo>/.rtrt/config.toml`),
@@ -89,8 +118,10 @@ enum Cmd {
         onnx_tokenizer: Option<PathBuf>,
     },
     /// Report session token usage and Output Optimizer savings.
+    #[command(hide = true)]
     Stats,
     /// Show Command Optimizer savings.
+    #[command(hide = true)]
     Gain {
         /// Filter rows to this project.
         #[arg(long)]
@@ -121,11 +152,13 @@ enum Cmd {
         format: ReportFormatArg,
     },
     /// Filter a command output (read from stdin) for a given command.
+    #[command(hide = true)]
     Proxy {
         /// Command being run (e.g. "git status").
         command: String,
     },
     /// Run a shell command through the Command Optimizer.
+    #[command(hide = true)]
     ProxyRun {
         /// Print captured output unchanged.
         #[arg(long)]
@@ -141,8 +174,10 @@ enum Cmd {
         command: Vec<String>,
     },
     /// List available project templates (built-in + custom).
+    #[command(hide = true)]
     Templates,
     /// Scaffold a new project from a template.
+    #[command(hide = true)]
     New {
         /// Template name (see `rtrt templates`).
         template: String,
@@ -159,6 +194,7 @@ enum Cmd {
         no_hooks: bool,
     },
     /// Render a template into an existing repository.
+    #[command(hide = true)]
     Init {
         /// Template name (defaults to standardization).
         #[arg(long)]
@@ -177,6 +213,7 @@ enum Cmd {
         vars: Vec<(String, String)>,
     },
     /// Migrate an existing repository to the rtrt project standard.
+    #[command(hide = true)]
     Migrate {
         /// Template name (defaults to standardization).
         #[arg(long)]
@@ -195,16 +232,19 @@ enum Cmd {
         vars: Vec<(String, String)>,
     },
     /// Inspect and repair the project-standardization lifecycle contract.
+    #[command(hide = true)]
     Project {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
     /// Talk to a chat provider.
+    #[command(hide = true)]
     Provider {
         #[command(subcommand)]
         cmd: ProviderCmd,
     },
     /// Invoke a detected local agent or provider through the cross-tool bridge.
+    #[command(hide = true)]
     Call {
         /// Target from `rtrt detect`, e.g. claude, codex, ollama, openai.
         target: String,
@@ -229,6 +269,7 @@ enum Cmd {
         prompt: Vec<String>,
     },
     /// Pick and optionally invoke the cheapest useful route for a prompt.
+    #[command(hide = true)]
     Route {
         /// Needed capability.
         #[arg(long, value_enum)]
@@ -260,20 +301,25 @@ enum Cmd {
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
-    /// Show per-target windowed provider usage (5h / 24h / 7d) and the
-    /// headroom remaining against the configured `[limits]` daily caps.
-    /// Estimated rows (CLI shell-outs) are marked with `~`.
+    /// Show per-target windowed provider usage and headroom.
+    ///
+    /// Windowed provider usage (5h / 24h / 7d) and the headroom remaining
+    /// against the configured `[limits]` daily caps. Estimated rows (CLI
+    /// shell-outs) are marked with `~`.
+    #[command(hide = true)]
     Usage {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: ReportFormatArg,
     },
     /// Persistent memory operations (SQLite-backed).
+    #[command(hide = true)]
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
     /// Run a Criterion benchmark from the workspace and summarise savings.
+    #[command(hide = true)]
     Benchmark {
         /// Bench name (default: rtrt-compress `compress_bench`).
         #[arg(long, default_value = "compress_bench")]
@@ -286,6 +332,7 @@ enum Cmd {
         extra: Vec<String>,
     },
     /// Launch the bundled MCP server (passthrough to `rtrt-mcp`).
+    #[command(hide = true)]
     Mcp {
         /// Transport. `stdio` (default) for agents; `http` for Streamable HTTP.
         #[arg(long, default_value = "stdio")]
@@ -309,10 +356,12 @@ enum Cmd {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
-    /// Reverse a previous `rtrt setup`. Drops the `rtrt` MCP entry from the
-    /// agent's config; with `--plugin`, also removes the rtrt hook entries
-    /// from `~/.claude/settings.json`. Dry-run by default;
-    /// pass `--apply` to actually delete.
+    /// Reverse a previous `rtrt setup`.
+    ///
+    /// Drops the `rtrt` MCP entry from the agent's config; with `--plugin`,
+    /// also removes the rtrt hook entries from `~/.claude/settings.json`.
+    /// Dry-run by default; pass `--apply` to actually delete.
+    #[command(hide = true)]
     Uninstall {
         #[arg(short, long, value_enum)]
         agent: AgentKind,
@@ -323,16 +372,20 @@ enum Cmd {
         #[arg(long)]
         plugin: bool,
     },
-    /// Capture a hook payload — used by the `~/.claude/settings.json`
-    /// entries that `rtrt setup --plugin --apply` installs. Reads the
-    /// payload on stdin, strips control bytes, applies `redact_secrets`,
-    /// and writes a memory row with the supplied kind. Exits 0 even on
-    /// error so a hook never blocks the host agent.
+    /// Claude Code hook entry points (internal plumbing).
+    ///
+    /// Used by the `~/.claude/settings.json` entries that `rtrt setup
+    /// --plugin --apply` installs. Reads the payload on stdin, strips
+    /// control bytes, applies `redact_secrets`, and writes a memory row
+    /// with the supplied kind. Exits 0 even on error so a hook never
+    /// blocks the host agent.
+    #[command(hide = true)]
     Hook {
         #[command(subcommand)]
         cmd: HookCmd,
     },
     /// Print the Output Optimizer statusline badge or rich Claude Code line.
+    #[command(hide = true)]
     Statusline {
         /// Force rich mode even when stdin is a TTY.
         #[arg(long)]
@@ -341,10 +394,12 @@ enum Cmd {
         #[arg(long)]
         format: Option<String>,
     },
-    /// Wire RTRT into a popular coding agent's MCP config. `--plugin`
-    /// (Claude only) also merges hook entries into
+    /// Wire RTRT into a popular coding agent's MCP config.
+    ///
+    /// `--plugin` (Claude only) also merges hook entries into
     /// `~/.claude/settings.json` so every PreToolUse / PostToolUse /
     /// SessionStart etc. auto-captures into the memory store.
+    #[command(hide = true)]
     Setup {
         /// Target agent.
         #[arg(short, long, value_enum)]
@@ -363,30 +418,36 @@ enum Cmd {
         #[arg(long)]
         plugin: bool,
     },
-    /// Run `rtrt-dashboard` as a background OS service so it starts on login
-    /// and restarts on crash (systemd --user on Linux, launchd on macOS).
-    /// Dry-run by default; pass `--apply`.
+    /// Run `rtrt-dashboard` as a background OS service.
+    ///
+    /// Starts on login and restarts on crash (systemd --user on Linux,
+    /// launchd on macOS). Dry-run by default; pass `--apply`.
+    #[command(hide = true)]
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
     /// Security scanning and profile management.
+    #[command(hide = true)]
     Security {
         #[command(subcommand)]
         cmd: security::SecurityCmd,
     },
     /// Extract top-level signatures from source via tree-sitter (drops bodies).
+    #[command(hide = true)]
     Signatures {
         /// Language. Currently: `rust`.
         #[arg(long, default_value = "rust")]
         lang: String,
     },
     /// Versioned prompt registry (file-backed under ~/.rtrt/prompts/).
+    #[command(hide = true)]
     Prompt {
         #[command(subcommand)]
         cmd: PromptCmd,
     },
     /// Walk a directory and emit a tree-sitter signature map of every Rust file.
+    #[command(hide = true)]
     RepoMap {
         /// Root directory to walk.
         root: PathBuf,
@@ -399,11 +460,13 @@ enum Cmd {
         ext: String,
     },
     /// Build a compressed git-state context for the LLM.
+    #[command(hide = true)]
     Context {
         #[command(subcommand)]
         cmd: ContextCmd,
     },
     /// Run a command, capture failures, then ask an LLM for a fix suggestion.
+    #[command(hide = true)]
     Diagnose {
         /// Command + args.
         #[arg(num_args = 1..)]
@@ -422,6 +485,7 @@ enum Cmd {
         context: usize,
     },
     /// Run a command, capture stdout+stderr, and filter to errors/warnings only.
+    #[command(hide = true)]
     Run {
         /// Command + args. Quote spaces.
         #[arg(num_args = 1..)]
@@ -439,6 +503,7 @@ enum Cmd {
         passthrough_status: bool,
     },
     /// Fetch library docs from context7 (`/owner/repo`, optional --topic).
+    #[command(hide = true)]
     Docs {
         /// Library id as `<owner>/<repo>` (e.g. `facebook/react`).
         library: String,
@@ -450,6 +515,7 @@ enum Cmd {
         base_url: String,
     },
     /// Discover commands that can use the Command Optimizer.
+    #[command(hide = true)]
     Discover {
         /// Filter transcript commands to this project.
         #[arg(long)]
@@ -465,6 +531,7 @@ enum Cmd {
         format: ReportFormatArg,
     },
     /// Detect local AI agents, runtimes, provider APIs, and MCP servers.
+    #[command(hide = true)]
     Detect {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
@@ -480,11 +547,25 @@ enum Cmd {
         enabled_only: bool,
     },
     /// Show RTRT version + crate manifest.
+    #[command(hide = true)]
     Info,
     /// Manage the global config file (`~/.rtrt/config.toml`).
+    #[command(hide = true)]
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+    /// One-shot health check for the rtrt install.
+    ///
+    /// Probes PATH binary versions, Claude Code integration (hooks / MCP /
+    /// statusline), the memory store, detected agents/providers, the
+    /// dashboard service, and the provider-usage ledger. Every row is a
+    /// real local probe; exits non-zero only when a critical check fails.
+    #[command(hide = true)]
+    Doctor {
+        /// Emit the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -977,8 +1058,6 @@ const MIGRATE_GITIGNORE_ENTRIES: &[&str] = &[
 ];
 const PROJECT_STATE_WIDTH: usize = 4;
 const PROJECT_CHECK_WIDTH: usize = 18;
-const PROJECT_STATUSLINE_NEEDLE: &str = "statusline --rich";
-const PROJECT_HOOK_NEEDLE: &str = "rtrt hook";
 #[cfg(unix)]
 const UNIX_EXECUTE_BITS: u32 = 0o111;
 const DETECT_KIND_ORDER: &[ToolKind] = &[
@@ -1219,10 +1298,10 @@ fn run_migrate(
     if dry_run {
         println!(
             "[dry-run] would ensure memory DB is reachable at {}",
-            default_memory_path().display()
+            rtrt_core::default_memory_store_path().display()
         );
     } else {
-        let path = default_memory_path();
+        let path = rtrt_core::default_memory_store_path();
         let _store = MemoryStore::open(&path).map_err(anyhow::Error::from)?;
         println!("memory DB reachable at {}", path.display());
     }
@@ -1482,23 +1561,6 @@ fn resolve_project_path(path: Option<PathBuf>) -> Result<PathBuf> {
         None => std::env::current_dir().context("resolve current directory")?,
     };
     rtrt_templates::project::validate_project_path(&raw).map_err(anyhow::Error::from)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectCheckState {
-    Pass,
-    Warn,
-    Fail,
-}
-
-impl ProjectCheckState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Warn => "WARN",
-            Self::Fail => "FAIL",
-        }
-    }
 }
 
 struct ProjectCheckRow {
@@ -1801,132 +1863,10 @@ fn print_repair_action(action: &rtrt_templates::project::RepairAction, dry_run: 
     }
 }
 
-struct ClaudeSettingsStatus {
-    hooks_state: ProjectCheckState,
-    hooks_detail: String,
-    statusline_state: ProjectCheckState,
-    statusline_detail: String,
-}
-
-fn claude_settings_status(health: bool) -> ClaudeSettingsStatus {
-    let missing = ClaudeSettingsStatus {
-        hooks_state: ProjectCheckState::Warn,
-        hooks_detail: "settings file missing".into(),
-        statusline_state: ProjectCheckState::Warn,
-        statusline_detail: "settings file missing".into(),
-    };
-    let Some(settings_path) = home_dir().map(|home| home.join(".claude/settings.json")) else {
-        return ClaudeSettingsStatus {
-            hooks_detail: "home directory unavailable".into(),
-            statusline_detail: "home directory unavailable".into(),
-            ..missing
-        };
-    };
-    if !settings_path.exists() {
-        return missing;
-    }
-    let raw = match std::fs::read_to_string(&settings_path) {
-        Ok(raw) => raw,
-        Err(err) => {
-            let state = if health {
-                ProjectCheckState::Fail
-            } else {
-                ProjectCheckState::Warn
-            };
-            return ClaudeSettingsStatus {
-                hooks_state: state,
-                hooks_detail: format!("read failed: {err}"),
-                statusline_state: state,
-                statusline_detail: format!("read failed: {err}"),
-            };
-        }
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            let state = if health {
-                ProjectCheckState::Fail
-            } else {
-                ProjectCheckState::Warn
-            };
-            return ClaudeSettingsStatus {
-                hooks_state: state,
-                hooks_detail: format!("invalid JSON: {err}"),
-                statusline_state: state,
-                statusline_detail: format!("invalid JSON: {err}"),
-            };
-        }
-    };
-    let hooks_present = parsed
-        .get("hooks")
-        .is_some_and(|hooks| json_contains_text(hooks, PROJECT_HOOK_NEEDLE));
-    let statusline_present = parsed
-        .get("statusLine")
-        .is_some_and(|statusline| json_contains_text(statusline, PROJECT_STATUSLINE_NEEDLE));
-    ClaudeSettingsStatus {
-        hooks_state: if hooks_present {
-            ProjectCheckState::Pass
-        } else {
-            ProjectCheckState::Warn
-        },
-        hooks_detail: if hooks_present {
-            "rtrt hook entries found".into()
-        } else {
-            "rtrt hook entries missing".into()
-        },
-        statusline_state: if statusline_present {
-            ProjectCheckState::Pass
-        } else {
-            ProjectCheckState::Warn
-        },
-        statusline_detail: if statusline_present {
-            "rtrt rich statusLine found".into()
-        } else {
-            "rtrt rich statusLine missing".into()
-        },
-    }
-}
-
-fn json_contains_text(value: &serde_json::Value, needle: &str) -> bool {
-    match value {
-        serde_json::Value::String(s) => s.contains(needle),
-        serde_json::Value::Array(items) => {
-            items.iter().any(|item| json_contains_text(item, needle))
-        }
-        serde_json::Value::Object(map) => map.values().any(|item| json_contains_text(item, needle)),
-        _ => false,
-    }
-}
-
-fn memory_reachable_status(health: bool) -> (ProjectCheckState, String) {
-    let path = std::env::var_os("RTRT_MEMORY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_memory_path);
-    if !path.exists() {
-        return (
-            ProjectCheckState::Warn,
-            format!("missing {}", path.display()),
-        );
-    }
-    let flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    match rusqlite::Connection::open_with_flags(&path, flags)
-        .and_then(|conn| conn.query_row("SELECT 1", [], |_row| Ok(())))
-    {
-        Ok(()) => (
-            ProjectCheckState::Pass,
-            format!("reachable {}", path.display()),
-        ),
-        Err(err) => (
-            if health {
-                ProjectCheckState::Fail
-            } else {
-                ProjectCheckState::Warn
-            },
-            format!("unreachable {}: {err}", path.display()),
-        ),
-    }
-}
+// `ClaudeSettingsStatus` / `claude_settings_status` / `memory_reachable_status`
+// live in `setup.rs` now — shared with `rtrt doctor` so the Claude Code
+// integration and memory-store probes aren't duplicated across the two
+// commands. See the `use setup::{...}` import above.
 
 fn detect_init_vars(target: &Path) -> BTreeMap<String, String> {
     let mut vars = BTreeMap::new();
@@ -2370,13 +2310,32 @@ fn current_project_name() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Printed when `rtrt` runs with no subcommand — a short quickstart instead
+/// of clap's raw `--help` dump. `rtrt --help` still shows the full grouped
+/// command overview.
+fn print_quickstart() {
+    let dashboard = effective_config_for_cwd().dashboard.bind;
+    println!("rtrt (Retort) — distills AI agent context: memory, compression, proxy, routing.");
+    println!();
+    println!("  1. rtrt setup --agent claude --apply --plugin   wire hooks + MCP + statusline");
+    println!("  2. rtrt doctor                                  confirm the install is healthy");
+    println!("  3. rtrt gain                                    see Command Optimizer savings");
+    println!("  Dashboard: http://{dashboard} (rtrt service install --apply for always-on)");
+    println!();
+    println!("Run `rtrt --help` for the full command list.");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("rtrt=info")
         .init();
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        print_quickstart();
+        return Ok(());
+    };
+    match command {
         Cmd::Compress {
             level,
             file,
@@ -2956,6 +2915,7 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Config { cmd } => run_config(cmd)?,
+        Cmd::Doctor { json } => doctor::run(json)?,
     }
     Ok(())
 }
@@ -3702,7 +3662,7 @@ struct SourceSavings {
 fn print_memory_savings() {
     let path = std::env::var_os("RTRT_MEMORY_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(default_memory_path);
+        .unwrap_or_else(rtrt_core::default_memory_store_path);
     if !path.exists() {
         println!("memory: unavailable ({} not found)", path.display());
         println!("savings: unavailable (memory store unavailable)");
@@ -4572,10 +4532,6 @@ fn run_prompt(cmd: PromptCmd) -> Result<()> {
     Ok(())
 }
 
-fn default_memory_path() -> PathBuf {
-    rtrt_core::default_memory_store_path()
-}
-
 /// Resolve the project bucket for a hook command. Explicit `--project`
 /// wins first, then `$RTRT_PROJECT`; otherwise the bucket is derived from
 /// the **git repository root** of the current working directory (so
@@ -4620,7 +4576,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
         return Ok(());
     }
     let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(default_memory_path);
+    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
     if !store_path.exists() {
         return Ok(());
     }
@@ -4719,7 +4675,7 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
             }
             let redacted = rtrt_compress::redact_secrets(&cleaned);
             let project = resolve_hook_project(project);
-            let store_path = store.unwrap_or_else(default_memory_path);
+            let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
             if let Some(parent) = store_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -4843,7 +4799,7 @@ fn cwd_repo_root() -> Option<PathBuf> {
 /// config overlaid with `<repo>/.rtrt/config.toml` when the cwd is inside a
 /// repo, else the plain global config. Errors fall back to the default config
 /// so a malformed per-project file never breaks a routing/compression command.
-fn effective_config_for_cwd() -> rtrt_core::Config {
+pub(crate) fn effective_config_for_cwd() -> rtrt_core::Config {
     rtrt_core::Config::load_effective(cwd_repo_root().as_deref()).unwrap_or_default()
 }
 
@@ -6280,7 +6236,7 @@ fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Opt
 fn memory_savings_for_statusline(project: &str) -> (u64, u64) {
     let path = std::env::var_os("RTRT_MEMORY_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(default_memory_path);
+        .unwrap_or_else(rtrt_core::default_memory_store_path);
     let (original, stored) = if path.exists() {
         MemoryStore::open(&path)
             .ok()
@@ -6319,24 +6275,19 @@ fn try_hybrid_recall(
     timeout: std::time::Duration,
 ) -> Option<Vec<rtrt_memory::MemoryRecord>> {
     let cfg = rtrt_core::Config::load().unwrap_or_default();
-    let ecfg = cfg.embeddings;
-    // Gate 1: embeddings must be enabled (honours RTRT_EMBED_ENABLED).
-    if !ecfg.is_enabled() {
-        return None;
-    }
-    // Gate 2: meaningful embedding coverage for this project. Probing coverage
-    // is a cheap local SQL read (no network), so do it before touching Ollama.
+    // Gates 1+2 (embeddings enabled, meaningful project coverage) are shared
+    // with the MCP server's `memory_recall` / `memory_smart_search` via
+    // `rtrt_memory::hybrid_recall_ready` — a cheap local config + SQL read, no
+    // network, so it's checked before touching Ollama at all.
     let coverage_store = MemoryStore::open(store_path).ok()?;
-    let (embedded, total) = coverage_store.embedding_coverage(project).ok()?;
-    if embedded == 0 || embedded.saturating_mul(2) < total {
+    if !rtrt_memory::hybrid_recall_ready(&coverage_store, project, &cfg) {
         return None;
     }
     drop(coverage_store);
 
-    // Gate 3: build the embedder (mirrors the dashboard daemon's resolution:
-    // embeddings.base_url → auto_compress.base_url → Ollama default).
-    let base_url = ecfg.resolved_base_url(cfg.auto_compress.base_url.as_deref());
-    let model = ecfg.effective_model();
+    // Gate 3: build the embedder (same shared resolution: embeddings.base_url
+    // → auto_compress.base_url → Ollama default).
+    let embedder = rtrt_memory::hybrid_embedder_from_config(&cfg);
 
     // Run the hybrid recall on a worker thread bounded by `timeout`. The thread
     // opens its OWN MemoryStore on the WAL db (concurrent reads are fine) and
@@ -6351,7 +6302,6 @@ fn try_hybrid_recall(
     std::thread::spawn(move || {
         let result = (|| {
             let store = MemoryStore::open(&store_path).ok()?;
-            let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
             let scored = store
                 .recall_hybrid(&project, &query, limit, &embedder)
                 .ok()?;
@@ -6370,6 +6320,38 @@ fn try_hybrid_recall(
     }
 }
 
+/// Short bound for the opportunistic embed sweep triggered right after `memory
+/// save` — the CLI process exits shortly after printing its result, so this
+/// can't wait as long as an interactive recall; it's an "if it's fast, take
+/// the win" courtesy call, not a guarantee. Any rows embedded before the
+/// timeout are already committed (each is written as it's stored), so a
+/// partial sweep still makes real progress.
+const OPPORTUNISTIC_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Best-effort incremental embed sweep after `memory save`, so a project's
+/// embedding coverage climbs even without the dashboard's periodic auto-embed
+/// daemon running. No-op (immediately, zero Ollama traffic) when embeddings
+/// are disabled. Never fails the caller — `memory save` has already printed
+/// its result by the time this runs.
+fn try_opportunistic_embed_sweep(store_path: &std::path::Path, timeout: std::time::Duration) {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    if !cfg.embeddings.is_enabled() {
+        return;
+    }
+    let store_path = store_path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(1);
+    std::thread::spawn(move || {
+        let embedded = (|| -> Option<usize> {
+            let store = MemoryStore::open(&store_path).ok()?;
+            let embedder = rtrt_memory::hybrid_embedder_from_config(&cfg);
+            Some(store.opportunistic_embed_sweep(&embedder))
+        })()
+        .unwrap_or(0);
+        let _ = tx.send(embedded);
+    });
+    let _ = rx.recv_timeout(timeout);
+}
+
 fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize) -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok();
@@ -6380,7 +6362,7 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
         return Ok(());
     }
     let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(default_memory_path);
+    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
     if !store_path.exists() {
         return Ok(());
     }
@@ -6488,7 +6470,7 @@ fn run_hook_session_inject(
     limit: usize,
 ) -> Result<()> {
     let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(default_memory_path);
+    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
     if !store_path.exists() {
         return Ok(());
     }
@@ -6651,10 +6633,10 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             project,
             kind,
             body,
-            store,
+            store: store_path,
             meta,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let store = MemoryStore::open(&store_path)?;
             let body = read_body_or_stdin(body)?;
             let id = if meta.is_empty() {
                 store.save(&project, &kind, &body)?
@@ -6663,6 +6645,11 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
                 store.save_with_metadata(&project, &kind, &body, &map)?
             };
             println!("saved id={id}");
+            drop(store);
+            // Grow embedding coverage opportunistically, bounded so it can't
+            // meaningfully delay this command's exit; no-op when embeddings
+            // are disabled.
+            try_opportunistic_embed_sweep(&store_path, OPPORTUNISTIC_EMBED_TIMEOUT);
         }
         MemoryCmd::Blocks { cmd } => match cmd {
             BlockCmd::Set {

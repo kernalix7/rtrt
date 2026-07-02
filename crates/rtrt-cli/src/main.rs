@@ -22,10 +22,11 @@ use rtrt_core::{
 use rtrt_memory::{LlmSummariser, MemoryStore};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
-    DEFAULT_TIMEOUT_SECS, InvokeOptions, Mode as InvokeMode, OpenAICompatibleProvider,
-    OpenAIProvider, Prefer, Provider, RankedTarget, Role, RouteDecision, RouteRequest,
-    TargetHeadroom, TargetWindows, UsageSnapshot, invoke_agent, invoke_with_failover,
-    provider_usage_windows, record_invocation, select_route, target_headroom,
+    DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
+    Mode as InvokeMode, OpenAICompatibleProvider, OpenAIProvider, Prefer, Provider, RankedTarget,
+    Role, RouteDecision, RouteRequest, TargetHeadroom, TargetWindows, UsageSnapshot,
+    gateway_default_timeout, invoke_agent, invoke_with_failover, provider_usage_windows,
+    record_invocation, select_route, serve_gateway, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{AgentKind, SetupPlan};
@@ -309,6 +310,14 @@ enum Cmd {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+    /// Run the OpenAI-compatible HTTP gateway. Point ANY OpenAI client at
+    /// `http://<host>:<port>/v1` and rtrt auto-routes across your detected
+    /// providers (use model `auto` / `rtrt/cheapest` / `rtrt/best`, or an
+    /// explicit `provider/model`).
+    Gateway {
+        #[command(subcommand)]
+        cmd: GatewayCmd,
+    },
     /// Reverse a previous `rtrt setup`. Drops the `rtrt` MCP entry from the
     /// agent's config; with `--plugin`, also removes the rtrt hook entries
     /// from `~/.claude/settings.json`. Dry-run by default;
@@ -485,6 +494,23 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayCmd {
+    /// Start the OpenAI-compatible HTTP server. Binds loopback by default.
+    Serve {
+        /// Bind port.
+        #[arg(long, default_value_t = DEFAULT_GATEWAY_PORT)]
+        port: u16,
+        /// Bind host. Keep loopback unless you also set a bearer token.
+        #[arg(long, default_value = DEFAULT_GATEWAY_HOST)]
+        host: String,
+        /// Optional bearer token required on `/v1/*`. Reads `RTRT_GATEWAY_TOKEN`
+        /// by default. `/healthz` is always open.
+        #[arg(long, env = "RTRT_GATEWAY_TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -2766,6 +2792,11 @@ async fn main() -> Result<()> {
                 anyhow::bail!("rtrt-mcp exited with status {status}");
             }
         }
+        Cmd::Gateway { cmd } => match cmd {
+            GatewayCmd::Serve { port, host, token } => {
+                serve_gateway(&host, port, token, gateway_default_timeout()).await?;
+            }
+        },
         Cmd::Uninstall {
             agent,
             apply,

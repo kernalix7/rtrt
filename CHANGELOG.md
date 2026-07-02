@@ -246,6 +246,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **`rtrt doctor`**: one-shot CLI health check — PATH binary versions (`rtrt`/`rtrt-mcp`/`rtrt-dashboard`), Claude Code integration (hooks / MCP registration / statusline), memory-store reachability + row count, agent/provider detection summary, dashboard-service reachability, and provider-usage-ledger presence. `--json` for machine output; every row is a real local probe (no fabricated values), and the process exits non-zero only when the memory store exists but can't be read.
 - **MCP HTTP transport**: `--transport http --bind ADDR --path /mcp` boots `rmcp::StreamableHttpService` behind an axum `Router`. `--http-token` enforces a constant-time bearer guard. `--allowed-origins` plumbs `StreamableHttpServerConfig.allowed_origins`.
 - **MCP tools**: `compress_ml`, `proxy`, `memory_set_block` / `memory_get_block` / `memory_list_blocks`, `filter` parameter on `memory_recall`.
 - **Memory payload filter DSL**: `PayloadFilter::parse("source=claude,topic~^auth")`, `recall_bm25_with_filter`, `save_with_metadata`, `get_metadata`, `set_metadata`; v3 schema migration adds the `metadata` column.
@@ -276,6 +277,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **CLI help restructure**: every top-level `rtrt` command's `about` is now one line (detail moved to `long_about`, still shown by `rtrt <command> --help`); all top-level commands are hidden from clap's flat `Commands:` list in favor of a hand-curated "Command groups" overview (Savings & Analytics / Memory / Routing & Providers / Project / Setup & Install) printed after `rtrt --help`'s usage/options — `rtrt --help` output shrinks from 44 to 18 lines. `rtrt` with no subcommand now prints a 5-line quickstart (setup → doctor → gain, plus the dashboard URL) instead of clap's raw help dump.
+- `rtrt project status`/`health`'s Claude Code settings and memory-store checks moved from `main.rs` into `setup.rs` (`claude_settings_status`, `memory_reachable_status`, new `claude_mcp_registered_status`) so they're shared with `rtrt doctor` instead of duplicated; `memory_reachable_status` now also reports the `memories` row count.
 - **Headroom-aware routing everywhere**: MCP `agent_route` and the dashboard route preview/`/api/route` now rank candidates on the same ledger-overlaid usage snapshot as the CLI (`UsageSnapshot::load_for_routing()`, new shared helper), instead of routing blind on stale best-effort data.
 - **MCP detection parity**: `agent_route` detects targets with the effective (global ⊕ project `.rtrt/config.toml`) config via `detect_tools_with_config`, so per-project agent/provider enable maps apply to MCP routing; `agent_route`'s capability parser accepts `agentic`.
 - **Configurable API answer length**: the routed API-mode output-token ceiling is no longer a hardcoded 1024 — it resolves `RTRT_API_MAX_TOKENS` env → `[providers] api_max_tokens` (global or per-project) → a 4096 default. New `rtrt_core::repo_root_from` / `Config::load_effective_for_cwd()` helpers back the per-project resolution.

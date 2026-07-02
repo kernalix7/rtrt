@@ -35,8 +35,18 @@ use tokio::sync::broadcast;
 
 use crate::prelude::*;
 
-pub(crate) async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+/// Serve the SPA shell with `no-cache` so a redeployed UI shows up on the next
+/// load instead of being pinned to a browser-cached copy.
+fn index_response() -> axum::response::Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        Html(INDEX_HTML),
+    )
+        .into_response()
+}
+
+pub(crate) async fn index() -> axum::response::Response {
+    index_response()
 }
 
 /// Catch-all fallback for SPA deep links. Any path that didn't match an explicit
@@ -53,7 +63,7 @@ pub(crate) async fn spa_fallback(uri: axum::http::Uri) -> axum::response::Respon
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Html(INDEX_HTML).into_response()
+    index_response()
 }
 
 /// Serve the vendored graph libraries (Cytoscape + cola/fcose layout deps) from
@@ -85,33 +95,45 @@ pub(crate) async fn vendor_asset(
 
 /// Serve a front-end asset (split out of index.html) with an explicit
 /// Content-Type. Embedded via include_str! so the binary stays self-contained.
+///
+/// These assets have no content hash in their URL, so a long cache would pin
+/// the browser to a stale UI for up to a day after every redeploy (the "my
+/// UI/UX changes aren't showing up" trap). `no-cache` makes the browser
+/// revalidate on each load, so a rebuilt binary's UI appears immediately.
+/// (The large, never-changing vendor libs keep their long cache instead.)
 pub(crate) fn asset_response(
     body: &'static str,
     content_type: &'static str,
-) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
-    ([(axum::http::header::CONTENT_TYPE, content_type)], body)
+) -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
 }
 
-pub(crate) async fn asset_styles_css() -> ([(axum::http::HeaderName, &'static str); 1], &'static str)
+pub(crate) async fn asset_styles_css() -> ([(axum::http::HeaderName, &'static str); 2], &'static str)
 {
     asset_response(ASSET_STYLES_CSS, "text/css; charset=utf-8")
 }
 
-pub(crate) async fn asset_js_api() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+pub(crate) async fn asset_js_api() -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
     asset_response(ASSET_JS_API, "text/javascript; charset=utf-8")
 }
 
 pub(crate) async fn asset_js_components()
--> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+-> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
     asset_response(ASSET_JS_COMPONENTS, "text/javascript; charset=utf-8")
 }
 
-pub(crate) async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str); 1], &'static str)
+pub(crate) async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str); 2], &'static str)
 {
     asset_response(ASSET_JS_PAGES, "text/javascript; charset=utf-8")
 }
 
-pub(crate) async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+pub(crate) async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
     asset_response(ASSET_JS_APP, "text/javascript; charset=utf-8")
 }
 

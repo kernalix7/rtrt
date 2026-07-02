@@ -15,13 +15,16 @@
 |                                rtrt-core                                   |
 |   플러그인 트레이트 · 설정 · 에러 · 토큰 회계 · 텔레메트리                   |
 +----------------------------------------------------------------------------+
-   |              |               |                |                 |
-   v              v               v                v                 v
-+--------+   +---------+    +----------+    +-------------+    +---------+
-| rtrt-  |   | rtrt-   |    | rtrt-    |    | rtrt-       |    | rtrt-   |
-| compr. |   | proxy   |    | memory   |    | providers   |    | templ.  |
-+--------+   +---------+    +----------+    +-------------+    +---------+
+   |           |           |            |              |           |
+   v           v           v            v              v           v
++--------+ +--------+ +----------+ +------------+ +----------+ +----------+
+| rtrt-  | | rtrt-  | | rtrt-    | | rtrt-      | | rtrt-    | | rtrt-    |
+| compr. | | proxy  | | memory   | | providers  | | templ.   | | security |
++--------+ +--------+ +----------+ +------------+ +----------+ +----------+
 ```
+
+`rtrt-eval`(옵트인 평가 하네스, 자체 `rtrt-eval` 바이너리)은 라이브러리
+크레이트 옆에 위치하며 `rtrt-core` + `rtrt-compress` + `rtrt-memory`를 사용합니다.
 
 ## 크레이트 경계
 
@@ -33,9 +36,11 @@
 | `rtrt-memory` | `MemoryStore` (`open`, `save`, `save_embedded`, `recall_bm25`, `recall_vector`, `recall_hybrid`, `list_by_project`, `delete`, `extract_and_save`, `compress_project`), `Embedder` 트레이트 (+ `FastEmbedder` `embeddings` 피처), `Summariser` 트레이트 (+ `LlmSummariser` `llm` 피처), `MemoryRecord`, `ScoredRecord` | `rtrt-core`, `rusqlite`(bundled), `serde`, `tokio`; 선택: `fastembed`, `rtrt-providers` |
 | `rtrt-providers` | `Provider`, `ChatRequest`, `ChatResponse`, 어댑터 3종 | `rtrt-core`, `reqwest`, `serde`, `tokio` |
 | `rtrt-templates` | `Template`, `RenderPlan`, `builtin::ALL`, `custom::scan_default_dir`, `render::plan`, `render::write` | `rtrt-core`, `toml`, `walkdir`, `dirs`, `once_cell` |
-| `rtrt-mcp` | 바이너리 `rtrt-mcp` | core / compress / memory / providers + tokio |
-| `rtrt-dashboard` | 바이너리 `rtrt-dashboard` | core / templates + axum + tower |
-| `rtrt-cli` | 바이너리 `rtrt` | 모든 하위 크레이트 + clap |
+| `rtrt-security` | `Profile`, `Rule`, `Finding`, `ScanReport`, `Severity`, `Standards`, `Engine` 트레이트, `run`, `BUILTIN_PROFILES`, `list_profiles`, `load_profile` | `rtrt-core`, `regex`, `walkdir`, `toml`, `dirs`, `once_cell` |
+| `rtrt-eval` | 바이너리 `rtrt-eval` + `evaluate_recall`, `evaluate_compression`, 픽스처 로더 (옵트인 `bertscore` 피처) | `rtrt-core`, `rtrt-compress`, `rtrt-memory` |
+| `rtrt-mcp` | 바이너리 `rtrt-mcp` | core / compress / memory / proxy / providers / templates / security + tokio |
+| `rtrt-dashboard` | 바이너리 `rtrt-dashboard` | core / compress / memory / proxy / providers / templates / security + axum + tower |
+| `rtrt-cli` | 바이너리 `rtrt` | 모든 라이브러리 크레이트(security 포함) + clap |
 
 ## 소스 트리
 
@@ -47,7 +52,7 @@
 ├── README.md / *.md                 # 영문 표준 문서
 ├── docs/                            # 다국어 문서
 ├── .github/                         # 워크플로우 · 템플릿
-└── crates/                          # 9개 크레이트
+└── crates/                          # 11개 크레이트
 ```
 
 ## 데이터 흐름

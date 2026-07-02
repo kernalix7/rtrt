@@ -127,6 +127,70 @@ rtrt discover --all --since 2026-06-01
 rtrt discover --format json
 ```
 
+### `rtrt route`
+
+Pick — and optionally invoke — the cheapest useful route for a prompt. Ranking is cost-tier first (local-free → subscription-flat → API-metered), headroom-weighted inside each tier: candidates under ~15% remaining `[limits]` headroom are penalized, exhausted targets are demoted to last resort.
+
+```bash
+rtrt route --dry-run "summarise this diff"          # decision only, no invocation
+rtrt route --explain "summarise this diff"          # decision + ranked alternatives + headroom
+rtrt route --prefer local "quick sanity check"      # --prefer cheapest|quality|local
+rtrt route --failover "must succeed"                # walk ranked candidates on retryable errors
+rtrt route --target ollama --model llama3.2 "hi"    # explicit target override
+```
+
+### `rtrt call`
+
+Invoke a detected local agent or provider through the cross-tool bridge.
+
+```bash
+rtrt call claude "explain this error"               # target from `rtrt detect`
+rtrt call ollama --model llama3.2 "ping"
+rtrt call codex --mode cli --timeout 60 "review"    # --mode auto|cli|api
+rtrt call claude --failover "must succeed"          # fall over to the next ranked target
+rtrt call claude --format json "ping"
+```
+
+`--failover` retries the next ranked target on retryable failures (rate-limit / quota / 429 / 5xx / timeout).
+
+### `rtrt usage`
+
+Show per-target windowed provider usage (5h / 24h / 7d) and the headroom remaining against the `[limits]` daily caps (see [Configuration file](#configuration-file)). Rows with estimated token counts (CLI shell-outs, ~chars/4) are marked `~`.
+
+```bash
+rtrt usage
+rtrt usage --format json
+```
+
+The ledger lives at `~/.rtrt/provider-usage.tsv` (override with `RTRT_PROVIDER_USAGE_PATH`), capped at the most-recent 5000 rows.
+
+### `rtrt security`
+
+Profile-driven security + license scan (secrets / licenses / deps / patterns / AI-artifact engines). See [FEATURES.md](FEATURES.md#security--license-scanning) for the engine and profile details.
+
+```bash
+rtrt security scan --profile ai-default --path . --json
+rtrt security profile list
+rtrt security profile show owasp-top-10
+rtrt security gate --profile ai-default    # CI gate: non-zero exit at/above threshold
+rtrt security init                         # copy built-in profiles to ~/.rtrt/security/profiles/
+```
+
+### `rtrt migrate` / `rtrt project`
+
+Migrate an existing repository to the rtrt project standard and keep it consistent. Both `migrate` and `project refresh` are dry-run by default — pass `--apply` to write.
+
+```bash
+rtrt migrate                        # plan only (dry-run)
+rtrt migrate --apply                # apply the migration
+rtrt project refresh --apply        # one-command alias: render contract → canonical settings → audit
+rtrt project status                 # contract, agents, hooks, statusline, memory reachability
+rtrt project health                 # status + deeper lifecycle consistency checks
+rtrt project repair --dry-run       # append missing managed sections / install missing agents
+```
+
+Both `migrate` and `project refresh` strip project-level rtrt-owned key shadows (e.g. a project `.claude/settings.json` re-declaring `statusLine`) with a `.bak` backup so the project follows the global base kernel.
+
 ### `rtrt templates`
 
 List available templates (built-in + custom).
@@ -410,4 +474,23 @@ rtrt memory compress --project rtrt --keep 20 --provider openai-compat \
 
 ## Configuration file
 
-Planned (`~/.rtrt/config.toml`). See `crates/rtrt-core/src/config.rs` for the schema; `Config::default()` is the only currently-supported loader.
+Configuration is two-tier:
+
+1. **Global** — `~/.rtrt/config.toml` (override the path with `RTRT_CONFIG`). Create it with `rtrt config init`; inspect the resolved path with `rtrt config path`. The base kernel — hooks, MCP wiring, statusline command binding — lives here and is managed by `rtrt setup`.
+2. **Per-project** — `<repo>/.rtrt/config.toml`. Optional overrides only: output level (`off` / `lite` / `full` / `ultra`), compression, per-project agent + provider enablement, and the statusline. Absent fields inherit the global value; the effective config is global ⊕ project. When every override is back at "follow global", the file is deleted so the repo stays clean. The dashboard edits this layer through its **Follow global / Custom** scope toggles.
+
+Selected global sections:
+
+```toml
+# Optional daily usage ceilings per routing target — powers `rtrt usage`
+# headroom and the router's headroom-weighted selection. Targets without an
+# entry report no cap (never fabricated).
+[limits.openai]
+daily_tokens = 1_000_000
+daily_requests = 2_000
+
+[limits.ollama]
+daily_tokens = 250_000
+```
+
+See `crates/rtrt-core/src/config.rs` for the full schema (`[compression]`, `[memory]`, `[dashboard]`, `[providers]`, `[agents]`, `[capture]`, `[auto_compress]`, `[embeddings]`, `[security]`, `[limits]`, `[[projects]]`).

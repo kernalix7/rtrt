@@ -177,19 +177,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for crate in \
-            rtrt-core \
-            rtrt-compress \
-            rtrt-proxy \
-            rtrt-memory \
-            rtrt-providers \
-            rtrt-templates \
-            rtrt-mcp \
-            rtrt-dashboard \
-            rtrt-cli ; do
+          # Every publishable workspace crate, topologically sorted by their
+          # rtrt-* dependencies. Optional deps count too: crates.io refuses a
+          # publish whose optional path dep is not on the registry yet.
+          #   core → (providers) → compress/proxy/memory/templates/security
+          #        → eval → mcp/dashboard/cli
+          crates=(
+            rtrt-core
+            rtrt-providers
+            rtrt-compress
+            rtrt-proxy
+            rtrt-memory
+            rtrt-templates
+            rtrt-security
+            rtrt-eval
+            rtrt-mcp
+            rtrt-dashboard
+            rtrt-cli
+          )
+          # Guard: fail fast if the workspace gains/loses a crate this list
+          # does not know about, instead of silently skipping it.
+          expected=$(printf '%s\n' "${crates[@]}" | sort)
+          actual=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].name' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::publish list is out of sync with workspace members"
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          for crate in "${crates[@]}"; do
             echo "== publishing $crate =="
-            cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN" --no-verify || {
-              echo "publish $crate failed (already published? continuing)" >&2
-            }
+            rc=0
+            out=$(cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN" --no-verify 2>&1) || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -ne 0 ]; then
+              # Idempotent re-run: a version already on crates.io is fine.
+              if grep -qiE 'already (uploaded|exists)' <<< "$out"; then
+                echo "== $crate already published — skipping =="
+              else
+                echo "::error::cargo publish failed for $crate"
+                exit "$rc"
+              fi
+            fi
             sleep 10  # let crates.io index settle before the next dep publishes
           done

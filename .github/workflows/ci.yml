@@ -70,4 +70,3 @@ jobs:
         run: cargo install --locked cargo-audit
       - name: Run cargo-audit
         run: cargo audit
-        continue-on-error: true

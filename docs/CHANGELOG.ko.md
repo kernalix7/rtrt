@@ -8,6 +8,71 @@
 
 ## [Unreleased]
 
+### Highlights — 대시보드 URL 라우팅 / 딥링크
+
+**대시보드의 모든 페이지가 진짜 URL이 됩니다.**
+
+- History-API 라우팅: 각 페이지(및 서브탭)가 경로에 매핑되어 새로고침 · 앞뒤 이동 · 딥링크가 올바른 화면에 도착; 미지의 경로는 SPA 셸로 폴백 (#56).
+- 메모리 페이지의 이중 내비게이션(사이드바 항목 + 페이지 내 서브탭)을 단일 내비게이션 모델로 정리 (#55).
+
+### Highlights — 사용량 인지 프로바이더 라우팅: 원장 → 헤드룸 → 페일오버
+
+**라우터가 각 프로바이더의 사용량과 잔여 쿼터를 알고, 헤드룸 있는 타깃을 선호하며, 소진/오류 타깃에서 자동으로 넘어갑니다.**
+
+- **프로바이더 사용량 원장** (#52): 모든 프로바이더 호출이 `epoch_ts / target / model / input_tokens / output_tokens / est / ok`를 `~/.rtrt/provider-usage.tsv`에 기록(`RTRT_PROVIDER_USAGE_PATH` 재정의; 최근 5000행 상한; best-effort 기록이라 호출을 실패시키지 않음). CLI 셸-아웃은 실제 사용량을 보고하지 않으므로 토큰 수는 ~chars/4 추정치이며 끝까지 `est`로 표시.
+- 타깃별 롤링 **5h / 24h / 7d 윈도우**; 새 `rtrt usage`가 타깃별 표 출력(추정 행은 `~` 표시). 헤드룸 = 24h 사용량 vs `~/.rtrt/config.toml`의 `[limits.<target>] daily_tokens / daily_requests` 상한; `[limits]` 항목 없는 타깃은 상한 없음 보고 — 지어내지 않음.
+- **헤드룸 가중 선택** (#53): 로컬-무료 → 구독-정액 → API-종량 비용 순서 안에서, 가장 빠듯한 차원이 ~15% 미만 남은 후보는 같은 계층 내 감점, 완전 소진 타깃은 계층 무관 최후 폴백으로 강등; 동률은 잔여 헤드룸 비율이 큰 쪽 승리. `rtrt route --explain`이 결정 · 랭크 대안 · 판단 근거 헤드룸 출력.
+- **자동 페일오버** (#53): `rtrt route --failover` / `rtrt call --failover`가 랭크 후보를 순회 — 재시도 가능 실패(rate-limit / quota / 429 / 5xx / 타임아웃)는 다음 타깃으로, 종결성 오류는 중단; 결과에 어떤 타깃이 왜 넘어갔는지 요약.
+- **대시보드 게이지 + 라우팅 프리뷰** (#54): `GET /api/usage`(타깃별 윈도우 사용량 + 헤드룸) + `GET /api/route/preview`(프롬프트 없이 *다음* 요청의 로드밸런싱 결정)가 Tools 쪽 사용량/헤드룸 게이지와 라우팅 프리뷰를 지탱.
+
+### Highlights — 2단 설정: 글로벌 베이스 커널 + 프로젝트별 오버라이드
+
+**글로벌 베이스(훅 / MCP / 스테이터스라인 배선, `~/.rtrt/config.toml`, `rtrt setup` 관리) + 얇은 프로젝트별 커스터마이즈 파일. 유효 설정 = 글로벌 ⊕ 프로젝트.**
+
+- `<repo>/.rtrt/config.toml`의 `ProjectConfig` (#34, #44): 출력 레벨(`off`/`lite`/`full`/`ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인 — 모두 옵션 오버라이드. 비어 있는 필드는 글로벌 상속; 전부 기본값이면 파일 삭제로 저장소 청결 유지. `Config::load_effective(repo)`가 오버레이 적용.
+- 대시보드: 프로젝트별 설정 표면마다 **글로벌 따름 / 커스텀** 스코프 토글 — 스테이터스라인 (#42), Output Optimizer 레벨 (#43), 프로바이더 / 압축 / 에이전트 (#45).
+- `rtrt migrate`(기본 dry-run; `--apply`로 기록)가 기존 저장소를 rtrt 프로젝트 표준으로 이관; `rtrt project refresh`는 원커맨드 별칭(컨트랙트 렌더 → 표준 설정 활성화 → 전체 일관성 감사). 둘 다 프로젝트 레벨 rtrt 소유 키 섀도(예: 프로젝트 `.claude/settings.json`의 `statusLine` 재선언)를 감지해 `.bak` 백업과 함께 제거 — 프로젝트가 글로벌 베이스 커널을 따르게 함 (#34).
+- `rtrt project status / health / repair`가 표준화 컨트랙트를 점검/복구; 팀 에이전트 동반 설치 (#32).
+
+### Highlights — 스테이터스라인 필러별 절감 모델
+
+**리치 스테이터스라인 3행이 프로젝트별 · 필러별 절감을 각자 정직한 단위로 보고 — 혼합 · 조작된 퍼센트 없음.**
+
+- `📝opt:<level>` — Output Optimizer는 활성 terse 레벨로 표시(프롬프트 주입이라 전/후 측정 불가 — 퍼센트 없음); `🧠mem:X%` — 메모리 저장 축소(원본 vs 저장 본문; 내부 효율, 자체 필러); `⚡cmd:Y%` — Command Optimizer 유효(EFFECTIVE) 절감률(실제 필터링된 실행만, 패스스루 제외로 희석 방지); `💯Σ:Z%` — 에이전트-토큰 절감: 모델 컨텍스트 밖으로 지켜낸 토큰(명령 필터링 + 리콜 재사용; 저장 압축과 terse 모드는 제외) (#37, #38, #39).
+- ctx% 보정 + 실제 5h / 주간 rate-limit 윈도우 (#36); rtrt 네이티브 라벨 (#41); 프로젝트별 스테이터스라인 상속/오버라이드, 기본은 글로벌 따름 (#42).
+
+### Highlights — 대시보드 재구성 (Project / Tools)
+
+- 상단 바를 **Project / Tools** 모드로 분리 (#51); Overview / Environment / Route 페이지를 데이터 모델 중심으로 재구성 (#49); Overview Σ가 혼합 합계 대신 에이전트-토큰 모델 사용 (#50).
+- 남은 설정 전부 웹 UI에서 편집 가능 (#48).
+- 프런트엔드를 HTML 셸 + `styles.css` + 클래식-JS 모듈로 분리 (#46); 백엔드 `main.rs`를 state / routes / handlers 모듈 트리로 분리 (#47); 기능 그룹 IA + 통합 페이지로 UI 개편 (#40); 대시보드 v2: 6-섹션 IA, 시간 윈도우, 유효%/커버리지, 정확한 Output Optimizer 보고 (#28, #29).
+
+### Highlights — 오케스트레이터: detect → invoke → route
+
+- `rtrt detect`가 로컬 AI CLI / API / 서버를 스캔해 가용 상태를 보고, 대시보드 Environment 탭에서 도구별 opt-in/out (#19, #22).
+- `rtrt call <target>` 크로스-툴 호출 브리지: 감지된 에이전트/프로바이더를 `--mode` cli / api / auto로 하나의 프롬프트 인터페이스에서 실행; MCP `agent_call` 도구로도 노출 (#21, #24).
+- `rtrt route` 비용 인지 라우트 선택: 능력 기준 가장 저렴하고 쓸모 있는 타깃(로컬-무료 → 구독 → API-종량), `--explain` / `--dry-run`; MCP `agent_route` 도구; 대시보드 Orchestration 뷰 (#23, #24, #26).
+- 리치 커스텀 스테이터스라인 `rtrt statusline --rich`(모델 / ctx% / rate-limit 윈도우 / 프로젝트별 절감), 웹 UI에서 커스터마이즈 (#25, #27).
+
+### Highlights — 템플릿 · 프로젝트 라이프사이클 · 표준화
+
+- 대시보드 비주얼 템플릿 에디터 + 커스텀 템플릿 CRUD (#30); 템플릿 페이지 개편 — 그룹화된 라이브러리 + 다듬은 에디터 (#33).
+- 새 표준화 템플릿 + `rtrt init` 프로젝트 부트스트랩 (#31); `rtrt project` 라이프사이클(status / health / repair) + 팀 에이전트 (#32).
+
+### Highlights — Output Optimizer + Command Optimizer
+
+- **Output Optimizer** (#10): 일회성 압축 호출 대신 레벨(`off` / `lite` / `full` / `ultra`)을 갖는 영구 terse 모드; 다국어 룰 + 보조 스킬 (#12); 압축-출력 crew 서브에이전트 (#13); 사용자 레벨 디렉터리에서 스킬/에이전트 로드 + 에이전트별 terse 룰 (#14); 웹 UI 레벨 토글 (#15).
+- **Command Optimizer** (#17): 광범위 명령 출력 필터(git / cargo / 파일시스템 / 검색 / HTTP / GitHub / 컨테이너 / Kubernetes / Python / Go / Node / TypeScript / 린터); `rtrt proxy-run <cmd>`가 명령을 실행하고 종료 코드를 보존하며 출력 필터링; 투명한 Claude Code `PreToolUse` 훅(`rtrt hook proxy-rewrite`)이 축소 가능 명령을 자동 재작성; `~/.rtrt/proxy-stats.sqlite` 기반 `rtrt gain` 절감 분석 (#20); `rtrt discover`가 Claude Code transcript에서 축소 가능 명령 스캔.
+- 대시보드에서 3개 옵티마이저 전체의 실시간 프로젝트별 토큰 절감 (#18); 퍼센트-절감 헤드라인 + Environment 탭 (#22).
+- rtrt를 **Retort** — "AI 에이전트 컨텍스트를 증류" — 로 리브랜딩 (#16).
+
+### Fixed — 6월 스윕 이후
+
+- 메모리 캡처를 cwd basename이 아닌 git 저장소 루트로 귀속 (#9).
+- 대시보드: 스테이터스라인에서 서드파티 에이전트 이름 제거; 기본값을 에이전트에 동기화 (#41); Output Optimizer를 오해 소지 있는 % 대신 레벨로 표시 (#28).
+- CI: clippy 1.96 `sort_by_key` + Windows unused-path 수정 (#35).
+- 릴리스 파이프라인: `release.yml`의 crates.io 게시 루프가 워크스페이스 크레이트 11개 전부를 의존성 순서로 커버하고 실제 게시 오류에는 즉시 실패(기존엔 9개만 나열 — `rtrt-security` / `rtrt-eval` 누락 — 하고 모든 실패를 삼킴); 이미-게시됨 스킵(멱등)은 유지. `coverage.yml`이 라인 커버리지 하한(`--fail-under-lines 35`) 강제; CI `cargo audit` 차단화.
+
 ### Highlights — 인터랙티브 메모리 그래프 (기본: 무-LLM 유사도)
 
 **메모리 그래프가 흩뿌린 점에서 탐색 맵으로. 기본 모드는 엔티티 추출도 생성 LLM도 불필요.**

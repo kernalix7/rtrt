@@ -238,7 +238,88 @@ Built-in adapters:
 - `OpenAIProvider` — base URL `https://api.openai.com/v1`. Models: `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`.
 - `OpenAICompatibleProvider` — user-provided base URL. Targets Ollama, llama.cpp server, vLLM, LM Studio, and any other OpenAI-compatible HTTP endpoint.
 
-v0.1.0 `chat` implementations return `Error::Provider("... not implemented yet")`. Wiring real chat is roadmap item.
+`chat` and `chat_stream` are implemented against the real HTTP APIs for all three adapters; a `Gateway` fronts every registered provider with per-request metrics, an optional budget cap, a response cache, and retry / fallback.
+
+### Usage ledger + windowed headroom (`rtrt usage`)
+
+Every provider invocation appends one row to a local usage ledger at `~/.rtrt/provider-usage.tsv` (override with `RTRT_PROVIDER_USAGE_PATH`):
+
+```text
+epoch_ts \t target \t model \t input_tokens \t output_tokens \t est \t ok
+```
+
+- The file is capped at the most-recent 5000 rows; writes are best-effort and never fail the invocation.
+- CLI shell-outs return only text, so their token counts are estimates (~chars/4) and stay marked `est` end to end — estimated rows render with `~`.
+- Usage is bucketed into rolling **5h / 24h / 7d** windows per target; `rtrt usage` prints the table (`--format json` available).
+- **Headroom** compares the 24h window against optional daily caps in `~/.rtrt/config.toml`:
+
+```toml
+[limits.openai]
+daily_tokens = 1_000_000
+daily_requests = 2_000
+
+[limits.ollama]
+daily_tokens = 250_000
+```
+
+Targets without a `[limits]` entry report no cap — RTRT never fabricates a ceiling.
+
+### Headroom-weighted route selection + automatic failover (`rtrt route`)
+
+`rtrt route` picks the cheapest useful target for a prompt. Ranking is cost-tier first — local-free → subscription-flat → API-metered → unknown — then headroom-aware inside each tier:
+
+- A candidate whose scarcest limited dimension (tokens or requests) is under **~15% remaining** is penalized within its cost tier.
+- A fully **exhausted** target (0 remaining on any dimension) sinks below every other candidate and is only ever a last-resort fallback.
+- Ties break toward the target with the larger remaining headroom fraction.
+
+`rtrt route --explain` prints the decision, the ranked alternatives, and the usage / headroom that drove it; `--dry-run` prints the decision without invoking.
+
+With `--failover`, `rtrt route` (and `rtrt call --failover`) walks the ranked candidate list: a **retryable** failure (rate-limit / quota / 429 / 5xx / timeout) falls over to the next ranked target, a terminal error stops the walk, and the result summarises which targets fell over and why.
+
+The dashboard mirrors this with `GET /api/usage` (windowed usage + headroom per target) and `GET /api/route/preview` (the load-balancing decision for the *next* request, no prompt required), rendered as usage / headroom gauges and a routing preview on the Tools side.
+
+## Security & license scanning
+
+`rtrt-security` is a profile-driven scanner for AI-generated artifacts, modeled on OpenSCAP-style declarative profiles. Five engines run per scan:
+
+| Engine | What it checks |
+|--------|----------------|
+| `secrets` | built-in secret patterns + Shannon-entropy gate; excerpts are redacted |
+| `licenses` | SPDX manifest policy (allow / forbid lists), optional header check, workspace-inheritance aware |
+| `deps` | Cargo.lock / package-lock hygiene (git / wildcard / yanked) + optional offline RustSec advisory match |
+| `patterns` | regex source scanner with language + path filters |
+| `ai` | AI-artifact checks: hallucinated-import / slopsquatting, base64 blobs, eval usage, TODO-secret, unsafe blocks |
+
+Six built-in profiles (`ai-default`, `ai-strict`, `owasp-top-10`, `asvs-l2`, `cis-baseline`, `nist-ssdf`) map every rule to industry standards (CWE / OWASP / NIST / CIS / SLSA / EU AI Act). Profiles are declarative TOML — drop your own under `~/.rtrt/security/profiles/` to override built-ins or add new ones.
+
+```bash
+rtrt security scan --profile ai-default [--path DIR] [--json]
+rtrt security profile list
+rtrt security profile show ai-strict
+rtrt security gate --profile ai-default        # non-zero exit at/above threshold — CI gate
+rtrt security init                             # copy built-ins to ~/.rtrt/security/profiles/
+```
+
+The same scanner backs the dashboard Security page (project-aware: scans the selected project's path with its bound profile) and the MCP `security_scan` tool.
+
+## Two-tier configuration & project lifecycle
+
+Configuration is layered:
+
+1. **Global base kernel** — `~/.rtrt/config.toml` plus the agent wiring (hooks / MCP / statusline command binding). Managed by `rtrt setup`; projects never override it.
+2. **Per-project overrides** — `<repo>/.rtrt/config.toml` (`ProjectConfig`): optional output level (`off` / `lite` / `full` / `ultra`), compression, per-project agent + provider enablement, and statusline. Absent fields inherit the global value; effective config = global ⊕ project (`Config::load_effective`). An all-default override file is deleted so the repo stays clean.
+
+The dashboard exposes each per-project surface behind a **Follow global / Custom** scope toggle.
+
+Lifecycle commands:
+
+```bash
+rtrt migrate [--path DIR] [--apply]      # migrate an existing repo to the rtrt project standard (dry-run by default)
+rtrt project refresh [--apply]           # one-command alias: render contract → activate canonical settings → audit
+rtrt project status | health | repair    # inspect / verify / repair the standardization contract
+```
+
+`rtrt migrate` / `rtrt project refresh` also detect project-level rtrt-owned key shadows (e.g. a project `.claude/settings.json` re-declaring `statusLine`) and strip them with a `.bak` backup so the project defers to the global base kernel.
 
 ## Project scaffolds
 
@@ -298,7 +379,7 @@ Each `[[files]]` entry either points to a `source` file (relative to the manifes
 
 ## MCP and dashboard
 
-`rtrt-mcp` is currently a stub that announces the planned tool surface (`compress`, `memory.save`, `memory.recall`, `provider.chat`). The stdio transport implementation is on the roadmap.
+`rtrt-mcp` is a real rmcp-based MCP server over stdio and Streamable HTTP, exposing the memory / compress / proxy / templates / provider / security tool surface (see [USAGE.md](USAGE.md) for the full tool table).
 
 `rtrt-dashboard` is an axum server bound to `127.0.0.1:7311` by default. It serves:
 

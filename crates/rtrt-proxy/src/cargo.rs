@@ -42,15 +42,48 @@ static TEST_OK_LINE: Lazy<Regex> =
 
 static RUNNING_N_TESTS: Lazy<Regex> = Lazy::new(|| Regex::new(r"^running \d+ tests?$").unwrap());
 
+/// `---- <test name> stdout ----` (or stderr) — opens a captured-output block
+/// for a failing test. Everything until the closing `failures:` list or the
+/// `test result:` summary is that test's own output and must pass through
+/// byte-identical: it can legitimately contain lines shaped exactly like
+/// libtest progress or cargo noise.
+static FAILURE_DUMP_HEADER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^---- .+ (stdout|stderr) ----$").unwrap());
+
 /// `cargo test` filter: cargo build noise is dropped (same rules as
 /// `cargo_noise`), consecutive passing `test … ... ok` lines collapse into a
 /// single `✓ N passed` per run, and everything about failures — the FAILED
-/// lines, panic/assertion output, the `failures:` block, and the final
-/// `test result:` summary — survives verbatim.
+/// lines, panic/assertion output, the `failures:` blocks (including every line
+/// of captured stdout/stderr), and the final `test result:` summary — survives
+/// verbatim.
 pub(crate) fn cargo_test(input: &str) -> String {
     let mut out = String::new();
     let mut ok_run = 0usize;
+    let mut in_failure_dump = false;
+    let mut last_blank = false;
     for line in input.lines() {
+        if in_failure_dump {
+            if line == "failures:" || line.starts_with("test result:") {
+                // End of the captured-output region; both boundary lines are
+                // kept by the normal path below.
+                in_failure_dump = false;
+            } else {
+                // Inside a failing test's captured output: no collapsing, no
+                // noise-dropping, no blank merging — verbatim.
+                out.push_str(line);
+                out.push('\n');
+                last_blank = false;
+                continue;
+            }
+        }
+        if FAILURE_DUMP_HEADER.is_match(line) {
+            flush_ok_run(&mut out, &mut ok_run);
+            in_failure_dump = true;
+            out.push_str(line);
+            out.push('\n');
+            last_blank = false;
+            continue;
+        }
         if TEST_OK_LINE.is_match(line) {
             ok_run += 1;
             continue;
@@ -62,20 +95,26 @@ pub(crate) fn cargo_test(input: &str) -> String {
         if is_noise {
             continue;
         }
+        // Blank collapsing is done inline (not via collapse_blanks on the
+        // final string) so failure dumps above stay untouched.
+        let is_blank = line.trim().is_empty();
+        if is_blank && last_blank {
+            continue;
+        }
         // Any kept line ends the run, so the ✓ summary lands where the ok
         // lines were and counts stay per test-binary section (each section
         // closes with a kept `test result:` line).
         flush_ok_run(&mut out, &mut ok_run);
         out.push_str(line);
         out.push('\n');
+        last_blank = is_blank;
     }
     flush_ok_run(&mut out, &mut ok_run);
 
-    let collapsed = collapse_blanks(&out);
-    if collapsed.trim().is_empty() && !input.trim().is_empty() {
+    if out.trim().is_empty() && !input.trim().is_empty() {
         "ok\n".to_string()
     } else {
-        collapsed
+        out
     }
 }
 
@@ -181,6 +220,59 @@ mod tests {
         // Build noise and section headers are gone.
         assert!(!out.contains("Compiling"), "{out}");
         assert!(!out.contains("running 5 tests"), "{out}");
+    }
+
+    #[test]
+    fn cargo_test_failure_dump_passes_through_verbatim() {
+        // A failing test's captured stdout can contain lines shaped exactly
+        // like libtest progress or cargo noise; inside the `---- … stdout ----`
+        // block nothing may be collapsed, dropped, or blank-merged.
+        let raw = concat!(
+            "running 2 tests\n",
+            "test tests::quick ... ok\n",
+            "test tests::replay ... FAILED\n",
+            "\n",
+            "failures:\n",
+            "\n",
+            "---- tests::replay stdout ----\n",
+            "running 2 tests\n",
+            "test inner ... ok\n",
+            "   Compiling x\n",
+            "Running step 3 of 5\n",
+            "\n",
+            "\n",
+            "thread 'tests::replay' panicked at src/lib.rs:18:9:\n",
+            "replay diverged\n",
+            "\n",
+            "failures:\n",
+            "    tests::replay\n",
+            "\n",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+        );
+        let out = cargo_test(raw);
+        // The whole dump — progress-shaped lines and the double blank —
+        // survives byte-identical.
+        assert!(
+            out.contains(concat!(
+                "---- tests::replay stdout ----\n",
+                "running 2 tests\n",
+                "test inner ... ok\n",
+                "   Compiling x\n",
+                "Running step 3 of 5\n",
+                "\n",
+                "\n",
+                "thread 'tests::replay' panicked at src/lib.rs:18:9:\n",
+            )),
+            "{out}"
+        );
+        // Outside the dump, collapsing still works and no ✓ is fabricated
+        // inside the dump.
+        assert!(
+            out.starts_with("✓ 1 passed\ntest tests::replay ... FAILED"),
+            "{out}"
+        );
+        assert_eq!(out.matches('✓').count(), 1, "{out}");
+        assert!(out.contains("test result: FAILED. 1 passed;"), "{out}");
     }
 
     #[test]

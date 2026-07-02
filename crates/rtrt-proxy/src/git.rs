@@ -219,7 +219,12 @@ fn condense_unified_diff(input: &str) -> Option<String> {
     let mut hunk: Option<HunkBudget> = None;
     let mut context: Vec<&str> = Vec::new();
 
-    for line in input.lines() {
+    // Iterate preserving `\r`: `str::lines()` would strip it, silently
+    // erasing the only difference in a LF→CRLF conversion diff. Only the
+    // terminating `\n` is trimmed here and re-emitted on output, so `+`/`-`
+    // line content — including a trailing `\r` — survives byte-identical.
+    for raw_line in input.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         if let Some(budget) = hunk.as_mut() {
             if !budget.exhausted() {
                 if line.starts_with('+') || line.starts_with('-') || line.starts_with('\\') {
@@ -241,7 +246,7 @@ fn condense_unified_diff(input: &str) -> Option<String> {
                     flush_context_run(&mut body, &mut context, position);
                     body.push_str(line);
                     body.push('\n');
-                } else if line.starts_with(' ') || line.is_empty() {
+                } else if line.starts_with(' ') || line.is_empty() || line == "\r" {
                     budget.old = budget.old.checked_sub(1)?;
                     budget.new = budget.new.checked_sub(1)?;
                     context.push(line);
@@ -250,6 +255,14 @@ fn condense_unified_diff(input: &str) -> Option<String> {
                     return None;
                 }
                 continue;
+            }
+            // A real unified hunk always contains at least one `+`/`-` line.
+            // A hunk whose budget exhausted on context alone means the input
+            // is not plain unified format (e.g. `--word-diff`, whose inline
+            // markers leave indented lines looking like context) — condensing
+            // it would hide every change, so keep the raw diff.
+            if !budget.seen_change {
+                return None;
             }
             hunk = None;
         }
@@ -279,6 +292,12 @@ fn condense_unified_diff(input: &str) -> Option<String> {
             body.push_str(line);
             body.push('\n');
         }
+    }
+    // Same no-change-hunk guard for a hunk that runs to end of input.
+    if let Some(budget) = &hunk
+        && !budget.seen_change
+    {
+        return None;
     }
     flush_context_run(&mut body, &mut context, ContextPosition::Trailing);
 
@@ -643,6 +662,43 @@ index abc..def 100644\n\
         let names = "src/lib.rs\nsrc/main.rs\n";
         assert_eq!(git_diff(names), names);
         assert_eq!(git_diff(""), "");
+    }
+
+    #[test]
+    fn git_diff_word_diff_hunk_with_no_change_lines_falls_back_to_raw() {
+        // `--word-diff` marks changes inline, so an indented hunk body looks
+        // like pure context and the budget exhausts without a single +/- line.
+        // Condensing would hide every change and report "+0 -0" — must fall
+        // back to the raw diff. The second file forces the mid-input hunk
+        // transition path (the EOF path is covered by the fixture test).
+        let raw = concat!(
+            "diff --git a/cfg.py b/cfg.py\n",
+            "index fb15fe2..4fa8459 100644\n",
+            "--- a/cfg.py\n",
+            "+++ b/cfg.py\n",
+            "@@ -1,3 +1,3 @@\n",
+            "    a = 1\n",
+            "    d = [-4-]{+40+}\n",
+            "    e = 5\n",
+            "diff --git a/other b/other\n",
+            "--- a/other\n",
+            "+++ b/other\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-x\n",
+            "+y\n",
+        );
+        assert_eq!(git_diff(raw), raw);
+    }
+
+    #[test]
+    fn git_diff_preserves_carriage_returns_in_changed_lines() {
+        // LF→CRLF conversion: the trailing `\r` on the `+` side is the entire
+        // change. Stripping it (as `str::lines()` would) renders the -/+ pair
+        // byte-identical and destroys the signal.
+        let raw = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-alpha\n+alpha\r\n";
+        let out = git_diff(raw);
+        assert!(out.contains("-alpha\n"), "{out:?}");
+        assert!(out.contains("+alpha\r\n"), "{out:?}");
     }
 
     #[test]

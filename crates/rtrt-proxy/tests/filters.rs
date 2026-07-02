@@ -9,6 +9,9 @@ use std::collections::HashSet;
 
 const GIT_DIFF: &str = include_str!("fixtures/git_diff.txt");
 const GIT_DIFF_U10: &str = include_str!("fixtures/git_diff_u10.txt");
+const GIT_DIFF_WORD: &str = include_str!("fixtures/git_diff_word_diff.txt");
+const GIT_DIFF_CRLF: &str = include_str!("fixtures/git_diff_crlf.txt");
+const CARGO_TEST_NESTED: &str = include_str!("fixtures/cargo_test_nested.txt");
 const CARGO_TEST_PASS: &str = include_str!("fixtures/cargo_test_pass.txt");
 const CARGO_TEST_FAIL: &str = include_str!("fixtures/cargo_test_fail.txt");
 const RG_NO_HEADING: &str = include_str!("fixtures/rg_no_heading.txt");
@@ -99,6 +102,77 @@ fn git_diff_actually_shrinks_the_fixture() {
         out.len()
     );
     assert!(out.contains("lines unchanged"), "no context run collapsed");
+}
+
+#[test]
+fn git_diff_word_diff_fixture_passes_through_raw() {
+    // Real `git diff --word-diff` of an indented change: every hunk-body line
+    // starts with whitespace, so unified-diff parsing would classify the
+    // whole hunk as context and hide the change behind a "+0 -0" summary.
+    // The no-change-hunk guard must return the raw output byte-identical.
+    assert_eq!(apply("git diff", GIT_DIFF_WORD), GIT_DIFF_WORD);
+}
+
+#[test]
+fn git_diff_crlf_fixture_preserves_carriage_returns() {
+    // Real LF→CRLF conversion diff: the trailing \r on the + side is the
+    // entire change and must survive byte-identical.
+    let out = apply("git diff", GIT_DIFF_CRLF);
+    for want in [
+        "-alpha\n",
+        "-beta\n",
+        "-gamma\n",
+        "+alpha\r\n",
+        "+beta\r\n",
+        "+gamma\r\n",
+    ] {
+        assert!(
+            out.contains(want),
+            "missing byte-identical {want:?}: {out:?}"
+        );
+    }
+    assert_eq!(
+        out.matches('\r').count(),
+        3,
+        "exactly the three + lines carry \\r: {out:?}"
+    );
+    assert!(out.starts_with("1 file, +3 -3\n"), "{out}");
+}
+
+#[test]
+fn cargo_test_nested_fixture_dump_region_is_byte_identical() {
+    // Real failing test whose captured stdout is shaped like libtest/cargo
+    // output ("test inner ... ok", "   Compiling x", "Running step 3 of 5",
+    // "running 2 tests") — the dump must pass through byte-identical.
+    let out = apply("cargo test", CARGO_TEST_NESTED);
+    fn region(s: &str) -> &str {
+        let start = s
+            .find("---- tests::harness_replay_fails stdout ----")
+            .expect("dump header present");
+        let end = s[start..].find("\nfailures:").expect("dump terminator") + start;
+        &s[start..end]
+    }
+    assert_eq!(
+        region(CARGO_TEST_NESTED),
+        region(&out),
+        "captured stdout of the failing test must pass through byte-identical"
+    );
+    for want in [
+        "running 2 tests\n",
+        "test inner ... ok\n",
+        "   Compiling x\n",
+        "Running step 3 of 5\n",
+    ] {
+        assert!(out.contains(want), "lost dump line {want:?}: {out}");
+    }
+    // Exactly one collapsed run (the real passing test) — nothing fabricated
+    // inside the dump.
+    assert_eq!(out.matches('✓').count(), 1, "{out}");
+    assert!(out.contains("✓ 1 passed"), "{out}");
+    assert!(
+        out.contains("test result: FAILED. 1 passed; 1 failed;"),
+        "{out}"
+    );
 }
 
 #[test]

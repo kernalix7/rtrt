@@ -21,9 +21,9 @@ pub mod summarise;
 
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
-#[cfg(feature = "ollama-embed")]
-pub use embed::OllamaEmbedder;
 pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
+#[cfg(feature = "ollama-embed")]
+pub use embed::{OllamaEmbedder, hybrid_embedder_from_config, hybrid_recall_ready};
 #[cfg(feature = "hnsw")]
 pub use hnsw_index::{EmbVec, HnswIndex};
 pub use payload::{PayloadFilter, PayloadPredicate};
@@ -357,6 +357,19 @@ const INTRA_EDGE_CAP: usize = 4000;
 /// Builds the `kind` string for a Letta memory block.
 pub fn block_kind(name: &str) -> String {
     format!("{BLOCK_KIND_PREFIX}{name}")
+}
+
+/// Batch size for an OPPORTUNISTIC embed sweep (triggered right after a save)
+/// as opposed to the dashboard's periodic full-backlog daemon. Sqrt-scaled
+/// from the outstanding `backlog` so a small backlog embeds a large share of
+/// itself in one hop while a huge one still makes bounded, non-blocking
+/// progress — never a flat magic-number cap; when the backlog itself is small
+/// the sqrt clamp just means "embed everything that's there".
+pub fn opportunistic_embed_batch_size(backlog: usize) -> usize {
+    if backlog == 0 {
+        return 0;
+    }
+    ((backlog as f64).sqrt().ceil() as usize).clamp(1, backlog)
 }
 
 /// Salient-token set of free text for lexical similarity: distinct lowercase
@@ -4361,6 +4374,70 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Global count of rows with **no** entry in the `embeddings` table — the
+    /// backlog [`unembedded_batch`](Self::unembedded_batch) draws from. A cheap
+    /// `COUNT(*)` so a caller can size a sweep before paying to fetch row bodies.
+    pub fn unembedded_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM memories m
+                   LEFT JOIN embeddings e ON e.memory_id = m.id
+                  WHERE e.memory_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(n as usize)
+    }
+
+    /// Opportunistic incremental embed sweep — pulls a small, backlog-scaled
+    /// batch of unembedded rows (see [`opportunistic_embed_batch_size`]) and
+    /// embeds + stores each one. Meant to run right after a save (CLI `memory
+    /// save`, MCP `memory_save`) so a project's embedding coverage climbs even
+    /// when the dashboard's periodic auto-embed daemon isn't running — that
+    /// daemon does full-backlog sweeps on a timer; this does one small,
+    /// call-bounded hop. Returns the number of rows actually embedded. Never
+    /// fails the caller: a backlog-count, batch-fetch, embed, or store error is
+    /// logged via `tracing::warn!` and the sweep just stops or skips that row.
+    pub fn opportunistic_embed_sweep(&self, embedder: &dyn Embedder) -> usize {
+        let backlog = match self.unembedded_count() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("opportunistic embed sweep: backlog count: {e}");
+                return 0;
+            }
+        };
+        let batch = opportunistic_embed_batch_size(backlog);
+        if batch == 0 {
+            return 0;
+        }
+        let rows = match self.unembedded_batch(batch) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("opportunistic embed sweep: unembedded_batch: {e}");
+                return 0;
+            }
+        };
+        let mut done = 0usize;
+        for (id, _project, body) in rows {
+            let vector = match embedder.embed_one(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("opportunistic embed sweep #{id}: embed: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = self.store_embedding(id, embedder.model_name(), &vector) {
+                tracing::warn!("opportunistic embed sweep #{id}: store_embedding: {e}");
+                continue;
+            }
+            done += 1;
+        }
+        done
+    }
+
     /// Hybrid recall — Reciprocal Rank Fusion of BM25 and dense-vector
     /// rankings. Score per record is `Σ 1 / (rrf_k + rank_i)` over the two
     /// streams; default `rrf_k = 60`. Each stream is fetched at `limit * 2` so
@@ -6108,6 +6185,53 @@ mod tests {
         assert!(hits[0].record.body.contains("rust"), "{:?}", hits);
     }
 
+    #[cfg(feature = "ollama-embed")]
+    #[test]
+    fn hybrid_recall_ready_gates_on_config_and_coverage() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let mut cfg = rtrt_core::Config::default();
+
+        // Gate 1: embeddings disabled (the default) -> never ready, regardless
+        // of coverage.
+        assert!(!hybrid_recall_ready(&store, "p", &cfg));
+
+        // Enable embeddings but leave the project empty (0/0 coverage): the
+        // `embedded > 0` check must reject an all-zero project too, not just
+        // a partially-covered one.
+        cfg.embeddings.enabled = true;
+        assert!(!hybrid_recall_ready(&store, "p", &cfg));
+
+        // Some rows, none embedded (0/2): below the 50% coverage floor.
+        store.save("p", "note", "alpha").unwrap();
+        let b = store.save("p", "note", "beta").unwrap();
+        assert!(!hybrid_recall_ready(&store, "p", &cfg));
+
+        // Embed exactly half (1/2): embedded*2 >= total -> ready.
+        store.store_embedding(b, "test-model", &[0.1, 0.2]).unwrap();
+        assert!(hybrid_recall_ready(&store, "p", &cfg));
+
+        // A different, still-empty project isn't affected by "p"'s coverage.
+        assert!(!hybrid_recall_ready(&store, "other", &cfg));
+    }
+
+    #[cfg(feature = "ollama-embed")]
+    #[test]
+    fn hybrid_embedder_from_config_resolves_base_url_and_model() {
+        let mut cfg = rtrt_core::Config::default();
+        cfg.embeddings.model = "bge-m3".to_string();
+        cfg.embeddings.base_url = Some("http://example.invalid:1234".to_string());
+
+        let embedder = hybrid_embedder_from_config(&cfg);
+        assert_eq!(embedder.model_name(), "bge-m3");
+
+        // No explicit embeddings.base_url -> falls back to auto_compress's,
+        // then the Ollama default. Construction never touches the network.
+        let mut cfg2 = rtrt_core::Config::default();
+        cfg2.embeddings.model = "nomic-embed-text".to_string();
+        let embedder2 = hybrid_embedder_from_config(&cfg2);
+        assert_eq!(embedder2.model_name(), "nomic-embed-text");
+    }
+
     /// Regression test for the auto-capture pipeline primitives that the
     /// dashboard and rtrt-mcp both depend on.
     ///
@@ -6795,6 +6919,65 @@ mod tests {
         // INSERT OR IGNORE: re-storing the same id is a harmless no-op.
         store.store_embedding(a, "test-model", &[9.0, 9.0]).unwrap();
         assert_eq!(store.embedding_coverage("p").unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn unembedded_count_matches_batch_and_drops_as_rows_are_embedded() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        assert_eq!(store.unembedded_count().unwrap(), 0);
+        let a = store.save("p", "note", "alpha").unwrap();
+        let _b = store.save("p", "note", "beta").unwrap();
+        let _c = store.save("p", "note", "gamma").unwrap();
+        assert_eq!(store.unembedded_count().unwrap(), 3);
+
+        store.store_embedding(a, "test-model", &[0.1, 0.2]).unwrap();
+        assert_eq!(store.unembedded_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn opportunistic_embed_batch_size_is_sqrt_scaled_with_a_floor() {
+        // Empty backlog: nothing to do.
+        assert_eq!(opportunistic_embed_batch_size(0), 0);
+        // Tiny backlogs never round down to zero — sqrt(1).ceil() == 1.
+        assert_eq!(opportunistic_embed_batch_size(1), 1);
+        // sqrt(2).ceil() == 2, sqrt(3).ceil() == 2.
+        assert_eq!(opportunistic_embed_batch_size(2), 2);
+        assert_eq!(opportunistic_embed_batch_size(3), 2);
+        // Never exceeds the backlog itself ("show all that exist" for small n).
+        assert!(opportunistic_embed_batch_size(3) <= 3);
+        // Scales with sqrt(n), not a flat cap: bigger backlog -> bigger batch,
+        // but always far less than the backlog once it's large.
+        assert_eq!(opportunistic_embed_batch_size(100), 10);
+        let big = opportunistic_embed_batch_size(1_000_000);
+        assert_eq!(big, 1000);
+        assert!(big < 1_000_000);
+    }
+
+    #[test]
+    fn opportunistic_embed_sweep_embeds_a_scaled_batch_and_skips_embedded_rows() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = WordHashEmbedder;
+        // 4 unembedded rows -> batch size sqrt(4).ceil() == 2.
+        for i in 0..4 {
+            store.save("p", "note", &format!("row {i} rust")).unwrap();
+        }
+        assert_eq!(store.unembedded_count().unwrap(), 4);
+
+        let done = store.opportunistic_embed_sweep(&embedder);
+        assert_eq!(done, 2, "sqrt(4) batch should embed exactly 2 rows");
+        assert_eq!(store.unembedded_count().unwrap(), 2);
+
+        // Sweeping again makes further progress on the remaining backlog
+        // (sqrt(2).ceil() == 2) until nothing is left.
+        let done2 = store.opportunistic_embed_sweep(&embedder);
+        assert_eq!(done2, 2);
+        assert_eq!(store.unembedded_count().unwrap(), 0);
+
+        // A final sweep on an empty backlog is a no-op, not an error.
+        assert_eq!(store.opportunistic_embed_sweep(&embedder), 0);
+
+        let (embedded, total) = store.embedding_coverage("p").unwrap();
+        assert_eq!((embedded, total), (4, 4));
     }
 
     /// Hand-insert an embedding row for `id` so vector clustering has dense

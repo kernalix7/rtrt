@@ -9,6 +9,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **MCP semantic recall**: `rtrt-mcp` now builds an `OllamaEmbedder` at startup (embeddings enabled + a cheap reachability probe) and routes `memory_recall` / `memory_smart_search` through hybrid (BM25 + vector RRF) recall once a project has meaningful embedding coverage, sharing the CLI hook's gate/timeout/fallback logic via new `rtrt_memory::hybrid_recall_ready` / `hybrid_embedder_from_config` helpers. `rtrt setup` turns `[embeddings] enabled` on by default when a local Ollama with an embedding-capable model is detected (never overrides an explicit user setting). `memory save` (CLI) and `memory_save` (MCP) now opportunistically embed a small, backlog-scaled batch of unembedded rows after every save (`MemoryStore::opportunistic_embed_sweep`), so coverage climbs even without the dashboard's auto-embed daemon running.
+
+### Changed
+
+- `memory_recall` / `memory_smart_search` MCP tool descriptions and server instructions now describe actual runtime behavior (hybrid when an embedder is attached, BM25 otherwise) instead of a static claim.
+
 ### Highlights — dashboard UX overhaul (dead spots fixed, IA tightened)
 
 **Every dashboard surface now does something real: the Sessions decoy became a feature, Route merged into Router, the gateway cards got a live data source, and the last dead panels were removed or wired.**

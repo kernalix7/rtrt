@@ -31,6 +31,14 @@ const LEDGER_FILE_NAME: &str = "provider-usage.tsv";
 const MAX_LEDGER_ROWS: usize = 5000;
 /// CLI shell-outs return only text, so tokens are estimated at ~4 chars/token.
 const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
+/// A `.lock` file older than this is treated as leftover from a crashed
+/// process and stolen — an append + trim takes milliseconds, never seconds.
+const LOCK_STALE_SECS: u64 = 10;
+/// How many times to retry lock acquisition (with [`LOCK_RETRY_WAIT`] between
+/// attempts) before falling back to an untrimmed append. Bounded so recording
+/// can never block a caller for long.
+const LOCK_RETRY_ATTEMPTS: u32 = 5;
+const LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Rolling windows surfaced by [`provider_usage_windows`], in seconds.
 const WINDOW_5H_SECS: u64 = 5 * 60 * 60;
@@ -161,12 +169,78 @@ pub fn record_invocation(
         ok,
     };
     let path = ledger_path();
+    // Serialize writers across concurrent rtrt processes: trim_to_cap is a
+    // read-rewrite, so a concurrent append during a trim could be lost. The
+    // lock is best-effort — when it cannot be acquired within the bounded
+    // retries we still append (recording must never be dropped or block) and
+    // only skip the trim; the next successful writer trims the backlog.
+    let lock = LedgerLock::try_acquire(lock_path(&path), LOCK_STALE_SECS);
     if append_row(&path, &row).is_err() {
         return None;
     }
-    // Cap the file on a best-effort basis; ignore any trim failure.
-    let _ = trim_to_cap(&path, MAX_LEDGER_ROWS);
+    if lock.is_some() {
+        // Cap the file on a best-effort basis; ignore any trim failure.
+        let _ = trim_to_cap(&path, MAX_LEDGER_ROWS);
+    }
     Some(row)
+}
+
+/// Best-effort advisory lock: an `O_EXCL`-created sibling `.lock` file, removed
+/// on drop. Dependency-light by design — no OS advisory-lock crate. A lock file
+/// whose mtime is older than `stale_secs` is treated as leftover from a crashed
+/// process and stolen.
+struct LedgerLock {
+    path: PathBuf,
+}
+
+impl LedgerLock {
+    fn try_acquire(path: PathBuf, stale_secs: u64) -> Option<Self> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        for attempt in 0..LOCK_RETRY_ATTEMPTS {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Some(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path, stale_secs) {
+                        // Steal the abandoned lock and retry the exclusive
+                        // create immediately (another process may win the
+                        // race — that is fine, we just keep retrying).
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if attempt + 1 < LOCK_RETRY_ATTEMPTS {
+                        std::thread::sleep(LOCK_RETRY_WAIT);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path, stale_secs: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_secs() >= stale_secs)
+}
+
+fn lock_path(ledger: &Path) -> PathBuf {
+    let mut name = ledger
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from(LEDGER_FILE_NAME));
+    name.push(".lock");
+    ledger.with_file_name(name)
 }
 
 /// Estimate token count for a CLI text body (`chars / 4`, rounded up).
@@ -383,6 +457,56 @@ mod tests {
         assert_eq!(headroom.remaining_requests, Some(9));
         assert!(!headroom.limits_unknown());
         assert!(!headroom.tokens_estimated);
+    }
+
+    fn temp_ledger_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rtrt-ledger-{tag}-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn ledger_lock_is_exclusive_and_released_on_drop() {
+        let ledger = temp_ledger_path("lock");
+        let lock_file = lock_path(&ledger);
+
+        let held = LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS);
+        assert!(held.is_some(), "first acquire should succeed");
+        // Contended (and fresh, so not stealable): second acquire fails after
+        // its bounded retries instead of blocking or clobbering.
+        assert!(LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS).is_none());
+
+        drop(held);
+        assert!(!lock_file.exists(), "drop must remove the lock file");
+        let reacquired = LedgerLock::try_acquire(lock_file.clone(), LOCK_STALE_SECS);
+        assert!(reacquired.is_some(), "released lock is acquirable again");
+    }
+
+    #[test]
+    fn stale_ledger_lock_is_stolen() {
+        let ledger = temp_ledger_path("stale");
+        let lock_file = lock_path(&ledger);
+        // Simulate a crashed process: a lock file nobody will ever remove.
+        std::fs::write(&lock_file, b"").unwrap();
+        // With a zero stale timeout the leftover file is immediately stale.
+        let stolen = LedgerLock::try_acquire(lock_file.clone(), 0);
+        assert!(stolen.is_some(), "stale lock must be stolen");
+        drop(stolen);
+        assert!(!lock_file.exists());
+    }
+
+    #[test]
+    fn lock_path_appends_lock_suffix() {
+        let ledger = PathBuf::from("/tmp/x/provider-usage.tsv");
+        assert_eq!(
+            lock_path(&ledger),
+            PathBuf::from("/tmp/x/provider-usage.tsv.lock")
+        );
     }
 
     #[test]

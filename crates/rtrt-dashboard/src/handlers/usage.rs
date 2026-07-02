@@ -170,7 +170,9 @@ pub(crate) async fn route_preview_api(
         mode: None,
     };
     let tools = detected_tools_with_config_overrides();
-    let usage = UsageSnapshot::load_best_effort();
+    // Ledger-aware snapshot, same as `/api/route` and the CLI — the preview
+    // must show the decision the router would actually make.
+    let usage = UsageSnapshot::load_for_routing();
     let decision = match select_route(&request, &tools, &usage) {
         Ok(decision) => decision,
         Err(e) => return route_error(StatusCode::BAD_REQUEST, &e.to_string()),

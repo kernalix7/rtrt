@@ -355,9 +355,13 @@ fn parse_agent_route_capability(value: Option<&str>) -> Result<Option<Capability
         "reasoning" => Ok(Some(Capability::Reasoning)),
         "vision" => Ok(Some(Capability::Vision)),
         "embed" => Ok(Some(Capability::Embed)),
+        "agentic" => Ok(Some(Capability::Agentic)),
         "cheap" => Ok(Some(Capability::CheapBulk)),
         other => Err(McpError::invalid_params(
-            format!("agent_route capability: unknown capability '{other}'"),
+            format!(
+                "agent_route capability: unknown capability '{other}' \
+                 (expected code, reasoning, vision, embed, agentic, or cheap)"
+            ),
             None,
         )),
     }
@@ -971,8 +975,13 @@ impl RtrtMcp {
             model: args.model,
             mode: None,
         };
-        let tools = rtrt_core::detect::detect_tools();
-        let usage = UsageSnapshot::load_best_effort();
+        // Same routing inputs as the CLI: the effective (global ⊕ project
+        // `.rtrt/config.toml`) config drives the per-project enable map, and
+        // the usage snapshot carries the ledger's rolling 24h window so
+        // ranking is headroom-aware here too.
+        let cfg = rtrt_core::Config::load_effective_for_cwd();
+        let tools = rtrt_core::detect_tools_with_config(cfg);
+        let usage = UsageSnapshot::load_for_routing();
         let decision = select_route(&req, &tools, &usage)
             .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
         let target = decision.target.clone();
@@ -1472,5 +1481,29 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn agent_route_capability_parses_every_label_including_agentic() {
+        let cases = [
+            ("code", Capability::Code),
+            ("reasoning", Capability::Reasoning),
+            ("vision", Capability::Vision),
+            ("embed", Capability::Embed),
+            ("agentic", Capability::Agentic),
+            ("cheap", Capability::CheapBulk),
+        ];
+        for (label, expected) in cases {
+            let parsed = parse_agent_route_capability(Some(label))
+                .unwrap_or_else(|e| panic!("'{label}' should parse: {e:?}"));
+            assert_eq!(parsed, Some(expected), "label '{label}'");
+        }
+        // Case/whitespace tolerant, None passthrough, unknown rejected.
+        assert_eq!(
+            parse_agent_route_capability(Some(" Agentic ")).unwrap(),
+            Some(Capability::Agentic)
+        );
+        assert_eq!(parse_agent_route_capability(None).unwrap(), None);
+        assert!(parse_agent_route_capability(Some("telepathy")).is_err());
     }
 }

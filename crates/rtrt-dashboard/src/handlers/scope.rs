@@ -484,8 +484,11 @@ pub(crate) async fn post_providers_config(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // The UI form only carries `active` + the enable map; `api_max_tokens` is
+    // preserved from the layer being rewritten so saving here never wipes it.
     let providers_cfg = rtrt_core::config::ProvidersConfig {
         active,
+        api_max_tokens: None,
         enabled: body.enabled.clone(),
     };
 
@@ -494,6 +497,8 @@ pub(crate) async fn post_providers_config(
             Ok(p) => p,
             Err(e) => return clear_field_error(e),
         };
+        let mut providers_cfg = providers_cfg;
+        providers_cfg.api_max_tokens = project.providers.as_ref().and_then(|p| p.api_max_tokens);
         project.providers = Some(providers_cfg);
         if let Err(e) = rtrt_core::Config::save_project(path, &project) {
             return clear_field_error(e);
@@ -514,6 +519,8 @@ pub(crate) async fn post_providers_config(
         Ok(c) => c,
         Err(e) => return clear_field_error(e),
     };
+    let mut providers_cfg = providers_cfg;
+    providers_cfg.api_max_tokens = cfg.providers.api_max_tokens;
     cfg.providers = providers_cfg;
     if let Err((status, msg)) = write_config_file(&cfg) {
         return (status, Json(serde_json::json!({ "error": msg }))).into_response();

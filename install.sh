@@ -36,9 +36,18 @@
 #   --dry-run           Print intended actions without writing anything.
 
 set -eu
+# pipefail is not guaranteed by POSIX sh; enable it where the shell supports
+# it (bash, zsh, dash >= 0.5.12, POSIX 2024 shells) — hence the subshell probe.
+# shellcheck disable=SC3040
+if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
 
 REPO="kernalix7/rtrt"
 BINS="rtrt rtrt-mcp rtrt-dashboard"
+
+if [ -z "${HOME:-}" ]; then
+    printf '[error] HOME is not set — cannot pick an install dir.\n' >&2
+    exit 1
+fi
 
 # Env-var fallbacks. Flags take precedence when both are set.
 RTRT_REF="${RTRT_REF:-}"
@@ -72,6 +81,38 @@ log()  { printf '%s[rtrt]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s[warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf '%s[error]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
+# Self-contained usage text — `sed "$0"` breaks under `curl | sh` where $0 is
+# the shell binary, so the flag summary is duplicated here instead.
+usage() {
+    cat <<'EOF'
+RTRT installer — Linux / macOS / WSL.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
+  ./install.sh [--main] [--ref TAG] [--source PATH] [--version vX.Y.Z]
+               [--dir PATH] [--skip-deps] [--no-setup] [--no-service]
+               [--uninstall] [--dry-run] [--help]
+
+Version selection (default: latest GitHub release, falls back to --main):
+  --main              Build from git main HEAD. Same as --ref main. (env: RTRT_REF=main)
+  --ref TAG           Build from a tag / branch / commit. (env: RTRT_REF=<ref>)
+  --version vX.Y.Z    Pin a specific release tarball (skip source build).
+
+Local-path option (offline / air-gapped):
+  --source PATH       Build from a local copy instead of git clone. (env: RTRT_SOURCE)
+
+Install dir + toolchain:
+  --dir PATH          Install dir (default: $HOME/.local/bin).
+  --skip-deps         Skip the toolchain check. (env: RTRT_SKIP_DEPS=1)
+  --no-setup          Don't auto-refresh the Claude Code MCP config + hooks. (env: RTRT_NO_SETUP=1)
+  --no-service        Don't install the rtrt-dashboard background service. (env: RTRT_NO_SERVICE=1)
+
+Compat shims:
+  --uninstall         Deletes the three binaries from --dir; use uninstall.sh for the full flow.
+  --dry-run           Print intended actions without writing anything.
+EOF
+}
+
 # ---------- arg parse ----------
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -85,7 +126,7 @@ while [ $# -gt 0 ]; do
     --no-setup)      NO_SETUP=1; shift ;;
     --no-service)    NO_SERVICE=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
-    -h|--help)       sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help)       usage; exit 0 ;;
     *)
         err "unknown arg: $1"; exit 2 ;;
     esac
@@ -100,7 +141,7 @@ run() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] %s\n' "$*"
     else
-        eval "$@"
+        eval "$*"
     fi
 }
 
@@ -275,7 +316,9 @@ if [ -n "$REF" ]; then
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT INT TERM
     log "  ref: $REF (source build into $WORK)"
-    run "git clone --depth 1 --branch \"$REF\" \"https://github.com/$REPO\" \"$WORK\" 2>/dev/null || git clone \"https://github.com/$REPO\" \"$WORK\" && git -C \"$WORK\" checkout \"$REF\""
+    # Group the fallback: a plain `a || b && c` would run the checkout even
+    # after a successful shallow clone.
+    run "git clone --depth 1 --branch \"$REF\" \"https://github.com/$REPO\" \"$WORK\" 2>/dev/null || { git clone \"https://github.com/$REPO\" \"$WORK\" && git -C \"$WORK\" checkout \"$REF\"; }"
     build_from_source "$WORK"
     exit 0
 fi
@@ -288,9 +331,11 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
 fi
 
 if [ -z "$VERSION" ]; then
+    # A 404 (zero releases yet) or offline curl must not abort under
+    # set -e / pipefail — an empty VERSION is the fallback signal.
     VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-        | head -1)"
+        | head -1)" || VERSION=""
     if [ -z "$VERSION" ]; then
         warn "no GitHub Release published yet — falling back to source build from main."
         warn "Pass --version vX.Y.Z to pin a release once one is cut, or --ref BRANCH to track a different branch."
@@ -321,30 +366,40 @@ log "  downloading $URL"
 run "curl -fsSL -o \"$WORK/$ASSET\" \"$URL\""
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    if EXPECTED="$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null | awk '{print $1}' | head -1)"; then
-        if [ -n "$EXPECTED" ]; then
-            ACTUAL="$(sha256sum "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')"
-            if [ -z "$ACTUAL" ]; then
-                ACTUAL="$(shasum -a 256 "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')"
-            fi
-            if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-                err "checksum mismatch:"
-                err "  expected $EXPECTED"
-                err "  actual   $ACTUAL"
-                exit 1
-            fi
-            log "  checksum: ok"
-        else
-            warn "  checksum: no SHA256 file at release; skipping verification"
+    # A missing .sha256 asset (`curl -f` fails) must surface as an empty
+    # EXPECTED — not abort the install under set -e / pipefail.
+    EXPECTED="$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null | awk '{print $1}' | head -1)" || EXPECTED=""
+    if [ -n "$EXPECTED" ]; then
+        ACTUAL="$(sha256sum "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
+        if [ -z "$ACTUAL" ]; then
+            ACTUAL="$(shasum -a 256 "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
         fi
+        if [ -z "$ACTUAL" ]; then
+            err "a SHA256 checksum is published for $ASSET but neither sha256sum nor shasum is available to verify it."
+            err "Install coreutils (sha256sum) or perl (shasum), or verify manually against:"
+            err "  $CHECKSUM_URL"
+            exit 1
+        fi
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+            err "checksum mismatch:"
+            err "  expected $EXPECTED"
+            err "  actual   $ACTUAL"
+            exit 1
+        fi
+        log "  checksum: ok"
     else
-        warn "  checksum: SHA256 file not yet attached; skipping verification"
+        warn "  checksum: no SHA256 file attached to the release; skipping verification"
     fi
 fi
 
 run "tar -xzf \"$WORK/$ASSET\" -C \"$WORK\""
 run "mkdir -p \"$INSTALL_DIR\""
 for bin in $BINS; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+        # Nothing was downloaded in dry-run mode, so skip the existence probe.
+        run "install -m 0755 \"$WORK/$bin\" \"$INSTALL_DIR/$bin\""
+        continue
+    fi
     src=""
     for candidate in "$WORK/$bin" "$WORK/${ASSET%.tar.gz}/$bin"; do
         if [ -f "$candidate" ]; then src="$candidate"; break; fi

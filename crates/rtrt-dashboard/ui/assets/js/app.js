@@ -616,7 +616,7 @@ async function loadLlmModels() {
   body.innerHTML = `<table>
     <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th style="text-align:right;">Actions</th></tr></thead>
     <tbody>${models.map(m => {
-      const mod = m.modified_at ? new Date(m.modified_at).toLocaleDateString('ko-KR') : '—';
+      const mod = m.modified_at ? new Date(m.modified_at).toLocaleDateString() : '—';
       return `<tr>
         <td><code>${escapeHtml(m.name)}</code></td>
         <td>${humanBytes(m.size)}</td>
@@ -751,7 +751,7 @@ const MODE_PAGES = {
   },
   tools: {
     default: 'llm',
-    pages: ['llm', 'limits', 'environment', 'usage', 'route', 'connect'],
+    pages: ['llm', 'chat', 'limits', 'environment', 'usage', 'connect'],
   },
 };
 const PAGE_MODE = {};
@@ -769,8 +769,8 @@ Object.entries(MODE_PAGES).forEach(([mode, def]) => def.pages.forEach(p => { PAG
 // data-sub ids (e.g. memory's `memquery` sub → /memory/search).
 const PAGE_SLUG = { usage: 'router' };          // page id -> URL slug (override only)
 const SUB_SLUG = {                              // internal data-sub -> URL slug
-  memquery: 'search', memhistory: 'timeline', memmap: 'map',
-  memblocks: 'blocks', memstats: 'stats', membackup: 'backup',
+  memquery: 'search', memhistory: 'timeline', memsessions: 'sessions',
+  memmap: 'map', memblocks: 'blocks', memstats: 'stats', membackup: 'backup',
   'command-gain': 'gain', 'command-coverage': 'coverage',
   'command-proxy': 'proxy', 'command-repomap': 'repomap',
   securityscan: 'scan', securityprofiles: 'profiles',
@@ -780,6 +780,9 @@ const SLUG_SUB = {};    // URL sub slug -> internal data-sub (inverse of SUB_SLU
 Object.keys(PAGE_MODE).forEach(p => { SLUG_PAGE[p] = p; });
 Object.entries(PAGE_SLUG).forEach(([page, slug]) => { SLUG_PAGE[slug] = page; });
 Object.entries(SUB_SLUG).forEach(([sub, slug]) => { SLUG_SUB[slug] = sub; });
+// Legacy alias: the separate Route page merged into Router. Old /route deep
+// links land on the merged page (the address bar then normalises to /router).
+SLUG_PAGE.route = 'usage';
 
 const DEFAULT_PAGE = MODE_PAGES.project.default; // overview
 // Guard so popstate-driven navigate() doesn't push a duplicate history entry.
@@ -926,7 +929,6 @@ if (INITIAL_ROUTE.project) {
 setMode(INITIAL_MODE, false);
 
 // Init
-document.getElementById('env-bind').textContent = window.location.host;
 syncOverviewWindowButtons();
 // loadProjects() populates the selector (honouring the seeded ?project=); once it
 // settles, route from the URL so the deep page/sub is restored. Suppress URL

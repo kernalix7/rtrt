@@ -64,18 +64,21 @@ sh install.sh --dir /opt/rtrt/bin --skip-deps
 ### 원라이너 제거
 
 ```bash
-# Linux / macOS / WSL — 바이너리만 (~/.rtrt 상태 유지)
+# Linux / macOS / WSL — Claude Code 연동(MCP + 훅 + 상태줄) 해제 + 대시보드
+# 서비스 + 바이너리 제거 (~/.rtrt 상태 유지)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
 
-# 완전 제거 — 바이너리 + ~/.rtrt + fastembed 모델 캐시
+# 완전 제거 — 위 항목 + ~/.rtrt + fastembed 모델 캐시
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
 ```
 
 ```powershell
-# Windows PowerShell
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
+# Windows PowerShell — `irm | iex`는 파라미터를 전달하지 못하므로 스크립트블록으로 감쌉니다
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Confirm
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Purge
 ```
+
+언인스톨러는 `install.sh` / `rtrt setup`이 만든 모든 것 — Claude Code MCP 등록, 훅, 상태줄, 스킬(내부적으로 `rtrt uninstall --agent claude --plugin --apply`), 대시보드 백그라운드 서비스, 바이너리 3종 — 을 제거하되, `--purge` / `-Purge`를 넘기지 않는 한 데이터(`~/.rtrt` 메모리 저장소, 프롬프트 레지스트리)는 보존합니다.
 
 로컬에서 `--confirm` / `-Confirm` 없이 실행하면 단계마다 확인을 묻는 대화형 모드로 동작합니다. 기존 `install.sh --uninstall` / `install.ps1 -Uninstall`은 상태를 건드리지 않는 호환성 셰임으로 남아 있습니다.
 
@@ -146,7 +149,7 @@ rtrt templates
 cargo uninstall rtrt-cli rtrt-mcp rtrt-dashboard
 ```
 
-원라이너 설치 경로는 위쪽 [원라이너 제거](#원라이너-제거) 절을 사용하세요. 독립 스크립트(`uninstall.sh` / `uninstall.ps1`)로 살아 있으며 `--confirm` (바이너리만) 또는 `--purge` (바이너리 + `~/.rtrt` + fastembed 캐시)를 받습니다.
+원라이너 설치 경로는 위쪽 [원라이너 제거](#원라이너-제거) 절을 사용하세요. 독립 스크립트(`uninstall.sh` / `uninstall.ps1`)로 살아 있으며 `--confirm` (Claude Code 연동 + 서비스 + 바이너리, 데이터 유지) 또는 `--purge` (위 항목 + `~/.rtrt` + fastembed 캐시)를 받습니다.
 
 수동 상태 정리:
 

@@ -32,6 +32,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Windows PowerShell 5.1 may default to TLS 1.0 — force TLS 1.2+ so the
+# GitHub API / release downloads don't fail the handshake.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {
+    # PowerShell 7+ negotiates modern TLS on its own.
+}
+
 $Repo = "kernalix7/rtrt"
 $Bins = @("rtrt.exe", "rtrt-mcp.exe", "rtrt-dashboard.exe")
 
@@ -65,7 +75,7 @@ function Require-Cmd($Name) {
 if ($Uninstall) {
     Write-Log "== rtrt uninstall (compat shim) =="
     Write-Log "For interactive / purge flow, use uninstall.ps1:"
-    Write-Log "  irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1 | iex -Args '-Confirm'"
+    Write-Log "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1))) -Confirm"
     Write-Host ""
     foreach ($bin in $Bins) {
         $target = Join-Path $InstallDir $bin
@@ -97,7 +107,10 @@ function Show-InstallCheck {
     if (-not ($current.Split($pathSep) -contains $InstallDir)) {
         Write-Host ""
         Write-Warn "$InstallDir is not on `$env:PATH."
-        Write-Warn "  Add it via:  setx PATH `"$InstallDir;$env:PATH`""
+        # NOT `setx PATH` — that flattens machine+user PATH into the user value
+        # and truncates it at 1024 characters.
+        Write-Warn "  Add it (user scope, new shells) via:"
+        Write-Warn "    [Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path','User') + ';$InstallDir'), 'User')"
         Write-Host ""
     }
     Write-Log "rtrt installed:"
@@ -224,7 +237,7 @@ $work = Join-Path $env:TEMP "rtrt-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
     $archivePath = Join-Path $work $asset
-    Invoke-Step "downloading $url" { Invoke-WebRequest -Uri $url -OutFile $archivePath }
+    Invoke-Step "downloading $url" { Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing }
     if (-not $DryRun) {
         try {
             $expected = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content.Trim().Split(' ')[0]
@@ -247,9 +260,14 @@ try {
         Invoke-Step "mkdir $InstallDir" { New-Item -ItemType Directory -Path $InstallDir | Out-Null }
     }
     foreach ($bin in $Bins) {
+        $dst = Join-Path $InstallDir $bin
+        if ($DryRun) {
+            # Nothing was downloaded in dry-run mode, so skip the existence probe.
+            Invoke-Step "install $bin -> $dst" { }
+            continue
+        }
         $src = Get-ChildItem -Path $extract -Recurse -Filter $bin | Select-Object -First 1
         if (-not $src) { throw "binary missing from zip: $bin" }
-        $dst = Join-Path $InstallDir $bin
         Invoke-Step "install $bin" { Copy-Item -Force $src.FullName $dst }
     }
     Show-InstallCheck

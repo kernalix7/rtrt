@@ -209,6 +209,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - AIPS plugin workaround at init time: `lib/detect-project.sh` emits unquoted multi-word values (e.g. `DEPLOYMENT=GitHub Actions`), which breaks `lib/render-claude-md.sh`'s `eval` call. Worked around locally.
 - `rtrt-cli` clippy fixes on stable: `sort_by(|a,b| b.cmp(a))` → `sort_by_key(Reverse(...))`; manual `if zero { 0 } else { x*100/y }` → `checked_sub` + `checked_mul` + `checked_div` chain.
+- Install/uninstall hardening: uninstallers now unwire the Claude Code integration (MCP + hooks + statusline via `rtrt uninstall --agent claude --plugin --apply`) and fall back to direct service-unit cleanup; `rtrt uninstall --agent claude` drops the rtrt `statusLine` entry; `install.sh` gains pipefail (where supported), a fixed `--ref` clone fallback, working release-path `--dry-run`, and a hard error when a published SHA256 can't be verified; `install.ps1` forces TLS 1.2+ and safe PATH guidance (no `setx` truncation); docs drop the broken `irm | iex -Args` pattern.
 
 <!--
 Template for each new version section — copy this stanza when cutting a release.

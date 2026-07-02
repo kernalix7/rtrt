@@ -2,7 +2,7 @@
 
 **English** | [한국어](INSTALL.ko.md)
 
-RTRT is in alpha. Two install paths are supported today: **one-line script** (fetches the binary or builds from `main` if no release matches) and **from source via `cargo`**. Pre-built binary releases land with `v0.2.0` — until then the one-liner falls back to `--main` automatically when invoked with that flag.
+RTRT is in alpha. Two install paths are supported today: **one-line script** (fetches the binary or builds from `main` if no release matches) and **from source via `cargo`**. No GitHub Release is published yet — until the first one is cut, the one-liner detects that automatically, prints a notice, and builds from `main` (a Rust toolchain + git are required for that path).
 
 ## One-liner (recommended)
 
@@ -64,18 +64,21 @@ sh install.sh --dir /opt/rtrt/bin --skip-deps
 ### Uninstall (one-liner)
 
 ```bash
-# Linux / macOS / WSL — binaries only (state under ~/.rtrt left intact)
+# Linux / macOS / WSL — unwires Claude Code (MCP + hooks + statusline), removes
+# the dashboard service + binaries; state under ~/.rtrt left intact
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
 
-# Full purge — binaries + ~/.rtrt + fastembed model cache
+# Full purge — the above + ~/.rtrt + fastembed model cache
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --purge
 ```
 
 ```powershell
-# Windows PowerShell
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
-irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
+# Windows PowerShell — `irm | iex` cannot forward parameters, so wrap in a scriptblock
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Confirm
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Purge
 ```
+
+The uninstaller removes everything `install.sh` / `rtrt setup` created — the Claude Code MCP registration, hooks, statusline, skills (`rtrt uninstall --agent claude --plugin --apply` under the hood), the dashboard background service, and the three binaries — while preserving your data (`~/.rtrt` memory store, prompt registry) unless you pass `--purge` / `-Purge`.
 
 Both `uninstall.sh` and `uninstall.ps1` also run interactively when executed locally without `--confirm` / `-Confirm` — they ask before each step. `install.sh --uninstall` / `install.ps1 -Uninstall` stay as compatibility shims that delete the binaries without touching state.
 
@@ -146,7 +149,7 @@ If you installed from source via `cargo install`, remove the binaries with:
 cargo uninstall rtrt-cli rtrt-mcp rtrt-dashboard
 ```
 
-For the curl-installer flow, prefer the one-liners under [Uninstall (one-liner)](#uninstall-one-liner) above. They live as standalone scripts (`uninstall.sh` / `uninstall.ps1`) and accept `--confirm` (binaries only) or `--purge` (binaries + `~/.rtrt` + fastembed model cache).
+For the curl-installer flow, prefer the one-liners under [Uninstall (one-liner)](#uninstall-one-liner) above. They live as standalone scripts (`uninstall.sh` / `uninstall.ps1`) and accept `--confirm` (Claude Code wiring + service + binaries, data kept) or `--purge` (the above + `~/.rtrt` + fastembed model cache).
 
 Manual state cleanup:
 

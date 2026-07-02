@@ -3,15 +3,17 @@
 # Interactive (asks before each step):
 #   .\uninstall.ps1
 #
-# Auto (binaries only, keeps state):
-#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Confirm'
+# Auto (agent wiring + task + binaries, keeps state):
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Confirm
 #
-# Full purge (binaries + %APPDATA%\rtrt):
-#   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1 | iex -Args '-Purge'
+# Full purge (the above + %USERPROFILE%\.rtrt + caches):
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Purge
+#
+# (`irm ... | iex` cannot forward parameters — the scriptblock form above can.)
 #
 # Flags:
-#   -Confirm                non-interactive, removes the three binaries only
-#   -Purge                  non-interactive, also wipes %APPDATA%\rtrt
+#   -Confirm                non-interactive: Claude Code wiring + task + binaries
+#   -Purge                  non-interactive, also wipes %USERPROFILE%\.rtrt + caches
 #   -InstallDir <path>      install dir (default: $env:LOCALAPPDATA\Programs\rtrt)
 
 param(
@@ -40,11 +42,41 @@ Write-Host "=========================================="
 Write-Host " rtrt uninstaller"
 Write-Host "=========================================="
 if ($Purge) {
-    Write-Log "Mode: FULL PURGE (binaries + %APPDATA%\rtrt + fastembed cache)"
+    Write-Log "Mode: FULL PURGE (binaries + %USERPROFILE%\.rtrt + fastembed cache)"
+    Write-Warn "purge is irreversible — memory store, prompt registry, and model caches will be deleted."
 } else {
     Write-Log "Mode: BINARIES ONLY (use -Purge for full wipe)"
 }
 Write-Host ""
+
+# Unwire the Claude Code integration first, while rtrt.exe still exists to do
+# it — otherwise settings keep hooks + a statusline that point at deleted
+# binaries. Best-effort: no prior `rtrt setup` is fine.
+$rtrtExe = Join-Path $InstallDir 'rtrt.exe'
+if (-not (Test-Path $rtrtExe)) {
+    $found = Get-Command rtrt.exe -ErrorAction SilentlyContinue
+    if ($found) { $rtrtExe = $found.Source } else { $rtrtExe = $null }
+}
+$claudeJson = Join-Path $env:USERPROFILE '.claude.json'
+$claudeSettings = Join-Path $env:USERPROFILE '.claude\settings.json'
+$claudeWired = ((Test-Path $claudeJson) -and (Select-String -Path $claudeJson -Pattern '"rtrt"' -Quiet -ErrorAction SilentlyContinue)) -or
+               ((Test-Path $claudeSettings) -and (Select-String -Path $claudeSettings -Pattern 'rtrt hook' -Quiet -ErrorAction SilentlyContinue))
+if ($claudeWired) {
+    if ($rtrtExe) {
+        if (Confirm-Step "Remove the Claude Code integration (MCP server, hooks, statusline, skills)?") {
+            & $rtrtExe uninstall --agent claude --plugin --apply *> $null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "  Claude Code integration removed (.claude.json, .claude\settings.json)"
+                Write-Log "  restart Claude Code to drop the unloaded MCP server + hooks"
+            } else {
+                Write-Warn "  could not unwire Claude Code — run: rtrt uninstall --agent claude --plugin --apply"
+            }
+        }
+    } else {
+        Write-Warn "  Claude Code is wired to rtrt but no rtrt.exe was found to unwire it."
+        Write-Warn "  Reinstall rtrt and run: rtrt uninstall --agent claude --plugin --apply"
+    }
+}
 
 # Remove the dashboard logon task first (best-effort).
 $existingTask = Get-ScheduledTask -TaskName "rtrt-dashboard" -ErrorAction SilentlyContinue
@@ -87,7 +119,7 @@ if ($Purge) {
         }
     }
 } else {
-    Write-Log "Local state left intact. Use -Purge to wipe %APPDATA%\rtrt + caches."
+    Write-Log "Local state left intact. Use -Purge to wipe %USERPROFILE%\.rtrt + caches."
 }
 
 Write-Host ""

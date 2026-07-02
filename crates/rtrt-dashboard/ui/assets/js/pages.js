@@ -295,13 +295,25 @@ async function loadOverview() {
   updateOverviewLiveIndicator();
 
   setPill('pill-gateway', calls > 0, calls > 0 ? 'gateway active' : 'gateway idle');
-  setPill('pill-memory', null, 'Memory');
+  // Memory pill mirrors the savings source's availability (honest state, not a
+  // permanently-neutral decoration).
+  const memSource = oRes && Array.isArray(oRes.sources)
+    ? oRes.sources.find(s => s.name === 'memory')
+    : null;
+  setPill('pill-memory', memSource ? memSource.available !== false : null, 'Memory');
   if (bRes) {
     const cache = (bRes.cache_len === null || bRes.cache_len === undefined) ? 'off' : `${bRes.cache_len} entries`;
     setPill('pill-cache', bRes.cache_len !== null && bRes.cache_len !== undefined, `Cache ${cache}`);
-    document.getElementById('env-cache').textContent = cache;
-    document.getElementById('env-budget').textContent = bRes.cap_usd ? `${fmtUsd(bRes.cap_usd)} (${fmtUsd(bRes.spent_usd)} spent)` : 'not set';
   }
+
+  // Gateway cards (trend / recent calls / budget) are fed exclusively by
+  // POST /api/chat traffic. Until the gateway has served a call, show one
+  // honest empty state instead of three dead cards.
+  const gatewayEmpty = document.getElementById('overview-gateway-empty');
+  const gatewayCards = document.getElementById('overview-gateway-cards');
+  const gatewayActive = calls > 0;
+  if (gatewayEmpty) gatewayEmpty.hidden = gatewayActive;
+  if (gatewayCards) gatewayCards.hidden = !gatewayActive;
 
   const recent = mRes.recent || [];
   spark('chart-latency', recent.slice().reverse().map(r => r.latency_ms), '#2962FF');
@@ -326,8 +338,14 @@ async function loadOverview() {
     rows.push(row(h, 0));
     for (const c of (byParent.get(h.id) || [])) rows.push(row(c, 1));
   }
-  document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">No calls yet. Start with <code>rtrt provider chat</code> or MCP.</td></tr>';
+  document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">No calls yet. Send one from the Chat playground (Tools › Chat) or <code>rtrt provider chat</code>.</td></tr>';
 }
+
+// The gateway-inactive empty state links straight to the Chat playground.
+(function wireOverviewChatLink() {
+  const link = document.getElementById('overview-open-chat');
+  if (link) link.onclick = () => navigate('chat');
+})();
 function startOverviewPolling() {
   if (activePage() !== 'overview') return;
   if (!overviewPollTimer) {
@@ -681,96 +699,12 @@ function routeCapabilities(caps) {
     : '';
 }
 
-function renderRouteResult(data) {
-  const chosen = data.chosen || {};
-  const alternatives = Array.isArray(data.alternatives) ? data.alternatives : [];
-  const usage = data.usage_headroom || {};
-  const byTarget = usage.by_target || {};
-  // The chosen target's headroom (if the endpoint reports usage limits for it)
-  // is part of "why" — surface it alongside cost class / mode / reason.
-  const chosenHeadroom = (chosen.target && byTarget[chosen.target] && byTarget[chosen.target].label)
-    ? byTarget[chosen.target].label
-    : null;
-  document.getElementById('route-results').hidden = false;
-  document.getElementById('route-chosen').innerHTML = `
-    <div class="route-chosen-card">
-      <div class="route-chosen-top">
-        <div class="route-target-name">${escapeHtml(routeValue(chosen.target))}</div>
-        ${routeCostBadge(chosen.cost_class)}
-      </div>
-      <div class="route-meta-grid">
-        <div class="route-meta-box"><div class="label">mode</div><div class="value">${escapeHtml(routeValue(chosen.mode))}</div></div>
-        <div class="route-meta-box"><div class="label">model</div><div class="value">${escapeHtml(routeValue(chosen.model))}</div></div>
-        <div class="route-meta-box"><div class="label">headroom</div><div class="value">${escapeHtml(chosenHeadroom || 'n/a')}</div></div>
-        <div class="route-meta-box"><div class="label">why</div><div class="value">${escapeHtml(routeValue(chosen.reason))}</div></div>
-      </div>
-    </div>`;
-  document.getElementById('route-alternatives').innerHTML = alternatives.length
-    ? alternatives.map((alt, idx) => {
-      const caps = routeCapabilities(alt.capabilities);
-      return `
-      <div class="route-alt-row">
-        <div><span class="badge">#${idx + 1}</span> <strong>${escapeHtml(routeValue(alt.target))}</strong></div>
-        <div>${routeCostBadge(alt.cost_class)}</div>
-        <div><code>${escapeHtml(routeValue(alt.mode))}</code>${alt.model ? `<div class="hint">${escapeHtml(alt.model)}</div>` : ''}</div>
-        <div>${escapeHtml(routeValue(alt.reason))}<div class="hint">${escapeHtml(routeValue(alt.headroom))}</div>${caps ? `<div class="hint">${caps}</div>` : ''}</div>
-      </div>`;
-    }).join('')
-    : '<div class="empty">No alternatives returned for this request.</div>';
-  const headroomRows = Object.entries(byTarget);
-  document.getElementById('route-headroom').innerHTML = headroomRows.length
-    ? headroomRows.map(([target, info]) => `
-      <div class="route-meta-box">
-        <div class="label">${escapeHtml(target)}</div>
-        <div class="value">${escapeHtml(routeValue(info.label))}</div>
-        <div class="hint">used ${escapeHtml(routeValue(info.used))} · limit ${escapeHtml(routeValue(info.limit))} · remaining ${escapeHtml(routeValue(info.remaining))}</div>
-      </div>`).join('')
-    : '<div class="empty">No usage limits found.</div>';
-  const sources = Array.isArray(usage.sources) ? usage.sources : [];
-  document.getElementById('route-headroom-sources').textContent = sources.length
-    ? `${sources.length.toLocaleString()} usage sources`
-    : 'No usage sources';
-}
-
-document.getElementById('route-form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const prompt = document.getElementById('route-prompt').value.trim();
-  const prefer = document.getElementById('route-prefer').value;
-  const capability = document.getElementById('route-capability').value;
-  const status = document.getElementById('route-status');
-  const btn = document.getElementById('route-submit');
-  const params = new URLSearchParams({ prompt, prefer, capability });
-  btn.disabled = true;
-  status.textContent = 'Routing…';
-  try {
-    const r = await fetch(`/api/route?${params.toString()}`);
-    const text = await r.text();
-    let data = {};
-    if (text) {
-      try { data = JSON.parse(text); } catch (_) { data = { error: text }; }
-    }
-    if (!r.ok) {
-      const msg = data.error || `HTTP ${r.status}`;
-      status.innerHTML = `<span style="color:var(--err);">${escapeHtml(msg)}</span>`;
-      document.getElementById('route-results').hidden = true;
-      showToast(`Route preview failed: ${msg}`, 'err');
-      return;
-    }
-    renderRouteResult(data);
-    status.innerHTML = '<span class="badge ok">dry-run complete</span>';
-    pushActivity(`route · ${data.chosen && data.chosen.target ? data.chosen.target : 'selected'}`);
-  } catch (e) {
-    status.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
-    document.getElementById('route-results').hidden = true;
-  } finally {
-    btn.disabled = false;
-  }
-};
-
 // ── Router page: provider usage + headroom + load-balancing decision ─────────
 // Global (provider usage is not per-project). Cards reuse the savings-bar idiom
-// for the headroom bar; the routing preview reuses the Route page's cost badge +
-// alt-row renderers via /api/route/preview (no prompt required).
+// for the headroom bar. The routing preview absorbed the former Route page:
+// with a task prompt it dry-runs GET /api/route, without one it asks
+// GET /api/route/preview ("who serves the next request"). Same response shape,
+// one renderer.
 
 function usageNum(value) {
   return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : '0';
@@ -923,11 +857,17 @@ function renderUsageRoutePreview(data) {
 
 async function loadUsageRoutePreview() {
   const status = document.getElementById('usage-route-status');
+  const promptEl = document.getElementById('usage-route-prompt');
+  const prompt = promptEl ? promptEl.value.trim() : '';
   const prefer = document.getElementById('usage-prefer').value;
   const capability = document.getElementById('usage-capability').value;
   const params = new URLSearchParams({ prefer, capability });
+  // With a task prompt this is a full routing dry-run (/api/route); without one
+  // it previews the load-balancing pick for the next request (/api/route/preview).
+  if (prompt) params.set('prompt', prompt);
+  const url = prompt ? `/api/route?${params.toString()}` : `/api/route/preview?${params.toString()}`;
   try {
-    const r = await fetch(`/api/route/preview?${params.toString()}`);
+    const r = await fetch(url);
     const text = await r.text();
     let data = {};
     if (text) { try { data = JSON.parse(text); } catch (_) { data = { error: text }; } }
@@ -938,7 +878,11 @@ async function loadUsageRoutePreview() {
       return;
     }
     renderUsageRoutePreview(data);
-    if (status) status.innerHTML = '<span class="badge ok">load-balanced selection</span>';
+    if (status) {
+      status.innerHTML = prompt
+        ? '<span class="badge ok">dry-run complete — no provider call made</span>'
+        : '<span class="badge ok">load-balanced selection</span>';
+    }
   } catch (e) {
     document.getElementById('usage-route-results').hidden = true;
     if (status) status.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
@@ -1197,6 +1141,118 @@ document.getElementById('export-form').onsubmit = (ev) => {
   window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
   pushActivity(`export ${project}`);
 };
+
+// ── Memory Sessions — GET /api/memory/sessions ──────────────────────────────
+// One row per agent session (count + first/last activity, newest first).
+// Clicking a session drills into its saved memories; a memory row opens the
+// shared detail modal. The empty session id groups legacy untagged captures.
+
+function showSessionsOverview() {
+  const overview = document.getElementById('sessions-overview-card');
+  const rows = document.getElementById('session-rows-card');
+  if (overview) overview.hidden = false;
+  if (rows) rows.hidden = true;
+}
+
+async function loadMemSessions(project) {
+  showSessionsOverview();
+  const list = document.getElementById('sessions-list');
+  const meta = document.getElementById('sessions-meta');
+  if (!list) return;
+  if (isGlobalScope() || isGlobalProjectValue(project)) { showGlobalScopeEmpty('sessions-list'); return; }
+  if (!project) { list.innerHTML = '<div class="empty">Select or add a project</div>'; return; }
+  list.innerHTML = '<div class="empty">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch(`/api/memory/sessions?project=${encodeURIComponent(project)}`);
+    if (!r.ok) {
+      const text = await r.text();
+      showToast(`Failed to load sessions ${r.status}: ${text}`, 'err');
+      list.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: Failed to load sessions</div>`;
+      return;
+    }
+    d = await r.json();
+  } catch (e) {
+    list.innerHTML = `<div class="empty" style="color:var(--err);">Network error: ${escapeHtml(e.message || String(e))}</div>`;
+    return;
+  }
+  const sessions = Array.isArray(d.sessions) ? d.sessions : [];
+  if (meta) meta.textContent = `${sessions.length.toLocaleString()} session${sessions.length === 1 ? '' : 's'} · newest activity first`;
+  if (!sessions.length) {
+    list.innerHTML = '<div class="empty">No sessions yet. Sessions appear as agent captures tag memories with a session id.</div>';
+    return;
+  }
+  list.innerHTML = `<table id="sessions-tbl">
+    <thead><tr><th>Session</th><th>Memories</th><th>First activity</th><th>Last activity</th></tr></thead>
+    <tbody>${sessions.map(s => {
+      const sid = String(s.session_id || '');
+      const label = sid ? `<code>${escapeHtml(sid)}</code>` : '<span class="hint">(untagged — saved before session tracking)</span>';
+      return `<tr class="session-row" data-session="${escapeAttr(sid)}" tabindex="0" role="button" aria-label="View session memories">
+        <td>${label}</td>
+        <td class="tokens-cell">${numberValue(s.count).toLocaleString()}</td>
+        <td>${relativeTime(s.first_ts)}</td>
+        <td>${relativeTime(s.last_ts)}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+  list.querySelectorAll('.session-row').forEach(row => {
+    const open = () => loadSessionRows(project, row.dataset.session || '');
+    row.onclick = open;
+    row.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+  });
+}
+
+async function loadSessionRows(project, sessionId) {
+  const card = document.getElementById('session-rows-card');
+  const rowsEl = document.getElementById('session-rows');
+  const title = document.getElementById('session-rows-title');
+  const metaEl = document.getElementById('session-rows-meta');
+  if (!card || !rowsEl) return;
+  const overview = document.getElementById('sessions-overview-card');
+  if (overview) overview.hidden = true;
+  card.hidden = false;
+  if (title) title.textContent = sessionId ? `Session ${sessionId}` : 'Untagged memories';
+  if (metaEl) metaEl.textContent = '';
+  rowsEl.innerHTML = '<div class="empty">Loading…</div>';
+  let d;
+  try {
+    const r = await fetch(`/api/memory/sessions?project=${encodeURIComponent(project)}&session=${encodeURIComponent(sessionId)}`);
+    if (!r.ok) {
+      const text = await r.text();
+      rowsEl.innerHTML = `<div class="empty" style="color:var(--err);">${r.status}: ${escapeHtml(text)}</div>`;
+      return;
+    }
+    d = await r.json();
+  } catch (e) {
+    rowsEl.innerHTML = `<div class="empty" style="color:var(--err);">Network error: ${escapeHtml(e.message || String(e))}</div>`;
+    return;
+  }
+  const items = Array.isArray(d.items) ? d.items : [];
+  if (metaEl) metaEl.textContent = `${items.length.toLocaleString()} memories · newest first · click a row for detail`;
+  if (!items.length) { rowsEl.innerHTML = '<div class="empty">No memories in this session.</div>'; return; }
+  rowsEl.innerHTML = items.map(i => `
+    <div class="hist-item">
+      <div class="hist-click-area" data-id="${i.id}" tabindex="0" role="button" aria-label="View detail">
+        <span class="when">${relativeTime(i.created_at)}</span>
+        <span class="kind">${escapeHtml(i.kind || '?')}</span>
+        <span class="body">${renderBody(i.body)}</span>
+      </div>
+    </div>`).join('');
+  rowsEl.querySelectorAll('.hist-click-area').forEach(area => {
+    const open = () => openDetailModal(Number(area.dataset.id));
+    area.addEventListener('click', open);
+    area.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+  });
+}
+
+(function wireSessions() {
+  const back = document.getElementById('session-rows-back');
+  if (back) back.onclick = () => {
+    const project = currentProject();
+    if (project && !isGlobalScope()) loadMemSessions(project);
+    else showSessionsOverview();
+  };
+})();
 
 // Memory stats subtab — calls GET /api/memory/stats?project=
 async function loadMemStats(project) {
@@ -3442,6 +3498,7 @@ document.getElementById('diagnose-form').onsubmit = async (ev) => {
   if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); refreshDiagnoseScope(); return; }
   if (!currentProject()) { showToast('Select or add a project', 'err'); return; }
   if (!projectPath()) { showToast('No path set — add one in Edit project', 'err'); refreshDiagnoseScope(); return; }
+  if (!document.getElementById('diagnose-model').value) { showToast('Select a model.', 'err'); return; }
   const body = {
     model: document.getElementById('diagnose-model').value,
     raw: document.getElementById('diagnose-raw').value,
@@ -3577,6 +3634,7 @@ function renderTemplateList() {
     renderTemplateGroup('Document Chains', documentChains),
     customEmpty,
   ].join('');
+  list.querySelectorAll('[data-tpl-use]').forEach(btn => btn.onclick = () => openScaffoldModal(btn.dataset.tplUse));
   list.querySelectorAll('[data-tpl-duplicate]').forEach(btn => btn.onclick = () => duplicateTemplate(btn.dataset.tplDuplicate));
   list.querySelectorAll('[data-tpl-edit]').forEach(btn => btn.onclick = () => editTemplate(btn.dataset.tplEdit));
   list.querySelectorAll('[data-tpl-delete]').forEach(btn => btn.onclick = () => deleteTemplate(btn.dataset.tplDelete));
@@ -3596,9 +3654,13 @@ function templateCard(t) {
   const builtin = isBuiltinTemplate(t);
   const activeClass = active === t.name ? ' active' : '';
   const badge = builtin ? '<span class="badge warn">read-only</span>' : '<span class="badge ok">custom</span>';
+  // Every template is usable: "Scaffold" opens the generate-project modal
+  // (target dir + variables + preview). Built-ins additionally offer
+  // Duplicate; customs offer Edit / Delete.
+  const useBtn = `<button type="button" class="ghost" data-tpl-use="${escapeAttr(t.name)}">Scaffold</button>`;
   const actions = builtin
-    ? `<button type="button" class="ghost" data-tpl-duplicate="${escapeAttr(t.name)}">Duplicate as custom</button>`
-    : `<button type="button" class="ghost" data-tpl-edit="${escapeAttr(t.name)}">Edit</button><button type="button" class="ghost" data-tpl-delete="${escapeAttr(t.name)}">Delete</button>`;
+    ? `${useBtn}<button type="button" class="ghost" data-tpl-duplicate="${escapeAttr(t.name)}">Duplicate as custom</button>`
+    : `${useBtn}<button type="button" class="ghost" data-tpl-edit="${escapeAttr(t.name)}">Edit</button><button type="button" class="ghost" data-tpl-delete="${escapeAttr(t.name)}">Delete</button>`;
   return `<article class="tpl-list-item${activeClass}">
     <div class="tpl-top">
       <div><div class="tpl-name">${escapeHtml(t.name || '')}</div><div class="tpl-desc">${escapeHtml(t.description || '')}</div></div>
@@ -4114,8 +4176,23 @@ function populateModelSelects() {
     // Restore previously selected value if it still exists.
     if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
   });
+  // Selects where a model is REQUIRED (no "default" fallback): the blank
+  // option is a placeholder, not a valid choice.
+  ['diagnose-model', 'chat-model'].forEach(populateRequiredModelSelect);
   // Embeddings model <select> — populated from installed Ollama models.
   populateEmbModelSelect(document.getElementById('cfg-emb-model')?.value || '');
+}
+
+// Model <select> variant for endpoints that need an explicit model
+// (Diagnose, Chat): placeholder + the shared MODELS_CACHE entries.
+function populateRequiredModelSelect(id) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = '<option value="">Select a model…</option>' + MODELS_CACHE.map(m =>
+    `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)} (${escapeHtml(m.source)})</option>`
+  ).join('');
+  if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
 }
 
 // Installed Ollama models — fetched for the embedding model <select>.
@@ -4810,5 +4887,81 @@ document.getElementById('setup-form').onsubmit = async (ev) => {
   const d = await r.json();
   pre.hidden = false;
   pre.textContent = `# ${d.agent} → ${d.target_path}\n\n${d.snippet}`;
+};
+
+// ── Chat playground (Tools) — POST /api/chat through the rtrt gateway ────────
+// The live data source for the Overview gateway cards: every send is metered
+// (metrics / recent calls / budget). Keeps the conversation in-page and sends
+// the full history each turn so follow-ups have context.
+let CHAT_MESSAGES = [];   // [{role, content, meta?}]
+
+function renderChatThread(pending) {
+  const thread = document.getElementById('chat-thread');
+  if (!thread) return;
+  if (!CHAT_MESSAGES.length && !pending) {
+    thread.innerHTML = '<div class="empty">No messages yet. Pick a model and send a prompt.</div>';
+    return;
+  }
+  thread.innerHTML = CHAT_MESSAGES.map(m =>
+    `<div class="chat-msg ${m.role === 'user' ? 'user' : 'assistant'}">${escapeHtml(m.content)}${m.meta ? `<span class="chat-msg-meta">${escapeHtml(m.meta)}</span>` : ''}</div>`
+  ).join('') + (pending ? '<div class="chat-msg assistant pending">…</div>' : '');
+  thread.scrollTop = thread.scrollHeight;
+}
+
+document.getElementById('chat-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const model = document.getElementById('chat-model').value;
+  const input = document.getElementById('chat-input');
+  const status = document.getElementById('chat-status');
+  const send = document.getElementById('chat-send');
+  const content = input.value.trim();
+  if (!model) { showToast('Select a model.', 'err'); return; }
+  if (!content) return;
+  CHAT_MESSAGES.push({ role: 'user', content });
+  renderChatThread(true);
+  input.value = '';
+  send.disabled = true;
+  status.textContent = 'Waiting for the gateway…';
+  const started = performance.now();
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: CHAT_MESSAGES.map(m => ({ role: m.role, content: m.content })),
+        max_tokens: Number(document.getElementById('chat-max-tokens').value) || 512,
+      }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      status.innerHTML = `<span style="color:var(--err);">${r.status}: ${escapeHtml(text)}</span>`;
+      showToast(`Chat failed ${r.status}`, 'err');
+      renderChatThread(false);
+      return;
+    }
+    const d = await r.json();
+    const latency = Math.round(performance.now() - started);
+    CHAT_MESSAGES.push({
+      role: 'assistant',
+      content: d.content || '',
+      meta: `${d.provider}/${d.model} · in ${d.input_tokens} · out ${d.output_tokens} · ${latency} ms`,
+    });
+    renderChatThread(false);
+    status.textContent = '';
+    pushActivity(`chat · ${d.provider}/${d.model} · ${d.output_tokens} out`);
+  } catch (e) {
+    status.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
+    renderChatThread(false);
+  } finally {
+    send.disabled = false;
+  }
+};
+
+document.getElementById('chat-clear').onclick = () => {
+  CHAT_MESSAGES = [];
+  renderChatThread(false);
+  const status = document.getElementById('chat-status');
+  if (status) status.textContent = '';
 };
 

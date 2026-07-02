@@ -262,16 +262,12 @@ pub fn run(plan: SetupPlan) -> Result<()> {
     let binary = plan.binary.to_string_lossy().to_string();
     // Default to ~/.rtrt/memory.sqlite (absolute) so the MCP server, the
     // plugin hooks (via `_common.sh`'s same default), and any ad-hoc CLI
-    // invocation all read and write the same SQLite file. Without this the
-    // MCP server falls back to a cwd-relative path and ends up on a
-    // different store than the rest of the toolchain.
-    let memory_path = Some(plan.memory_path.clone().unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".rtrt").join("memory.sqlite")
-    }));
+    // invocation all read and write the same SQLite file.
+    let memory_path = Some(
+        plan.memory_path
+            .clone()
+            .unwrap_or_else(rtrt_core::default_memory_store_path),
+    );
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
     }
@@ -712,6 +708,53 @@ fn claude_statusline_entry(rtrt_cmd: &str) -> serde_json::Value {
     })
 }
 
+/// Strips an rtrt-owned `statusLine` entry from a parsed settings root.
+/// A user-authored statusline (command without the rtrt suffix) is preserved.
+fn strip_rtrt_statusline(root: &mut serde_json::Value) -> bool {
+    let is_rtrt = root
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains(STATUSLINE_COMMAND_SUFFIX));
+    if is_rtrt && let Some(obj) = root.as_object_mut() {
+        obj.remove("statusLine");
+        return true;
+    }
+    false
+}
+
+/// Reverse of `install_claude_statusline`: drops the rtrt `statusLine` entry
+/// from `~/.claude/settings.json` so uninstalled binaries aren't invoked on
+/// every prompt render.
+fn remove_claude_statusline(apply: bool) -> Result<()> {
+    let settings = expand_home("~/.claude/settings.json")?;
+    if !settings.exists() {
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "[dry-run] would drop the rtrt statusLine entry from {}",
+            settings.display()
+        );
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&settings)
+        .with_context(|| format!("read {}", settings.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let mut root: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{}: not valid JSON", settings.display()))?;
+    if strip_rtrt_statusline(&mut root) {
+        backup_if_needed(&settings)?;
+        let rendered = serde_json::to_string_pretty(&root)?;
+        std::fs::write(&settings, rendered)
+            .with_context(|| format!("write {}", settings.display()))?;
+        println!("dropped rtrt statusLine from {}", settings.display());
+    }
+    Ok(())
+}
+
 fn claude_skill_path(skills_root: &Path, skill: &SkillSpec) -> PathBuf {
     skills_root.join(skill.name).join("SKILL.md")
 }
@@ -1053,6 +1096,9 @@ pub fn uninstall_agent(agent: AgentKind, apply: bool) -> Result<()> {
         }
         AgentKind::Claude => {
             uninstall_claude_skills_agents(apply)?;
+            // Symmetric with setup: both plugin and non-plugin setup paths
+            // install the statusLine, so both uninstall paths remove it.
+            remove_claude_statusline(apply)?;
             drop_json_entry("~/.claude.json", apply)
         }
         AgentKind::Cursor => {
@@ -1175,5 +1221,27 @@ mod tests {
             entry.get("command").and_then(|v| v.as_str()),
             Some("rtrt statusline --rich")
         );
+    }
+
+    #[test]
+    fn strip_rtrt_statusline_removes_rtrt_entry() {
+        let mut root = serde_json::json!({
+            "statusLine": claude_statusline_entry("/home/u/.local/bin/rtrt"),
+            "other": true
+        });
+
+        assert!(strip_rtrt_statusline(&mut root));
+        assert!(root.get("statusLine").is_none());
+        assert_eq!(root.get("other"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn strip_rtrt_statusline_preserves_user_entry() {
+        let mut root = serde_json::json!({
+            "statusLine": { "type": "command", "command": "my-own-statusline" }
+        });
+
+        assert!(!strip_rtrt_statusline(&mut root));
+        assert!(root.get("statusLine").is_some());
     }
 }

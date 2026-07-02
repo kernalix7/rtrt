@@ -16,7 +16,8 @@
 # released tarball, and bump the `version` line to match the tag.
 
 class Rtrt < Formula
-  desc "Retort — a Rust toolkit that distills AI agent context: compression, memory, multi-provider gateway, MCP server"
+  # Kept under 80 chars and free of the formula name for `brew audit --strict`.
+  desc "Rust toolkit that distills AI agent context: compression, memory, MCP"
   homepage "https://github.com/kernalix7/rtrt"
   license "MIT"
 

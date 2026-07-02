@@ -13,12 +13,14 @@ use rtrt_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub mod capture_bucket;
 pub mod embed;
 #[cfg(feature = "hnsw")]
 pub mod hnsw_index;
 pub mod payload;
 pub mod summarise;
 
+pub use capture_bucket::is_capture_bucket_name;
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
 pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
@@ -1250,6 +1252,26 @@ impl MemoryStore {
         }
         .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Folds every row currently in bucket `from` into project `to` — a
+    /// manual analogue of [`Self::reattribute`] for orphan capture buckets
+    /// whose source transcript was deleted, so the automatic reattribution
+    /// pass (which needs that transcript to resolve a parent) can never fold
+    /// them on its own. One parameterized bulk `UPDATE`; like `reattribute`,
+    /// only `project` changes, and the FTS5 index mirrors `body` (not
+    /// `project`) while `embeddings` / `edges` / `entities` key off the row
+    /// id — so nothing else needs to be kept in sync. Returns the number of
+    /// rows moved.
+    pub fn reassign_project(&self, from: &str, to: &str) -> Result<usize> {
+        let moved = self
+            .conn
+            .execute(
+                "UPDATE memories SET project = ?1 WHERE project = ?2",
+                rusqlite::params![to, from],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(moved)
     }
 
     /// Transcript-captured rows that may need (re)attribution — purely by
@@ -5401,6 +5423,46 @@ mod tests {
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
+    }
+
+    /// `reassign_project` folds every row of an orphan bucket into a target
+    /// project, keeps them fully searchable via FTS afterward, and leaves
+    /// unrelated buckets untouched.
+    #[test]
+    fn reassign_project_moves_rows_and_stays_searchable() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let orphan = "a1f52dae1234567890abcdef1234f6600-hexpair";
+        store.save(orphan, "note", "rust orphaned capture").unwrap();
+        store.save(orphan, "note", "second orphaned row").unwrap();
+        store
+            .save("untouched", "note", "unrelated project row")
+            .unwrap();
+
+        let moved = store.reassign_project(orphan, "realproject").unwrap();
+        assert_eq!(moved, 2);
+
+        let projects: std::collections::BTreeMap<String, usize> = store
+            .projects()
+            .unwrap()
+            .into_iter()
+            .map(|(name, count, _)| (name, count))
+            .collect();
+        assert_eq!(projects.get(orphan), None, "orphan bucket is now empty");
+        assert_eq!(projects.get("realproject"), Some(&2));
+        assert_eq!(
+            projects.get("untouched"),
+            Some(&1),
+            "unrelated bucket untouched"
+        );
+
+        // Rows are still recallable under the new project via FTS.
+        let hits = store.recall_bm25("realproject", "rust", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].body.contains("rust"));
+
+        // Re-running against an already-empty bucket is a safe no-op.
+        let moved_again = store.reassign_project(orphan, "realproject").unwrap();
+        assert_eq!(moved_again, 0);
     }
 
     #[test]

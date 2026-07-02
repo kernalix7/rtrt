@@ -172,12 +172,168 @@ async fn projects_lists_memory_buckets() {
     let resp = call(app, get("/api/projects")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
-    let arr = v.as_array().expect("projects is an array");
+    let arr = v["projects"].as_array().expect("projects is an array");
     let demo = arr
         .iter()
         .find(|p| p["name"] == "demo")
         .expect("demo project present");
     assert_eq!(demo["mem_count"], 1);
+    assert_eq!(v["hidden_capture_buckets"], 0);
+    assert_eq!(v["hidden_capture_bucket_rows"], 0);
+}
+
+/// A bucket named like a machine-generated session-hash pair (the confirmed
+/// orphan shape: source transcript deleted, reattribution can never resolve
+/// it) must not clutter the selector — but its rows stay in the store.
+#[tokio::test]
+async fn projects_hides_orphan_capture_buckets_but_keeps_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let orphan = "30877432d1026706d7e805da846a32c3-bb81e3c29b62179273c8eb5bb682575ec87a171a";
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for _ in 0..3 {
+            store
+                .save(orphan, "teammate-message", "stray subagent output")
+                .unwrap();
+        }
+        store.save("realproject", "note", "actual work").unwrap();
+    }
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let arr = v["projects"].as_array().unwrap();
+    assert!(
+        arr.iter().all(|p| p["name"] != orphan),
+        "orphan bucket must not be listed"
+    );
+    assert!(arr.iter().any(|p| p["name"] == "realproject"));
+    assert_eq!(v["hidden_capture_buckets"], 1);
+    assert_eq!(v["hidden_capture_bucket_rows"], 3);
+
+    // Also exposed via the dedicated hidden-buckets endpoint for the UI's
+    // reassign picker.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/projects/hidden")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hidden = json_body(resp).await;
+    let hidden = hidden.as_array().unwrap();
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0]["name"], orphan);
+    assert_eq!(hidden[0]["mem_count"], 3);
+
+    // Nothing was deleted — the rows are still in the store under the
+    // orphan's own name, untouched.
+    let store = state.memory.as_ref().unwrap().lock().await;
+    let projects = store.projects().unwrap();
+    let (_, count, _) = projects
+        .iter()
+        .find(|(n, _, _)| n == orphan)
+        .expect("orphan bucket still present in the store");
+    assert_eq!(*count, 3);
+}
+
+/// A registered project always shows, even if its name happens to match the
+/// capture-bucket shape (e.g. someone genuinely named a project `agent-42`).
+#[tokio::test]
+async fn projects_registered_entry_is_never_hidden_even_if_name_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::PUT,
+            "/api/projects",
+            r#"{"name":"agent-42","path":null}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        store.save("agent-42", "note", "real project work").unwrap();
+    }
+    let app = router(state, None);
+    let resp = call(app, get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let arr = v["projects"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|p| p["name"] == "agent-42"),
+        "registered project must stay visible despite matching the capture-bucket shape"
+    );
+    assert_eq!(v["hidden_capture_buckets"], 0);
+}
+
+/// `POST /api/projects/reassign` folds an orphan bucket's rows into a real
+/// project via a parameterized bulk UPDATE — the manual fallback for when
+/// automatic reattribution can never resolve a parent.
+#[tokio::test]
+async fn projects_reassign_folds_orphan_rows_into_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let orphan = "agent-1234";
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for _ in 0..2 {
+            store
+                .save(orphan, "teammate-message", "stray subagent output")
+                .unwrap();
+        }
+    }
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/projects/reassign",
+            &format!(r#"{{"from":"{orphan}","to":"realproject"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["moved"], 2);
+    assert_eq!(v["from"], orphan);
+    assert_eq!(v["to"], "realproject");
+
+    let store = state.memory.as_ref().unwrap().lock().await;
+    let projects = store.projects().unwrap();
+    assert!(
+        projects.iter().all(|(n, _, _)| n != orphan),
+        "orphan bucket should be empty/gone after reassign"
+    );
+    let (_, count, _) = projects
+        .iter()
+        .find(|(n, _, _)| n == "realproject")
+        .expect("target project now has the rows");
+    assert_eq!(*count, 2);
+}
+
+/// `from` and `to` must both be present and differ — a same-name reassign is
+/// a no-op the caller almost certainly didn't intend.
+#[tokio::test]
+async fn projects_reassign_rejects_same_from_and_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let app = router(state, None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/projects/reassign",
+            r#"{"from":"demo","to":"demo"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

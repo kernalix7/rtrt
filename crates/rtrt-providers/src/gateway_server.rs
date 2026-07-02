@@ -42,7 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{FromRequest, Request, State},
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
     response::{
         IntoResponse, Response,
@@ -51,12 +51,12 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::stream;
-use rtrt_core::{Capability, Result};
+use rtrt_core::{Capability, Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ChatMessage, ChatRequest, Gateway, Prefer, Role, RouteRequest, UsageSnapshot, invoke,
-    invoke_with_failover, select_route, usage_ledger,
+    invoke_with_failover, is_retryable_error, select_route, usage_ledger,
 };
 
 /// Requests longer than this many characters are treated as reasoning work
@@ -205,12 +205,13 @@ impl MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireMessage {
     pub role: String,
-    #[serde(default = "empty_content")]
-    pub content: MessageContent,
-}
-
-fn empty_content() -> MessageContent {
-    MessageContent::Text(String::new())
+    // `Option` so an explicit `content: null` (which OpenAI SDKs serialize on
+    // assistant tool-call turns, e.g. `{"role":"assistant","content":null,
+    // "tool_calls":[…]}`) parses as `None` instead of a 422. `#[serde(default)]`
+    // alone only covers a MISSING key, not an explicit null — a tool-using
+    // client replaying history would otherwise be hard-blocked at JSON parse.
+    #[serde(default)]
+    pub content: Option<MessageContent>,
 }
 
 /// Incoming `POST /v1/chat/completions` body (the fields we honour).
@@ -240,7 +241,8 @@ impl ChatCompletionRequest {
                     "assistant" => Role::Assistant,
                     _ => Role::User,
                 },
-                content: m.content.into_text(),
+                // A null / omitted content collapses to an empty string.
+                content: m.content.map(MessageContent::into_text).unwrap_or_default(),
             })
             .collect()
     }
@@ -492,10 +494,33 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn chat_completions(
-    State(state): State<GatewayState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Response {
+/// Body extractor that renders EVERY parse failure as the OpenAI error envelope
+/// (`{"error":{message,type}}`) with a 400. The stock `Json` extractor leaks
+/// axum's own rejections — plain-text 400 for malformed JSON, 422 for a missing
+/// field, 415 for a missing `Content-Type` — none of which a real OpenAI client
+/// expects on this route.
+struct OpenAiRequest(ChatCompletionRequest);
+
+impl<S> FromRequest<S> for OpenAiRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> std::result::Result<Self, Self::Rejection> {
+        match Json::<ChatCompletionRequest>::from_request(req, state).await {
+            Ok(Json(body)) => Ok(Self(body)),
+            Err(rejection) => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &rejection.body_text(),
+            )),
+        }
+    }
+}
+
+async fn chat_completions(State(state): State<GatewayState>, request: OpenAiRequest) -> Response {
+    let OpenAiRequest(req) = request;
     if req.messages.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -513,8 +538,33 @@ async fn chat_completions(
     match dispatch(&state, route, &req).await {
         Ok(completion) if stream => stream_response(&model_label, completion),
         Ok(completion) => Json(completion_response(&model_label, completion)).into_response(),
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, "upstream_error", &e.to_string()),
+        Err(e) => dispatch_error_response(&e),
     }
+}
+
+/// Map a dispatch [`Error`] onto the right HTTP status + OpenAI error shape.
+///
+/// A permanent client error (unknown model → "no provider registered") returns
+/// a non-retryable 404 `model_not_found`, so SDKs with `max_retries` do not
+/// storm a typo (which on the `auto` route would re-invoke ranked CLIs and burn
+/// real tokens). Other terminal/config errors (auth, disabled target, no route)
+/// return a non-retryable 400. Only genuinely transient failures (rate-limit /
+/// 5xx / timeout, which `is_retryable_error` recognises) keep the 502 that
+/// invites a retry.
+fn dispatch_error_response(e: &Error) -> Response {
+    let msg = e.to_string();
+    if msg.to_ascii_lowercase().contains("no provider registered") {
+        return error_response_code(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            "model_not_found",
+            &msg,
+        );
+    }
+    if is_retryable_error(e) {
+        return error_response(StatusCode::BAD_GATEWAY, "upstream_error", &msg);
+    }
+    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &msg)
 }
 
 fn completion_response(model: &str, c: Completion) -> ChatCompletionResponse {
@@ -630,12 +680,23 @@ fn model_object(id: &str, owned_by: &str, created: u64) -> ModelObject {
 // ---------------------------------------------------------------------------
 
 fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": kind,
-        }
+    error_body(status, kind, None, message)
+}
+
+/// Error envelope carrying an OpenAI `code` (e.g. `model_not_found`).
+fn error_response_code(status: StatusCode, kind: &str, code: &str, message: &str) -> Response {
+    error_body(status, kind, Some(code), message)
+}
+
+fn error_body(status: StatusCode, kind: &str, code: Option<&str>, message: &str) -> Response {
+    let mut err = serde_json::json!({
+        "message": message,
+        "type": kind,
     });
+    if let Some(code) = code {
+        err["code"] = serde_json::Value::String(code.to_string());
+    }
+    let body = serde_json::json!({ "error": err });
     (status, Json(body)).into_response()
 }
 
@@ -834,6 +895,26 @@ mod tests {
         assert_eq!(msgs[0].content, "sys");
         assert_eq!(msgs[1].role, Role::User);
         assert_eq!(msgs[1].content, "ab");
+    }
+
+    #[test]
+    fn request_wire_tolerates_null_and_missing_content() {
+        // OpenAI SDKs serialize assistant tool-call turns with `content: null`;
+        // a follow-up turn may omit content entirely. Both must parse (as an
+        // empty string) rather than 422.
+        let raw = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "content": null},
+                {"role": "assistant"},
+                {"role": "user", "content": "ping"}
+            ]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).expect("parse");
+        let msgs = req.to_chat_messages();
+        assert_eq!(msgs[0].content, "");
+        assert_eq!(msgs[1].content, "");
+        assert_eq!(msgs[2].content, "ping");
     }
 
     #[test]
@@ -1046,6 +1127,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Echo gateway with a model-id prefix but NO default, so an unmatched
+    /// model surfaces the gateway's "no provider registered" error.
+    fn echo_state_no_default() -> GatewayState {
+        let gateway = Gateway::new().register("openai", Box::new(Echo), ["gpt-"]);
+        GatewayState::with_gateway(Arc::new(gateway), None, Duration::from_secs(5))
+    }
+
+    /// POST a raw body (optionally without a content-type) and return the
+    /// response status plus the parsed JSON body.
+    async fn post_raw(
+        state: GatewayState,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let resp = app(state)
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    fn assert_error_envelope(value: &serde_json::Value, expected_type: &str) {
+        let err = value
+            .get("error")
+            .unwrap_or_else(|| panic!("expected error envelope, got: {value}"));
+        assert!(err.get("message").and_then(|m| m.as_str()).is_some());
+        assert_eq!(
+            err.get("type").and_then(|t| t.as_str()),
+            Some(expected_type)
+        );
+    }
+
+    #[tokio::test]
+    async fn null_content_completes_200() {
+        // Bug #1: a tool-history turn with `content: null` must not 422.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "content": null},
+                {"role": "user", "content": "ping"}
+            ]
+        });
+        let (status, value) = post_raw(
+            echo_state(None),
+            &body.to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value["choices"][0]["message"]["content"].as_str(),
+            Some("echo: ping")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_400_envelope() {
+        // Bug #2: malformed JSON → 400 with the OpenAI error envelope.
+        let (status, value) = post_raw(
+            echo_state(None),
+            "{not valid json",
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_envelope(&value, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn missing_messages_is_400_envelope() {
+        // Bug #2: a missing required field must be 400 JSON, not a plain 422.
+        let (status, value) = post_raw(
+            echo_state(None),
+            r#"{"model":"auto"}"#,
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_envelope(&value, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_is_400_envelope() {
+        // Bug #2: a missing Content-Type must be 400 JSON, not a plain 415.
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let (status, value) = post_raw(echo_state(None), &body.to_string(), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_error_envelope(&value, "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_404_model_not_found() {
+        // Bug #3: an unknown model is a permanent client error → non-retryable
+        // 404 model_not_found, never a retryable 502.
+        let body = serde_json::json!({
+            "model": "does-not-exist",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let (status, value) = post_raw(
+            echo_state_no_default(),
+            &body.to_string(),
+            Some("application/json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_error_envelope(&value, "invalid_request_error");
+        assert_eq!(value["error"]["code"].as_str(), Some("model_not_found"));
     }
 
     fn detected(name: &str, cost_class: CostClass) -> DetectedTool {

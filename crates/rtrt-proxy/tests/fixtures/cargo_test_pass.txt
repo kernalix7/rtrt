@@ -1,0 +1,70 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling memchr v2.8.0
+   Compiling libc v0.2.186
+   Compiling hashbrown v0.17.1
+   Compiling zmij v1.0.21
+   Compiling equivalent v1.0.2
+   Compiling thiserror v2.0.18
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling option-ext v0.2.0
+   Compiling serde_json v1.0.149
+   Compiling itoa v1.0.18
+   Compiling regex-syntax v0.8.10
+   Compiling once_cell v1.21.4
+   Compiling indexmap v2.14.0
+   Compiling aho-corasick v1.1.4
+   Compiling syn v2.0.117
+   Compiling dirs-sys v0.4.1
+   Compiling dirs v5.0.1
+   Compiling regex-automata v0.4.14
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling async-trait v0.1.89
+   Compiling regex v1.12.3
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+   Compiling rtrt-core v0.1.0 (/work/rtrt/crates/rtrt-core)
+   Compiling rtrt-proxy v0.1.0 (/work/rtrt/crates/rtrt-proxy)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.88s
+     Running unittests src/lib.rs (target/debug/deps/rtrt_proxy-daafda6fdb3aa73f)
+
+running 23 tests
+test generic::tests::gh_filter_keeps_failing_checks_and_summarizes_passes ... ok
+test generic::tests::gh_filter_all_passing_collapses_to_summary ... ok
+test generic::tests::gh_filter_passes_through_non_check_lines ... ok
+test generic::tests::ls_long_drops_permissions_owner_group_date_and_dirs_first ... ok
+test generic::tests::grep_rn_style_output_can_pass_through_unchanged ... ok
+test git::tests::git_log_oneline_passes_through ... ok
+test git::tests::git_branch_strips_origin_and_summarizes_remote_only ... ok
+test git::tests::git_status_short_clean_emits_ok ... ok
+test tests::filter_count_tracks_broad_command_coverage ... ok
+test tests::picks_expanded_filters ... ok
+test tests::ultra_compact_collapses_runs_and_strips_ansi ... ok
+test git::tests::git_status_condenses_branch_tracking_and_dirty_summary ... ok
+test generic::tests::http_clients_drop_progress_and_keep_errors ... ok
+test node::tests::npm_drops_install_progress_and_keeps_errors ... ok
+test node::tests::tsc_diagnostics_keep_errors ... ok
+test kubernetes::tests::kubectl_drops_defaulted_container_noise_and_keeps_errors ... ok
+test generic::tests::go_test_returns_ok_for_success_noise_only ... ok
+test cargo::tests::nextest_drops_pass_progress_but_keeps_failures ... ok
+test containers::tests::docker_drops_layer_progress_and_keeps_errors ... ok
+test generic::tests::pytest_keeps_failure_sections ... ok
+test tests::errors_only_keeps_failures_with_context ... ok
+test cargo::tests::cargo_strips_compiling_lines_and_keeps_errors ... ok
+test cargo::tests::cargo_clippy_keeps_warnings ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests rtrt_proxy
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

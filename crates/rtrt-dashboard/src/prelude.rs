@@ -57,7 +57,8 @@ pub(crate) use crate::handlers::orch::{
     provider_api_key_present, route_api, route_error, route_usage_headroom, toggle_detected_tool,
 };
 pub(crate) use crate::handlers::projects::{
-    ProjectUpsertReq, ProjectView, list_projects, upsert_project,
+    HiddenBucketView, ProjectUpsertReq, ProjectView, ProjectsResponse, ReassignProjectReq,
+    ReassignProjectResp, list_hidden_buckets, list_projects, reassign_project, upsert_project,
 };
 pub(crate) use crate::handlers::prompts::{
     PromptSummary, get_prompt, list_prompt_versions, list_prompts, require_prompts,

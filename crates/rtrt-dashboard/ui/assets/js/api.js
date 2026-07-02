@@ -22,6 +22,12 @@ document.querySelectorAll('aside a.nav').forEach(a => a.onclick = () => {
 
 // Global project selector
 let PROJECTS_CACHE = [];
+// Capture buckets (agent-*, p<n>-*, session-hash names) hidden from the
+// selector because they're unambiguously machine-generated and unregistered
+// — see rtrt-memory::is_capture_bucket_name. Populated by loadProjects().
+let HIDDEN_BUCKETS_CACHE = [];
+let HIDDEN_CAPTURE_BUCKETS_COUNT = 0;
+let HIDDEN_CAPTURE_BUCKET_ROWS = 0;
 let SECURITY_PROFILES_CACHE = [];
 let GLOBAL_DEFAULT_PROFILE = 'ai-default';
 const GLOBAL_PROJECT_VALUE = '__global__';
@@ -159,13 +165,18 @@ async function loadProjects() {
       select.innerHTML = globalOption + '<option value="">Failed to load projects</option>';
       select.value = GLOBAL_PROJECT_VALUE;
       PROJECTS_CACHE = [];
+      HIDDEN_CAPTURE_BUCKETS_COUNT = 0;
+      HIDDEN_CAPTURE_BUCKET_ROWS = 0;
+      refreshOrphanBuckets();
       syncProjectInputs('');
       refreshProjectScopePage();
       navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
       return;
     }
-    const projects = await r.json();
-    PROJECTS_CACHE = Array.isArray(projects) ? projects : [];
+    const data = await r.json();
+    PROJECTS_CACHE = Array.isArray(data.projects) ? data.projects : [];
+    HIDDEN_CAPTURE_BUCKETS_COUNT = data.hidden_capture_buckets || 0;
+    HIDDEN_CAPTURE_BUCKET_ROWS = data.hidden_capture_bucket_rows || 0;
     const projectOptions = PROJECTS_CACHE.length ? PROJECTS_CACHE.map(p =>
       `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
     ).join('') : '<option value="">No projects</option>';
@@ -175,17 +186,77 @@ async function loadProjects() {
     localStorage.setItem('rtrt.project', select.value);
     localStorage.setItem('rtrt-project', select.value);
     refreshProjectScopePage();
+    refreshOrphanBuckets();
     if (isGlobalScope()) navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
   } catch (e) {
     showToast(`Project load error: ${e.message || e}`, 'err');
     select.innerHTML = globalOption + '<option value="">Failed to load projects</option>';
     select.value = GLOBAL_PROJECT_VALUE;
     PROJECTS_CACHE = [];
+    HIDDEN_CAPTURE_BUCKETS_COUNT = 0;
+    HIDDEN_CAPTURE_BUCKET_ROWS = 0;
+    refreshOrphanBuckets();
     syncProjectInputs('');
     refreshProjectScopePage();
     navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
   }
 }
+
+/// Populate the "orphaned capture buckets" note + reassign picker inside the
+/// project modal from the counts `loadProjects()` just read off `GET
+/// /api/projects`. Fetches `GET /api/projects/hidden` for the bucket names
+/// only when there's something to show, so the common (zero-orphan) case
+/// costs nothing extra.
+async function refreshOrphanBuckets() {
+  const section = document.getElementById('orphan-buckets-section');
+  const note = document.getElementById('orphan-buckets-note');
+  const bucketSelect = document.getElementById('orphan-bucket-select');
+  const targetSelect = document.getElementById('orphan-target-select');
+  if (!section || !note || !bucketSelect || !targetSelect) return;
+  if (!HIDDEN_CAPTURE_BUCKETS_COUNT) {
+    section.hidden = true;
+    HIDDEN_BUCKETS_CACHE = [];
+    return;
+  }
+  const bucketWord = HIDDEN_CAPTURE_BUCKETS_COUNT === 1 ? 'bucket' : 'buckets';
+  const rowWord = HIDDEN_CAPTURE_BUCKET_ROWS === 1 ? 'row' : 'rows';
+  note.textContent = `${HIDDEN_CAPTURE_BUCKETS_COUNT} orphaned capture ${bucketWord} hidden (${HIDDEN_CAPTURE_BUCKET_ROWS} ${rowWord}) — fold one into a project below.`;
+  section.hidden = false;
+  try {
+    const r = await fetch('/api/projects/hidden');
+    const hidden = r.ok ? await r.json() : [];
+    HIDDEN_BUCKETS_CACHE = Array.isArray(hidden) ? hidden : [];
+  } catch (e) {
+    HIDDEN_BUCKETS_CACHE = [];
+  }
+  bucketSelect.innerHTML = HIDDEN_BUCKETS_CACHE.length
+    ? HIDDEN_BUCKETS_CACHE.map(b => `<option value="${escapeAttr(b.name)}">${escapeHtml(b.name)} · ${b.mem_count}</option>`).join('')
+    : '<option value="">No hidden buckets</option>';
+  const targets = PROJECTS_CACHE.filter(p => !isGlobalProjectValue(p.name));
+  targetSelect.innerHTML = targets.length
+    ? targets.map(p => `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}</option>`).join('')
+    : '<option value="">No projects to fold into</option>';
+}
+
+document.getElementById('orphan-reassign-btn').onclick = async () => {
+  const from = document.getElementById('orphan-bucket-select').value;
+  const to = document.getElementById('orphan-target-select').value;
+  if (!from || !to) { showToast('Pick both an orphan bucket and a target project.', 'err'); return; }
+  if (from === to) { showToast('Bucket and target must differ.', 'err'); return; }
+  try {
+    const r = await fetch('/api/projects/reassign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to }),
+    });
+    if (!r.ok) { showToast(await securityErrorMessage(r, 'Failed to fold bucket in'), 'err'); return; }
+    const data = await r.json();
+    showToast(`Folded ${data.moved} row${data.moved === 1 ? '' : 's'} from ${from} into ${to}`, 'ok');
+    await loadProjects();
+  } catch (e) {
+    showToast(`Reassign error: ${e.message || e}`, 'err');
+  }
+};
 
 function closeProjectModal() {
   document.getElementById('project-modal').hidden = true;

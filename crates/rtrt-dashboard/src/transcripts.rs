@@ -203,6 +203,10 @@ struct AssistantTurn {
     project: String,
     text: String,
     session_id: String,
+    /// The main session a subagent transcript ran under — the `<session>`
+    /// path component two levels above `.../subagents/<file>.jsonl`. `None`
+    /// for a top-level (main) transcript, which has no parent.
+    parent_session: Option<String>,
     agent_id: Option<String>,
     slug: Option<String>,
     file: PathBuf,
@@ -256,6 +260,40 @@ fn representative_project(encoded_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// For a subagent transcript at `<encoded>/<session>/subagents/<file>.jsonl`,
+/// returns the parent `<session>` id — pure path parsing, no filesystem
+/// access, so it stays correct even after the transcript file itself is
+/// gone. `None` for a top-level (main) transcript, which has no parent.
+fn parent_session_from_path(file: &Path) -> Option<String> {
+    let subagents_dir = file.parent()?; // .../<session>/subagents
+    if subagents_dir.file_name()? != std::ffi::OsStr::new("subagents") {
+        return None;
+    }
+    let session_dir = subagents_dir.parent()?; // .../<session>
+    session_dir.file_name()?.to_str().map(String::from)
+}
+
+/// Synthesizes a classifiable capture-bucket name for the rare case where
+/// project resolution genuinely fails at capture time — no `<encoded>` dir
+/// project (e.g. the dir held no top-level session transcript yet) AND no
+/// resolvable line `cwd`. Shaped `agent-<session>[-<agent>]` so
+/// [`rtrt_memory::is_capture_bucket_name`] always recognises it: the row is
+/// never silently dropped, and instead of parking under an unclassified name
+/// forever it surfaces immediately via the dashboard's hidden-bucket count
+/// (and can be folded into its real project with `/api/projects/reassign`
+/// once a human figures out which one that is).
+fn fallback_capture_bucket(session_id: &str, agent_id: Option<&str>) -> String {
+    let session = if session_id.is_empty() {
+        "unknown"
+    } else {
+        session_id
+    };
+    match agent_id {
+        Some(a) if !a.is_empty() => format!("agent-{session}-{a}"),
+        _ => format!("agent-{session}"),
+    }
 }
 
 /// Read the first `cwd` field from a transcript file (scanning the first lines).
@@ -316,17 +354,7 @@ fn parse_assistant_turn(
     let is_subagent = file
         .components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"));
-
-    // Project: the file's `<encoded>` dir project is authoritative (one project
-    // per dir, worktree-stable) for both main and subagent rows. Fall back to
-    // the line's own cwd, resolved to its git root, only if the dir couldn't be
-    // resolved — never the raw cwd basename, which scatters sub-dir / worktree
-    // sessions into bogus buckets.
-    let line_project = v
-        .get("cwd")
-        .and_then(|c| c.as_str())
-        .map(rtrt_core::project_for_cwd_str);
-    let project = resolved_project.map(String::from).or(line_project)?;
+    let parent_session = parent_session_from_path(file);
 
     let session_id = v
         .get("sessionId")
@@ -336,10 +364,30 @@ fn parse_assistant_turn(
     let agent_id = v.get("agentId").and_then(|s| s.as_str()).map(String::from);
     let slug = v.get("slug").and_then(|s| s.as_str()).map(String::from);
 
+    // Project: the file's `<encoded>` dir project is authoritative (one project
+    // per dir, worktree-stable) for both main and subagent rows — resolved
+    // HERE, at capture time, while the transcript is still on disk, so a
+    // later deletion/rotation of that file can never orphan this row. Fall
+    // back to the line's own cwd, resolved to its git root, only if the dir
+    // couldn't be resolved — never the raw cwd basename, which scatters
+    // sub-dir / worktree sessions into bogus buckets. If BOTH fail (the rare
+    // case where the encoded dir has no top-level session yet and the line
+    // carries no usable cwd), synthesize a classifiable capture bucket
+    // instead of silently dropping the turn — see [`fallback_capture_bucket`].
+    let line_project = v
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .map(rtrt_core::project_for_cwd_str);
+    let project = resolved_project
+        .map(String::from)
+        .or(line_project)
+        .unwrap_or_else(|| fallback_capture_bucket(&session_id, agent_id.as_deref()));
+
     Some(AssistantTurn {
         project,
         text: text.to_string(),
         session_id,
+        parent_session,
         agent_id,
         slug,
         file: file.to_path_buf(),
@@ -378,6 +426,12 @@ async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &AssistantTurn) -> anyho
     if !t.session_id.is_empty() {
         meta.insert("session_id".into(), t.session_id.clone());
     }
+    // The main session a subagent ran under, captured at write time from the
+    // transcript's path — survives even after that transcript is deleted, so
+    // a manual reassign later can still tell which project's work this was.
+    if let Some(p) = &t.parent_session {
+        meta.insert("parent_session".into(), p.clone());
+    }
     if let Some(a) = &t.agent_id {
         meta.insert("agent_id".into(), a.clone());
     }
@@ -391,4 +445,94 @@ async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &AssistantTurn) -> anyho
     let id = guard.save_with_metadata(&t.project, kind, &t.text, &meta)?;
     let _ = guard.tag_row(id, Some(&t.session_id), Some(&sha));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subagent_line(session_id: &str, agent_id: Option<&str>, cwd: Option<&str>) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "cwd": cwd,
+            "message": { "content": [{ "type": "text", "text": "teammate output" }] },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parent_session_from_path_extracts_the_session_dir() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-123/subagents/agent-x.jsonl");
+        assert_eq!(parent_session_from_path(file), Some("sess-123".to_string()));
+    }
+
+    #[test]
+    fn parent_session_from_path_is_none_for_a_main_transcript() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-123.jsonl");
+        assert_eq!(parent_session_from_path(file), None);
+    }
+
+    /// The core guarantee this change adds: a subagent row is attributed to
+    /// its real (parent) project THE MOMENT it's captured, using whatever
+    /// `resolved_project` the live sweep computed from the still-on-disk
+    /// transcript. Once `parse_assistant_turn` returns, the row no longer
+    /// depends on that transcript file existing — even if it's deleted a
+    /// moment later, the row it already produced still carries the correct
+    /// project and parent session.
+    #[test]
+    fn captured_subagent_row_lands_in_the_parent_project_at_capture_time() {
+        let file = Path::new(
+            "/home/u/.claude/projects/-enc-/a1f52dae-1111-2222-3333-197bb559b207/subagents/agent-code-reviewer.jsonl",
+        );
+        let line = subagent_line(
+            "a1f52dae-1111-2222-3333-197bb559b207",
+            Some("agent-code-reviewer"),
+            // A worktree cwd that, on its own, would NOT resolve to the real
+            // project — the point is that `resolved_project` (computed once,
+            // at capture time, from the encoded dir) wins regardless.
+            Some("/home/u/repo/.worktrees/scratch"),
+        );
+        let turn = parse_assistant_turn(&line, file, Some("00G_AI-Project-Setup"))
+            .expect("assistant turn with text parses");
+        assert_eq!(turn.project, "00G_AI-Project-Setup");
+        assert_eq!(
+            turn.parent_session,
+            Some("a1f52dae-1111-2222-3333-197bb559b207".to_string())
+        );
+        assert!(turn.is_subagent);
+        // The transcript file is now free to disappear (rotation, cleanup,
+        // whatever) — nothing about the saved row depends on it anymore.
+    }
+
+    #[test]
+    fn fallback_capture_bucket_is_classifiable_and_never_empty() {
+        let with_agent = fallback_capture_bucket("sess-1", Some("agent-7"));
+        assert!(rtrt_memory::is_capture_bucket_name(&with_agent));
+
+        let session_only = fallback_capture_bucket("sess-1", None);
+        assert!(rtrt_memory::is_capture_bucket_name(&session_only));
+
+        let unknown_everything = fallback_capture_bucket("", None);
+        assert!(rtrt_memory::is_capture_bucket_name(&unknown_everything));
+    }
+
+    /// When capture-time resolution genuinely can't determine a project (no
+    /// encoded-dir project AND no resolvable line cwd), the turn must still
+    /// be captured — never silently dropped — and land somewhere the orphan
+    /// classifier (and the dashboard's hidden-bucket count) will catch.
+    #[test]
+    fn unresolvable_project_falls_back_to_a_classifiable_bucket_instead_of_dropping() {
+        let file =
+            Path::new("/home/u/.claude/projects/-enc-/sess-999/subagents/agent-orphan.jsonl");
+        let line = subagent_line("sess-999", Some("agent-orphan"), None);
+        let turn = parse_assistant_turn(&line, file, None)
+            .expect("turn is still captured even when unattributable");
+        assert!(
+            rtrt_memory::is_capture_bucket_name(&turn.project),
+            "fallback project `{}` should be a classifiable capture bucket",
+            turn.project
+        );
+    }
 }

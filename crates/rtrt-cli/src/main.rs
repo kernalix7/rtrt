@@ -4036,10 +4036,10 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
         mode: (mode != InvokeMode::Auto).then_some(mode),
     };
     let tools = rtrt_core::detect_tools_with_config(cfg);
-    // Overlay the provider-usage ledger's rolling 24h window so ranking is
+    // Routing snapshot with the ledger's rolling 24h window so ranking is
     // headroom-aware: exhausted `[limits]` targets are demoted and near-limit
     // ones penalized (targets with no cap keep pure cost-tier order).
-    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
+    let usage = UsageSnapshot::load_for_routing();
     let decision = select_route(&req, &tools, &usage)?;
 
     if opts.explain || opts.dry_run {
@@ -4126,7 +4126,7 @@ fn ranked_targets_for_call(
     };
     let cfg = effective_config_for_cwd();
     let tools = rtrt_core::detect_tools_with_config(cfg);
-    let usage = UsageSnapshot::load_best_effort().with_ledger_window();
+    let usage = UsageSnapshot::load_for_routing();
     let req = RouteRequest {
         capability: None,
         prefer: Prefer::Cheapest,

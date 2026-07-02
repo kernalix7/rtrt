@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rtrt_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{ChatRequest, ChatResponse, Provider, Role, Usage};
+use crate::{ChatRequest, ChatResponse, Provider, Role, Usage, usage_ledger};
 
 /// One observation per chat call. Cheap to clone (`Arc`-free, all owned data).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +244,13 @@ pub struct Gateway {
     retry: RetryPolicy,
     next_metric_id: Arc<Mutex<u64>>,
     cache: Option<Arc<Mutex<ResponseCache>>>,
+    /// When set, every dispatched request is also appended to the persistent
+    /// provider-usage ledger (`usage_ledger::record_invocation`), so gateway
+    /// callers (MCP `provider_chat`, dashboard chat/compress/memory daemons)
+    /// count toward the same windowed headroom the router balances on.
+    /// `Gateway::from_env` enables it; embedded/test gateways built via
+    /// `Gateway::new` stay ledger-silent unless opted in.
+    record_usage: bool,
 }
 
 /// Helicone-style response cache. The key hashes
@@ -322,8 +329,10 @@ impl Default for Gateway {
 impl Gateway {
     /// Constructs a gateway from environment variables. The intent is "spin up
     /// a usable gateway in one line" — primarily for the dashboard binary.
+    /// Ledger recording is on: from-env gateways serve real provider traffic,
+    /// which must count toward routing headroom.
     pub fn from_env() -> Self {
-        let mut gw = Gateway::new();
+        let mut gw = Gateway::new().with_usage_recording(true);
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             gw = gw.register(
                 "anthropic",
@@ -369,7 +378,15 @@ impl Gateway {
             retry: RetryPolicy::default(),
             next_metric_id: Arc::new(Mutex::new(1)),
             cache: None,
+            record_usage: false,
         }
+    }
+
+    /// Toggle persistent provider-usage ledger recording for every dispatched
+    /// request. See the `record_usage` field for the default per constructor.
+    pub fn with_usage_recording(mut self, enabled: bool) -> Self {
+        self.record_usage = enabled;
+        self
     }
 
     /// Attach a fixed-capacity response cache. When `cap == 0` the cache is
@@ -575,8 +592,18 @@ impl Gateway {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let model = req.model.clone();
+        // Char count of the outbound messages, kept for the estimated ledger
+        // row when the provider fails (or reports no usage block).
+        let prompt_chars: String = if self.record_usage {
+            req.messages.iter().map(|m| m.content.as_str()).collect()
+        } else {
+            String::new()
+        };
         let result = registration.provider.chat(req).await;
         let latency_ms = started.elapsed().as_millis() as u64;
+        if self.record_usage {
+            record_dispatch_to_ledger(&name, &model, &prompt_chars, &result);
+        }
         let id = {
             let mut guard = self
                 .next_metric_id
@@ -643,6 +670,53 @@ impl MetricsBuffer {
 
     pub fn recent(&self, limit: usize) -> Vec<RequestMetric> {
         self.inner.iter().rev().take(limit).cloned().collect()
+    }
+}
+
+/// Append one dispatched request to the provider-usage ledger, following the
+/// ledger convention: real API [`Usage`] counts are recorded exactly with
+/// `est = 0`; when no usage is available (failure, or a backend that returns
+/// no usage block) tokens are estimated at chars/4 with `est = 1`. Best-effort
+/// by contract — `record_invocation` never propagates failures.
+fn record_dispatch_to_ledger(
+    target: &str,
+    model: &str,
+    prompt_chars: &str,
+    result: &Result<ChatResponse>,
+) {
+    match result {
+        Ok(resp) if resp.usage.total() > 0 => {
+            usage_ledger::record_invocation(
+                target,
+                model,
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+                false,
+                true,
+            );
+        }
+        Ok(resp) => {
+            // Some OpenAI-compatible backends omit the usage block; estimate
+            // both sides so the request still counts toward headroom.
+            usage_ledger::record_invocation(
+                target,
+                model,
+                usage_ledger::estimate_tokens(prompt_chars),
+                usage_ledger::estimate_tokens(&resp.content),
+                true,
+                true,
+            );
+        }
+        Err(_) => {
+            usage_ledger::record_invocation(
+                target,
+                model,
+                usage_ledger::estimate_tokens(prompt_chars),
+                0,
+                true,
+                false,
+            );
+        }
     }
 }
 

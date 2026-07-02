@@ -43,6 +43,9 @@ mod state;
 mod transcripts;
 mod util;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use anyhow::Result;

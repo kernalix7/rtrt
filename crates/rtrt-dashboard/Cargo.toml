@@ -38,3 +38,10 @@ toml.workspace = true
 dirs.workspace = true
 rusqlite.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+# `ServiceExt::oneshot` lives behind the `util` feature; enable it for tests so
+# the router can be exercised directly without binding a TCP listener.
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

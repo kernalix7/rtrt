@@ -629,3 +629,116 @@ async fn spa_fallback_404_for_bogus_api() {
     let resp = call(app, get("/api/bogus")).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// Reproduces the real-world "one mega-bubble eats the map" problem at small
+/// scale: 300 memories share NO lexical token with one another (each body is
+/// built from row-index-unique words), so the lexical clusterer cannot merge
+/// them and folds the overflow into a single catch-all — well past
+/// [`crate::state::STALL_DOMINANCE`] of the project (in this fixture, over
+/// 80%), exactly like the 70% "(기타)" bubble the live `00G_CADKernel` store
+/// produced. The rows are round-robin tagged across 5 sessions so the
+/// overview's anti-stall balancing (`balance_overview_dominance` in
+/// `handlers/memgraph.rs`) has a metadata facet to redistribute the mass
+/// along, mirroring the per-bubble drill's own facet fallback.
+///
+/// Asserts the invariant the fix exists for: no top-level bubble holds
+/// `>= STALL_DOMINANCE` of the whole map, every bubble's sizes still sum to
+/// `total_nodes` (no member dropped or duplicated), every bubble carries a
+/// drill token, the split sub-bubbles are labeled by their session (a real
+/// group, not another generic misc label), and drilling one of those tokens
+/// still resolves to its members.
+#[tokio::test]
+async fn memory_graph_overview_balances_dominant_catchall_bubble() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    const TOTAL: usize = 300;
+    const SESSIONS: usize = 5;
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for i in 0..TOTAL {
+            let body = format!("uniqueword{i}xyz alphatok{i}abc betatok{i}def gammatok{i}ghi");
+            let id = store.save("bigproj", "note", &body).unwrap();
+            let session = format!("sess-{}", i % SESSIONS);
+            store.tag_row(id, Some(&session), None).unwrap();
+        }
+    }
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        get("/api/memory/graph?project=bigproj&mode=overview&group=context&basis=lexical"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["mode"], "overview");
+    let total_nodes = v["total_nodes"].as_u64().expect("total_nodes present");
+    assert_eq!(total_nodes, TOTAL as u64, "no row dropped from the project");
+
+    let clusters = v["clusters"].as_array().expect("clusters array");
+    assert!(!clusters.is_empty());
+
+    let cap = total_nodes as f64 * crate::state::STALL_DOMINANCE;
+    let mut size_sum: u64 = 0;
+    let mut saw_session_label = false;
+    for c in clusters {
+        let size = c["size"].as_u64().expect("size present");
+        size_sum += size;
+        let label = c["label"].as_str().unwrap_or_default();
+        let pct = crate::state::STALL_DOMINANCE * 100.0;
+        assert!(
+            (size as f64) < cap,
+            "bubble {label:?} holds {size}/{total_nodes} rows, >= the {pct:.0}% dominance cap \
+             (the mega-bubble regression this test guards against)"
+        );
+        let token = c["token"].as_str().expect("every bubble carries a token");
+        assert!(!token.is_empty());
+        if let Some(label) = c["label"].as_str()
+            && label.starts_with("sess-")
+        {
+            saw_session_label = true;
+        }
+        assert_ne!(
+            c["label"], "(기타)",
+            "split sub-bubbles must read as real groups, not a generic misc label"
+        );
+    }
+    assert_eq!(
+        size_sum, total_nodes,
+        "size_sum across bubbles == total_nodes"
+    );
+    assert!(
+        saw_session_label,
+        "the balanced dominant bubble's children should be labeled by session (the facet used to split it)"
+    );
+
+    // Drilling one of the split, session-labeled sub-bubbles must still
+    // resolve to real members (the token path is untouched by the fix). The
+    // token was minted into `state.level_tokens`, so the drill request must
+    // reuse the SAME state (a fresh `test_state` would have no record of it).
+    let split_token = clusters
+        .iter()
+        .find(|c| c["label"].as_str().is_some_and(|l| l.starts_with("sess-")))
+        .and_then(|c| c["token"].as_str())
+        .expect("at least one session-labeled bubble with a token")
+        .to_string();
+    let app = router(state, None);
+    let resp = call(app, get(&format!("/api/memory/graph?token={split_token}"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let drilled = json_body(resp).await;
+    let member_count: u64 = match drilled["mode"].as_str() {
+        Some("leaf") => drilled["nodes"]
+            .as_array()
+            .map(|a| a.len() as u64)
+            .unwrap_or(0),
+        Some("group") => drilled["clusters"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| c["size"].as_u64()).sum())
+            .unwrap_or(0),
+        other => panic!("unexpected drill mode {other:?}"),
+    };
+    assert!(
+        member_count > 0,
+        "drilling the split bubble's token still returns members"
+    );
+}

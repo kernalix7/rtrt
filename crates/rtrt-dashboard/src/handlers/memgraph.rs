@@ -507,7 +507,7 @@ pub(crate) async fn memory_graph_overview(
             // Miss / expired: rebuild under the store lock (no await inside).
             let idx = {
                 let guard = store.lock().await;
-                if is_context {
+                let raw = if is_context {
                     match basis_pref {
                         // Force semantic: cluster on vectors even at low coverage
                         // (the map then covers only the embedded rows).
@@ -541,7 +541,17 @@ pub(crate) async fn memory_graph_overview(
                     guard
                         .group_meta(project, CLUSTER_MAX_NODES, group, target)
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                }
+                };
+                // Anti-stall balancing: a single top-level bubble dominating the
+                // whole map (the "(기타)"/misc mega-bubble that can swallow most
+                // of a large lexical project) reads as one undifferentiated
+                // blob and blocks drilling from ever revealing structure —
+                // exactly the failure the per-bubble drill already guards
+                // against. Split it in place with the same cascade before it
+                // is cached, so every cached/served overview honours the
+                // invariant, not just the first request after a rebuild.
+                balance_overview_dominance(&guard, raw)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             };
             let mut cache = state.cluster_cache.lock().await;
             cache.insert(cache_key, (std::time::Instant::now(), idx.clone()));
@@ -632,6 +642,118 @@ pub(crate) async fn memory_graph_overview(
         "embedded": embedded,
         "total_rows": total_rows,
     })))
+}
+
+/// If the whole-project overview's largest bubble dominates the map (`>=`
+/// [`STALL_DOMINANCE`] of ALL nodes — the same bar the per-bubble drill uses
+/// to decide a re-cluster has stalled, reused here rather than inventing a
+/// second bespoke fraction), split it in place with
+/// [`split_stalled_cluster`]'s cascade so the top level never shows one mass
+/// eating everything. Repeats on whichever bubble is still dominant
+/// afterwards — normally one pass is enough, but a metadata facet can itself
+/// leave one oversized "no session" style bucket, so this keeps applying the
+/// cascade to it until the invariant holds or the mass genuinely cannot be
+/// split further (both terminate: every pass strictly shrinks the largest
+/// remaining piece, so the loop is bounded by how many times it can halve).
+///
+/// `size_sum` and every member id are preserved exactly — nodes only ever
+/// move BETWEEN bubbles, never dropped or duplicated. Non-dominant bubbles
+/// (and their labels/tokens, minted by the caller afterwards) are untouched.
+///
+/// Synchronous (no `.await`) so it can run inside the `!Send` store-guard
+/// block [`memory_graph_overview`] already holds.
+fn balance_overview_dominance(
+    guard: &MemoryStore,
+    index: ClusterIndex,
+) -> anyhow::Result<ClusterIndex> {
+    let total = index.node_cluster.len();
+    let ClusterIndex {
+        mut clusters,
+        mut cluster_edges,
+        mut node_cluster,
+    } = index;
+    if total == 0 {
+        return Ok(ClusterIndex {
+            clusters,
+            cluster_edges,
+            node_cluster,
+        });
+    }
+    let leaf_cut = dynamic_leaf(total);
+
+    // Defensive cap only: each pass strictly shrinks the largest remaining
+    // bubble, so this converges in a handful of iterations even on a huge
+    // catch-all. It exists to guard against a future regression looping
+    // forever, not to bound normal behaviour (which is 1-2 passes).
+    const MAX_PASSES: usize = 32;
+    for _ in 0..MAX_PASSES {
+        let Some(dom) = clusters.iter().max_by_key(|c| c.size).cloned() else {
+            break;
+        };
+        if (dom.size as f64) < total as f64 * STALL_DOMINANCE {
+            break;
+        }
+        let ids: Vec<i64> = node_cluster
+            .iter()
+            .filter(|(_, root)| **root == dom.id)
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.len() <= 1 {
+            break;
+        }
+        let split = split_stalled_cluster(guard, &ids, leaf_cut)?;
+        if split.clusters.len() <= 1 {
+            // The cascade could not split this mass any further (a truly
+            // homogeneous, tiny-total edge case) — stop rather than spin.
+            break;
+        }
+        clusters.retain(|c| c.id != dom.id);
+        node_cluster.retain(|_, root| *root != dom.id);
+        cluster_edges.retain(|(a, b, _)| *a != dom.id && *b != dom.id);
+        for (&id, &root) in &split.node_cluster {
+            node_cluster.insert(id, root);
+        }
+        clusters.extend(split.clusters);
+    }
+    clusters.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.cmp(&b.id)));
+    Ok(ClusterIndex {
+        clusters,
+        cluster_edges,
+        node_cluster,
+    })
+}
+
+/// Anti-stall cascade for one bubble's member-id set. Mirrors the per-bubble
+/// re-cluster stall guard in [`memory_graph_drill`] (kept as its own copy
+/// here — rather than a shared call — so the drill path's control flow stays
+/// untouched): semantic [`MemoryStore::subcluster`] first; if that still
+/// leaves one dominant child (`>= STALL_DOMINANCE` of the subset), a
+/// metadata-facet fallback (session -> time -> kind) until one actually
+/// distributes the mass (`>1` bucket, none holding ~everything); if no facet
+/// helps (a truly homogeneous mass), time-ordered PAGE buckets so every
+/// member stays reachable. Labels come from the same c-TF-IDF /
+/// facet-value paths `subcluster` / `group_meta_ids` already use, so the
+/// resulting sub-bubbles read as real groups instead of another "(기타)".
+fn split_stalled_cluster(
+    guard: &MemoryStore,
+    ids: &[i64],
+    leaf_cut: usize,
+) -> anyhow::Result<ClusterIndex> {
+    let branch = dynamic_branch(ids.len());
+    let idx2 = guard.subcluster(ids, CLUSTER_TOP_K, CLUSTER_MIN_WEIGHT, branch)?;
+    let largest = idx2.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+    let stalled = idx2.clusters.len() <= 1 || largest as f64 >= ids.len() as f64 * STALL_DOMINANCE;
+    if !stalled {
+        return Ok(idx2);
+    }
+    for facet in ["session", "time", "kind"] {
+        let meta = guard.group_meta_ids(ids, facet, branch)?;
+        let ml = meta.clusters.iter().map(|c| c.size).max().unwrap_or(0);
+        if meta.clusters.len() > 1 && (ml as f64) < ids.len() as f64 * 0.9 {
+            return Ok(meta);
+        }
+    }
+    Ok(page_buckets(ids, leaf_cut))
 }
 
 /// Resolve a drill `token` to its member-id set and render the next level.

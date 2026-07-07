@@ -3056,6 +3056,13 @@ impl MemoryStore {
     ///    bodies, dominant source from member source kinds) sorted by size
     ///    desc, and aggregate inter-cluster edge weights capped at the
     ///    strongest ~2000.
+    ///
+    /// A convenience default (`allow_vector = true`, `target = CLUSTER_TARGET`)
+    /// over [`graph_clusters_opt`](Self::graph_clusters_opt). The dashboard's
+    /// `mode=overview` builds its LOD index via `graph_clusters_opt` directly
+    /// (it needs per-request control of both knobs); this wrapper is exercised
+    /// by the unit tests below and kept as public API for callers happy with
+    /// the defaults.
     pub fn graph_clusters(
         &self,
         project: &str,
@@ -4020,6 +4027,14 @@ impl MemoryStore {
     /// (`index.node_cluster`) to decide membership, then recomputes the
     /// lexical similarity *within* the cluster only — cheap because a single
     /// cluster is a small slice of the project.
+    ///
+    /// No longer called by the dashboard: the `?cluster=<root>` HTTP drill
+    /// this served has been retired (it resolved root ids against a stale,
+    /// separately-cached index and could silently return the wrong or an
+    /// empty cluster — see `rtrt-dashboard`'s `memory_graph` handler). The
+    /// live drill path is `token`-based ([`subcluster`](Self::subcluster) /
+    /// [`members_for_ids`](Self::members_for_ids)). Kept as public API,
+    /// exercised directly by the unit tests below.
     pub fn cluster_members(
         &self,
         project: &str,

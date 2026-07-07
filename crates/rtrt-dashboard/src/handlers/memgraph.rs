@@ -55,8 +55,13 @@ pub(crate) struct MemoryGraphQuery {
     /// re-subclusters (deeper `group` level) or returns a `leaf`.
     #[serde(default)]
     token: Option<String>,
-    /// Legacy drill-down by cluster root id (kept for the old frontend path);
-    /// superseded by `token`.
+    /// Legacy drill-down by cluster root id. The frontend path that used this
+    /// is gone, and the index it resolved against (a bare-`project`-keyed
+    /// cache entry, distinct from the overview's composite-keyed one) has been
+    /// removed — resolving a root id here would silently serve empty or wrong
+    /// data (most root ids do not exist in that keyspace). Kept ONLY so a
+    /// straggling caller (stale cached JS, a bookmarked API call) is detected
+    /// and gets an explicit `410 Gone` instead of a bad response.
     #[serde(default)]
     cluster: Option<i64>,
     /// Clustering basis the user picked on the map for `group=context`:
@@ -108,43 +113,19 @@ pub(crate) async fn memory_graph(
         return memory_graph_drill(&state, store, tok, q.leaf).await;
     }
 
-    // LOD drill-down (`cluster=<root>`): return the members of one cluster from
-    // the cached index. Rebuilds the index if missing/expired. Checked before
-    // `mode` so a drill-down request needs no extra `mode=` param. Resolved
-    // before the long-lived store guard below so the `!Send` store reference is
-    // never held across an `.await`. Superseded by `token`, kept for the old UI.
-    if let Some(root_id) = q.cluster {
-        let index = cluster_index_cached(&state, store, &q.project).await?;
-        let members = {
-            let guard = store.lock().await;
-            guard
-                .cluster_members(&q.project, root_id, &index)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        };
-        let nodes: Vec<serde_json::Value> = members
-            .nodes
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "id": format!("m{}", m.id),
-                    "node_type": "memory",
-                    "label": m.preview,
-                    "kind": m.kind,
-                    "source_kind": m.source_kind,
-                })
-            })
-            .collect();
-        let edges: Vec<serde_json::Value> = members
-            .edges
-            .iter()
-            .map(|(a, b, w)| serde_json::json!({"src": format!("m{a}"), "dst": format!("m{b}"), "weight": w}))
-            .collect();
-        return Ok(Json(serde_json::json!({
-            "mode": "cluster",
-            "root": root_id,
-            "nodes": nodes,
-            "edges": edges,
-        })));
+    // Legacy `cluster=<root>` drill: removed. It resolved root ids against a
+    // DIFFERENT partition (a bare-`project`-keyed index) than the one that
+    // minted them for the shipped `mode=overview` UI (composite-keyed, dynamic
+    // target) — most root ids simply did not exist in that keyspace, so this
+    // silently served an empty `{nodes:[],edges:[]}` (or, on a min-id
+    // collision, the WRONG cluster's members) instead of erroring. The current
+    // frontend drills via `token` exclusively and never sends `cluster=`; this
+    // only guards against a stale client still sending it.
+    if q.cluster.is_some() {
+        return Err((
+            StatusCode::GONE,
+            "legacy cluster drill removed; re-fetch the overview and drill via token".into(),
+        ));
     }
 
     // LOD overview (`mode=overview&group=<basis>`): server-side top-level
@@ -448,47 +429,6 @@ pub(crate) async fn memory_graph_brain_concept(
         "nodes": nodes,
         "edges": [],
     })))
-}
-
-/// Return a fresh [`ClusterIndex`] for `project`, served from the per-project
-/// cache when the entry is younger than [`CLUSTER_INDEX_TTL`]; otherwise rebuild
-/// it via [`MemoryStore::graph_clusters`] and refresh the cache.
-///
-/// The store is `!Send` (it wraps a `rusqlite::Connection`), so the build runs
-/// inside a synchronous block with no `.await` while the store guard is held —
-/// keeping the returned future `Send` for axum.
-pub(crate) async fn cluster_index_cached(
-    state: &AppState,
-    store: &Arc<Mutex<MemoryStore>>,
-    project: &str,
-) -> std::result::Result<ClusterIndex, (StatusCode, String)> {
-    // Fast path: serve a still-fresh cached index.
-    {
-        let cache = state.cluster_cache.lock().await;
-        if let Some((built_at, index)) = cache.get(project)
-            && built_at.elapsed() < CLUSTER_INDEX_TTL
-        {
-            return Ok(index.clone());
-        }
-    }
-    // Miss / expired: rebuild under the store lock (no await inside this block).
-    let index = {
-        let guard = store.lock().await;
-        guard
-            .graph_clusters(
-                project,
-                CLUSTER_MAX_NODES,
-                CLUSTER_TOP_K,
-                CLUSTER_MIN_WEIGHT,
-            )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
-    let mut cache = state.cluster_cache.lock().await;
-    cache.insert(
-        project.to_string(),
-        (std::time::Instant::now(), index.clone()),
-    );
-    Ok(index)
 }
 
 /// Cache-key separator for the `(project, group)` overview cache.

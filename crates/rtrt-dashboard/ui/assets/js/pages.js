@@ -1503,7 +1503,7 @@ document.getElementById('queue-compress-all').onclick = async (ev) => {
 // Memory knowledge map — Cytoscape.js node graph (library owns layout/zoom/pan/drag).
 // Drives the #sub-memmap subtab using the server LOD API:
 //   GET /api/memory/graph?project=X&mode=overview  -> { clusters, cluster_edges, total_nodes, ... }
-//   GET /api/memory/graph?project=X&cluster=<id>   -> { root, nodes, edges }
+//   GET /api/memory/graph?token=<tok>              -> { mode: "group"|"leaf", ... } (drill one bubble deeper)
 // We never hand-roll a force simulation: Cytoscape's built-in 'cose' layout
 // positions nodes, and the cy instance handles wheel-zoom / background-pan /
 // node-drag natively. If the CDN failed to load (offline), window.cytoscape is

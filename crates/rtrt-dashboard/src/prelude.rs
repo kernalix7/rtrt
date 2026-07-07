@@ -32,9 +32,9 @@ pub(crate) use crate::handlers::limits::{
 pub(crate) use crate::handlers::memgraph::{
     BRAIN_MIN_COOCCUR, CACHE_KEY_SEP, CLUSTER_MAX_NODES, CLUSTER_MIN_WEIGHT, CLUSTER_TOP_K,
     GLOBAL_PROJECT_SENTINEL, MemoryGraphQuery, brain_hierarchy_cached, brain_scope,
-    cluster_index_cached, default_graph_limit, emit_group_response, memory_graph,
-    memory_graph_brain, memory_graph_brain_community, memory_graph_brain_concept,
-    memory_graph_drill, memory_graph_leaf, memory_graph_overview, page_buckets,
+    default_graph_limit, emit_group_response, memory_graph, memory_graph_brain,
+    memory_graph_brain_community, memory_graph_brain_concept, memory_graph_drill,
+    memory_graph_leaf, memory_graph_overview, page_buckets,
 };
 pub(crate) use crate::handlers::memory::{
     DayCount, DeleteBatchRequest, DeleteBatchResponse, DeleteOneResponse, GetBlockQuery, KindCount,

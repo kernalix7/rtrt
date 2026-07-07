@@ -50,10 +50,15 @@ pub(crate) struct AppState {
     /// the config (or `RTRT_EMBED_ENABLED=1`). `None` keeps all non-vector
     /// paths working without an Ollama instance.
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
-    /// Per-`(project, group)` LOD cluster/group index cache
-    /// (`"project\x1fgroup" -> (built_at, index)`), TTL [`CLUSTER_INDEX_TTL`].
-    /// The `overview` mode builds + caches; the legacy `cluster` drill-down
-    /// reads the `context` entry (rebuilding if missing/expired).
+    /// LOD cluster/group index cache for `mode=overview`, keyed on every knob
+    /// that can change what's built — `"{project}\x1f{group}\x1f{basis}\x1f
+    /// {target}\x1f{allow_vector as u8}"` -> `(built_at, index)`, TTL
+    /// [`CLUSTER_INDEX_TTL`] (see [`CACHE_KEY_SEP`](crate::handlers::memgraph::CACHE_KEY_SEP)
+    /// and `memory_graph_overview`'s `cache_key`). Only the overview build
+    /// reads/writes this map now — the legacy bare-`project`-keyed entry the
+    /// retired `?cluster=<id>` drill used to read (a different, incompatible
+    /// partition) is gone; no code path resolves a composite key it didn't
+    /// itself mint.
     pub(crate) cluster_cache:
         Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
     /// Per-scope TOP-LEVEL "digital brain" community hierarchy cache (the

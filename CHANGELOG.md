@@ -17,6 +17,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 ### Changed
 
 - `memory_recall` / `memory_smart_search` MCP tool descriptions and server instructions now describe actual runtime behavior (hybrid when an embedder is attached, BM25 otherwise) instead of a static claim.
+
+### Fixed
+
+- **Retired the broken legacy memory-map cluster drill**: `GET /api/memory/graph?cluster=<id>` resolved a cluster root id against a DIFFERENT, separately-cached partition than the one that minted it (the `mode=overview` build), so most root ids simply did not exist in that keyspace — the endpoint silently returned an empty `{nodes:[],edges:[]}` (or, on a min-id collision, the wrong cluster's members) instead of erroring, and rebuilding that stale index wasted a multi-second whole-project pass on every miss. The shipped dashboard frontend never sent `cluster=` (it drills exclusively via the `token` param, which is unaffected and correct); the endpoint now returns `410 Gone` with a hint to re-fetch the overview and drill via `token` instead of resolving against dead state. The bare-`project`-keyed cache entry this legacy path read (`AppState::cluster_cache`) is gone — only the overview's composite-keyed entries remain.
+
 ### Highlights — descriptive memory-map cluster labels + zoom-to-drill
 
 **Cluster bubbles now say what's actually inside them, and zooming into the map reveals detail automatically instead of staying a flat blob at any depth.**

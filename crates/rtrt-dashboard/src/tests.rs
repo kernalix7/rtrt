@@ -430,6 +430,104 @@ async fn memory_sessions_empty_project_returns_empty() {
     assert!(v["sessions"].as_array().unwrap().is_empty());
 }
 
+/// `mode=overview` builds the whole-project LOD index and mints one drill
+/// token per bubble — the live path the Memory map actually uses.
+#[tokio::test]
+async fn memory_graph_overview_returns_bubbles_with_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for i in 0..6 {
+            store
+                .save(
+                    "demo",
+                    "note",
+                    &format!("memory row number {i} about the deploy pipeline"),
+                )
+                .unwrap();
+        }
+    }
+    let app = router(state, None);
+    let resp = call(app, get("/api/memory/graph?project=demo&mode=overview")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["mode"], "overview");
+    let clusters = v["clusters"].as_array().expect("clusters array");
+    assert!(!clusters.is_empty(), "at least one bubble");
+    for c in clusters {
+        assert!(
+            c["token"].as_str().is_some_and(|t| !t.is_empty()),
+            "every bubble carries a drill token: {c:?}"
+        );
+    }
+}
+
+/// Drilling an overview bubble's token must resolve real memory nodes — this
+/// is the ONLY drill-down path the shipped frontend uses.
+#[tokio::test]
+async fn memory_graph_token_drill_returns_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for i in 0..6 {
+            store
+                .save(
+                    "demo",
+                    "note",
+                    &format!("memory row number {i} about the deploy pipeline"),
+                )
+                .unwrap();
+        }
+    }
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/memory/graph?project=demo&mode=overview")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let overview = json_body(resp).await;
+    let token = overview["clusters"][0]["token"]
+        .as_str()
+        .expect("first bubble has a token")
+        .to_string();
+
+    let app = router(state, None);
+    let resp = call(app, get(&format!("/api/memory/graph?token={token}"))).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    // A 6-row bubble is well under the dynamic leaf cutoff, so it renders
+    // straight to individual memory nodes rather than sub-bubbling further.
+    assert_eq!(
+        v["mode"], "leaf",
+        "small bucket drills straight to a leaf: {v:?}"
+    );
+    assert!(
+        !v["nodes"].as_array().unwrap().is_empty(),
+        "leaf carries real memory nodes"
+    );
+}
+
+/// The retired `?cluster=<id>` drill-down must never silently resolve — it
+/// used to look the root id up in a differently-keyed (and since-removed)
+/// index than the one the overview minted, which mostly returned an empty
+/// `{nodes:[],edges:[]}` for a valid-looking root id. It must now return an
+/// explicit `410 Gone` so a straggling client learns to re-fetch and drill
+/// via `token` instead of rendering a bogus empty cluster.
+#[tokio::test]
+async fn memory_graph_legacy_cluster_query_returns_410() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let resp = call(app, get("/api/memory/graph?project=demo&cluster=123")).await;
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let body = body_text(resp).await;
+    assert!(
+        body.contains("token"),
+        "hints the client to re-fetch via token, got: {body}"
+    );
+}
+
 #[tokio::test]
 async fn bearer_guard_blocks_api_without_token() {
     let tmp = tempfile::tempdir().unwrap();

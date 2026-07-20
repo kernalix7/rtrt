@@ -352,6 +352,14 @@
               <button class="sort-btn" type="button" data-source-kind="main">Main</button>
               <button class="sort-btn" type="button" data-source-kind="subagent">Subagent</button>
             </div>
+            <!-- Input (the user's own typed prompts) vs Output (everything agent-produced)
+                 role filter. Output rows dominate volume ~30:1, so without this the
+                 user's own prompts are effectively invisible in the timeline. -->
+            <div id="role-filter" class="sort-row" aria-label="Role filter">
+              <button class="sort-btn active" type="button" data-role="all">전체</button>
+              <button class="sort-btn" type="button" data-role="input">입력</button>
+              <button class="sort-btn" type="button" data-role="output">응답</button>
+            </div>
             <div id="history-list" class="hist-list"><div class="empty">Loading…</div></div>
             <div id="history-pager" class="pager" hidden>
               <button id="history-prev" class="ghost" type="button">← Prev</button>
@@ -419,6 +427,13 @@
               <h2>Search</h2>
               <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;">
                 <button id="embed-backfill-btn" class="ghost" type="button" style="font-size:0.85em;" title="Backfill embeddings for this project's memories">Backfill embeddings</button>
+                <!-- Input (my prompts) vs Output (agent responses) role filter — same
+                     grouping as the Timeline's 전체/입력/응답 toggle. -->
+                <div class="mode-toggle" id="recall-role-toggle" title="Role filter">
+                  <button id="recall-role-all" class="active" type="button" data-role="">전체</button>
+                  <button id="recall-role-input" type="button" data-role="input">입력</button>
+                  <button id="recall-role-output" type="button" data-role="output">응답</button>
+                </div>
                 <div class="mode-toggle" id="recall-mode-toggle" title="Search mode">
                   <button id="recall-mode-bm25" class="active" type="button">BM25</button>
                   <button id="recall-mode-hybrid" type="button">Hybrid</button>
@@ -428,6 +443,7 @@
             <form id="recall-form">
               <input id="recall-project" type="hidden">
               <input id="recall-mode-val" type="hidden" value="bm25">
+              <input id="recall-role-val" type="hidden" value="">
               <input id="recall-query" placeholder="search query" required>
               <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
                 <button class="primary" type="submit">Search</button>

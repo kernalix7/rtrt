@@ -18,6 +18,7 @@ pub mod embed;
 #[cfg(feature = "hnsw")]
 pub mod hnsw_index;
 pub mod payload;
+pub mod role;
 pub mod summarise;
 
 pub use capture_bucket::is_capture_bucket_name;
@@ -29,6 +30,7 @@ pub use embed::{OllamaEmbedder, hybrid_embedder_from_config, hybrid_recall_ready
 #[cfg(feature = "hnsw")]
 pub use hnsw_index::{EmbVec, HnswIndex};
 pub use payload::{PayloadFilter, PayloadPredicate};
+pub use role::{INPUT_KINDS, is_input_kind, normalize_role, role_matches, role_sql_clause};
 #[cfg(feature = "llm")]
 pub use summarise::LlmSummariser;
 pub use summarise::Summariser;
@@ -1343,45 +1345,53 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<MemoryRecord>> {
-        self.recent_paged_filtered(project, limit, offset, None)
+        self.recent_paged_filtered(project, limit, offset, None, None)
     }
 
     /// Like [`recent_paged`] but optionally restricted to rows whose
-    /// `metadata.source_kind` equals `source_kind` (e.g. `"main"` / `"subagent"`).
-    /// `None` returns every row — the server-side half of the memory page's
-    /// 전체 / 메인 / 서브 filter, so the filter spans the whole project rather
-    /// than just the current page.
+    /// `metadata.source_kind` equals `source_kind` (e.g. `"main"` / `"subagent"`)
+    /// and/or whose `kind` belongs to the coarse `role` group (`"input"` — the
+    /// user's own prompts, see [`crate::role`] — or `"output"`). Either filter
+    /// may be `None` independently; both apply server-side so they span the
+    /// whole project rather than just the current page.
     pub fn recent_paged_filtered(
         &self,
         project: &str,
         limit: usize,
         offset: usize,
         source_kind: Option<&str>,
+        role: Option<&str>,
     ) -> Result<Vec<MemoryRecord>> {
+        let (role_clause, role_vals) = crate::role::role_sql_clause(role);
+        let sql = format!(
+            "SELECT id, project, kind, body, created_at, scope FROM memories \
+              WHERE project = ? \
+                AND (? IS NULL OR json_extract(metadata, '$.source_kind') = ?) \
+                AND ({role_clause}) \
+              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project, kind, body, created_at, scope FROM memories \
-                  WHERE project = ?1 \
-                    AND (?4 IS NULL OR json_extract(metadata, '$.source_kind') = ?4) \
-                  ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3",
-            )
+            .prepare(&sql)
             .map_err(|e| Error::Memory(e.to_string()))?;
+        let limit_i64 = limit as i64;
+        let offset_i64 = offset as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&project, &source_kind, &source_kind];
+        params.extend(role_vals.iter().map(|v| v as &dyn rusqlite::ToSql));
+        params.push(&limit_i64);
+        params.push(&offset_i64);
         let rows = stmt
-            .query_map(
-                rusqlite::params![project, limit as i64, offset as i64, source_kind],
-                |row| {
-                    let scope: String = row.get(5)?;
-                    Ok(MemoryRecord {
-                        id: row.get(0)?,
-                        project: row.get(1)?,
-                        kind: row.get(2)?,
-                        body: row.get(3)?,
-                        created_at: row.get(4)?,
-                        scope: MemoryScope::parse(&scope),
-                    })
-                },
-            )
+            .query_map(params.as_slice(), |row| {
+                let scope: String = row.get(5)?;
+                Ok(MemoryRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    kind: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                    scope: MemoryScope::parse(&scope),
+                })
+            })
             .map_err(|e| Error::Memory(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Memory(e.to_string()))
@@ -1459,7 +1469,7 @@ impl MemoryStore {
     /// Row count for one project. Used by paginated views to compute the
     /// total page count without scanning every row client-side.
     pub fn count_by_project(&self, project: &str) -> Result<usize> {
-        self.count_by_project_filtered(project, None)
+        self.count_by_project_filtered(project, None, None)
     }
 
     /// Storage efficiency for a project: `(original_chars, stored_chars)` summed
@@ -1481,22 +1491,29 @@ impl MemoryStore {
         Ok((original.max(0) as u64, stored.max(0) as u64))
     }
 
-    /// [`count_by_project`] optionally restricted by `metadata.source_kind`, so
-    /// the paged total matches a source-filtered timeline.
+    /// [`count_by_project`] optionally restricted by `metadata.source_kind`
+    /// and/or the coarse `role` group (see [`recent_paged_filtered`]), so the
+    /// paged total matches a source- and/or role-filtered timeline.
+    ///
+    /// [`recent_paged_filtered`]: Self::recent_paged_filtered
     pub fn count_by_project_filtered(
         &self,
         project: &str,
         source_kind: Option<&str>,
+        role: Option<&str>,
     ) -> Result<usize> {
+        let (role_clause, role_vals) = crate::role::role_sql_clause(role);
+        let sql = format!(
+            "SELECT COUNT(*) FROM memories \
+              WHERE project = ? \
+                AND (? IS NULL OR json_extract(metadata, '$.source_kind') = ?) \
+                AND ({role_clause})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&project, &source_kind, &source_kind];
+        params.extend(role_vals.iter().map(|v| v as &dyn rusqlite::ToSql));
         let n: i64 = self
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories \
-                  WHERE project = ?1 \
-                    AND (?2 IS NULL OR json_extract(metadata, '$.source_kind') = ?2)",
-                rusqlite::params![project, source_kind],
-                |row| row.get(0),
-            )
+            .query_row(&sql, params.as_slice(), |row| row.get(0))
             .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(n as usize)
     }
@@ -2416,17 +2433,19 @@ impl MemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<DetailedRecord>> {
-        self.recent_paged_by_importance_filtered(project, limit, offset, None)
+        self.recent_paged_by_importance_filtered(project, limit, offset, None, None)
     }
 
     /// [`recent_paged_by_importance`] optionally restricted by
-    /// `metadata.source_kind`.
+    /// `metadata.source_kind` and/or the coarse `role` group (see
+    /// [`recent_paged_filtered`](Self::recent_paged_filtered)).
     pub fn recent_paged_by_importance_filtered(
         &self,
         project: &str,
         limit: usize,
         offset: usize,
         source_kind: Option<&str>,
+        role: Option<&str>,
     ) -> Result<Vec<DetailedRecord>> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2436,36 +2455,40 @@ impl MemoryStore {
         // Fetch a larger window and sort in Rust so we can compute the
         // composite score without storing it in the schema.
         let fetch_limit = (offset + limit).saturating_mul(2).max(200);
+        let (role_clause, role_vals) = crate::role::role_sql_clause(role);
+        let sql = format!(
+            "SELECT id, project, kind, body, body_full, created_at, scope, metadata \
+               FROM memories WHERE project = ? \
+                AND (? IS NULL OR json_extract(metadata, '$.source_kind') = ?) \
+                AND ({role_clause}) \
+              ORDER BY created_at DESC, id DESC LIMIT ?"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project, kind, body, body_full, created_at, scope, metadata \
-                   FROM memories WHERE project = ?1 \
-                    AND (?3 IS NULL OR json_extract(metadata, '$.source_kind') = ?3) \
-                  ORDER BY created_at DESC, id DESC LIMIT ?2",
-            )
+            .prepare(&sql)
             .map_err(|e| Error::Memory(e.to_string()))?;
+        let fetch_limit_i64 = fetch_limit as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&project, &source_kind, &source_kind];
+        params.extend(role_vals.iter().map(|v| v as &dyn rusqlite::ToSql));
+        params.push(&fetch_limit_i64);
         let rows = stmt
-            .query_map(
-                rusqlite::params![project, fetch_limit as i64, source_kind],
-                |row| {
-                    let scope_str: String = row.get(6)?;
-                    let meta_str: String = row.get(7)?;
-                    let body: String = row.get(3)?;
-                    let body_full: Option<String> = row.get(4)?;
-                    let created_at: i64 = row.get(5)?;
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        body,
-                        body_full,
-                        created_at,
-                        scope_str,
-                        meta_str,
-                    ))
-                },
-            )
+            .query_map(params.as_slice(), |row| {
+                let scope_str: String = row.get(6)?;
+                let meta_str: String = row.get(7)?;
+                let body: String = row.get(3)?;
+                let body_full: Option<String> = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    body,
+                    body_full,
+                    created_at,
+                    scope_str,
+                    meta_str,
+                ))
+            })
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         let mut records: Vec<DetailedRecord> = Vec::new();

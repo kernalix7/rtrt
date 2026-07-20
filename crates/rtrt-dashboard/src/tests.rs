@@ -742,3 +742,139 @@ async fn memory_graph_overview_balances_dominant_catchall_bubble() {
         "drilling the split bubble's token still returns members"
     );
 }
+
+/// The memory timeline's `role` filter is the coarse INPUT (the user's own
+/// typed prompts) / OUTPUT (everything agent-produced) split described in
+/// `rtrt_memory::role`. `role=input` must return only `user-prompt-submit` /
+/// `user-prompt-expansion` rows, `role=output` must exclude them, an absent
+/// `role` must return every row, and `total` must always match the returned
+/// item count (no pagination drift between the count and paged queries).
+#[tokio::test]
+async fn timeline_role_filter_splits_input_and_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let input_kinds = [
+        "user-prompt-submit",
+        "user-prompt-submit",
+        "user-prompt-expansion",
+    ];
+    let output_kinds = [
+        "assistant-turn",
+        "teammate-message",
+        "stop",
+        "subagent-stop",
+    ];
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        for kind in input_kinds {
+            store.save("demo", kind, "typed by the user").unwrap();
+        }
+        for kind in output_kinds {
+            store.save("demo", kind, "produced by an agent").unwrap();
+        }
+    }
+
+    // role=input — only the user's own prompts.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/memory/timeline?project=demo&role=input")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["total"], input_kinds.len() as i64);
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), input_kinds.len());
+    assert!(
+        items
+            .iter()
+            .all(|i| i["kind"] == "user-prompt-submit" || i["kind"] == "user-prompt-expansion")
+    );
+
+    // role=output — everything else, input rows excluded.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/memory/timeline?project=demo&role=output")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["total"], output_kinds.len() as i64);
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), output_kinds.len());
+    assert!(
+        items
+            .iter()
+            .all(|i| i["kind"] != "user-prompt-submit" && i["kind"] != "user-prompt-expansion")
+    );
+
+    // Absent role — every row, and input+output counts add up to it.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/memory/timeline?project=demo")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let total_all = input_kinds.len() + output_kinds.len();
+    assert_eq!(v["total"], total_all as i64);
+    assert_eq!(v["items"].as_array().unwrap().len(), total_all);
+    assert!(v["role"].is_null());
+
+    // role composes with the existing sort=importance path too.
+    let app = router(state, None);
+    let resp = call(
+        app,
+        get("/api/memory/timeline?project=demo&role=input&sort=importance"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["total"], input_kinds.len() as i64);
+    assert_eq!(v["items"].as_array().unwrap().len(), input_kinds.len());
+}
+
+/// The search/recall endpoint (`/api/memory/recall`) accepts the same `role`
+/// filter as the timeline, so a query can be scoped to just the user's own
+/// prompts or just agent output.
+#[tokio::test]
+async fn recall_role_filter_restricts_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        store
+            .save("demo", "user-prompt-submit", "fix the parser bug")
+            .unwrap();
+        store
+            .save("demo", "assistant-turn", "fixed the parser bug")
+            .unwrap();
+        store
+            .save("demo", "teammate-message", "parser bug report")
+            .unwrap();
+    }
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/memory/recall",
+            r#"{"project":"demo","query":"parser bug","role":"input"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let hits = v["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|h| h["kind"] == "user-prompt-submit"));
+
+    let app = router(state, None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/memory/recall",
+            r#"{"project":"demo","query":"parser bug","role":"output"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let hits = v["hits"].as_array().unwrap();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|h| h["kind"] != "user-prompt-submit"));
+}

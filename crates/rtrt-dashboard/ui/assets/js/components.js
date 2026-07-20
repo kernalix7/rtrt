@@ -41,7 +41,25 @@ let HISTORY_OFFSET = 0;
 let HISTORY_TOTAL = 0;
 let HISTORY_SORT = 'recent';   // 'recent' | 'importance'
 let HISTORY_SOURCE_FILTER = 'all'; // 'all' | 'main' | 'subagent'
+// Input (the user's own typed prompts) vs Output (everything agent-produced)
+// role filter — persisted like rtrt.overview.window since it's a standing view
+// preference, not a one-off per-session toggle.
+const HISTORY_ROLE_VALUES = new Set(['all', 'input', 'output']);
+let HISTORY_ROLE_FILTER = HISTORY_ROLE_VALUES.has(localStorage.getItem('rtrt.memory.role'))
+  ? localStorage.getItem('rtrt.memory.role')
+  : 'all'; // 'all' | 'input' | 'output'
 let SELECTED_IDS = new Set();  // ids of checked rows
+
+// `kind` values that are the user's own typed prompts. Mirrors
+// `rtrt_memory::role::INPUT_KINDS` (the server-side source of truth) so a
+// row's badge/accent agrees with what the server-side `role` filter selects.
+const INPUT_KINDS = new Set(['user-prompt-submit', 'user-prompt-expansion']);
+function isInputKind(kind) {
+  return INPUT_KINDS.has(kind);
+}
+function roleBadge(kind) {
+  return isInputKind(kind) ? `<span class="badge role-input">🗣 입력</span>` : '';
+}
 
 function escapeHtml(s) {
   return String(s)
@@ -94,6 +112,29 @@ function applySourceKindFilter() {
   }
 }
 
+function applyRoleFilter() {
+  const list = document.getElementById('history-list');
+  const rows = list.querySelectorAll('.hist-item');
+  let shown = 0;
+  rows.forEach(row => {
+    const visible = HISTORY_ROLE_FILTER === 'all' || row.dataset.role === HISTORY_ROLE_FILTER;
+    row.style.display = visible ? '' : 'none';
+    if (visible) shown++;
+  });
+  let empty = document.getElementById('history-role-empty');
+  if (rows.length && shown === 0) {
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.id = 'history-role-empty';
+      empty.className = 'empty';
+      list.appendChild(empty);
+    }
+    empty.textContent = 'No memories for the selected role.';
+  } else if (empty) {
+    empty.remove();
+  }
+}
+
 // Render a memory body. Legacy rows (and provider_chat captures) may hold a
 // raw JSON payload; pretty-print those in a monospace block. Plain-text
 // summaries (the current hook-capture format) render inline escaped.
@@ -138,7 +179,11 @@ async function loadHistory(name, offset) {
   // the current page.
   const skParam = (HISTORY_SOURCE_FILTER && HISTORY_SOURCE_FILTER !== 'all')
     ? `&source_kind=${encodeURIComponent(HISTORY_SOURCE_FILTER)}` : '';
-  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}${skParam}`);
+  // Server-side role filter (전체/입력/응답) — same "spans the whole project"
+  // reasoning as source_kind above.
+  const roleParam = (HISTORY_ROLE_FILTER && HISTORY_ROLE_FILTER !== 'all')
+    ? `&role=${encodeURIComponent(HISTORY_ROLE_FILTER)}` : '';
+  const r = await fetch(`/api/memory/timeline?project=${encodeURIComponent(name)}&limit=${HISTORY_PAGE_SIZE}&offset=${offset}&sort=${HISTORY_SORT}${skParam}${roleParam}`);
   if (!r.ok) {
     const text = await r.text();
     showToast(`Failed to load memory timeline ${r.status}: ${text}`, 'err');
@@ -175,16 +220,19 @@ async function loadHistory(name, offset) {
       <button class="ghost row-recompress-btn" type="button" style="font-size:0.8em;">Recompress</button>
       <span class="row-recompress-result" style="font-size:0.8em;color:var(--muted);"></span>
     </div>`;
-    return `<div class="hist-item selectable" data-id="${i.id}" data-source-kind="${escapeHtml(srcKind || '')}">
+    const isInput = isInputKind(i.kind);
+    const rBadge = roleBadge(i.kind);
+    return `<div class="hist-item selectable${isInput ? ' role-input' : ''}" data-id="${i.id}" data-source-kind="${escapeHtml(srcKind || '')}" data-role="${isInput ? 'input' : 'output'}">
        <input type="checkbox" class="hist-check" data-id="${i.id}" title="Select">
        <div class="hist-click-area" data-id="${i.id}" tabindex="0" role="button" aria-label="View detail">
          <span class="when">${relativeTime(i.created_at)}</span>
-         <span class="kind">${escapeHtml(i.kind)}</span>${srcBadge}${compBadge}${impBadge}
+         <span class="kind">${escapeHtml(i.kind)}</span>${rBadge}${srcBadge}${compBadge}${impBadge}
          <span class="body">${renderBody(i.body)}${orig}${recompressRow}</span>
        </div>
      </div>`;
   }).join('');
   applySourceKindFilter();
+  applyRoleFilter();
 
   // Wire checkboxes.
   list.querySelectorAll('.hist-check').forEach(chk => {
@@ -353,6 +401,27 @@ document.querySelectorAll('#source-kind-filter .sort-btn').forEach(btn => {
     document.querySelectorAll('.hist-item.selected').forEach(i => i.classList.remove('selected'));
     syncBulkBar();
     // Reload from page 0 with the server-side source filter so it spans the
+    // whole project rather than only the rows already on screen.
+    const project = currentProject();
+    if (project && !isGlobalScope()) loadHistory(project, 0);
+  };
+});
+// 전체/입력/응답 role toggle — same shape as the source-kind filter above.
+// Reflect the persisted HISTORY_ROLE_FILTER in the button states on load
+// (source-kind isn't persisted, so it has no equivalent sync step).
+document.querySelectorAll('#role-filter .sort-btn').forEach(btn => {
+  btn.classList.toggle('active', (btn.dataset.role || 'all') === HISTORY_ROLE_FILTER);
+});
+document.querySelectorAll('#role-filter .sort-btn').forEach(btn => {
+  btn.onclick = () => {
+    HISTORY_ROLE_FILTER = btn.dataset.role || 'all';
+    localStorage.setItem('rtrt.memory.role', HISTORY_ROLE_FILTER);
+    document.querySelectorAll('#role-filter .sort-btn').forEach(x => x.classList.toggle('active', x === btn));
+    SELECTED_IDS.clear();
+    document.querySelectorAll('.hist-check').forEach(c => { c.checked = false; });
+    document.querySelectorAll('.hist-item.selected').forEach(i => i.classList.remove('selected'));
+    syncBulkBar();
+    // Reload from page 0 with the server-side role filter so it spans the
     // whole project rather than only the rows already on screen.
     const project = currentProject();
     if (project && !isGlobalScope()) loadHistory(project, 0);

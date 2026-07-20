@@ -49,6 +49,11 @@ pub(crate) struct MemoryRecallRequest {
     /// TODO: wire fastembed / Ollama bge-m3 for full vector hybrid.
     #[serde(default)]
     mode: Option<String>,
+    /// Coarse producer/consumer split over `kind`: `input` (the user's own
+    /// typed prompts) | `output` (everything agent-produced) | absent/other
+    /// = all. Mirrors the timeline's `role` param — see [`rtrt_memory::role`].
+    #[serde(default)]
+    role: Option<String>,
 }
 
 pub(crate) fn default_recall_limit() -> u32 {
@@ -66,6 +71,16 @@ pub(crate) async fn memory_recall(
     let guard = store.lock().await;
 
     let mode = req.mode.as_deref().unwrap_or("bm25");
+    let role = req.role.as_deref();
+    let limit = req.limit as usize;
+    // Over-fetch when a role filter is active so the post-filter pass below
+    // doesn't starve the caller of hits below `limit` — same idea as the
+    // payload filter's over-fetch in `recall_bm25_with_filter`.
+    let fetch_limit = if rtrt_memory::normalize_role(role).is_some() {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
 
     match mode {
         "hybrid" => {
@@ -74,19 +89,21 @@ pub(crate) async fn memory_recall(
             // endpoint stays usable without an embedding server.
             let (scored, effective_mode) = if let Some(emb) = state.embedder.as_ref() {
                 let s = guard
-                    .recall_hybrid(&req.project, &req.query, req.limit as usize, emb.as_ref())
+                    .recall_hybrid(&req.project, &req.query, fetch_limit, emb.as_ref())
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 (s, "hybrid-vector")
             } else {
                 // No embedder available — use graph-blended BM25 as a
                 // graceful degradation.
                 let s = guard
-                    .recall_bm25_graph_blend(&req.project, &req.query, req.limit as usize)
+                    .recall_bm25_graph_blend(&req.project, &req.query, fetch_limit)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 (s, "hybrid-graph")
             };
             let hits: Vec<serde_json::Value> = scored
                 .into_iter()
+                .filter(|sr| rtrt_memory::role_matches(role, &sr.record.kind))
+                .take(limit)
                 .map(|sr| {
                     serde_json::json!({
                         "id": sr.record.id,
@@ -110,13 +127,18 @@ pub(crate) async fn memory_recall(
                     let f = PayloadFilter::parse(spec)
                         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
                     guard
-                        .recall_bm25_with_filter(&req.project, &req.query, req.limit as usize, &f)
+                        .recall_bm25_with_filter(&req.project, &req.query, fetch_limit, &f)
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 }
                 _ => guard
-                    .recall_bm25(&req.project, &req.query, req.limit as usize)
+                    .recall_bm25(&req.project, &req.query, fetch_limit)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             };
+            let hits: Vec<_> = hits
+                .into_iter()
+                .filter(|r| rtrt_memory::role_matches(role, &r.kind))
+                .take(limit)
+                .collect();
             Ok(Json(serde_json::json!({ "hits": hits, "mode": "bm25" })))
         }
     }
@@ -155,6 +177,14 @@ pub(crate) struct MemoryTimelineQuery {
     /// Restrict to a `source_kind` (`main` / `subagent`). Absent = all rows.
     #[serde(default)]
     source_kind: Option<String>,
+    /// Coarse producer/consumer split over `kind`: `input` (the user's own
+    /// typed prompts — `user-prompt-submit` / `user-prompt-expansion`) |
+    /// `output` (everything else: assistant-turn, teammate-message, stop,
+    /// subagent-stop, post-tool-batch, …) | absent/other = all. Composes with
+    /// `source_kind` (both apply as an AND) — see [`rtrt_memory::role`] for
+    /// the shared kind-group mapping.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 pub(crate) fn default_timeline_limit() -> usize {
@@ -173,15 +203,16 @@ pub(crate) async fn memory_timeline(
 
     let sort = q.sort.as_deref().unwrap_or("recent");
     let sk = q.source_kind.as_deref().filter(|s| !s.is_empty());
+    let role = q.role.as_deref();
     let total = guard
-        .count_by_project_filtered(&q.project, sk)
+        .count_by_project_filtered(&q.project, sk, role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = if sort == "importance" {
         // Importance sort — returns DetailedRecord which already includes
         // body_full, metadata, and a pre-computed score.
         let rows = guard
-            .recent_paged_by_importance_filtered(&q.project, q.limit, q.offset, sk)
+            .recent_paged_by_importance_filtered(&q.project, q.limit, q.offset, sk, role)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -203,7 +234,7 @@ pub(crate) async fn memory_timeline(
     } else {
         // Default: newest-first paged view.
         let rows = guard
-            .recent_paged_filtered(&q.project, q.limit, q.offset, sk)
+            .recent_paged_filtered(&q.project, q.limit, q.offset, sk, role)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -242,6 +273,7 @@ pub(crate) async fn memory_timeline(
         "limit": q.limit,
         "offset": q.offset,
         "sort": sort,
+        "role": rtrt_memory::normalize_role(role),
     })))
 }
 

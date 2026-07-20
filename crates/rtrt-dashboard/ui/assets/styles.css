@@ -360,6 +360,11 @@
   .imp-bar-fill { height: 100%; border-radius: 3px; background: var(--warn); }
   .badge.imp { color: var(--warn); border-color: var(--warn); }
   .badge.source-subagent { color: #7c3aed; border-color: #7c3aed; }
+  /* Input role — the user's own typed prompts, a tiny fraction of total rows
+     next to agent output; badge + a subtle left accent so they're spottable
+     even in the unfiltered "All" view. */
+  .badge.role-input { color: #0d9488; border-color: #0d9488; }
+  .hist-item.role-input { border-left: 3px solid #0d9488; padding-left: calc(0.65rem - 3px); }
 
   /* Sort controls */
   .sort-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; flex-wrap: wrap; }

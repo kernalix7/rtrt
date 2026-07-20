@@ -935,6 +935,18 @@ function stopUsagePolling() {
   };
 })();
 
+// Search role toggle (전체/입력/응답) — same role grouping as the Timeline's
+// toggle; sets a hidden field that the next Search submit reads.
+(function wireRecallRoleToggle() {
+  const val = document.getElementById('recall-role-val');
+  document.querySelectorAll('#recall-role-toggle button').forEach(btn => {
+    btn.onclick = () => {
+      val.value = btn.dataset.role || '';
+      document.querySelectorAll('#recall-role-toggle button').forEach(x => x.classList.toggle('active', x === btn));
+    };
+  });
+})();
+
 // Memory
 document.getElementById('recall-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -944,6 +956,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
   const kindVal = document.getElementById('recall-kind').value;
   const compressedOnly = document.getElementById('recall-compressed-only').checked;
   const mode = document.getElementById('recall-mode-val').value || 'bm25';
+  const role = document.getElementById('recall-role-val').value || null;
   const body = {
     project,
     query: document.getElementById('recall-query').value,
@@ -952,6 +965,7 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
     kind: kindVal || null,
     compressed_only: compressedOnly || null,
     mode,
+    role,
   };
   const results = document.getElementById('recall-results');
   results.innerHTML = `<div class="empty">Searching…</div>`;
@@ -1000,11 +1014,12 @@ document.getElementById('recall-form').onsubmit = async (ev) => {
            <div style="margin-top:0.4rem;font-size:0.85em;white-space:pre-wrap;overflow-wrap:anywhere;padding:0.5rem;background:var(--bg);border-radius:6px;border:1px solid var(--border);">${escapeHtml(h.body_full)}</div>
          </details>`
       : '';
+    const rBadge = roleBadge(h.kind || '');
     return `<div class="recall-card" style="cursor:pointer;" onclick="openDetailModal(${h.id})" title="View detail">
       <div class="rc-meta">
         <span class="badge">#${h.id}</span>
         <code style="font-size:0.82em;">${escapeHtml(h.kind || '?')}</code>
-        ${compBadge}${semanticBadge}${impBadge}
+        ${rBadge}${compBadge}${semanticBadge}${impBadge}
         ${h.scope ? `<span style="font-size:0.8em;color:var(--muted);">${escapeHtml(h.scope)}</span>` : ''}
         ${scoreHtml}
       </div>

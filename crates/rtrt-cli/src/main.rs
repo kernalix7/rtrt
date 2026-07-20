@@ -6639,7 +6639,18 @@ fn summarize_hook_payload(kind: &str, raw: &str) -> Option<String> {
             let head = if tool.is_empty() { kind } else { tool };
             format!("{head}: {input}{result}").trim().to_string()
         }
-        "user-prompt-submit" | "user-prompt-expansion" => get("prompt").trim().to_string(),
+        "user-prompt-submit" | "user-prompt-expansion" => {
+            let prompt = get("prompt").trim();
+            // Claude Code delivers harness-injected events (background-task
+            // notifications, `<task-notification>` blocks, bare task/tool-use
+            // metadata) through the SAME UserPromptSubmit channel as real user
+            // typing. Capturing those pollutes the user's own prompt history
+            // (they are literally tagged "NOT USER INPUT"), so skip them.
+            if is_synthetic_prompt(prompt) {
+                return None;
+            }
+            prompt.to_string()
+        }
         "notification" => get("message").trim().to_string(),
         "pre-compact" | "post-compact" => {
             let trigger = get("trigger");
@@ -6683,6 +6694,27 @@ fn summarize_hook_payload(kind: &str, raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// True when a "user prompt" is actually a harness-injected event rather than
+/// something the user typed — a background-task notification, a
+/// `<task-notification>` block, or bare `task-id:` / `tool-use-id:` metadata.
+/// Claude Code routes these through the UserPromptSubmit channel, so the
+/// capture hook must filter them out to keep the memory prompt stream clean.
+fn is_synthetic_prompt(prompt: &str) -> bool {
+    let p = prompt.trim_start();
+    // Explicit harness markers — these payloads announce themselves.
+    if p.contains("SYSTEM NOTIFICATION - NOT USER INPUT")
+        || p.contains("<task-notification>")
+        || p.contains("This is an automated background-task event")
+    {
+        return true;
+    }
+    // Bare task/tool-use metadata dumps (e.g. "task-id: bxyz, tool-use-id:
+    // toolu_..., output-file: ..."). Real prompts don't lead with these keys.
+    let head = p.get(..64).unwrap_or(p);
+    (head.starts_with("task-id:") || head.starts_with("task-id "))
+        && (p.contains("tool-use-id") || p.contains("output-file"))
 }
 
 /// Render a JSON value as a compact single-line string, clipped so a giant
@@ -6971,6 +7003,54 @@ fn detect_provider(model: &str) -> ProviderArg {
         ProviderArg::Openai
     } else {
         ProviderArg::OpenaiCompat
+    }
+}
+
+#[cfg(test)]
+mod hook_capture_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_prompts_are_skipped() {
+        // Harness-injected events that arrive through the UserPromptSubmit channel.
+        assert!(is_synthetic_prompt(
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event"
+        ));
+        assert!(is_synthetic_prompt(
+            "<task-notification>\n<task-id>bxyz</task-id>\n</task-notification>"
+        ));
+        assert!(is_synthetic_prompt(
+            "task-id: bs2ne03kz, tool-use-id: toolu_01QyNuv9, output-file: /tmp/x.output"
+        ));
+        assert!(is_synthetic_prompt(
+            "task-id:a5c726cce05,tool-use-id:toolu_01BpPZ,output-file:/tmp/y"
+        ));
+    }
+
+    #[test]
+    fn real_prompts_are_kept() {
+        assert!(!is_synthetic_prompt(
+            "근데 내가 입력한 항목은 왜 안떠 메모리에?"
+        ));
+        assert!(!is_synthetic_prompt("지금 왜 서비스 죽어있어?"));
+        assert!(!is_synthetic_prompt(
+            "fix the task-id parsing in the ledger" // mentions task-id but is real typing
+        ));
+        assert!(!is_synthetic_prompt("進行시켜"));
+    }
+
+    #[test]
+    fn user_prompt_payload_skips_synthetic_and_keeps_real() {
+        let synthetic = r#"{"prompt":"[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event"}"#;
+        assert_eq!(
+            summarize_hook_payload("user-prompt-submit", synthetic),
+            None
+        );
+        let real = r#"{"prompt":"왜 서비스 죽어있어?"}"#;
+        assert_eq!(
+            summarize_hook_payload("user-prompt-submit", real).as_deref(),
+            Some("왜 서비스 죽어있어?")
+        );
     }
 }
 

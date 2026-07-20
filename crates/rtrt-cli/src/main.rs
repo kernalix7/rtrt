@@ -20,7 +20,7 @@ use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
     ToolKind,
 };
-use rtrt_memory::{LlmSummariser, MemoryStore};
+use rtrt_memory::{LlmSummariser, MemoryStore, is_synthetic_prompt};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
@@ -6694,27 +6694,6 @@ fn summarize_hook_payload(kind: &str, raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
-}
-
-/// True when a "user prompt" is actually a harness-injected event rather than
-/// something the user typed — a background-task notification, a
-/// `<task-notification>` block, or bare `task-id:` / `tool-use-id:` metadata.
-/// Claude Code routes these through the UserPromptSubmit channel, so the
-/// capture hook must filter them out to keep the memory prompt stream clean.
-fn is_synthetic_prompt(prompt: &str) -> bool {
-    let p = prompt.trim_start();
-    // Explicit harness markers — these payloads announce themselves.
-    if p.contains("SYSTEM NOTIFICATION - NOT USER INPUT")
-        || p.contains("<task-notification>")
-        || p.contains("This is an automated background-task event")
-    {
-        return true;
-    }
-    // Bare task/tool-use metadata dumps (e.g. "task-id: bxyz, tool-use-id:
-    // toolu_..., output-file: ..."). Real prompts don't lead with these keys.
-    let head = p.get(..64).unwrap_or(p);
-    (head.starts_with("task-id:") || head.starts_with("task-id "))
-        && (p.contains("tool-use-id") || p.contains("output-file"))
 }
 
 /// Render a JSON value as a compact single-line string, clipped so a giant

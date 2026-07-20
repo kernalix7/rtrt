@@ -1,8 +1,12 @@
 //! Background watcher that tails Claude Code session transcripts (the JSONL
-//! files under `~/.claude/projects/`) and saves every new assistant turn into
-//! the rtrt memory store. Closes the capture gap for teammate / subagent work
-//! that runs in its own session (FleetView, Task-tool subagents) and never
-//! reaches the main agent's transcript.
+//! files under `~/.claude/projects/`) and saves every new assistant turn AND
+//! genuine user prompt into the rtrt memory store. Closes two capture gaps at
+//! once: teammate / subagent work that runs in its own session (FleetView,
+//! Task-tool subagents) and never reaches the main agent's transcript, and
+//! user input from backfilled or subagent transcripts — the live
+//! `UserPromptSubmit` CLI hook only sees the main session as it happens, so
+//! without this, old/backfilled and subagent sessions end up with answers
+//! that have no matching question.
 //!
 //! Layout the watcher knows about:
 //!   ~/.claude/projects/<encoded-cwd>/<session>.jsonl
@@ -14,15 +18,15 @@
 //! and uses that basename as the rtrt project bucket — so a capture in a
 //! sub-dir (`src`, `web`, …) or a git worktree lands under the real repo
 //! instead of its own bogus bucket. It dedups via `MemoryStore::body_seen_at`
-//! so existing rows from the SessionStart / Stop / SubagentStop hooks don't
-//! get duplicated.
+//! so existing rows from the SessionStart / Stop / SubagentStop / live
+//! UserPromptSubmit hooks don't get duplicated.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtrt_memory::MemoryStore;
+use rtrt_memory::{MemoryStore, is_synthetic_prompt};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
@@ -179,7 +183,7 @@ async fn sweep(
                 Ok(s) if !s.trim().is_empty() => s,
                 _ => continue,
             };
-            if let Some(turn) = parse_assistant_turn(s, &path, resolved_project.as_deref()) {
+            if let Some(turn) = parse_line(s, &path, resolved_project.as_deref()) {
                 if let Err(e) = save_turn(memory, &turn).await {
                     tracing::warn!("transcript save {}: {e}", path.display());
                 }
@@ -199,7 +203,9 @@ fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-struct AssistantTurn {
+/// A single capturable transcript line — either an assistant/teammate turn or
+/// a genuine user-authored prompt.
+struct Turn {
     project: String,
     text: String,
     session_id: String,
@@ -210,7 +216,15 @@ struct AssistantTurn {
     agent_id: Option<String>,
     slug: Option<String>,
     file: PathBuf,
-    is_subagent: bool,
+    /// Row kind: `"assistant-turn"`, `"teammate-message"`, or
+    /// `"user-prompt-submit"`.
+    kind: &'static str,
+    /// `"main"` or `"subagent"` — classifies whose work this row represents,
+    /// same as the `source_kind` metadata the live hooks write. A captured
+    /// user prompt is always `"main"`, even inside a `/subagents/`
+    /// transcript: that line is the parent handing the subagent its task —
+    /// human-authored main-session input, not subagent-produced output.
+    source_kind: &'static str,
 }
 
 /// The project a transcript file belongs to. Claude Code stores every session
@@ -310,27 +324,25 @@ fn first_cwd_in(jsonl: &Path) -> Option<String> {
     None
 }
 
-/// Returns `Some` only for lines that look like an `assistant` turn carrying
-/// non-empty visible text. Skips thinking-only, tool-use-only, or partial lines.
-/// `resolved_project` (the file's `<encoded>` dir project) is authoritative and
-/// overrides the line's own cwd for BOTH main and subagent rows.
-fn parse_assistant_turn(
-    line: &str,
-    file: &Path,
-    resolved_project: Option<&str>,
-) -> Option<AssistantTurn> {
-    let v: Value = serde_json::from_str(line).ok()?;
-    // Top-level `type` is "assistant" on every Claude transcript line that
-    // carries an assistant message; also accept `message.role == "assistant"`
-    // as a fallback for older formats.
-    let is_assistant = v.get("type").and_then(|t| t.as_str()) == Some("assistant")
-        || v.get("message")
+/// Top-level line role: `"assistant"` or `"user"` when recognisable, else
+/// `None`. Checks `type` first (the modern transcript field); falls back to
+/// `message.role` for lines where `type` isn't one of those two values —
+/// matches Claude Code's transcript shape across format revisions.
+fn line_role(v: &Value) -> Option<&str> {
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some(t @ ("assistant" | "user")) => Some(t),
+        _ => v
+            .get("message")
             .and_then(|m| m.get("role"))
             .and_then(|r| r.as_str())
-            == Some("assistant");
-    if !is_assistant {
-        return None;
+            .filter(|r| matches!(*r, "assistant" | "user")),
     }
+}
+
+/// Extracts visible text from an `assistant`-role line's `message.content`
+/// parts array. `None` when there's no text part (thinking-only, tool-use-only)
+/// or the content isn't an array.
+fn extract_assistant_text(v: &Value) -> Option<String> {
     let content = v
         .get("message")
         .and_then(|m| m.get("content"))
@@ -348,9 +360,71 @@ fn parse_assistant_turn(
     }
     let text = text.trim();
     if text.is_empty() {
-        return None;
+        None
+    } else {
+        Some(text.to_string())
     }
+}
 
+/// Extracts real user-typed text from a `user`-role line's `message.content`,
+/// or `None` when the line isn't a genuine prompt.
+///
+/// `content` is either a plain string (a real prompt) or an array of parts.
+/// Claude Code also routes tool_result echoes back to the harness through a
+/// `user`-role line — those carry a `tool_result` part in the array and MUST
+/// NOT be mistaken for something the user typed. Only a plain string, or an
+/// array with `text` parts and NO `tool_result` part, counts as real prompt
+/// text.
+fn extract_user_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let has_tool_result = parts
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+            if has_tool_result {
+                return None;
+            }
+            let mut text = String::new();
+            for part in parts {
+                if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(s);
+                    }
+                }
+            }
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    }
+}
+
+/// Metadata shared by both the assistant and user parse paths, resolved
+/// identically regardless of which role the line turns out to be.
+struct LineContext {
+    is_subagent: bool,
+    parent_session: Option<String>,
+    session_id: String,
+    agent_id: Option<String>,
+    slug: Option<String>,
+    project: String,
+}
+
+/// Resolves session/parent/agent metadata plus the project bucket for a
+/// transcript line. `resolved_project` (the file's `<encoded>` dir project) is
+/// authoritative and overrides the line's own cwd for BOTH main and subagent
+/// rows — resolved HERE, at capture time, while the transcript is still on
+/// disk, so a later deletion/rotation of that file can never orphan the row.
+/// Falls back to the line's own cwd, resolved to its git root, only if the
+/// dir couldn't be resolved — never the raw cwd basename, which scatters
+/// sub-dir / worktree sessions into bogus buckets. If BOTH fail (the rare
+/// case where the encoded dir has no top-level session yet and the line
+/// carries no usable cwd), synthesize a classifiable capture bucket instead
+/// of silently dropping the turn — see [`fallback_capture_bucket`].
+fn line_context(v: &Value, file: &Path, resolved_project: Option<&str>) -> LineContext {
     let is_subagent = file
         .components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("subagents"));
@@ -364,16 +438,6 @@ fn parse_assistant_turn(
     let agent_id = v.get("agentId").and_then(|s| s.as_str()).map(String::from);
     let slug = v.get("slug").and_then(|s| s.as_str()).map(String::from);
 
-    // Project: the file's `<encoded>` dir project is authoritative (one project
-    // per dir, worktree-stable) for both main and subagent rows — resolved
-    // HERE, at capture time, while the transcript is still on disk, so a
-    // later deletion/rotation of that file can never orphan this row. Fall
-    // back to the line's own cwd, resolved to its git root, only if the dir
-    // couldn't be resolved — never the raw cwd basename, which scatters
-    // sub-dir / worktree sessions into bogus buckets. If BOTH fail (the rare
-    // case where the encoded dir has no top-level session yet and the line
-    // carries no usable cwd), synthesize a classifiable capture bucket
-    // instead of silently dropping the turn — see [`fallback_capture_bucket`].
     let line_project = v
         .get("cwd")
         .and_then(|c| c.as_str())
@@ -383,25 +447,83 @@ fn parse_assistant_turn(
         .or(line_project)
         .unwrap_or_else(|| fallback_capture_bucket(&session_id, agent_id.as_deref()));
 
-    Some(AssistantTurn {
-        project,
-        text: text.to_string(),
-        session_id,
+    LineContext {
+        is_subagent,
         parent_session,
+        session_id,
         agent_id,
         slug,
-        file: file.to_path_buf(),
-        is_subagent,
-    })
+        project,
+    }
 }
 
-async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &AssistantTurn) -> anyhow::Result<()> {
+/// Parses one transcript line into a capturable [`Turn`] — either a genuine
+/// assistant/teammate turn carrying non-empty visible text, or a genuine
+/// user-authored prompt. Returns `None` for everything else: thinking-only or
+/// tool-use-only assistant lines, tool_result echoes routed through a
+/// `user`-role line, harness-injected synthetic prompts (see
+/// [`rtrt_memory::is_synthetic_prompt`]), and partial/unparseable lines.
+///
+/// `resolved_project` (the file's `<encoded>` dir project) is authoritative
+/// and overrides the line's own cwd for every captured kind.
+fn parse_line(line: &str, file: &Path, resolved_project: Option<&str>) -> Option<Turn> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    match line_role(&v) {
+        Some("assistant") => {
+            let text = extract_assistant_text(&v)?;
+            let ctx = line_context(&v, file, resolved_project);
+            let (kind, source_kind) = if ctx.is_subagent {
+                ("teammate-message", "subagent")
+            } else {
+                ("assistant-turn", "main")
+            };
+            Some(Turn {
+                project: ctx.project,
+                text,
+                session_id: ctx.session_id,
+                parent_session: ctx.parent_session,
+                agent_id: ctx.agent_id,
+                slug: ctx.slug,
+                file: file.to_path_buf(),
+                kind,
+                source_kind,
+            })
+        }
+        Some("user") => {
+            let content = v.get("message").and_then(|m| m.get("content"))?;
+            let text = extract_user_text(content)?;
+            let text = text.trim();
+            if text.is_empty() || is_synthetic_prompt(text) {
+                return None;
+            }
+            let ctx = line_context(&v, file, resolved_project);
+            Some(Turn {
+                project: ctx.project,
+                text: text.to_string(),
+                session_id: ctx.session_id,
+                parent_session: ctx.parent_session,
+                agent_id: ctx.agent_id,
+                slug: ctx.slug,
+                file: file.to_path_buf(),
+                kind: "user-prompt-submit",
+                // Always "main" — even inside a /subagents/ transcript this
+                // line is the parent's own task text, not subagent-produced
+                // output. See the field doc on `Turn::source_kind`.
+                source_kind: "main",
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &Turn) -> anyhow::Result<()> {
     let sha = rtrt_memory::MemoryStore::body_sha(&t.text);
     let guard = memory.lock().await;
-    // Dedup against everything already in this project's bucket — the
-    // SessionStart / Stop / SubagentStop hooks already cover the main agent's
-    // turns, so this watcher only adds the teammate / subagent outputs they
-    // miss without doubling up on what's there.
+    // Dedup against everything already in this project's bucket — e.g. the
+    // live UserPromptSubmit hook and the SessionStart / Stop / SubagentStop
+    // hooks already cover a lot of this ground, so the watcher only adds what
+    // they miss (backfilled transcripts, subagent transcripts) without
+    // doubling up on what's already there.
     if guard
         .body_seen_at(&t.project, &sha)
         .ok()
@@ -410,19 +532,11 @@ async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &AssistantTurn) -> anyho
     {
         return Ok(());
     }
-    let kind = if t.is_subagent {
-        "teammate-message"
-    } else {
-        "assistant-turn"
-    };
     let mut meta: BTreeMap<String, String> = BTreeMap::new();
     meta.insert("source".into(), "transcript".into());
     // Classify the row so the UI can split a project's main-agent work from its
     // subagent / teammate work.
-    meta.insert(
-        "source_kind".into(),
-        if t.is_subagent { "subagent" } else { "main" }.into(),
-    );
+    meta.insert("source_kind".into(), t.source_kind.into());
     if !t.session_id.is_empty() {
         meta.insert("session_id".into(), t.session_id.clone());
     }
@@ -442,7 +556,7 @@ async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &AssistantTurn) -> anyho
         "transcript_file".into(),
         t.file.to_string_lossy().into_owned(),
     );
-    let id = guard.save_with_metadata(&t.project, kind, &t.text, &meta)?;
+    let id = guard.save_with_metadata(&t.project, t.kind, &t.text, &meta)?;
     let _ = guard.tag_row(id, Some(&t.session_id), Some(&sha));
     Ok(())
 }
@@ -462,6 +576,36 @@ mod tests {
         .to_string()
     }
 
+    /// A `user`-role line with plain-string `message.content` — the common
+    /// shape for a real, human-typed prompt.
+    fn user_text_line(session_id: &str, cwd: Option<&str>, prompt: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "message": { "role": "user", "content": prompt },
+        })
+        .to_string()
+    }
+
+    /// A `user`-role line whose `message.content` is a `tool_result` echo —
+    /// the harness routes tool results back through the same `user`-role
+    /// channel as real typing, so this must never be mistaken for a prompt.
+    fn user_tool_result_line(session_id: &str, cwd: Option<&str>) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_01", "content": "ok" }
+                ]
+            },
+        })
+        .to_string()
+    }
+
     #[test]
     fn parent_session_from_path_extracts_the_session_dir() {
         let file = Path::new("/home/u/.claude/projects/-enc-/sess-123/subagents/agent-x.jsonl");
@@ -477,10 +621,10 @@ mod tests {
     /// The core guarantee this change adds: a subagent row is attributed to
     /// its real (parent) project THE MOMENT it's captured, using whatever
     /// `resolved_project` the live sweep computed from the still-on-disk
-    /// transcript. Once `parse_assistant_turn` returns, the row no longer
-    /// depends on that transcript file existing — even if it's deleted a
-    /// moment later, the row it already produced still carries the correct
-    /// project and parent session.
+    /// transcript. Once `parse_line` returns, the row no longer depends on
+    /// that transcript file existing — even if it's deleted a moment later,
+    /// the row it already produced still carries the correct project and
+    /// parent session.
     #[test]
     fn captured_subagent_row_lands_in_the_parent_project_at_capture_time() {
         let file = Path::new(
@@ -494,14 +638,15 @@ mod tests {
             // at capture time, from the encoded dir) wins regardless.
             Some("/home/u/repo/.worktrees/scratch"),
         );
-        let turn = parse_assistant_turn(&line, file, Some("00G_AI-Project-Setup"))
+        let turn = parse_line(&line, file, Some("00G_AI-Project-Setup"))
             .expect("assistant turn with text parses");
         assert_eq!(turn.project, "00G_AI-Project-Setup");
         assert_eq!(
             turn.parent_session,
             Some("a1f52dae-1111-2222-3333-197bb559b207".to_string())
         );
-        assert!(turn.is_subagent);
+        assert_eq!(turn.kind, "teammate-message");
+        assert_eq!(turn.source_kind, "subagent");
         // The transcript file is now free to disappear (rotation, cleanup,
         // whatever) — nothing about the saved row depends on it anymore.
     }
@@ -527,12 +672,110 @@ mod tests {
         let file =
             Path::new("/home/u/.claude/projects/-enc-/sess-999/subagents/agent-orphan.jsonl");
         let line = subagent_line("sess-999", Some("agent-orphan"), None);
-        let turn = parse_assistant_turn(&line, file, None)
-            .expect("turn is still captured even when unattributable");
+        let turn =
+            parse_line(&line, file, None).expect("turn is still captured even when unattributable");
         assert!(
             rtrt_memory::is_capture_bucket_name(&turn.project),
             "fallback project `{}` should be a classifiable capture bucket",
             turn.project
         );
+    }
+
+    #[test]
+    fn real_user_prompt_is_captured_as_user_prompt_submit() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-1.jsonl");
+        let line = user_text_line("sess-1", Some("/home/u/repo"), "fix the flaky test");
+        let turn = parse_line(&line, file, Some("00G_rtrt")).expect("real user prompt line parses");
+        assert_eq!(turn.kind, "user-prompt-submit");
+        assert_eq!(turn.source_kind, "main");
+        assert_eq!(turn.text, "fix the flaky test");
+        assert_eq!(turn.project, "00G_rtrt");
+    }
+
+    /// Even inside a `/subagents/` transcript, a captured user prompt is the
+    /// parent handing the subagent its task — human-authored main-session
+    /// input, never subagent-produced output.
+    #[test]
+    fn user_prompt_inside_a_subagent_transcript_is_still_tagged_main() {
+        let file =
+            Path::new("/home/u/.claude/projects/-enc-/sess-1/subagents/agent-code-reviewer.jsonl");
+        let line = user_text_line("sess-1", None, "review this diff for bugs");
+        let turn = parse_line(&line, file, Some("00G_rtrt")).expect("user prompt line parses");
+        assert_eq!(turn.kind, "user-prompt-submit");
+        assert_eq!(turn.source_kind, "main");
+    }
+
+    #[test]
+    fn tool_result_echo_is_not_captured_as_a_prompt() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-1.jsonl");
+        let line = user_tool_result_line("sess-1", Some("/home/u/repo"));
+        assert!(
+            parse_line(&line, file, Some("00G_rtrt")).is_none(),
+            "a tool_result echo routed through a user-role line must not be captured"
+        );
+    }
+
+    #[test]
+    fn synthetic_task_notification_is_not_captured() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-1.jsonl");
+        let line = user_text_line(
+            "sess-1",
+            Some("/home/u/repo"),
+            "<task-notification>\n<task-id>bxyz</task-id>\n</task-notification>",
+        );
+        assert!(
+            parse_line(&line, file, Some("00G_rtrt")).is_none(),
+            "a harness-injected synthetic prompt must not be captured"
+        );
+    }
+
+    #[test]
+    fn assistant_line_is_still_captured_as_assistant_turn() {
+        let file = Path::new("/home/u/.claude/projects/-enc-/sess-1.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "sess-1",
+            "cwd": "/home/u/repo",
+            "message": { "content": [{ "type": "text", "text": "here's the fix" }] },
+        })
+        .to_string();
+        let turn = parse_line(&line, file, Some("00G_rtrt")).expect("assistant line parses");
+        assert_eq!(turn.kind, "assistant-turn");
+        assert_eq!(turn.source_kind, "main");
+        assert_eq!(turn.text, "here's the fix");
+    }
+
+    #[tokio::test]
+    async fn duplicate_body_in_same_project_is_saved_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(tmp.path().join("mem.sqlite")).expect("open temp store");
+        let memory = Arc::new(Mutex::new(store));
+
+        let turn = Turn {
+            project: "00G_rtrt".to_string(),
+            text: "why is memory missing my questions?".to_string(),
+            session_id: "sess-1".to_string(),
+            parent_session: None,
+            agent_id: None,
+            slug: None,
+            file: PathBuf::from("/home/u/.claude/projects/-enc-/sess-1.jsonl"),
+            kind: "user-prompt-submit",
+            source_kind: "main",
+        };
+
+        save_turn(&memory, &turn)
+            .await
+            .expect("first save succeeds");
+        save_turn(&memory, &turn)
+            .await
+            .expect("second save succeeds");
+
+        let guard = memory.lock().await;
+        let rows = guard
+            .list_by_project("00G_rtrt", 10)
+            .expect("list rows back");
+        assert_eq!(rows.len(), 1, "the same body must dedup to a single row");
+        assert_eq!(rows[0].kind, "user-prompt-submit");
+        assert_eq!(rows[0].body, turn.text);
     }
 }

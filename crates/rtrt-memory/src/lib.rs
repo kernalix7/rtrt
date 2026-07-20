@@ -13,6 +13,7 @@ use rtrt_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub mod capture;
 pub mod capture_bucket;
 pub mod embed;
 #[cfg(feature = "hnsw")]
@@ -21,6 +22,7 @@ pub mod payload;
 pub mod role;
 pub mod summarise;
 
+pub use capture::is_synthetic_prompt;
 pub use capture_bucket::is_capture_bucket_name;
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;

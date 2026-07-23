@@ -217,7 +217,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 - `rtrt-mcp` (rmcp 1.x) ships 11 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`
 - HTTP transport hardens with `--http-token` (constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
 - `rtrt-dashboard` (axum) — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle. Routes: `/api/{metrics,budget,prompts,memory/*,templates*,compress,proxy,diagnose,repo-map,setup,chat,stats}`. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
-- `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf
+- `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf / opencode
 - Versioned prompt registry under `~/.rtrt/prompts/<name>/<NNNN>.toml` (`rtrt prompt {save,get,list,versions}`)
 - [Details →](docs/FEATURES.md#mcp-and-dashboard)
 
@@ -279,7 +279,7 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 11 tools (compress / compress_ml / proxy / memory_* / templates_* / provider_chat), bearer-token + RFC 6454 Origin guards
 - [x] `rtrt-dashboard` axum UI — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
 - [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
-- [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf
+- [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf / opencode
 - [x] criterion benchmark harness + per-fixture savings table + `rtrt benchmark` wrapper
 - [x] qdrant-style payload filter DSL (`source=claude,topic~^auth`) on `recall_bm25_with_filter`
 - [x] LLMLingua-style `MlCompressor` scaffold (heuristic backend; ONNX backend deferred)

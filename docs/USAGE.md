@@ -91,7 +91,7 @@ Claude Code can run the Command Optimizer transparently through a `PreToolUse` B
 rtrt setup --agent claude --apply
 ```
 
-The installed matcher targets Bash tool calls and rewrites shrinkable commands to `rtrt proxy-run ...`. It skips commands that already include pipes, `&&`, redirects, or an existing `rtrt proxy-run` wrapper. Cursor, Codex, Windsurf, and other MCP-aware agents receive the Command Optimizer tools through `rtrt-mcp` instead of the Claude-specific hook.
+The installed matcher targets Bash tool calls and rewrites shrinkable commands to `rtrt proxy-run ...`. It skips commands that already include pipes, `&&`, redirects, or an existing `rtrt proxy-run` wrapper. Cursor, Codex, Windsurf, opencode, and other MCP-aware agents receive the Command Optimizer tools through `rtrt-mcp` instead of the Claude-specific hook.
 
 The hook implementation can also be invoked directly by hook runners:
 
@@ -341,7 +341,7 @@ curl -N http://127.0.0.1:7412/v1/chat/completions \
 ## MCP server (`rtrt-mcp`)
 
 ```bash
-# stdio (default; what Claude Code / Codex / Cursor / Windsurf use)
+# stdio (default; what Claude Code / Codex / Cursor / Windsurf / opencode use)
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) behind axum

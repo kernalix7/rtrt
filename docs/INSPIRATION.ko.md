@@ -113,7 +113,7 @@ RTRT는 다른 토큰 절감 · 메모리 · 에이전트 도구 프로젝트에
 1. **`compress.tree_sitter` 모드** in `rtrt-compress` — 시그니처 추출, 본문 제거. 출처: repomix · aider.
 2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + 벡터 + 엔티티, Reciprocal Rank Fusion. 출처: mem0 · chroma · qdrant. (BM25 + 벡터는 출시 완료, 엔티티는 예정.)
 3. **`providers.gateway`** in `rtrt-providers` — 여러 프로바이더 앞의 단일 키, 요청별 비용 / 지연 지표를 `rtrt-dashboard`로 흘림. 출처: Helicone · Langfuse · llm-chain.
-4. **`rtrt setup --agent <name>`** in `rtrt-cli` — Claude Code / Cursor / Windsurf / Codex / Aider에 한 줄로 와이어업, rtk `init` 미러.
+4. **`rtrt setup --agent <name>`** in `rtrt-cli` — Claude Code / Cursor / Windsurf / Codex / opencode / Aider에 한 줄로 와이어업, rtk `init` 미러.
 5. **`rtrt-compress secretlint` 사전 검사** in `rtrt-compress` — LLM 도달 전 시크릿 차단. 출처: repomix.
 
 ## 이 백로그에서 이미 출시된 항목

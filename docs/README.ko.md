@@ -110,7 +110,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - **`rtrt-mcp`** — rmcp 1.7 stdio + Streamable HTTP. 18개 도구 (compress / compress_ml / proxy / memory_save / memory_recall / memory_timeline / memory_profile / memory_relations / memory_smart_search / memory_export / memory_consolidate / memory_sessions / memory_set_block / memory_get_block / memory_list_blocks / repo_map / templates_list / templates_scaffold / provider_chat). `--http-token` 상수-시간 베어러 가드 + RFC 6454 Origin 검증. 모든 핸들러가 자동 캡처 파이프라인 통과.
 - **`rtrt-dashboard`** — axum 10탭 (Metrics SVG 스파크라인 / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup). `/api/stream` SSE 라이브 활동, `/api/tokens/summary` 게이트웨이 시간/일 집계, `/api/memory/{projects,timeline}` 페이지네이션. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
 - **Claude Code 플러그인** — `plugins/claude-code/rtrt/` 훅 12종 (PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd). CLI 우선, 대시보드 POST 폴백.
-- **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/aider --apply`.
+- **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/opencode/aider --apply`.
 - **보안 & 라이선스 스캔** — `rtrt-security`: 프로파일 기반 5 엔진(secrets / licenses / deps / patterns / ai), 표준 매핑 빌트인 프로파일 6종(CWE / OWASP / NIST / CIS / SLSA / EU AI Act), `rtrt security scan | profile | gate | init` + 대시보드 보안 페이지 + MCP `security_scan`.
 - **2단 설정 & 프로젝트 라이프사이클** — 글로벌 베이스 커널(`~/.rtrt/config.toml`, `rtrt setup` 관리) + 프로젝트별 `<repo>/.rtrt/config.toml` 오버라이드(유효 설정 = 글로벌 ⊕ 프로젝트, 대시보드 글로벌 따름/커스텀 토글); `rtrt migrate` / `rtrt project refresh`(기본 dry-run, `--apply`) + `rtrt project status/health/repair`.
 - **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`, `rtrt benchmark`.
@@ -144,7 +144,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - [x] `rtrt-dashboard` axum 10탭 + SSE 라이브 + 토큰 집계 + 자동 캡처 파이프라인 + 시간당 콘솔리데이션 데몬
 - [x] Claude Code 플러그인 12개 훅 (`plugins/claude-code/rtrt/`)
 - [x] `install.sh` + `install.ps1` 원라이너 + `release.yml` 5-target 매트릭스
-- [x] `rtrt setup --agent <name>` Claude / Cursor / Codex / Windsurf 와이어업
+- [x] `rtrt setup --agent <name>` Claude / Cursor / Codex / Windsurf / opencode 와이어업
 - [x] criterion 벤치 + per-fixture 절감률 테이블 + `recall_bench` (1K/10K/100K)
 - [x] CI 회귀 게이트 (`.github/workflows/perf.yml` + `scripts/perf-gate.sh`) — 10% p50 회귀 차단
 - [x] `DESIGN.md` + `PERF.md` — 10개 원칙 + SLO 표 + 측정값 정책

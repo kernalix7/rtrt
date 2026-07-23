@@ -99,7 +99,7 @@ Claude Code는 `PreToolUse` Bash 훅으로 Command Optimizer를 투명하게 실
 rtrt setup --agent claude --apply
 ```
 
-설치된 matcher는 Bash 도구 호출을 대상으로 하며, 축소 가능한 명령을 `rtrt proxy-run ...`으로 재작성합니다. 파이프, `&&`, 리다이렉트, 이미 `rtrt proxy-run`으로 감싼 명령은 건너뜁니다. Cursor, Codex, Windsurf 등 MCP 인지 에이전트는 Claude 전용 훅 대신 `rtrt-mcp`를 통해 Command Optimizer 도구를 받습니다.
+설치된 matcher는 Bash 도구 호출을 대상으로 하며, 축소 가능한 명령을 `rtrt proxy-run ...`으로 재작성합니다. 파이프, `&&`, 리다이렉트, 이미 `rtrt proxy-run`으로 감싼 명령은 건너뜁니다. Cursor, Codex, Windsurf, opencode 등 MCP 인지 에이전트는 Claude 전용 훅 대신 `rtrt-mcp`를 통해 Command Optimizer 도구를 받습니다.
 
 훅 러너가 직접 호출할 수도 있습니다.
 
@@ -287,7 +287,7 @@ curl -N http://127.0.0.1:7412/v1/chat/completions \
 ## MCP 서버 (`rtrt-mcp`)
 
 ```bash
-# stdio (기본; Claude Code / Codex / Cursor / Windsurf가 사용)
+# stdio (기본; Claude Code / Codex / Cursor / Windsurf / opencode가 사용)
 rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) — axum 라우터

@@ -116,7 +116,7 @@ These are the items that:
 1. **`compress.tree_sitter` mode** in `rtrt-compress` — extract signatures, drop bodies. Sources: repomix + aider.
 2. **`memory.recall_hybrid`** in `rtrt-memory` — BM25 + vector + entity, Reciprocal Rank Fusion. Sources: mem0 + chroma + qdrant. (BM25 + vector are shipped; entity is planned.)
 3. **`providers.gateway`** in `rtrt-providers` — single key in front of many providers, cost/latency metrics per request feed `rtrt-dashboard`. Sources: Helicone + Langfuse + llm-chain.
-4. **`rtrt setup --agent <name>`** in `rtrt-cli` — wire RTRT into Claude Code / Cursor / Windsurf / Codex / Aider with one command, mirroring rtk's `init` flow.
+4. **`rtrt setup --agent <name>`** in `rtrt-cli` — wire RTRT into Claude Code / Cursor / Windsurf / Codex / opencode / Aider with one command, mirroring rtk's `init` flow.
 5. **`rtrt-compress secretlint` pre-pass** in `rtrt-compress` — block secrets before they reach the LLM. Source: repomix.
 
 ## Already shipped from this backlog

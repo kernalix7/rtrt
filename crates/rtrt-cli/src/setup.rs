@@ -5,6 +5,11 @@
 //! - `cursor`   — `~/.cursor/mcp.json` (`mcpServers.rtrt`)
 //! - `windsurf` — `~/.windsurf/mcp_config.json` (`mcpServers.rtrt`)
 //! - `codex`    — `~/.codex/config.toml` (`[mcp_servers.rtrt]`)
+//! - `opencode` — `~/.config/opencode/opencode.jsonc` (`mcp.rtrt`, `type:
+//!   "local"`); rules to `~/.config/opencode/AGENTS.md`. The config is
+//!   JSONC — a strict-JSON file round-trips through `serde_json`; a file
+//!   with comments/trailing commas falls back to a best-effort textual
+//!   insert that leaves the rest of the file (including comments) alone.
 //! - `aider`    — prints env-var hint; aider has no MCP config file.
 //!
 //! Default behaviour is **dry-run**: print the path + snippet so the user can
@@ -22,6 +27,7 @@ pub enum AgentKind {
     Cursor,
     Windsurf,
     Codex,
+    Opencode,
     Aider,
 }
 
@@ -60,6 +66,8 @@ const CLAUDE_AGENTS_ROOT_REL: &str = "~/.claude/agents";
 const CURSOR_RULES_REL: &str = "~/.cursor/rules/rtrt-output-optimizer.mdc";
 const WINDSURF_RULES_REL: &str = "~/.codeium/windsurf/memories/global_rules.md";
 const CODEX_RULES_REL: &str = "~/.codex/AGENTS.md";
+const OPENCODE_MCP_CONFIG_REL: &str = "~/.config/opencode/opencode.jsonc";
+const OPENCODE_RULES_REL: &str = "~/.config/opencode/AGENTS.md";
 const AIDER_RULES_REL: &str = "~/.aider/conventions.md";
 const TERSE_BLOCK_BEGIN: &str = "# BEGIN rtrt-output-optimizer";
 const TERSE_BLOCK_END: &str = "# END rtrt-output-optimizer";
@@ -317,6 +325,10 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             install_terse_rules(plan.agent, plan.apply)?;
             apply_codex_toml(&plan, &binary, &memory_path)
         }
+        AgentKind::Opencode => {
+            install_terse_rules(plan.agent, plan.apply)?;
+            apply_opencode_jsonc(&plan, &binary, &memory_path)
+        }
     }
 }
 
@@ -531,6 +543,301 @@ fn render_codex_toml_snippet(binary: &str, memory_path: &Option<PathBuf>) -> Str
         None => out.push_str("args = []\n"),
     }
     out
+}
+
+/// opencode's local-MCP-server shape (`McpLocalConfig` in opencode's own
+/// config schema): `type: "local"`, `command` as an array holding the binary
+/// plus every CLI arg (no separate `args` field, unlike the other agents'
+/// `mcpServers` shape), and `enabled: true` so it's live without a manual
+/// toggle in the opencode TUI.
+fn build_opencode_entry(binary: &str, memory_path: &Option<PathBuf>) -> serde_json::Value {
+    let mut command = vec![serde_json::Value::String(binary.to_string())];
+    if let Some(p) = memory_path {
+        command.push(serde_json::Value::String("--memory".to_string()));
+        command.push(serde_json::Value::String(p.to_string_lossy().into_owned()));
+    }
+    serde_json::json!({
+        "type": "local",
+        "command": command,
+        "enabled": true,
+    })
+}
+
+fn render_opencode_snippet(binary: &str, memory_path: &Option<PathBuf>) -> String {
+    let entry = build_opencode_entry(binary, memory_path);
+    let wrapped = serde_json::json!({ "mcp": { "rtrt": entry } });
+    serde_json::to_string_pretty(&wrapped).unwrap_or_else(|_| String::new())
+}
+
+/// Applies (or dry-run previews) the `mcp.rtrt` entry into opencode's global
+/// `~/.config/opencode/opencode.jsonc`.
+///
+/// opencode's config is JSONC (comments + trailing commas allowed), but a
+/// freshly-generated one — and most hand-edited ones in practice — is plain
+/// JSON. So the primary path parses the file strictly with `serde_json` and
+/// does a full object-model merge, same as every other agent's config file
+/// here. Only when strict parsing fails (a real sign of comments / trailing
+/// commas) does this fall back to `upsert_opencode_mcp_text`, a best-effort
+/// textual insert that never re-serializes the whole document — so existing
+/// comments and formatting survive untouched.
+fn apply_opencode_jsonc(
+    plan: &SetupPlan,
+    binary: &str,
+    memory_path: &Option<PathBuf>,
+) -> Result<()> {
+    let path = expand_home(OPENCODE_MCP_CONFIG_REL)?;
+    apply_opencode_jsonc_at(&path, plan.apply, binary, memory_path)
+}
+
+/// Path-parameterized core of `apply_opencode_jsonc`, split out so tests can
+/// exercise the real read/backup/write flow against a temp file instead of
+/// `~/.config/opencode/opencode.jsonc`.
+fn apply_opencode_jsonc_at(
+    path: &Path,
+    apply: bool,
+    binary: &str,
+    memory_path: &Option<PathBuf>,
+) -> Result<()> {
+    let snippet = render_opencode_snippet(binary, memory_path);
+    if !apply {
+        println!("[dry-run] target: {}", path.display());
+        println!("[dry-run] snippet:\n{snippet}");
+        println!("\nRe-run with --apply to merge into the file.");
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let entry = build_opencode_entry(binary, memory_path);
+    if !path.exists() {
+        let root = serde_json::json!({ "mcp": { "rtrt": entry } });
+        let rendered = serde_json::to_string_pretty(&root)?;
+        std::fs::write(path, rendered).with_context(|| format!("write {}", path.display()))?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+    backup_if_needed(path)?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut root) => {
+            if !root.is_object() {
+                bail!("{}: root is not a JSON object", path.display());
+            }
+            let obj = root
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("{}: root is not a JSON object", path.display()))?;
+            let mcp = obj.entry("mcp").or_insert_with(|| serde_json::json!({}));
+            if !mcp.is_object() {
+                bail!("{}: mcp exists but is not an object", path.display());
+            }
+            mcp.as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("{}: mcp is not an object", path.display()))?
+                .insert("rtrt".to_string(), entry);
+            let rendered = serde_json::to_string_pretty(&root)?;
+            std::fs::write(path, rendered).with_context(|| format!("write {}", path.display()))?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
+        Err(_) => {
+            let merged = upsert_opencode_mcp_text(&raw, &entry)?;
+            std::fs::write(path, merged).with_context(|| format!("write {}", path.display()))?;
+            println!(
+                "merged mcp.rtrt into {} via textual insert (file has JSONC comments/trailing commas that rtrt setup can't safely re-serialize — comments were left as-is; please double-check the result)",
+                path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Byte offset of the opening `{` of `"<key>": { ... }` in JSONC-ish text —
+/// the first occurrence of the key as an object value. Best-effort: it is a
+/// text scan, not a parser, so it can be fooled by the key text appearing
+/// inside a string value elsewhere in the file. Used only on the JSONC
+/// fallback path in [`upsert_opencode_mcp_text`], where the alternative is
+/// destroying the user's comments by re-serializing.
+fn find_object_key_brace(text: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\"");
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = text[start..].find(&needle) {
+        let key_start = start + rel;
+        let mut idx = key_start + needle.len();
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if bytes.get(idx) == Some(&b':') {
+            idx += 1;
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if bytes.get(idx) == Some(&b'{') {
+                return Some(idx);
+            }
+        }
+        start = key_start + needle.len();
+    }
+    None
+}
+
+/// Byte offset of the `}` matching the `{` at `open_idx`, skipping over
+/// string literals (respecting `\"` escapes) and `//` / `/* */` comments so
+/// brace characters inside either don't throw off the depth count. Still a
+/// best-effort scanner, not a real JSONC parser — used only by the textual
+/// JSONC fallback.
+fn find_matching_brace(text: &str, open_idx: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(open_idx) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = open_idx;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Best-effort JSONC merge for opencode's config when it can't be safely
+/// parsed and re-serialized as strict JSON (i.e. it has comments or trailing
+/// commas). Never rewrites the whole document — only splices in the `mcp` /
+/// `rtrt` keys as raw text — so anything else in the file, comments
+/// included, is left byte-for-byte intact.
+///
+/// Idempotent: if an `"mcp"` object already contains an `"rtrt"` key, this
+/// is a no-op (it does not attempt to diff-and-replace an existing entry,
+/// since that would require the same brace-matching risk this function
+/// otherwise avoids).
+fn upsert_opencode_mcp_text(raw: &str, entry: &serde_json::Value) -> Result<String> {
+    let entry_json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
+
+    if let Some(mcp_brace) = find_object_key_brace(raw, "mcp") {
+        let mcp_close = find_matching_brace(raw, mcp_brace).ok_or_else(|| {
+            anyhow::anyhow!(
+                "opencode config: found \"mcp\" object but couldn't find its closing brace; refusing to guess-edit a malformed JSONC file"
+            )
+        })?;
+        let mcp_body = &raw[mcp_brace + 1..mcp_close];
+        if mcp_body.contains("\"rtrt\"") {
+            // Already registered; leave it alone rather than risk corrupting
+            // a hand-edited block.
+            return Ok(raw.to_string());
+        }
+        let needs_comma = !mcp_body.trim().is_empty();
+        let insertion = if needs_comma {
+            format!("\n  \"rtrt\": {entry_json},")
+        } else {
+            format!("\n  \"rtrt\": {entry_json}\n  ")
+        };
+        let mut out = String::with_capacity(raw.len() + insertion.len());
+        out.push_str(&raw[..mcp_brace + 1]);
+        out.push_str(&insertion);
+        out.push_str(&raw[mcp_brace + 1..]);
+        return Ok(out);
+    }
+
+    let root_open = raw
+        .find('{')
+        .ok_or_else(|| anyhow::anyhow!("opencode config: no top-level JSON object found"))?;
+    let after = &raw[root_open + 1..];
+    let needs_comma = !after.trim_start().is_empty();
+    let comma = if needs_comma { "," } else { "" };
+    let block = format!("\n  \"mcp\": {{\n    \"rtrt\": {entry_json}\n  }}{comma}");
+    let mut out = String::with_capacity(raw.len() + block.len());
+    out.push_str(&raw[..root_open + 1]);
+    out.push_str(&block);
+    out.push_str(after);
+    Ok(out)
+}
+
+/// Reverse of `apply_opencode_jsonc`. Strict-JSON files round-trip cleanly;
+/// JSONC files with comments/trailing commas are left untouched with a
+/// pointer to remove the block by hand, same rationale as the apply-side
+/// fallback — an automated deletion risks corrupting a hand-edited file more
+/// than an automated addition does.
+fn drop_opencode_jsonc(apply: bool) -> Result<()> {
+    let path = expand_home(OPENCODE_MCP_CONFIG_REL)?;
+    drop_opencode_jsonc_at(&path, apply)
+}
+
+/// Path-parameterized core of `drop_opencode_jsonc`; see
+/// `apply_opencode_jsonc_at` for why the split exists (temp-file testing).
+fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
+    if !path.exists() {
+        println!("{}: not present", path.display());
+        return Ok(());
+    }
+    if !apply {
+        println!("[dry-run] would unset mcp.rtrt in {}", path.display());
+        return Ok(());
+    }
+    backup_if_needed(path)?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut root) => {
+            if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut())
+                && mcp.remove("rtrt").is_some()
+            {
+                let rendered = serde_json::to_string_pretty(&root)?;
+                std::fs::write(path, rendered)
+                    .with_context(|| format!("write {}", path.display()))?;
+                println!("dropped mcp.rtrt from {}", path.display());
+                return Ok(());
+            }
+            println!("{}: mcp.rtrt not present", path.display());
+            Ok(())
+        }
+        Err(_) => {
+            println!(
+                "{}: file has JSONC comments/trailing commas rtrt setup can't safely re-serialize; remove the \"mcp\".\"rtrt\" block by hand",
+                path.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 fn expand_home(rel: &str) -> Result<PathBuf> {
@@ -932,6 +1239,7 @@ fn terse_rules_path(agent: AgentKind) -> Option<&'static str> {
         AgentKind::Cursor => Some(CURSOR_RULES_REL),
         AgentKind::Windsurf => Some(WINDSURF_RULES_REL),
         AgentKind::Codex => Some(CODEX_RULES_REL),
+        AgentKind::Opencode => Some(OPENCODE_RULES_REL),
         AgentKind::Aider => Some(AIDER_RULES_REL),
     }
 }
@@ -1165,6 +1473,7 @@ fn remove_all_terse_rules(apply: bool) -> Result<()> {
         AgentKind::Cursor,
         AgentKind::Windsurf,
         AgentKind::Codex,
+        AgentKind::Opencode,
         AgentKind::Aider,
     ] {
         remove_terse_rules(agent, apply)?;
@@ -1214,6 +1523,10 @@ pub fn uninstall_agent(agent: AgentKind, apply: bool) -> Result<()> {
         AgentKind::Codex => {
             remove_terse_rules(agent, apply)?;
             drop_codex_toml(apply)
+        }
+        AgentKind::Opencode => {
+            remove_terse_rules(agent, apply)?;
+            drop_opencode_jsonc(apply)
         }
     }
 }
@@ -1580,5 +1893,185 @@ mod tests {
 
         assert!(!strip_rtrt_statusline(&mut root));
         assert!(root.get("statusLine").is_some());
+    }
+
+    #[test]
+    fn opencode_entry_has_local_type_command_array_and_enabled() {
+        let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
+        let entry = build_opencode_entry("/usr/local/bin/rtrt-mcp", &memory_path);
+
+        assert_eq!(entry.get("type").and_then(|v| v.as_str()), Some("local"));
+        assert_eq!(entry.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        let command: Vec<&str> = entry
+            .get("command")
+            .and_then(|v| v.as_array())
+            .expect("command must be an array")
+            .iter()
+            .map(|v| v.as_str().expect("command items must be strings"))
+            .collect();
+        assert_eq!(
+            command,
+            vec![
+                "/usr/local/bin/rtrt-mcp",
+                "--memory",
+                "/home/u/.rtrt/memory.sqlite",
+            ]
+        );
+    }
+
+    /// Writes an opencode config with a pre-existing `mcp.other` server to a
+    /// temp file (never touches the real `~/.config/opencode`), applies the
+    /// rtrt entry, and checks the result is valid JSON with `mcp.other`
+    /// intact alongside a well-formed `mcp.rtrt`.
+    #[test]
+    fn opencode_apply_merges_without_dropping_other_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.jsonc");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "$schema": "https://opencode.ai/config.json",
+                "mcp": { "other": { "type": "local", "command": ["other-server"] } }
+            }))
+            .unwrap(),
+        )
+        .expect("write starting config");
+
+        let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &memory_path)
+            .expect("apply should succeed");
+
+        let raw = std::fs::read_to_string(&path).expect("read merged config");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
+        assert!(
+            parsed.get("mcp").and_then(|m| m.get("other")).is_some(),
+            "pre-existing mcp.other must survive the merge"
+        );
+        let rtrt = parsed
+            .get("mcp")
+            .and_then(|m| m.get("rtrt"))
+            .expect("mcp.rtrt must be present");
+        assert_eq!(rtrt.get("type").and_then(|v| v.as_str()), Some("local"));
+        assert_eq!(rtrt.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        let command: Vec<&str> = rtrt
+            .get("command")
+            .and_then(|v| v.as_array())
+            .expect("command must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            command,
+            vec![
+                "/usr/local/bin/rtrt-mcp",
+                "--memory",
+                "/home/u/.rtrt/memory.sqlite",
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_apply_idempotent_on_second_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.jsonc");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcp": { "other": { "type": "local", "command": ["other-server"] } }
+            }))
+            .unwrap(),
+        )
+        .expect("write starting config");
+
+        let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &memory_path)
+            .expect("first apply should succeed");
+        let first = std::fs::read_to_string(&path).expect("read after first apply");
+
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &memory_path)
+            .expect("second apply should succeed");
+        let second = std::fs::read_to_string(&path).expect("read after second apply");
+
+        assert_eq!(first, second, "re-running apply must not change the file");
+        let parsed: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert!(parsed.get("mcp").and_then(|m| m.get("other")).is_some());
+        assert!(parsed.get("mcp").and_then(|m| m.get("rtrt")).is_some());
+    }
+
+    #[test]
+    fn opencode_apply_creates_config_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nested, not-yet-created parent — apply must mkdir -p it.
+        let path = dir.path().join("nested/opencode.jsonc");
+
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &None)
+            .expect("apply should create the file and its parent dir");
+
+        let raw = std::fs::read_to_string(&path).expect("read created config");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
+        assert_eq!(
+            parsed
+                .get("mcp")
+                .and_then(|m| m.get("rtrt"))
+                .and_then(|r| r.get("command"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str()),
+            Some("/usr/local/bin/rtrt-mcp")
+        );
+    }
+
+    /// A config with a `//` comment can't be safely round-tripped through
+    /// `serde_json`, so this exercises the textual-insert fallback: the
+    /// comment must survive, `mcp.other` must survive, and a second apply
+    /// must not duplicate the `"rtrt"` key.
+    #[test]
+    fn opencode_apply_preserves_comments_in_jsonc_fallback_and_stays_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.jsonc");
+        std::fs::write(
+            &path,
+            "{\n  // keep me\n  \"mcp\": {\n    \"other\": { \"type\": \"local\", \"command\": [\"x\"] }\n  }\n}\n",
+        )
+        .expect("write starting jsonc");
+
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &None)
+            .expect("first apply should succeed");
+        let first = std::fs::read_to_string(&path).expect("read after first apply");
+        assert!(first.contains("// keep me"), "comment must survive");
+        assert!(first.contains("\"other\""), "mcp.other must survive");
+        assert!(first.contains("\"rtrt\""), "mcp.rtrt must be inserted");
+
+        apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &None)
+            .expect("second apply should succeed");
+        let second = std::fs::read_to_string(&path).expect("read after second apply");
+        assert_eq!(
+            first, second,
+            "re-running apply on a JSONC file must not duplicate the rtrt block"
+        );
+    }
+
+    #[test]
+    fn opencode_uninstall_drops_rtrt_but_keeps_other_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.jsonc");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcp": {
+                    "other": { "type": "local", "command": ["other-server"] },
+                    "rtrt": { "type": "local", "command": ["rtrt-mcp"], "enabled": true }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write starting config");
+
+        drop_opencode_jsonc_at(&path, true).expect("uninstall should succeed");
+
+        let raw = std::fs::read_to_string(&path).expect("read after drop");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
+        assert!(parsed.get("mcp").and_then(|m| m.get("rtrt")).is_none());
+        assert!(parsed.get("mcp").and_then(|m| m.get("other")).is_some());
     }
 }

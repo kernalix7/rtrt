@@ -150,6 +150,25 @@ const ARCHIVE_PREVIEW_FLOOR: usize = 48;
 /// store size but never starves a small store of its whole neighbourhood.
 const GRAPH_VISIT_FLOOR: usize = 64;
 
+/// Tokenizes a natural-language query into content terms: alphanumeric runs
+/// only, lowercased, English stopwords and sub-3-*byte* tokens dropped,
+/// capped at [`FTS_MAX_TERMS`]. Shared by [`sanitize_fts_query`] (which
+/// OR-joins the result into an FTS5 `MATCH` expression) and
+/// [`MemoryStore::distinctive_terms`] (which scores each survivor by
+/// project-wide document frequency for the auto-recall relevance floor), so
+/// both see exactly the same term set for a given prompt.
+fn fts_terms(query: &str) -> Vec<String> {
+    query
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 3 && !FTS_STOPWORDS.contains(&w.as_str()))
+        .take(FTS_MAX_TERMS)
+        .collect()
+}
+
 /// Sanitizes a natural-language query into a safe FTS5 `MATCH` expression.
 ///
 /// Raw prompts routinely contain FTS5 operator characters (`don't`,
@@ -163,15 +182,7 @@ const GRAPH_VISIT_FLOOR: usize = 64;
 ///
 /// Returns `None` when no usable term survives.
 pub fn sanitize_fts_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .filter(|w| w.len() >= 3 && !FTS_STOPWORDS.contains(&w.as_str()))
-        .take(FTS_MAX_TERMS)
-        .collect();
+    let terms = fts_terms(query);
     if terms.is_empty() {
         None
     } else {
@@ -2171,6 +2182,110 @@ impl MemoryStore {
             .map_err(|e| Error::Memory(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Document frequency for a single content term — the number of rows
+    /// whose body matches it, optionally restricted to one project. The term
+    /// is wrapped in a quoted FTS5 phrase so punctuation-free tokens
+    /// (already guaranteed by [`fts_terms`]) can never be misread as a
+    /// column filter or operator. Used by
+    /// [`distinctive_terms`](Self::distinctive_terms) both for the
+    /// within-project rarity check (`project = Some(..)`) and the
+    /// cross-project enrichment baseline (`project = None`).
+    fn term_doc_freq(&self, project: Option<&str>, term: &str) -> Result<usize> {
+        let phrase = format!("\"{}\"", term.replace('"', ""));
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM memories_fts f
+                   JOIN memories m ON m.id = f.rowid
+                  WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.project = ?2)",
+                rusqlite::params![phrase, project],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Total row count across every project. Used only by
+    /// [`distinctive_terms`](Self::distinctive_terms) as the denominator for
+    /// its cross-project enrichment baseline.
+    fn total_row_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Data-derived relevance floor for context injection (recall's "does
+    /// this query carry real signal for this project" gate).
+    ///
+    /// Tokenizes `query` the same way [`sanitize_fts_query`] does, then keeps
+    /// only the terms that are DISTINCTIVE, via two data-derived tests:
+    ///
+    /// 1. **Within-project rarity**: the term's document frequency in
+    ///    `project` is at most `√(rows in project)` — the same
+    ///    data-scaled-cap pattern used elsewhere in this file (e.g. the graph
+    ///    walk's visit budget). Terms saturating most of the project's rows
+    ///    (common particles, generic dev-log words) never qualify no matter
+    ///    how often the prompt repeats them.
+    /// 2. **Cross-project enrichment**: when the store holds more than one
+    ///    project, rarity ALONE is not enough — a generic function word
+    ///    (e.g. a Korean conjunction) is "rare" in any one English-heavy
+    ///    project simply because most of the store is written in a
+    ///    different language, not because it is topically meaningful.
+    ///    Comparing the term's local document frequency against the count
+    ///    predicted by its GLOBAL (whole-store) frequency, scaled by this
+    ///    project's share of all rows, tells the two apart: a term used
+    ///    proportionally MORE here than store-wide is enriched — tied to
+    ///    THIS project specifically — while a term used at roughly its
+    ///    global background rate (or less) is just generic language, however
+    ///    rare it looks in isolation. Skipped for single-project stores,
+    ///    where there is no cross-project baseline to compare against.
+    ///
+    /// Neither test is a flat magic number: both scale with the store's own
+    /// size and composition, and neither needs a per-language stopword list
+    /// (works identically for English, Korean, or a mix).
+    ///
+    /// An empty result means the query has no distinctive term at all in
+    /// this project — callers should suppress recall output entirely
+    /// rather than inject generic noise.
+    pub fn distinctive_terms(&self, project: &str, query: &str) -> Result<Vec<String>> {
+        let terms = fts_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let project_total = self.count_by_project(project)?;
+        if project_total == 0 {
+            return Ok(Vec::new());
+        }
+        let local_floor = (project_total as f64).sqrt().ceil().max(1.0) as usize;
+        let all_total = self.total_row_count()?;
+        // Cross-project enrichment only makes sense when other projects
+        // actually contribute rows; otherwise every term's "global" rate
+        // trivially equals its local rate and the check would reject
+        // everything.
+        let project_share =
+            (all_total > project_total).then(|| project_total as f64 / all_total as f64);
+
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            let local_df = self.term_doc_freq(Some(project), &term)?;
+            if local_df == 0 || local_df > local_floor {
+                continue;
+            }
+            if let Some(share) = project_share {
+                let global_df = self.term_doc_freq(None, &term)?;
+                let expected_local = global_df as f64 * share;
+                if (local_df as f64) <= expected_local {
+                    continue; // no more common here than the store-wide baseline
+                }
+            }
+            out.push(term);
+        }
+        Ok(out)
     }
 
     /// Pure vector recall — embeds the query and ranks every memory in the
@@ -4632,6 +4747,13 @@ impl MemoryStore {
     /// rankings. Score per record is `Σ 1 / (rrf_k + rank_i)` over the two
     /// streams; default `rrf_k = 60`. Each stream is fetched at `limit * 2` so
     /// items only appearing in one stream still surface.
+    ///
+    /// Both legs see the same `query` text. When the caller has a
+    /// natural-language prompt AND a keyword-ised FTS5 query for it (e.g. the
+    /// auto-recall hook, which needs an OR-joined query for BM25 but the raw
+    /// prompt for the embedder), use
+    /// [`recall_hybrid_with`](Self::recall_hybrid_with) instead so each leg
+    /// gets the text it actually wants.
     pub fn recall_hybrid(
         &self,
         project: &str,
@@ -4639,9 +4761,28 @@ impl MemoryStore {
         limit: usize,
         embedder: &dyn Embedder,
     ) -> Result<Vec<ScoredRecord>> {
+        self.recall_hybrid_with(project, query, query, limit, embedder)
+    }
+
+    /// [`recall_hybrid`](Self::recall_hybrid) with independent text for each
+    /// leg: `bm25_query` is matched against the FTS5 index (pass a
+    /// [`sanitize_fts_query`] OR-join for natural-language input — a raw
+    /// multi-word sentence is implicit AND in FTS5 and rarely matches a terse
+    /// memory row), while `semantic_text` is what gets embedded for the
+    /// dense-vector leg (pass the raw, un-sanitized text — the embedder needs
+    /// real natural language, not a keyword bag, to produce a meaningful
+    /// vector).
+    pub fn recall_hybrid_with(
+        &self,
+        project: &str,
+        bm25_query: &str,
+        semantic_text: &str,
+        limit: usize,
+        embedder: &dyn Embedder,
+    ) -> Result<Vec<ScoredRecord>> {
         let fetch = limit.saturating_mul(2).max(limit);
-        let bm25 = self.recall_bm25(project, query, fetch)?;
-        let vector = self.recall_vector(project, query, fetch, embedder)?;
+        let bm25 = self.recall_bm25(project, bm25_query, fetch)?;
+        let vector = self.recall_vector(project, semantic_text, fetch, embedder)?;
 
         let rrf_k = 60.0f32;
         let mut fused: std::collections::HashMap<i64, ScoredRecord> =
@@ -6412,6 +6553,149 @@ mod tests {
         let hits = store.recall_hybrid("p1", "rust", 3, &embedder).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].record.body.contains("rust"), "{:?}", hits);
+    }
+
+    /// Embedder that records the exact text it was asked to embed, so a test
+    /// can assert *which* string reached the dense-vector leg.
+    struct RecordingEmbedder {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingEmbedder {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Embedder for RecordingEmbedder {
+        fn dimension(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "test-recording"
+        }
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .extend(texts.iter().map(|t| t.to_string()));
+            Ok(texts.iter().map(|t| word_hash_vec(t)).collect())
+        }
+    }
+
+    /// BUG2 regression: `recall_hybrid_with` must embed the RAW
+    /// `semantic_text` argument, never the sanitized OR-joined `bm25_query`
+    /// — the whole point of the two-argument split is that a natural
+    /// language prompt reaches the embedder unmangled while FTS5 still gets
+    /// a query shape it can actually match.
+    #[test]
+    fn recall_hybrid_with_embeds_raw_semantic_text_not_bm25_query() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = RecordingEmbedder::new();
+        store
+            .save_embedded("p1", "note", "rust cargo workspace", &embedder)
+            .unwrap();
+
+        let raw_prompt = "어떤 rust 업체를 쓸지 자동으로 고르는 방식이 뭐야";
+        let bm25_query = sanitize_fts_query(raw_prompt).unwrap();
+        assert_ne!(bm25_query, raw_prompt, "sanitized form must differ");
+
+        store
+            .recall_hybrid_with("p1", &bm25_query, raw_prompt, 3, &embedder)
+            .unwrap();
+
+        let seen = embedder.seen.lock().unwrap();
+        assert!(
+            seen.contains(&raw_prompt.to_string()),
+            "embedder must see the raw prompt: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&bm25_query),
+            "embedder must NOT see the sanitized OR-join: {seen:?}"
+        );
+    }
+
+    /// BUG3 regression: [`MemoryStore::distinctive_terms`] is the relevance
+    /// floor's data source. A query built only from terms that saturate the
+    /// project (near every row contains them) has no distinctive term —
+    /// callers use that to suppress recall entirely. A query naming a term
+    /// that appears in only a handful of rows keeps that term.
+    #[test]
+    fn distinctive_terms_gates_on_corpus_wide_document_frequency() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // 20 rows all share the common word "project"; only one mentions the
+        // specific technical term "headroom".
+        for i in 0..20 {
+            store
+                .save("p1", "note", &format!("project status update {i}"))
+                .unwrap();
+        }
+        store
+            .save("p1", "note", "gateway router headroom failover design")
+            .unwrap();
+
+        // "project" appears in 20/21 rows — far above √21 ≈ 5 — no signal.
+        let noise = store.distinctive_terms("p1", "project status").unwrap();
+        assert!(noise.is_empty(), "{noise:?}");
+
+        // "headroom"/"failover" appear in exactly 1/21 rows — well under the
+        // √21 floor — genuinely distinctive.
+        let signal = store
+            .distinctive_terms("p1", "headroom failover behaviour")
+            .unwrap();
+        assert!(
+            signal.iter().any(|t| t == "headroom" || t == "failover"),
+            "{signal:?}"
+        );
+    }
+
+    /// Regression: a generic function word can look "rare" in one project's
+    /// rows purely because that project is written in a different language
+    /// than the rest of the store — NOT because it is topically meaningful.
+    /// Cross-project enrichment must reject it (it appears at roughly its
+    /// global background rate, not more), while a term that is genuinely
+    /// concentrated in this project (used far more here than its global rate
+    /// predicts) must still pass.
+    #[test]
+    fn distinctive_terms_rejects_rare_but_unenriched_terms_across_projects() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "other" is a large, mostly-English corpus (like the rest of a real
+        // multi-project store) where the generic connector "however" shows up
+        // at a steady background rate.
+        for i in 0..200 {
+            let body = if i % 5 == 0 {
+                format!("status update {i} however things continue")
+            } else {
+                format!("status update {i}")
+            };
+            store.save("other", "note", &body).unwrap();
+        }
+        // "p1" is small and only a few of its rows happen to use "however"
+        // too — proportionally right in line with (not above) the global
+        // rate, so it is NOT enriched here even though its raw count is low.
+        store
+            .save("p1", "note", "reviewed the plan however nothing changed")
+            .unwrap();
+        for i in 0..5 {
+            store
+                .save("p1", "note", &format!("note {i} about the project"))
+                .unwrap();
+        }
+        // "headroom" appears ONLY in p1 — genuinely concentrated here.
+        store
+            .save("p1", "note", "gateway router headroom failover design")
+            .unwrap();
+
+        let generic = store.distinctive_terms("p1", "however").unwrap();
+        assert!(
+            generic.is_empty(),
+            "a term at its global background rate must not count as distinctive: {generic:?}"
+        );
+
+        let genuine = store.distinctive_terms("p1", "headroom").unwrap();
+        assert_eq!(genuine, vec!["headroom".to_string()], "{genuine:?}");
     }
 
     #[cfg(feature = "ollama-embed")]

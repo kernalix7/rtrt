@@ -6325,7 +6325,7 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Best-effort HYBRID recall for the auto-recall hook.
 ///
-/// Returns `Some(hits)` only when a hybrid (BM25 + dense-vector RRF) recall
+/// Returns `Some(recall)` only when a hybrid (BM25 + dense-vector RRF) recall
 /// completed successfully within `timeout`. Returns `None` — the caller's
 /// signal to fall back to pure `recall_bm25` — when any gate is unmet:
 /// embeddings disabled, no meaningful coverage, embedder cannot be built, the
@@ -6342,8 +6342,11 @@ fn home_dir() -> Option<PathBuf> {
 /// implicit AND on a raw sentence rarely matches a terse memory row), while
 /// `semantic_text` should be the raw, un-sanitized prompt (the embedder needs
 /// real natural language, not a keyword bag, to produce a meaningful dense
-/// vector). Set `RTRT_RECALL_DEBUG=1` to log the gate/timing decision to
-/// stderr (never stdout, so it can never leak into the injected context).
+/// vector). The prompt's meaning-free twin
+/// ([`rtrt_memory::null_probe_text`]) rides along in the same embed call so
+/// the caller can calibrate the similarity bar without a second round-trip.
+/// Set `RTRT_RECALL_DEBUG=1` to log the gate/timing decision to stderr (never
+/// stdout, so it can never leak into the injected context).
 fn try_hybrid_recall(
     store_path: &std::path::Path,
     project: &str,
@@ -6351,7 +6354,7 @@ fn try_hybrid_recall(
     semantic_text: &str,
     limit: usize,
     timeout: std::time::Duration,
-) -> Option<Vec<rtrt_memory::MemoryRecord>> {
+) -> Option<rtrt_memory::HybridRecall> {
     let debug = std::env::var_os("RTRT_RECALL_DEBUG").is_some();
     let t0 = std::time::Instant::now();
     let cfg = rtrt_core::Config::load().unwrap_or_default();
@@ -6383,7 +6386,7 @@ fn try_hybrid_recall(
     // bounded channel: if Ollama is slow/unreachable we stop waiting after
     // `timeout` and the caller falls back to BM25. The worker is detached and
     // simply finishes (or errors) on its own; its result is discarded.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<rtrt_memory::MemoryRecord>>>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Option<rtrt_memory::HybridRecall>>(1);
     let store_path = store_path.to_path_buf();
     let project = project.to_string();
     let bm25_query = bm25_query.to_string();
@@ -6391,22 +6394,37 @@ fn try_hybrid_recall(
     std::thread::spawn(move || {
         let result = (|| {
             let store = MemoryStore::open(&store_path).ok()?;
-            let scored = store
-                .recall_hybrid_with(&project, &bm25_query, &semantic_text, limit, &embedder)
-                .ok()?;
-            Some(scored.into_iter().map(|s| s.record).collect::<Vec<_>>())
+            let null_probe = rtrt_memory::null_probe_text(&semantic_text);
+            store
+                .recall_hybrid_scored(
+                    &project,
+                    rtrt_memory::HybridQuery {
+                        bm25: &bm25_query,
+                        semantic: &semantic_text,
+                        null_probe: Some(&null_probe),
+                        limit,
+                    },
+                    &embedder,
+                )
+                .ok()
         })();
         // Ignore send errors: the receiver may have already timed out and gone.
         let _ = tx.send(result);
     });
 
     // `recv_timeout` returns Err on both timeout and a dropped sender; either
-    // way we fall back. A successful hybrid yields `Some(hits)`; an inner error
-    // yields `Some(None)` which we also treat as a fall-back signal.
+    // way we fall back. A successful hybrid yields `Some(recall)`; an inner
+    // error yields `Some(None)` which we also treat as a fall-back signal.
     let outcome = rx.recv_timeout(timeout);
     if debug {
         let status = match &outcome {
-            Ok(Some(hits)) => format!("ok hits={}", hits.len()),
+            Ok(Some(recall)) => format!(
+                "ok hits={} bar={:?} null={:?} bg={:?}",
+                recall.hits.len(),
+                recall.similarity_bar(),
+                recall.null_similarity,
+                recall.background,
+            ),
             Ok(None) => "inner-error".to_string(),
             Err(_) => "timeout-or-disconnected".to_string(),
         };
@@ -6416,7 +6434,7 @@ fn try_hybrid_recall(
         );
     }
     match outcome {
-        Ok(Some(hits)) => Some(hits),
+        Ok(Some(recall)) => Some(recall),
         _ => None,
     }
 }
@@ -6481,23 +6499,52 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
 
 /// Core auto-recall logic, factored out of [`run_hook_recall`] so it is
 /// testable without stdin/stdout: given the already-extracted `prompt`,
-/// returns the hits that should be injected, or `None` when nothing should
-/// (empty prompt, missing store, no usable query, no distinctive signal, or
-/// every candidate hit was filtered out). Order of operations:
+/// returns the hits that should be injected, or `None` when nothing should.
+///
+/// **Relevance is decided by DENSE SIMILARITY, not by lexical statistics.**
+/// The lexical leg answers "which rows share words with this prompt"; only
+/// the embedding answers "is this row about what the prompt is about". The
+/// gate is therefore the raw prompt-vs-row cosine, read against the
+/// distribution of that same cosine over the project's whole corpus (see
+/// [`rtrt_memory::SimilarityBackground`]): a hit is dense-supported when it
+/// sits `√(2·ln n)` background standard deviations above the harsher of the
+/// corpus mean and the prompt's MEANING-FREE TWIN
+/// ([`rtrt_memory::null_probe_text`]). Nothing there is a tuned constant —
+/// the sigma count comes from the corpus size, the sigma from the corpus
+/// itself, and the twin from the prompt.
+///
+/// The twin is what makes the bar honest in both directions. Because it keeps
+/// every surface property of the prompt and none of its meaning, a result set
+/// that only matched on surface cannot clear it — which covers both "the
+/// corpus holds nothing relevant" and "the embedding model cannot resolve
+/// this prompt's language at all" (a model whose tokenizer does not cover a
+/// script returns near-identical vectors for unrelated sentences of the same
+/// shape, and would otherwise report that noise as a confident 0.9 match).
+///
+/// Order of operations:
 ///
 /// 1. Sanitize the prompt into an FTS5 OR-join for the lexical leg.
-/// 2. Relevance floor (BUG3): [`rtrt_memory::MemoryStore::distinctive_terms`]
-///    must find at least one query term whose project-wide document
-///    frequency is data-scaled-rare; otherwise the prompt carries no signal
-///    for this project and nothing is fetched at all.
-/// 3. Recall: hybrid (BM25 lexical leg + raw-prompt dense-vector leg) when
+/// 2. Recall: hybrid (BM25 lexical leg + raw-prompt dense-vector leg) when
 ///    safely available, else pure BM25 — never blocking beyond the hybrid
 ///    timeout (BUG2: the raw prompt, not the OR-join, is what gets embedded).
-/// 4. Self-recall exclusion (BUG1): drop any hit that IS the very prompt row
+/// 3. PRIMARY GATE: keep the dense-supported hits. When at least one hit
+///    clears the bar the dense leg has resolved the prompt and its verdict
+///    stands on its own.
+/// 4. FALLBACK GATE: when no hit clears the bar — no embedder, hybrid timed
+///    out, corpus holds nothing relevant, or the model cannot resolve the
+///    prompt — fall back to the conservative lexical floor
+///    ([`rtrt_memory::MemoryStore::significant_terms`]): the prompt must own
+///    at least one term statistically enriched in this project, and every
+///    surfaced hit must contain one. No significant term means inject
+///    nothing.
+/// 5. Self-recall exclusion (BUG1): drop any hit that IS the very prompt row
 ///    `hook capture user-prompt-submit` just saved (same body hash, or the
 ///    same trimmed text as a belt-and-suspenders check).
-/// 5. Legacy synthetic-noise filter (BUG4): drop any hit whose body is a
+/// 6. Legacy synthetic-noise filter (BUG4): drop any hit whose body is a
 ///    harness-injected event captured before PR #76 stopped saving them.
+/// 7. Dedupe: the same text is captured many times over a project's life
+///    (a repeated status line, a re-sent instruction), and both recall legs
+///    happily return every copy. Inject each distinct body once.
 fn recall_hits_for_hook(
     project: &str,
     store_path: &Path,
@@ -6515,19 +6562,6 @@ fn recall_hits_for_hook(
     // Stopwords and sub-3-char tokens are dropped to cut noise.
     let bm25_query = rtrt_memory::sanitize_fts_query(prompt)?;
 
-    // BUG3 fix: relevance floor, checked BEFORE spending a BM25/hybrid
-    // round-trip. A query built only from terms that saturate the project
-    // (common particles, generic chatter) has no term whose document
-    // frequency clears the data-scaled √(rows) bar — that means the prompt
-    // carries no distinguishing signal for this project, so inject nothing
-    // rather than flood the context with unrelated rows.
-    let distinctive = memory
-        .distinctive_terms(project, prompt)
-        .unwrap_or_default();
-    if distinctive.is_empty() {
-        return None;
-    }
-
     // Recall strategy: try HYBRID (BM25 + dense vector RRF) only when it can be
     // done safely, otherwise fall back to pure BM25 — and NEVER stall the
     // prompt. Hybrid is attempted iff:
@@ -6540,23 +6574,59 @@ fn recall_hits_for_hook(
     // timeout, so a slow/unreachable Ollama (ureq has no short default timeout)
     // falls back to BM25 fast. The BM25 leg gets the sanitized OR-join
     // (`bm25_query`); the dense-vector leg gets the RAW `prompt` (BUG2 fix —
-    // the embedder needs real natural language, not a keyword bag). On ANY
-    // error/timeout/absent-embedder we fall back to
-    // store.recall_bm25(project, bm25_query, limit), same as before.
+    // the embedder needs real natural language, not a keyword bag).
     const HYBRID_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-    let hits = try_hybrid_recall(
+    let recall = try_hybrid_recall(
         store_path,
         project,
         &bm25_query,
         prompt,
         limit,
         HYBRID_TIMEOUT,
-    )
-    .unwrap_or_else(|| {
-        memory
-            .recall_bm25(project, &bm25_query, limit)
-            .unwrap_or_default()
-    });
+    );
+
+    // PRIMARY GATE (similarity). `recall_vector` ranks by cosine but returns
+    // its top-K whatever those cosines are, so rank alone can never say "none
+    // of these is relevant". The bar can.
+    let dense: Vec<rtrt_memory::MemoryRecord> = recall
+        .as_ref()
+        .map(|r| {
+            r.dense_supported()
+                .into_iter()
+                .map(|h| h.record.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // FALLBACK GATE (lexical). Reached when the dense leg abstained: no
+    // embedder / timeout, or nothing cleared the bar. Terms enriched in this
+    // project are required both of the prompt (or there is no signal to
+    // recall on) and of each hit (or the hit is not what the prompt asked
+    // about).
+    let (hits, lexical_floor) = if dense.is_empty() {
+        let candidates = match recall {
+            Some(r) => r.hits.into_iter().map(|h| h.record).collect(),
+            None => memory
+                .recall_bm25(project, &bm25_query, limit)
+                .unwrap_or_default(),
+        };
+        let t_lex = std::time::Instant::now();
+        let significant = memory
+            .significant_terms(project, prompt)
+            .unwrap_or_default();
+        if std::env::var_os("RTRT_RECALL_DEBUG").is_some() {
+            eprintln!(
+                "rtrt recall debug: lexical fallback terms={significant:?} elapsed={:?}",
+                t_lex.elapsed()
+            );
+        }
+        if significant.is_empty() {
+            return None;
+        }
+        (candidates, significant)
+    } else {
+        (dense, Vec::new())
+    };
 
     // BUG1 fix (self-recall): `hook capture user-prompt-submit` runs before
     // `hook recall` and already saved this exact prompt as a memory row, so
@@ -6564,24 +6634,26 @@ fn recall_hits_for_hook(
     // trimmed-text equality (belt and suspenders, e.g. if the row predates a
     // hashing change). BUG4 fix: also drop legacy rows that are
     // harness-injected noise (task-id/tool-use-id dumps, <task-notification>
-    // blocks) captured before PR #76 stopped saving them. BUG3 fix (hit-level
-    // defense): `recall_vector` always returns its top-K nearest embeddings
-    // regardless of how similar they actually are, so the dense-vector leg of
-    // a hybrid fetch can still smuggle in a topically unrelated row even
-    // though the whole-query gate above found real signal via a DIFFERENT
-    // term. Require every surfaced hit to literally contain at least one of
-    // the query's own distinctive terms — the same data-derived floor,
-    // applied per hit instead of once per query.
+    // blocks) captured before PR #76 stopped saving them.
     let prompt_trimmed = prompt.trim();
     let prompt_sha = MemoryStore::body_sha(prompt_trimmed);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let hits: Vec<_> = hits
         .into_iter()
         .filter(|h| h.body.trim() != prompt_trimmed && MemoryStore::body_sha(&h.body) != prompt_sha)
         .filter(|h| !is_synthetic_prompt(&h.body))
         .filter(|h| {
-            let body_lower = h.body.to_lowercase();
-            distinctive.iter().any(|t| body_lower.contains(t.as_str()))
+            // Substring, not token, containment: agglutinative languages
+            // attach particles to the stem, so a corpus token 토큰이 must
+            // still count as carrying the query term 토큰.
+            lexical_floor.is_empty() || {
+                let body_lower = h.body.to_lowercase();
+                lexical_floor
+                    .iter()
+                    .any(|t| body_lower.contains(t.as_str()))
+            }
         })
+        .filter(|h| seen.insert(MemoryStore::body_sha(h.body.trim())))
         .collect();
 
     if hits.is_empty() { None } else { Some(hits) }
@@ -7220,15 +7292,13 @@ mod hook_recall_tests {
         );
     }
 
-    /// BUG3 regression (hit-level defense): a candidate hit that matched the
-    /// BM25 OR-query only through a common, corpus-saturated term (not any
-    /// distinctive one) must be dropped even though the query as a whole
-    /// cleared the relevance floor via a DIFFERENT, genuinely rare term.
-    /// This is what stands in for `recall_vector` always returning its
-    /// top-K neighbours regardless of true similarity — the per-hit
-    /// distinctive-term check is the floor's last line of defense.
+    /// On the lexical fallback path a candidate that matched the BM25
+    /// OR-query only through a corpus-saturated term must be dropped even
+    /// though the query as a whole cleared the floor via a DIFFERENT,
+    /// genuinely project-specific term. Without the per-hit check the
+    /// fallback would surface every row sharing any word with the prompt.
     #[test]
-    fn recall_drops_hits_that_share_no_distinctive_term_with_the_prompt() {
+    fn recall_drops_hits_that_share_no_significant_term_with_the_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("memory.sqlite");
         let memory = MemoryStore::open(&store_path).unwrap();
@@ -7267,6 +7337,91 @@ mod hook_recall_tests {
         assert!(
             hits.iter().all(|h| !h.body.contains("unconnected topic")),
             "{hits:?}"
+        );
+    }
+
+    /// The same text is captured over and over across a project's life, so
+    /// both recall legs return several rows with an identical body. Injecting
+    /// the same sentence twice in one response wastes the context it was
+    /// supposed to save.
+    #[test]
+    fn recall_dedupes_identical_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("memory.sqlite");
+        let memory = MemoryStore::open(&store_path).unwrap();
+        for i in 0..20 {
+            memory
+                .save("proj", "note", &format!("project status update {i}"))
+                .unwrap();
+        }
+        // The same observation captured three separate times.
+        for _ in 0..3 {
+            memory
+                .save("proj", "note", "gateway headroom failover check failed")
+                .unwrap();
+        }
+        drop(memory);
+
+        let hits = recall_hits_for_hook("proj", &store_path, "gateway headroom failover", 10)
+            .expect("expected hits");
+        let repeated = hits
+            .iter()
+            .filter(|h| h.body.contains("failover check failed"))
+            .count();
+        assert_eq!(
+            repeated, 1,
+            "duplicate bodies must be injected once: {hits:?}"
+        );
+    }
+
+    /// BM25-fallback regression (no embedder available): the conservative
+    /// lexical floor must reject a prompt whose only corpus footprint is the
+    /// conversation that just introduced it — the ambient transcript watcher
+    /// saves the user's own prompt, so an off-topic word ALWAYS exists in the
+    /// corpus at a handful of rows by the time recall runs. A floor that
+    /// rewards rarity promotes exactly that noise; enrichment against the
+    /// rest of the store does not.
+    #[test]
+    fn recall_fallback_floor_rejects_self_contaminated_off_topic_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("memory.sqlite");
+        let memory = MemoryStore::open(&store_path).unwrap();
+        // Cross-project background: without it there is no baseline to test
+        // enrichment against.
+        for i in 0..400 {
+            memory
+                .save("other", "note", &format!("unrelated journal entry {i}"))
+                .unwrap();
+        }
+        // The project's own vocabulary — common HERE, rare everywhere else.
+        for i in 0..120 {
+            memory
+                .save("proj", "note", &format!("headroom budget review {i}"))
+                .unwrap();
+        }
+        // Three rows of one off-topic conversation, captured verbatim.
+        for i in 0..3 {
+            memory
+                .save(
+                    "proj",
+                    "user-prompt-submit",
+                    &format!("volcano question {i}"),
+                )
+                .unwrap();
+        }
+        drop(memory);
+
+        let unrelated = recall_hits_for_hook("proj", &store_path, "volcano eruption cause", 5);
+        assert!(
+            unrelated.is_none(),
+            "a word this project only saw in one captured conversation is not signal: {unrelated:?}"
+        );
+
+        let topical = recall_hits_for_hook("proj", &store_path, "how is headroom budgeted", 5)
+            .expect("project vocabulary must still recall");
+        assert!(
+            topical.iter().all(|h| h.body.contains("headroom")),
+            "{topical:?}"
         );
     }
 

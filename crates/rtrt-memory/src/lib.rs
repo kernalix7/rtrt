@@ -94,6 +94,163 @@ pub struct ScoredRecord {
     pub score: f32,
 }
 
+/// Distribution of the prompt-vs-corpus cosine similarity, measured over
+/// EVERY embedded row of the project during the same scan that produces the
+/// dense-vector ranking (so it costs nothing extra — no sampling, no cache,
+/// no precompute job).
+///
+/// This is the reference frame that turns a raw cosine into a decision: dense
+/// similarity has no absolute meaning (every model has its own scale, and an
+/// anisotropic embedding space can park an entire corpus at 0.9), so
+/// "is 0.83 relevant?" is only answerable relative to what THIS prompt scores
+/// against THIS corpus on average.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SimilarityBackground {
+    /// Mean cosine between the prompt and every embedded row of the project.
+    pub mean: f32,
+    /// Population standard deviation of that cosine.
+    pub stddev: f32,
+    /// Number of embedded rows the statistics were measured over.
+    pub population: usize,
+}
+
+impl SimilarityBackground {
+    /// Number of background standard deviations a hit must clear to count as
+    /// a genuine outlier rather than the best of `population` coin flips.
+    ///
+    /// `√(2·ln n)` is the expected maximum of `n` standard-normal draws
+    /// (the classic extreme-value / Gumbel scaling). Requiring a hit to beat
+    /// it means "more similar than the most similar row you would EXPECT to
+    /// see by chance in a corpus of this size" — so the bar rises with the
+    /// corpus instead of being a tuned constant, exactly like the `√rows`
+    /// visit budget in [`MemoryStore::recall_via_graph_scoped`].
+    pub fn outlier_sigmas(&self) -> f32 {
+        if self.population < 2 {
+            return f32::INFINITY;
+        }
+        (2.0 * (self.population as f32).ln()).sqrt()
+    }
+
+    /// Absolute cosine a hit must reach to be treated as dense-supported.
+    ///
+    /// `max(mean, null_similarity) + outlier_sigmas · stddev`.
+    ///
+    /// Two references, whichever is harsher:
+    /// - the corpus background `mean` — the ordinary case, "this row is far
+    ///   more similar to the prompt than the corpus at large";
+    /// - `null_similarity`, the prompt's similarity to its own MEANING-FREE
+    ///   twin (see [`null_probe_text`]). A row that is no more similar to the
+    ///   prompt than a text sharing all of its surface properties and none of
+    ///   its meaning was matched on surface, not on meaning. This is what
+    ///   stops an all-junk result set from promoting its own best junk: when
+    ///   the embedding model cannot resolve the prompt's language at all, the
+    ///   twin scores ~1.0 and NOTHING can clear the bar, so the caller falls
+    ///   back to the lexical floor instead of injecting confident noise.
+    pub fn bar(&self, null_similarity: Option<f32>) -> f32 {
+        let reference = match null_similarity {
+            Some(null) if null > self.mean => null,
+            _ => self.mean,
+        };
+        reference + self.outlier_sigmas() * self.stddev
+    }
+}
+
+/// One hybrid-recall hit with BOTH of its scores kept separate: the fused
+/// rank score used for ordering, and the RAW cosine similarity to the prompt
+/// used for deciding relevance.
+///
+/// Reciprocal Rank Fusion deliberately throws similarity away (it only sees
+/// ranks), which is fine for ordering and useless for gating — a top-ranked
+/// hit is top-ranked even when every candidate is unrelated. Callers that
+/// must decide whether to surface a hit at all need `similarity`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridHit {
+    pub record: MemoryRecord,
+    /// Reciprocal Rank Fusion score (ordering only — not comparable across
+    /// queries, and never a relevance measure).
+    pub score: f32,
+    /// Cosine similarity between the prompt embedding and this row's stored
+    /// embedding. `None` when the row has no embedding, i.e. it is
+    /// lexical-only evidence.
+    pub similarity: Option<f32>,
+}
+
+/// Result of a scored hybrid recall: the fused hits plus everything needed to
+/// judge them ([`SimilarityBackground`] and the meaning-free null probe).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridRecall {
+    pub hits: Vec<HybridHit>,
+    /// `None` when the project has no embedded rows (pure-lexical result).
+    pub background: Option<SimilarityBackground>,
+    /// Cosine between the prompt and its meaning-free twin, when a null probe
+    /// was requested and embedded successfully.
+    pub null_similarity: Option<f32>,
+}
+
+impl HybridRecall {
+    /// Cosine a hit must reach to count as dense-supported, or `None` when
+    /// the project has no embeddings to compare against.
+    pub fn similarity_bar(&self) -> Option<f32> {
+        self.background.map(|bg| bg.bar(self.null_similarity))
+    }
+
+    /// Hits whose similarity clears [`Self::similarity_bar`]. Empty means the
+    /// dense leg had nothing trustworthy to say about this prompt — either
+    /// genuinely nothing relevant, or an embedding space that cannot resolve
+    /// the prompt at all — and the caller should fall back to the lexical
+    /// floor rather than inject the best of a bad set.
+    pub fn dense_supported(&self) -> Vec<&HybridHit> {
+        let Some(bar) = self.similarity_bar() else {
+            return Vec::new();
+        };
+        self.hits
+            .iter()
+            .filter(|h| h.similarity.is_some_and(|s| s >= bar))
+            .collect()
+    }
+}
+
+/// Text for one hybrid recall: the FTS5 leg and the dense leg get different
+/// input on purpose (see [`MemoryStore::recall_hybrid_with`]).
+#[derive(Debug, Clone, Copy)]
+pub struct HybridQuery<'a> {
+    /// OR-joined FTS5 `MATCH` expression (see [`sanitize_fts_query`]).
+    pub bm25: &'a str,
+    /// Raw natural-language text to embed for the dense leg.
+    pub semantic: &'a str,
+    /// Optional meaning-free twin of `semantic` (see [`null_probe_text`]),
+    /// embedded alongside it to calibrate [`SimilarityBackground::bar`].
+    pub null_probe: Option<&'a str>,
+    pub limit: usize,
+}
+
+/// Builds the MEANING-FREE TWIN of `text`: the characters inside every
+/// whitespace-separated token are reversed, token order untouched.
+///
+/// The twin keeps every surface property of the original — script, length,
+/// token count, token lengths, punctuation, whitespace shape — and keeps none
+/// of its meaning. Embedding it therefore measures how much of a model's
+/// similarity comes from surface rather than semantics, FOR THIS PROMPT, with
+/// no per-language configuration and no reference corpus.
+///
+/// That matters because an embedding model can be silently blind to a
+/// language: a model whose tokenizer maps a script to unknown-token runs
+/// returns a vector that encodes only the token-shape pattern, so two
+/// unrelated sentences of the same shape embed IDENTICALLY. Such a model
+/// scores the twin at ~1.0, which pushes [`SimilarityBackground::bar`] out of
+/// reach and correctly disqualifies its own output — no model allowlist
+/// required.
+pub fn null_probe_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, token) in text.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.extend(token.chars().rev());
+    }
+    out
+}
+
 /// Full detail for a single memory row, including the pre-compression original
 /// body, the parsed metadata map, and a deterministic importance score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,8 +311,8 @@ const GRAPH_VISIT_FLOOR: usize = 64;
 /// only, lowercased, English stopwords and sub-3-*byte* tokens dropped,
 /// capped at [`FTS_MAX_TERMS`]. Shared by [`sanitize_fts_query`] (which
 /// OR-joins the result into an FTS5 `MATCH` expression) and
-/// [`MemoryStore::distinctive_terms`] (which scores each survivor by
-/// project-wide document frequency for the auto-recall relevance floor), so
+/// [`MemoryStore::significant_terms`] (which tests each survivor for
+/// statistical enrichment in one project, the auto-recall lexical floor), so
 /// both see exactly the same term set for a given prompt.
 fn fts_terms(query: &str) -> Vec<String> {
     query
@@ -167,6 +324,25 @@ fn fts_terms(query: &str) -> Vec<String> {
         .filter(|w| w.len() >= 3 && !FTS_STOPWORDS.contains(&w.as_str()))
         .take(FTS_MAX_TERMS)
         .collect()
+}
+
+/// Natural log of an upper bound on the Poisson upper tail
+/// `P(X ≥ k | λ)`, via the standard Chernoff bound
+/// `P(X ≥ k) ≤ e^{−λ} (eλ/k)^k`, i.e.
+/// `ln P ≤ −λ + k·(1 + ln λ − ln k)`.
+///
+/// Returns `0.0` (`ln 1`, "not surprising at all") whenever the bound does
+/// not apply — `k ≤ λ`, `k = 0`, or `λ ≤ 0` — so callers can compare against
+/// a significance level without special-casing. Working in log space keeps it
+/// exact for the whole range that document frequencies produce: `e^{−λ}`
+/// alone underflows to zero by `λ ≈ 750`, which a corpus-wide stopword
+/// reaches easily.
+fn ln_poisson_upper_tail(k: usize, lambda: f64) -> f64 {
+    let k = k as f64;
+    if k <= lambda || k < 1.0 || lambda <= 0.0 {
+        return 0.0;
+    }
+    -lambda + k * (1.0 + lambda.ln() - k.ln())
 }
 
 /// Sanitizes a natural-language query into a safe FTS5 `MATCH` expression.
@@ -2189,28 +2365,45 @@ impl MemoryStore {
     /// is wrapped in a quoted FTS5 phrase so punctuation-free tokens
     /// (already guaranteed by [`fts_terms`]) can never be misread as a
     /// column filter or operator. Used by
-    /// [`distinctive_terms`](Self::distinctive_terms) both for the
-    /// within-project rarity check (`project = Some(..)`) and the
-    /// cross-project enrichment baseline (`project = None`).
+    /// [`significant_terms`](Self::significant_terms) both for the observed
+    /// local count (`project = Some(..)`) and the store-wide baseline it is
+    /// tested against (`project = None`).
     fn term_doc_freq(&self, project: Option<&str>, term: &str) -> Result<usize> {
         let phrase = format!("\"{}\"", term.replace('"', ""));
-        let n: i64 = self
-            .conn
-            .query_row(
+        // The store-wide count needs no join at all — walking the posting
+        // list is the whole answer. Keeping the join in (as a
+        // `?2 IS NULL OR ...` no-op predicate) costs a `memories` lookup per
+        // matched row, which for a corpus-wide word is tens of thousands of
+        // pointless row fetches on the auto-recall hook's critical path.
+        let n: i64 = match project {
+            // Intersect against the covering `(project, id)` index instead
+            // of joining: the join plan fetches a `memories` PAGE for every
+            // posting the term has store-wide, so a word appearing in a few
+            // thousand rows costs a few thousand random reads on a cold
+            // cache. The index-only form answers from the index alone.
+            Some(project) => self.conn.query_row(
                 "SELECT COUNT(*)
-                   FROM memories_fts f
-                   JOIN memories m ON m.id = f.rowid
-                  WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.project = ?2)",
+                   FROM memories m
+                  WHERE m.project = ?2
+                    AND m.id IN (SELECT rowid FROM memories_fts
+                                  WHERE memories_fts MATCH ?1)",
                 rusqlite::params![phrase, project],
                 |row| row.get(0),
-            )
-            .map_err(|e| Error::Memory(e.to_string()))?;
+            ),
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH ?1",
+                rusqlite::params![phrase],
+                |row| row.get(0),
+            ),
+        }
+        .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(n.max(0) as usize)
     }
 
-    /// Total row count across every project. Used only by
-    /// [`distinctive_terms`](Self::distinctive_terms) as the denominator for
-    /// its cross-project enrichment baseline.
+    /// Total row count across every project. Used by
+    /// [`significant_terms`](Self::significant_terms) both as the denominator
+    /// of the cross-project baseline and as the proxy for the corpus
+    /// vocabulary size that sets the significance level.
     fn total_row_count(&self) -> Result<usize> {
         let n: i64 = self
             .conn
@@ -2219,65 +2412,63 @@ impl MemoryStore {
         Ok(n.max(0) as usize)
     }
 
-    /// Data-derived relevance floor for context injection (recall's "does
-    /// this query carry real signal for this project" gate).
+    /// Data-derived lexical relevance floor: the query terms that are
+    /// STATISTICALLY TIED to `project` rather than to language in general.
     ///
-    /// Tokenizes `query` the same way [`sanitize_fts_query`] does, then keeps
-    /// only the terms that are DISTINCTIVE, via three data-derived tests:
+    /// This is the FALLBACK gate for context injection — the primary gate is
+    /// dense-vector similarity ([`SimilarityBackground::bar`]). It decides
+    /// alone only when there is no embedder, or when the embedding space
+    /// cannot resolve the prompt (see [`null_probe_text`]), so it is tuned to
+    /// be conservative: an empty result means "inject nothing".
     ///
-    /// 1. **Within-project rarity**: the term's document frequency in
-    ///    `project` is at most `√(rows in project)` — the same
-    ///    data-scaled-cap pattern used elsewhere in this file (e.g. the graph
-    ///    walk's visit budget). Terms saturating most of the project's rows
-    ///    (common particles, generic dev-log words) never qualify no matter
-    ///    how often the prompt repeats them.
-    /// 2. **Cross-project enrichment**: when the store holds more than one
-    ///    project, rarity ALONE is not enough — a generic function word
-    ///    (e.g. a Korean conjunction) is "rare" in any one English-heavy
-    ///    project simply because most of the store is written in a
-    ///    different language, not because it is topically meaningful.
-    ///    Comparing the term's local document frequency against the count
-    ///    predicted by its GLOBAL (whole-store) frequency, scaled by this
-    ///    project's share of all rows, tells the two apart: a term used
-    ///    proportionally MORE here than store-wide is enriched — tied to
-    ///    THIS project specifically — while a term used at roughly its
-    ///    global background rate (or less) is just generic language, however
-    ///    rare it looks in isolation. Skipped for single-project stores,
-    ///    where there is no cross-project baseline to compare against.
-    ///    The bar is variance-aware, not just mean-aware: the local count
-    ///    must clear the predicted mean by at least one Poisson standard
-    ///    deviation (`expected + √expected`), not merely exceed it by any
-    ///    margin. Without this, a term whose global occurrences sit almost
-    ///    entirely in ONE project — true of most words in a minority
-    ///    language when that project is the only one substantially written
-    ///    in it — trivially "beats" its own tiny predicted mean on pure
-    ///    sampling noise (one extra occurrence is enough), regardless of
-    ///    whether it is topically meaningful.
-    /// 3. **Distinctive mass vs. prompt length**: tests 1-2 alone still leak
-    ///    on an ordinary noun (e.g. Korean 비율 "ratio", 구성 "composition")
-    ///    that recurs across several UNRELATED rows of this project's own
-    ///    text — it clears both bars honestly (locally rare, and enriched
-    ///    relative to a store where most other Korean text also happens to
-    ///    live in this one project), yet is not what the prompt is actually
-    ///    about. A single such word is weak evidence on its own; it only
-    ///    becomes trustworthy once it is A LARGE ENOUGH SHARE of the
-    ///    prompt's own content, so the required count of qualifying terms
-    ///    scales with the prompt's total content-term count via the same
-    ///    √-scaling idiom as test 1 (`⌊√terms⌋`, floored rather than
-    ///    ceiled so a short 1-3 word query — a single keyword or a two-word
-    ///    technical phrase — still only needs ONE distinctive term, same as
-    ///    before; only prompts long enough to carry substantial OTHER
-    ///    content alongside the shared word are held to a stricter bar).
+    /// **The test.** Under the null hypothesis "this term is ordinary
+    /// language, so its occurrences are spread across the store in proportion
+    /// to each project's size", the number of its rows landing in `project`
+    /// is `Binomial(df_store, project_rows / store_rows)`, i.e. approximately
+    /// `Poisson(λ)` with `λ = df_store · project_share`. A term is kept when
+    /// its observed local count `k` is too high to be that coincidence:
     ///
-    /// No test is a flat magic number: all three scale with the store's own
-    /// size and composition (or the prompt's own length), and none needs a
-    /// per-language stopword list (works identically for English, Korean, or
-    /// a mix) — deliberate, since [`STOP_WORDS`] is English/dev-verb only.
+    /// ```text
+    /// k > λ   and   family · P(X ≥ k | Poisson(λ)) < 1
+    /// ```
     ///
-    /// An empty result means the query has no distinctive term (or not
-    /// enough distinctive mass) for this project — callers should suppress
-    /// recall output entirely rather than inject generic noise.
-    pub fn distinctive_terms(&self, project: &str, query: &str) -> Result<Vec<String>> {
+    /// The tail uses the closed-form Chernoff bound
+    /// `ln P(X ≥ k) ≤ −λ + k·(1 + ln λ − ln k)` (valid for `k > λ`), computed
+    /// in log space so it is exact and stable for `λ` from `10⁻²` to `10³`
+    /// alike. Being an UPPER bound on the p-value it can only make the gate
+    /// stricter, never looser — the conservative direction.
+    ///
+    /// **Why the family correction.** Asking "is this term enriched?" of a
+    /// whole corpus is a multiple-comparison problem: with a large vocabulary
+    /// SOMETHING always looks enriched. The family is therefore the corpus's
+    /// own vocabulary, whose size is approximated by the store's row count
+    /// (measured within ~11% of the true `fts5vocab` term count on a
+    /// 165k-row store), which makes the significance level `1/vocabulary`
+    /// — derived from the store, not chosen. The verdicts are insensitive to
+    /// the approximation: on the calibration set every kept term cleared the
+    /// bar by ≥25× and every rejected term missed it by ≥38×, a three-order
+    /// -of-magnitude window around the family size.
+    ///
+    /// **Why not rarity.** The previous floor asked whether a term was RARE
+    /// in the project (document frequency below `√rows`). That is backwards
+    /// for exactly the terms recall exists to serve: a project's core
+    /// vocabulary is its most COMMON vocabulary, so `token` (96 rows) and
+    /// `dashboard` (107 rows) were rejected as "too common" while a word
+    /// typed once in one unrelated conversation was accepted as "rare and
+    /// therefore distinctive". Enrichment against the rest of the store has
+    /// neither failure: a project's own jargon is enriched however common it
+    /// is locally, and a one-off word is not enriched enough to survive the
+    /// family correction.
+    ///
+    /// **Single-project stores** have no cross-project baseline (the null and
+    /// the observation are the same number), so they fall back to the
+    /// within-corpus rarity bound `0 < df ≤ ⌈√rows⌉` — the honest answer when
+    /// the store cannot distinguish "specific to this project" from "present
+    /// at all".
+    ///
+    /// No test is a flat magic number, and none needs a per-language stopword
+    /// list — deliberate, since [`STOP_WORDS`] is English/dev-verb only.
+    pub fn significant_terms(&self, project: &str, query: &str) -> Result<Vec<String>> {
         let terms = fts_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -2286,43 +2477,37 @@ impl MemoryStore {
         if project_total == 0 {
             return Ok(Vec::new());
         }
-        let local_floor = (project_total as f64).sqrt().ceil().max(1.0) as usize;
-        let all_total = self.total_row_count()?;
-        // Cross-project enrichment only makes sense when other projects
-        // actually contribute rows; otherwise every term's "global" rate
-        // trivially equals its local rate and the check would reject
-        // everything.
+        let store_total = self.total_row_count()?;
+        // Cross-project enrichment only means something when other projects
+        // actually contribute rows; otherwise every term's store-wide rate
+        // trivially equals its local rate.
         let project_share =
-            (all_total > project_total).then(|| project_total as f64 / all_total as f64);
+            (store_total > project_total).then(|| project_total as f64 / store_total as f64);
+        // Vocabulary-scale family size: the number of terms that got a chance
+        // to look enriched. `store_total` is the cheap proxy (one indexed
+        // COUNT already needed for `project_share`); `ln` of it is all the
+        // test consumes.
+        let ln_family = (store_total.max(2) as f64).ln();
+        let rarity_ceiling = (project_total as f64).sqrt().ceil().max(1.0) as usize;
 
-        let total_terms = terms.len();
-        let mut out = Vec::with_capacity(total_terms);
+        let mut out = Vec::with_capacity(terms.len());
         for term in terms {
             let local_df = self.term_doc_freq(Some(project), &term)?;
-            if local_df == 0 || local_df > local_floor {
-                continue;
+            if local_df == 0 {
+                continue; // never mentioned here at all
             }
-            if let Some(share) = project_share {
-                let global_df = self.term_doc_freq(None, &term)?;
-                let expected_local = global_df as f64 * share;
-                // Poisson-style: the mean alone is too easy to clear by pure
-                // sampling noise (a single extra occurrence), so require the
-                // count to also clear one standard deviation above it.
-                let noise_floor = expected_local + expected_local.sqrt();
-                if (local_df as f64) <= noise_floor {
-                    continue; // within sampling noise of the store-wide baseline
+            let Some(share) = project_share else {
+                // Degenerate single-project store: fall back to rarity.
+                if local_df <= rarity_ceiling {
+                    out.push(term);
                 }
+                continue;
+            };
+            let store_df = self.term_doc_freq(None, &term)?;
+            let lambda = store_df as f64 * share;
+            if ln_poisson_upper_tail(local_df, lambda) + ln_family < 0.0 {
+                out.push(term);
             }
-            out.push(term);
-        }
-
-        // Test 3: require the qualifying-term count to be a data-scaled
-        // share of the prompt's own content-term count (see doc comment).
-        // Purely arithmetic on values already in hand — no extra queries,
-        // so this never adds latency to the hook path.
-        let required_mass = (total_terms as f64).sqrt().floor().max(1.0) as usize;
-        if out.len() < required_mass {
-            return Ok(Vec::new());
         }
         Ok(out)
     }
@@ -2337,7 +2522,43 @@ impl MemoryStore {
         limit: usize,
         embedder: &dyn Embedder,
     ) -> Result<Vec<ScoredRecord>> {
+        Ok(self
+            .recall_vector_scored(project, query, limit, embedder)?
+            .0)
+    }
+
+    /// [`recall_vector`](Self::recall_vector) that also reports the
+    /// [`SimilarityBackground`] — the mean and standard deviation of the
+    /// prompt-vs-row cosine over EVERY embedded row of the project.
+    ///
+    /// The statistics are a by-product of the scan the ranking already
+    /// performs (every row is scored to find the top `limit`), so they are
+    /// free: no sampling, no cached table, no background job. Without them a
+    /// bare cosine cannot be judged — the top hit of a corpus that contains
+    /// nothing relevant still scores whatever the model's floor happens to be.
+    pub fn recall_vector_scored(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+        embedder: &dyn Embedder,
+    ) -> Result<(Vec<ScoredRecord>, SimilarityBackground)> {
         let q = embedder.embed_one(query)?;
+        self.rank_by_vector(project, &q, limit)
+    }
+
+    /// Cosine-ranks every embedded row of `project` against an ALREADY
+    /// EMBEDDED query vector, returning the top `limit` plus the background
+    /// statistics over the full population. Split out from
+    /// [`recall_vector_scored`](Self::recall_vector_scored) so a caller that
+    /// embeds several texts in one round-trip (the hybrid path embeds the
+    /// prompt and its null probe together) does not pay for a second embed.
+    fn rank_by_vector(
+        &self,
+        project: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<(Vec<ScoredRecord>, SimilarityBackground)> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2363,19 +2584,41 @@ impl MemoryStore {
             })
             .map_err(|e| Error::Memory(e.to_string()))?;
         let mut scored: Vec<ScoredRecord> = Vec::new();
+        // Accumulate in f64: a 100k-row corpus sums enough f32 cosines for
+        // the naive variance to lose its leading digits.
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
         for row in rows {
             let (record, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
             let v = vector_from_blob(&blob)?;
-            let score = cosine(&q, &v);
+            let score = cosine(query_vector, &v);
+            sum += score as f64;
+            sum_sq += (score as f64) * (score as f64);
             scored.push(ScoredRecord { record, score });
         }
+        let population = scored.len();
+        let background = if population == 0 {
+            SimilarityBackground {
+                mean: 0.0,
+                stddev: 0.0,
+                population: 0,
+            }
+        } else {
+            let n = population as f64;
+            let mean = sum / n;
+            SimilarityBackground {
+                mean: mean as f32,
+                stddev: (sum_sq / n - mean * mean).max(0.0).sqrt() as f32,
+                population,
+            }
+        };
         scored.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(limit);
-        Ok(scored)
+        Ok((scored, background))
     }
 
     /// Lists every memory in `project`, oldest first. Used by compression.
@@ -4819,40 +5062,115 @@ impl MemoryStore {
         limit: usize,
         embedder: &dyn Embedder,
     ) -> Result<Vec<ScoredRecord>> {
+        let recall = self.recall_hybrid_scored(
+            project,
+            HybridQuery {
+                bm25: bm25_query,
+                semantic: semantic_text,
+                null_probe: None,
+                limit,
+            },
+            embedder,
+        )?;
+        Ok(recall
+            .hits
+            .into_iter()
+            .map(|h| ScoredRecord {
+                record: h.record,
+                score: h.score,
+            })
+            .collect())
+    }
+
+    /// [`recall_hybrid_with`](Self::recall_hybrid_with) that KEEPS the dense
+    /// similarity instead of dissolving it into the fusion.
+    ///
+    /// Reciprocal Rank Fusion is a rank statistic: it answers "which of these
+    /// candidates is best" and is structurally incapable of answering "is any
+    /// of them relevant at all", because the top-ranked hit of an entirely
+    /// unrelated result set still ranks first. Every returned [`HybridHit`]
+    /// therefore carries its raw cosine to the prompt, and the result carries
+    /// the [`SimilarityBackground`] those cosines must be read against, so a
+    /// caller that has to decide whether to surface anything (context
+    /// injection) can — see [`HybridRecall::dense_supported`].
+    ///
+    /// When [`HybridQuery::null_probe`] is set it is embedded in the SAME
+    /// round-trip as the prompt (one `embed` call, two texts) and its cosine
+    /// to the prompt is returned as `null_similarity`.
+    pub fn recall_hybrid_scored(
+        &self,
+        project: &str,
+        query: HybridQuery<'_>,
+        embedder: &dyn Embedder,
+    ) -> Result<HybridRecall> {
+        let limit = query.limit;
         let fetch = limit.saturating_mul(2).max(limit);
-        let bm25 = self.recall_bm25(project, bm25_query, fetch)?;
-        let vector = self.recall_vector(project, semantic_text, fetch, embedder)?;
+
+        // One embed call for both texts: the null probe must not double the
+        // hook's latency budget.
+        let texts: Vec<&str> = match query.null_probe {
+            Some(probe) => vec![query.semantic, probe],
+            None => vec![query.semantic],
+        };
+        let mut vectors = embedder.embed(&texts)?;
+        if vectors.is_empty() {
+            return Err(Error::Memory("embedder returned no vector".into()));
+        }
+        let probe_vector = (vectors.len() > 1).then(|| vectors.remove(1));
+        let query_vector = vectors.remove(0);
+        let null_similarity = probe_vector
+            .as_deref()
+            .map(|probe| cosine(&query_vector, probe));
+
+        let bm25 = self.recall_bm25(project, query.bm25, fetch)?;
+        let (vector, background) = self.rank_by_vector(project, &query_vector, fetch)?;
 
         let rrf_k = 60.0f32;
-        let mut fused: std::collections::HashMap<i64, ScoredRecord> =
-            std::collections::HashMap::new();
+        let mut fused: std::collections::HashMap<i64, HybridHit> = std::collections::HashMap::new();
 
         for (rank, record) in bm25.into_iter().enumerate() {
             let score = 1.0 / (rrf_k + (rank + 1) as f32);
             fused
                 .entry(record.id)
-                .and_modify(|sr| sr.score += score)
-                .or_insert(ScoredRecord { record, score });
+                .and_modify(|hit| hit.score += score)
+                .or_insert(HybridHit {
+                    record,
+                    score,
+                    similarity: None,
+                });
         }
         for (rank, scored) in vector.into_iter().enumerate() {
             let score = 1.0 / (rrf_k + (rank + 1) as f32);
+            let similarity = Some(scored.score);
             fused
                 .entry(scored.record.id)
-                .and_modify(|sr| sr.score += score)
-                .or_insert(ScoredRecord {
+                .and_modify(|hit| {
+                    hit.score += score;
+                    hit.similarity = similarity;
+                })
+                .or_insert(HybridHit {
                     record: scored.record,
                     score,
+                    similarity,
                 });
         }
 
-        let mut out: Vec<ScoredRecord> = fused.into_values().collect();
-        out.sort_by(|a, b| {
+        let mut hits: Vec<HybridHit> = fused.into_values().collect();
+        hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic tie-break: RRF ties are the norm when each
+                // leg contributes a disjoint top-K.
+                .then_with(|| b.record.id.cmp(&a.record.id))
         });
-        out.truncate(limit);
-        Ok(out)
+        hits.truncate(limit);
+
+        Ok(HybridRecall {
+            hits,
+            background: (background.population > 0).then_some(background),
+            null_similarity,
+        })
     }
 
     /// Build an Obsidian-style "digital brain" [`ConceptGraph`] — nodes are
@@ -6309,6 +6627,204 @@ mod tests {
         v
     }
 
+    /// Mock embedder with a real topic axis: a body's vector is decided by the
+    /// topic marker it carries, plus a deterministic per-text jitter so the
+    /// corpus has a non-degenerate similarity distribution to calibrate
+    /// against (a constant background would have zero variance and no bar).
+    struct TopicEmbedder;
+
+    impl TopicEmbedder {
+        fn axis(text: &str) -> Vec<f32> {
+            let lower = text.to_lowercase();
+            let mut v = vec![0.0f32; 4];
+            if lower.contains("alpha") {
+                v[0] = 1.0;
+            }
+            if lower.contains("bravo") {
+                v[1] = 1.0;
+            }
+            if lower.contains("charlie") {
+                v[2] = 1.0;
+            }
+            // Jitter on the unused axis: deterministic in the text, tiny
+            // relative to the topic signal, enough to give the background a
+            // spread.
+            let jitter = text.bytes().map(|b| b as u32).sum::<u32>() % 17;
+            v[3] = 0.01 * jitter as f32;
+            if v.iter().all(|x| *x == 0.0) {
+                v[3] = 1.0;
+            }
+            v
+        }
+    }
+
+    impl Embedder for TopicEmbedder {
+        fn dimension(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "test-topic"
+        }
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| Self::axis(t)).collect())
+        }
+    }
+
+    /// Embedder that is BLIND to content: every text of the same token shape
+    /// gets the same vector. This is not a strawman — a production model whose
+    /// tokenizer does not cover a script behaves exactly this way, returning
+    /// bit-identical vectors for unrelated sentences of equal shape and
+    /// reporting them as ~0.9 matches.
+    struct ShapeOnlyEmbedder;
+
+    impl Embedder for ShapeOnlyEmbedder {
+        fn dimension(&self) -> usize {
+            4
+        }
+        fn model_name(&self) -> &str {
+            "test-shape-only"
+        }
+        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let tokens = t.split_whitespace().count() as f32;
+                    let chars = t.chars().filter(|c| !c.is_whitespace()).count() as f32;
+                    vec![tokens, chars, 1.0, 0.5]
+                })
+                .collect())
+        }
+    }
+
+    fn seed_topic_corpus(store: &MemoryStore, embedder: &dyn Embedder) {
+        for i in 0..60 {
+            store
+                .save_embedded("p1", "note", &format!("bravo routine note {i}"), embedder)
+                .unwrap();
+        }
+    }
+
+    fn hybrid(store: &MemoryStore, prompt: &str, embedder: &dyn Embedder) -> HybridRecall {
+        let bm25 = sanitize_fts_query(prompt).unwrap_or_else(|| prompt.to_string());
+        let probe = null_probe_text(prompt);
+        store
+            .recall_hybrid_scored(
+                "p1",
+                HybridQuery {
+                    bm25: &bm25,
+                    semantic: prompt,
+                    null_probe: Some(&probe),
+                    limit: 5,
+                },
+                embedder,
+            )
+            .unwrap()
+    }
+
+    /// (a) A hit whose vector is near the query clears the bar.
+    #[test]
+    fn dense_gate_admits_a_hit_near_the_query_vector() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = TopicEmbedder;
+        seed_topic_corpus(&store, &embedder);
+        store
+            .save_embedded("p1", "note", "alpha retention policy design", &embedder)
+            .unwrap();
+
+        let recall = hybrid(&store, "how does alpha retention work", &embedder);
+        let supported = recall.dense_supported();
+        assert!(
+            supported
+                .iter()
+                .any(|h| h.record.body.contains("alpha retention")),
+            "the semantically near row must be dense-supported: bar={:?} hits={:?}",
+            recall.similarity_bar(),
+            recall.hits,
+        );
+    }
+
+    /// (b) A hit that SHARES SURFACE TOKENS with the query but sits far away
+    /// in vector space is rejected. Lexical overlap is exactly what the old
+    /// floor trusted; similarity must overrule it.
+    #[test]
+    fn dense_gate_rejects_a_far_hit_that_shares_surface_tokens() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = TopicEmbedder;
+        seed_topic_corpus(&store, &embedder);
+        store
+            .save_embedded("p1", "note", "alpha retention policy design", &embedder)
+            .unwrap();
+        // Same words as the query ("retention", "policy"), different topic.
+        store
+            .save_embedded("p1", "note", "bravo retention policy design", &embedder)
+            .unwrap();
+
+        let recall = hybrid(&store, "alpha retention policy", &embedder);
+        let supported = recall.dense_supported();
+        assert!(
+            supported
+                .iter()
+                .all(|h| !h.record.body.starts_with("bravo")),
+            "a token-sharing but semantically distant row must be rejected: {supported:?}"
+        );
+        assert!(
+            supported.iter().any(|h| h.record.body.starts_with("alpha")),
+            "...while the near row still passes: {supported:?}"
+        );
+    }
+
+    /// (c) When every candidate is far, NOTHING is dense-supported — the
+    /// fusion still ranks them, but rank is not relevance.
+    #[test]
+    fn dense_gate_admits_nothing_when_every_candidate_is_far() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = TopicEmbedder;
+        seed_topic_corpus(&store, &embedder);
+
+        let recall = hybrid(&store, "charlie migration rollout note", &embedder);
+        assert!(
+            !recall.hits.is_empty(),
+            "the fusion still returns its top-K — that is the point"
+        );
+        assert!(
+            recall.dense_supported().is_empty(),
+            "no candidate may be promoted from an all-unrelated set: bar={:?} hits={:?}",
+            recall.similarity_bar(),
+            recall.hits,
+        );
+    }
+
+    /// The null probe disqualifies an embedder that cannot resolve content:
+    /// when the prompt's meaning-free twin scores as high as any row, the bar
+    /// moves out of reach and the dense verdict is withheld rather than
+    /// reported as a confident match.
+    #[test]
+    fn dense_gate_withholds_judgement_when_the_model_only_sees_shape() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let embedder = ShapeOnlyEmbedder;
+        for i in 0..60 {
+            store
+                .save_embedded(
+                    "p1",
+                    "note",
+                    &format!("bravo routine note{i:02}"),
+                    &embedder,
+                )
+                .unwrap();
+        }
+        let recall = hybrid(&store, "alpha retention policy tuning", &embedder);
+        let null = recall.null_similarity.expect("probe embedded");
+        assert!(
+            null > 0.99,
+            "a shape-only model scores the meaning-free twin as itself: {null}"
+        );
+        assert!(
+            recall.dense_supported().is_empty(),
+            "a blind model must not get to vote: bar={:?}",
+            recall.similarity_bar()
+        );
+    }
+
     #[test]
     fn save_embedded_and_recall_vector() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -6656,205 +7172,203 @@ mod tests {
         );
     }
 
-    /// BUG3 regression: [`MemoryStore::distinctive_terms`] is the relevance
-    /// floor's data source. A query built only from terms that saturate the
-    /// project (near every row contains them) has no distinctive term —
-    /// callers use that to suppress recall entirely. A query naming a term
-    /// that appears in only a handful of rows keeps that term.
-    #[test]
-    fn distinctive_terms_gates_on_corpus_wide_document_frequency() {
-        let store = MemoryStore::open_in_memory().unwrap();
-        // 20 rows all share the common word "project"; only one mentions the
-        // specific technical term "headroom".
-        for i in 0..20 {
+    /// Seeds a two-project store so `significant_terms` has the
+    /// cross-project baseline its enrichment test needs: `p1` is the small
+    /// project under test, `other` supplies the store-wide background.
+    fn seed_enrichment_store(store: &MemoryStore, p1_rows: usize, other_rows: usize) {
+        for i in 0..p1_rows {
             store
-                .save("p1", "note", &format!("project status update {i}"))
+                .save("p1", "note", &format!("routine build log entry {i}"))
                 .unwrap();
         }
-        store
-            .save("p1", "note", "gateway router headroom failover design")
-            .unwrap();
+        for i in 0..other_rows {
+            store
+                .save(
+                    "other",
+                    "note",
+                    &format!("unrelated project journal entry {i}"),
+                )
+                .unwrap();
+        }
+    }
 
-        // "project" appears in 20/21 rows — far above √21 ≈ 5 — no signal.
-        let noise = store.distinctive_terms("p1", "project status").unwrap();
-        assert!(noise.is_empty(), "{noise:?}");
-
-        // "headroom"/"failover" appear in exactly 1/21 rows — well under the
-        // √21 floor — genuinely distinctive.
-        let signal = store
-            .distinctive_terms("p1", "headroom failover behaviour")
+    /// The lexical floor keeps a project's OWN vocabulary however common it
+    /// is locally — the failure that made the previous rarity-based floor
+    /// reject `token` and `dashboard` in a project about tokens and
+    /// dashboards, injecting nothing for its most on-topic questions.
+    #[test]
+    fn significant_terms_keeps_frequent_project_vocabulary() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        seed_enrichment_store(&store, 0, 400);
+        // "headroom" appears in a LARGE share of p1 and almost nowhere else:
+        // core project vocabulary, the opposite of rare.
+        for i in 0..120 {
+            store
+                .save("p1", "note", &format!("headroom budget review {i}"))
+                .unwrap();
+        }
+        let terms = store
+            .significant_terms("p1", "how is headroom budgeted")
             .unwrap();
         assert!(
-            signal.iter().any(|t| t == "headroom" || t == "failover"),
-            "{signal:?}"
+            terms.iter().any(|t| t == "headroom"),
+            "a project's own high-frequency vocabulary must qualify: {terms:?}"
         );
     }
 
-    /// Regression: a generic function word can look "rare" in one project's
-    /// rows purely because that project is written in a different language
-    /// than the rest of the store — NOT because it is topically meaningful.
-    /// Cross-project enrichment must reject it (it appears at roughly its
-    /// global background rate, not more), while a term that is genuinely
-    /// concentrated in this project (used far more here than its global rate
-    /// predicts) must still pass.
+    /// A word that is ordinary language store-wide must NOT qualify just
+    /// because this project also uses it — the false-positive half of the
+    /// bug. `journal` is used at the same rate everywhere, so its local count
+    /// is exactly what proportional spreading predicts.
     #[test]
-    fn distinctive_terms_rejects_rare_but_unenriched_terms_across_projects() {
+    fn significant_terms_rejects_store_wide_ordinary_language() {
         let store = MemoryStore::open_in_memory().unwrap();
-        // "other" is a large, mostly-English corpus (like the rest of a real
-        // multi-project store) where the generic connector "however" shows up
-        // at a steady background rate.
-        for i in 0..200 {
-            let body = if i % 5 == 0 {
-                format!("status update {i} however things continue")
-            } else {
-                format!("status update {i}")
-            };
-            store.save("other", "note", &body).unwrap();
-        }
-        // "p1" is small and only a few of its rows happen to use "however"
-        // too — proportionally right in line with (not above) the global
-        // rate, so it is NOT enriched here even though its raw count is low.
-        store
-            .save("p1", "note", "reviewed the plan however nothing changed")
-            .unwrap();
-        for i in 0..5 {
+        seed_enrichment_store(&store, 0, 400);
+        for i in 0..40 {
             store
-                .save("p1", "note", &format!("note {i} about the project"))
+                .save("p1", "note", &format!("journal entry recorded {i}"))
                 .unwrap();
         }
-        // "headroom" appears ONLY in p1 — genuinely concentrated here.
-        store
-            .save("p1", "note", "gateway router headroom failover design")
-            .unwrap();
-
-        let generic = store.distinctive_terms("p1", "however").unwrap();
+        let terms = store.significant_terms("p1", "journal entry").unwrap();
         assert!(
-            generic.is_empty(),
-            "a term at its global background rate must not count as distinctive: {generic:?}"
+            terms.is_empty(),
+            "language used at its store-wide rate carries no project signal: {terms:?}"
         );
-
-        let genuine = store.distinctive_terms("p1", "headroom").unwrap();
-        assert_eq!(genuine, vec!["headroom".to_string()], "{genuine:?}");
     }
 
-    /// FIX (relevance-floor leak on ordinary nouns), variance-aware
-    /// refinement: the enrichment test above only required the local count
-    /// to exceed the raw predicted MEAN — for a term whose global
-    /// occurrences sit almost entirely in one project (true of most words
-    /// in a minority language when that project is the only one
-    /// substantially written in it), a single extra occurrence is enough
-    /// to "beat" a tiny predicted mean, which is sampling noise, not real
-    /// topical enrichment. The count must also clear one Poisson standard
-    /// deviation above the mean.
+    /// A word typed once, in one conversation, is not project vocabulary —
+    /// however "rare" it looks. This is the self-contamination case: the
+    /// ambient transcript watcher stores the user's own prompt, so an
+    /// off-topic word is guaranteed to exist in the corpus at df 1-3 by the
+    /// time recall runs, and a rarity-based floor promotes exactly that.
     #[test]
-    fn distinctive_terms_requires_enrichment_beyond_sampling_noise() {
+    fn significant_terms_rejects_one_off_words_from_a_single_conversation() {
         let store = MemoryStore::open_in_memory().unwrap();
-        // "other" is a large background corpus where "gamma" shows up at a
-        // steady rate (18/100 rows).
-        for i in 0..100 {
-            let body = if i < 18 {
-                format!("status update {i} gamma noted")
-            } else {
-                format!("status update {i}")
-            };
-            store.save("other", "note", &body).unwrap();
-        }
-        // p1 (25 rows total): "gamma" appears in 5 of them — proportionally
-        // a bit ABOVE the raw background rate (predicted mean ≈ 4.6), but
-        // within one standard deviation of it: sampling noise, not real
-        // enrichment.
-        for i in 0..5 {
+        seed_enrichment_store(&store, 0, 400);
+        for i in 0..120 {
             store
-                .save("p1", "note", &format!("gamma repeated note {i}"))
+                .save("p1", "note", &format!("headroom budget review {i}"))
                 .unwrap();
         }
-        // "epsilon" appears ONLY in p1 (5/25 rows), nowhere in "other" —
-        // heavily concentrated, nowhere near its (tiny) background rate.
-        for i in 0..5 {
+        // Three rows of one off-topic conversation, captured verbatim.
+        for i in 0..3 {
             store
-                .save("p1", "note", &format!("epsilon feature {i}"))
+                .save("p1", "user-prompt-submit", &format!("volcano question {i}"))
                 .unwrap();
         }
-        for i in 0..15 {
-            store
-                .save("p1", "note", &format!("padding row {i}"))
-                .unwrap();
-        }
-
-        let noise = store.distinctive_terms("p1", "gamma").unwrap();
+        let terms = store
+            .significant_terms("p1", "volcano eruption cause")
+            .unwrap();
         assert!(
-            noise.is_empty(),
-            "an excess over the raw mean that is within one std-dev of it is \
-             sampling noise, not real enrichment: {noise:?}"
+            terms.is_empty(),
+            "a word seen only in one captured conversation is not project vocabulary: {terms:?}"
         );
-
-        let genuine = store.distinctive_terms("p1", "epsilon").unwrap();
-        assert_eq!(genuine, vec!["epsilon".to_string()], "{genuine:?}");
     }
 
-    /// FIX (relevance-floor leak on ordinary nouns): "ratio" recurs across
-    /// several UNRELATED rows of this project's own text — a compression
-    /// note, a logging note, a UI note — so it clears both the rarity and
-    /// enrichment bars honestly (it really is locally rare and locally
-    /// concentrated), yet no single one of those rows is "about" ratios.
-    /// A long prompt that shares ONLY that one coincidental noun with the
-    /// project — every other word alien to the store — must not pass. The
-    /// SAME word alone, as a short keyword-style query, must still pass:
-    /// the tightened floor scales with prompt length, it does not ban any
-    /// term outright.
+    /// Single-project stores have no cross-project baseline to test against
+    /// (the observation and the null are the same number), so they fall back
+    /// to the within-corpus rarity bound rather than qualifying everything.
     #[test]
-    fn distinctive_terms_requires_more_mass_for_longer_diluted_prompts() {
+    fn significant_terms_falls_back_to_rarity_without_a_cross_project_baseline() {
         let store = MemoryStore::open_in_memory().unwrap();
-        // "ratio" shows up in three unrelated snippets — a generic noun,
-        // not a topic this project is about.
-        store
-            .save("p1", "note", "compression ratio tuning notes")
-            .unwrap();
-        store
-            .save("p1", "note", "signal to noise ratio in the logs")
-            .unwrap();
-        store
-            .save("p1", "note", "aspect ratio for the dashboard chart")
-            .unwrap();
-        // Padding so the project isn't trivially small (keeps the √rows
-        // rarity floor meaningful rather than admitting everything).
-        for i in 0..20 {
+        for i in 0..40 {
             store
-                .save("p1", "note", &format!("routine status entry {i}"))
+                .save("solo", "note", &format!("project status update {i}"))
                 .unwrap();
         }
-        // A genuinely project-specific multi-word topic.
         store
-            .save("p1", "note", "gateway proxy filter pipeline design")
+            .save("solo", "note", "gateway headroom failover design")
             .unwrap();
 
-        // Long prompt sharing ONLY "ratio" with the project — every other
-        // word (salting/cabbage/brine/percentage/kimchi) has zero document
-        // frequency anywhere in the store.
-        let diluted = store
-            .distinctive_terms("p1", "salting cabbage brine ratio percentage kimchi")
+        let rare = store
+            .significant_terms("solo", "headroom failover")
             .unwrap();
         assert!(
-            diluted.is_empty(),
-            "one coincidental generic-noun match diluted across a long, otherwise \
-             alien prompt must not clear the floor: {diluted:?}"
+            rare.iter().any(|t| t == "headroom"),
+            "a rare term must survive the single-project fallback: {rare:?}"
         );
-
-        // The same word as a short, keyword-style query still counts as
-        // real signal — short queries are not held to the multi-term bar.
-        let short = store.distinctive_terms("p1", "ratio").unwrap();
-        assert_eq!(short, vec!["ratio".to_string()], "{short:?}");
-
-        // A prompt carrying real distinctive mass (several project-specific
-        // words, not just one) still clears the floor — the tightened rule
-        // must not regress genuine topical overlap.
-        let genuine = store
-            .distinctive_terms("p1", "how does the gateway proxy filter pipeline work")
-            .unwrap();
+        let saturated = store.significant_terms("solo", "status update").unwrap();
         assert!(
-            genuine.len() >= 2,
-            "a genuinely on-topic multi-word prompt must clear the floor: {genuine:?}"
+            saturated.is_empty(),
+            "corpus-saturated terms must not survive it: {saturated:?}"
         );
+    }
+
+    /// The Chernoff bound underpinning the floor must stay finite and
+    /// correctly signed across the whole document-frequency range, including
+    /// `λ` large enough that `e^{-λ}` alone underflows to zero.
+    #[test]
+    fn poisson_upper_tail_is_stable_across_the_document_frequency_range() {
+        // Not surprising: k at or below the mean, or degenerate inputs.
+        assert_eq!(ln_poisson_upper_tail(0, 5.0), 0.0);
+        assert_eq!(ln_poisson_upper_tail(3, 5.0), 0.0);
+        assert_eq!(ln_poisson_upper_tail(5, 0.0), 0.0);
+        // Mildly surprising stays a small negative log-probability.
+        let mild = ln_poisson_upper_tail(10, 5.0);
+        assert!(mild < 0.0 && mild > -10.0, "{mild}");
+        // Wildly surprising is a large negative one — and finite.
+        let strong = ln_poisson_upper_tail(120, 5.0);
+        assert!(strong.is_finite() && strong < -200.0, "{strong}");
+        // λ past the point where exp(-λ) underflows in f64.
+        let huge = ln_poisson_upper_tail(2000, 800.0);
+        assert!(huge.is_finite() && huge < 0.0, "{huge}");
+        // Monotone in k for fixed λ.
+        assert!(ln_poisson_upper_tail(30, 5.0) < ln_poisson_upper_tail(20, 5.0));
+    }
+
+    /// The meaning-free twin must preserve every surface property of the text
+    /// (token count, token lengths, script) while destroying word identity —
+    /// that is the whole basis of the null probe.
+    #[test]
+    fn null_probe_preserves_shape_and_destroys_words() {
+        let twin = null_probe_text("dashboard bearer token guard");
+        assert_eq!(twin, "draobhsad reraeb nekot draug");
+        let src = "대시보드 인증 토큰 가드";
+        let twin_ko = null_probe_text(src);
+        assert_ne!(twin_ko, src);
+        assert_eq!(
+            twin_ko
+                .split_whitespace()
+                .map(|t| t.chars().count())
+                .collect::<Vec<_>>(),
+            src.split_whitespace()
+                .map(|t| t.chars().count())
+                .collect::<Vec<_>>(),
+        );
+        // Whitespace shape is normalised, not multiplied.
+        assert_eq!(null_probe_text("  a  bc  "), "a cb");
+        assert_eq!(null_probe_text(""), "");
+    }
+
+    /// The similarity bar must rise with BOTH references: the corpus mean and
+    /// the meaning-free null. A null probe that scores near 1.0 — what an
+    /// embedding model returns when it cannot resolve the prompt's script at
+    /// all — must push the bar out of reach so no hit is dense-supported.
+    #[test]
+    fn similarity_bar_tracks_corpus_and_null_references() {
+        let bg = SimilarityBackground {
+            mean: 0.45,
+            stddev: 0.07,
+            population: 6561,
+        };
+        let sigmas = bg.outlier_sigmas();
+        assert!((sigmas - (2.0f32 * 6561.0f32.ln()).sqrt()).abs() < 1e-5);
+        // No null probe: bar is the corpus outlier bar.
+        let plain = bg.bar(None);
+        assert!((plain - (0.45 + sigmas * 0.07)).abs() < 1e-5, "{plain}");
+        // A null below the mean cannot lower the bar.
+        assert!((bg.bar(Some(0.1)) - plain).abs() < 1e-5);
+        // A degenerate model (twin ~ identical) puts the bar past cosine's
+        // own maximum, so nothing can ever be dense-supported.
+        assert!(bg.bar(Some(0.99)) > 1.0);
+        // Too small a population to have a distribution at all.
+        let tiny = SimilarityBackground {
+            mean: 0.5,
+            stddev: 0.1,
+            population: 1,
+        };
+        assert!(tiny.outlier_sigmas().is_infinite());
+        assert!(tiny.bar(None).is_infinite());
     }
 
     #[cfg(feature = "ollama-embed")]

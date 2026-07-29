@@ -31,7 +31,7 @@ pub trait Embedder: Send + Sync {
     not(any(feature = "ollama-embed", feature = "embeddings", test)),
     allow(dead_code)
 )]
-pub(crate) const EMBED_CHAR_CAP: usize = 2000;
+pub const EMBED_CHAR_CAP: usize = 2000;
 
 /// Returns `text` capped to the first [`EMBED_CHAR_CAP`] chars. Cheap no-op when
 /// the text is already short (borrows instead of allocating).
@@ -39,7 +39,7 @@ pub(crate) const EMBED_CHAR_CAP: usize = 2000;
     not(any(feature = "ollama-embed", feature = "embeddings", test)),
     allow(dead_code)
 )]
-pub(crate) fn truncate_for_embed(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn truncate_for_embed(text: &str) -> std::borrow::Cow<'_, str> {
     if text.chars().count() <= EMBED_CHAR_CAP {
         std::borrow::Cow::Borrowed(text)
     } else {

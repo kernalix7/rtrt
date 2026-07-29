@@ -639,12 +639,21 @@ impl Config {
 /// `.git` or `.rtrt` entry. Returns `None` when `start` is not inside a repo,
 /// so callers fall back to the plain global config.
 pub fn repo_root_from(start: &Path) -> Option<PathBuf> {
-    let mut cur = Some(start);
-    while let Some(dir) = cur {
+    repo_root_in(std::iter::successors(Some(start), |dir| dir.parent()))
+}
+
+/// Core walk, parameterised over the ancestor sequence to examine.
+///
+/// Production always calls this with the *full*, unbounded ancestor chain of
+/// `start` (a real `.git`/`.rtrt` anywhere above `start` legitimately wins).
+/// Tests call it with a bounded, fixture-scoped ancestor list so their
+/// assertions don't depend on what markers happen to exist above the system
+/// temp dir on the machine running them.
+fn repo_root_in<'a>(ancestors: impl Iterator<Item = &'a Path>) -> Option<PathBuf> {
+    for dir in ancestors {
         if dir.join(".git").exists() || dir.join(".rtrt").exists() {
             return Some(dir.to_path_buf());
         }
-        cur = dir.parent();
     }
     None
 }
@@ -889,9 +898,31 @@ mod tests {
         ));
         let nested = root.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(repo_root_from(&nested), None);
+
+        // `repo_root_from` walks all the way to the filesystem root, so a
+        // stray `.git`/`.rtrt` above the system temp dir (this machine has
+        // one at `/tmp/.git`) would legitimately win and make the "no
+        // marker yet" assertion depend on the environment. Bound the
+        // ancestor walk to the fixture itself so the test only ever
+        // inspects directories it created.
+        let bounded_ancestors = || {
+            let v: Vec<&Path> = std::iter::successors(Some(nested.as_path()), |d| d.parent())
+                .take_while(|d| d.starts_with(&root))
+                .collect();
+            v
+        };
+        assert_eq!(repo_root_in(bounded_ancestors().into_iter()), None);
         std::fs::create_dir_all(root.join(".rtrt")).unwrap();
+        assert_eq!(
+            repo_root_in(bounded_ancestors().into_iter()),
+            Some(root.clone())
+        );
+
+        // The unbounded production entry point still finds the marker we
+        // just created (real markers above `root`, if any, are shadowed by
+        // it since it's closer).
         assert_eq!(repo_root_from(&nested), Some(root.clone()));
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 

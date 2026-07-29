@@ -31,8 +31,18 @@ use std::path::Path;
 /// Never panics. Any IO or parse error falls back to the cwd basename.
 pub fn project_for_cwd(cwd: &Path) -> String {
     let start = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    project_for_ancestors(&start, start.ancestors())
+}
 
-    for ancestor in start.ancestors() {
+/// Core walk, parameterised over the ancestor sequence to examine.
+///
+/// Production always calls this with the *full*, unbounded `start.ancestors()`
+/// (root markers anywhere above `start` legitimately win — see module docs).
+/// Tests call it with a bounded, fixture-scoped ancestor list so their
+/// assertions don't depend on what markers happen to exist above the system
+/// temp dir on the machine running them.
+fn project_for_ancestors<'a>(start: &Path, ancestors: impl Iterator<Item = &'a Path>) -> String {
+    for ancestor in ancestors {
         let dot_git = ancestor.join(".git");
         let meta = match std::fs::symlink_metadata(&dot_git) {
             Ok(m) => m,
@@ -41,7 +51,7 @@ pub fn project_for_cwd(cwd: &Path) -> String {
 
         if meta.is_dir() {
             // Normal repo: this ancestor is the root.
-            return basename(ancestor).unwrap_or_else(|| basename_or_empty(&start));
+            return basename(ancestor).unwrap_or_else(|| basename_or_empty(start));
         }
 
         if meta.is_file() {
@@ -53,12 +63,12 @@ pub fn project_for_cwd(cwd: &Path) -> String {
             }
             // Worktree pointer was unreadable/unparsable: this ancestor still
             // belongs to *some* repo, so prefer its basename over digging higher.
-            return basename(ancestor).unwrap_or_else(|| basename_or_empty(&start));
+            return basename(ancestor).unwrap_or_else(|| basename_or_empty(start));
         }
     }
 
-    // No `.git` anywhere up the tree — original fallback behaviour.
-    basename_or_empty(&start)
+    // No `.git` found within the examined ancestors — fall back to basename.
+    basename_or_empty(start)
 }
 
 /// Convenience wrapper over [`project_for_cwd`] taking a string path.
@@ -187,7 +197,21 @@ mod tests {
         let plain = tmp.path().join("lonely").join("leafdir");
         std::fs::create_dir_all(&plain).unwrap();
 
-        assert_eq!(project_for_cwd(&plain), "leafdir");
+        // `project_for_cwd` walks all the way to the filesystem root, so a
+        // stray `.git` anywhere above the system temp dir (this machine has
+        // one at `/tmp/.git`) would legitimately win and make this assertion
+        // depend on the environment. Bound the ancestor walk to the fixture
+        // itself so the test only ever inspects directories it created,
+        // proving the fallback fires with zero markers in scope — regardless
+        // of what exists above `tmp.path()` on the machine running it.
+        let bounded: Vec<&Path> = plain
+            .ancestors()
+            .take_while(|a| a.starts_with(tmp.path()))
+            .collect();
+        assert_eq!(
+            project_for_ancestors(&plain, bounded.into_iter()),
+            "leafdir"
+        );
     }
 
     #[test]

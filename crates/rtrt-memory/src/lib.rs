@@ -2223,7 +2223,7 @@ impl MemoryStore {
     /// this query carry real signal for this project" gate).
     ///
     /// Tokenizes `query` the same way [`sanitize_fts_query`] does, then keeps
-    /// only the terms that are DISTINCTIVE, via two data-derived tests:
+    /// only the terms that are DISTINCTIVE, via three data-derived tests:
     ///
     /// 1. **Within-project rarity**: the term's document frequency in
     ///    `project` is at most `√(rows in project)` — the same
@@ -2244,14 +2244,39 @@ impl MemoryStore {
     ///    global background rate (or less) is just generic language, however
     ///    rare it looks in isolation. Skipped for single-project stores,
     ///    where there is no cross-project baseline to compare against.
+    ///    The bar is variance-aware, not just mean-aware: the local count
+    ///    must clear the predicted mean by at least one Poisson standard
+    ///    deviation (`expected + √expected`), not merely exceed it by any
+    ///    margin. Without this, a term whose global occurrences sit almost
+    ///    entirely in ONE project — true of most words in a minority
+    ///    language when that project is the only one substantially written
+    ///    in it — trivially "beats" its own tiny predicted mean on pure
+    ///    sampling noise (one extra occurrence is enough), regardless of
+    ///    whether it is topically meaningful.
+    /// 3. **Distinctive mass vs. prompt length**: tests 1-2 alone still leak
+    ///    on an ordinary noun (e.g. Korean 비율 "ratio", 구성 "composition")
+    ///    that recurs across several UNRELATED rows of this project's own
+    ///    text — it clears both bars honestly (locally rare, and enriched
+    ///    relative to a store where most other Korean text also happens to
+    ///    live in this one project), yet is not what the prompt is actually
+    ///    about. A single such word is weak evidence on its own; it only
+    ///    becomes trustworthy once it is A LARGE ENOUGH SHARE of the
+    ///    prompt's own content, so the required count of qualifying terms
+    ///    scales with the prompt's total content-term count via the same
+    ///    √-scaling idiom as test 1 (`⌊√terms⌋`, floored rather than
+    ///    ceiled so a short 1-3 word query — a single keyword or a two-word
+    ///    technical phrase — still only needs ONE distinctive term, same as
+    ///    before; only prompts long enough to carry substantial OTHER
+    ///    content alongside the shared word are held to a stricter bar).
     ///
-    /// Neither test is a flat magic number: both scale with the store's own
-    /// size and composition, and neither needs a per-language stopword list
-    /// (works identically for English, Korean, or a mix).
+    /// No test is a flat magic number: all three scale with the store's own
+    /// size and composition (or the prompt's own length), and none needs a
+    /// per-language stopword list (works identically for English, Korean, or
+    /// a mix) — deliberate, since [`STOP_WORDS`] is English/dev-verb only.
     ///
-    /// An empty result means the query has no distinctive term at all in
-    /// this project — callers should suppress recall output entirely
-    /// rather than inject generic noise.
+    /// An empty result means the query has no distinctive term (or not
+    /// enough distinctive mass) for this project — callers should suppress
+    /// recall output entirely rather than inject generic noise.
     pub fn distinctive_terms(&self, project: &str, query: &str) -> Result<Vec<String>> {
         let terms = fts_terms(query);
         if terms.is_empty() {
@@ -2270,7 +2295,8 @@ impl MemoryStore {
         let project_share =
             (all_total > project_total).then(|| project_total as f64 / all_total as f64);
 
-        let mut out = Vec::with_capacity(terms.len());
+        let total_terms = terms.len();
+        let mut out = Vec::with_capacity(total_terms);
         for term in terms {
             let local_df = self.term_doc_freq(Some(project), &term)?;
             if local_df == 0 || local_df > local_floor {
@@ -2279,11 +2305,24 @@ impl MemoryStore {
             if let Some(share) = project_share {
                 let global_df = self.term_doc_freq(None, &term)?;
                 let expected_local = global_df as f64 * share;
-                if (local_df as f64) <= expected_local {
-                    continue; // no more common here than the store-wide baseline
+                // Poisson-style: the mean alone is too easy to clear by pure
+                // sampling noise (a single extra occurrence), so require the
+                // count to also clear one standard deviation above it.
+                let noise_floor = expected_local + expected_local.sqrt();
+                if (local_df as f64) <= noise_floor {
+                    continue; // within sampling noise of the store-wide baseline
                 }
             }
             out.push(term);
+        }
+
+        // Test 3: require the qualifying-term count to be a data-scaled
+        // share of the prompt's own content-term count (see doc comment).
+        // Purely arithmetic on values already in hand — no extra queries,
+        // so this never adds latency to the hook path.
+        let required_mass = (total_terms as f64).sqrt().floor().max(1.0) as usize;
+        if out.len() < required_mass {
+            return Ok(Vec::new());
         }
         Ok(out)
     }
@@ -6696,6 +6735,126 @@ mod tests {
 
         let genuine = store.distinctive_terms("p1", "headroom").unwrap();
         assert_eq!(genuine, vec!["headroom".to_string()], "{genuine:?}");
+    }
+
+    /// FIX (relevance-floor leak on ordinary nouns), variance-aware
+    /// refinement: the enrichment test above only required the local count
+    /// to exceed the raw predicted MEAN — for a term whose global
+    /// occurrences sit almost entirely in one project (true of most words
+    /// in a minority language when that project is the only one
+    /// substantially written in it), a single extra occurrence is enough
+    /// to "beat" a tiny predicted mean, which is sampling noise, not real
+    /// topical enrichment. The count must also clear one Poisson standard
+    /// deviation above the mean.
+    #[test]
+    fn distinctive_terms_requires_enrichment_beyond_sampling_noise() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "other" is a large background corpus where "gamma" shows up at a
+        // steady rate (18/100 rows).
+        for i in 0..100 {
+            let body = if i < 18 {
+                format!("status update {i} gamma noted")
+            } else {
+                format!("status update {i}")
+            };
+            store.save("other", "note", &body).unwrap();
+        }
+        // p1 (25 rows total): "gamma" appears in 5 of them — proportionally
+        // a bit ABOVE the raw background rate (predicted mean ≈ 4.6), but
+        // within one standard deviation of it: sampling noise, not real
+        // enrichment.
+        for i in 0..5 {
+            store
+                .save("p1", "note", &format!("gamma repeated note {i}"))
+                .unwrap();
+        }
+        // "epsilon" appears ONLY in p1 (5/25 rows), nowhere in "other" —
+        // heavily concentrated, nowhere near its (tiny) background rate.
+        for i in 0..5 {
+            store
+                .save("p1", "note", &format!("epsilon feature {i}"))
+                .unwrap();
+        }
+        for i in 0..15 {
+            store
+                .save("p1", "note", &format!("padding row {i}"))
+                .unwrap();
+        }
+
+        let noise = store.distinctive_terms("p1", "gamma").unwrap();
+        assert!(
+            noise.is_empty(),
+            "an excess over the raw mean that is within one std-dev of it is \
+             sampling noise, not real enrichment: {noise:?}"
+        );
+
+        let genuine = store.distinctive_terms("p1", "epsilon").unwrap();
+        assert_eq!(genuine, vec!["epsilon".to_string()], "{genuine:?}");
+    }
+
+    /// FIX (relevance-floor leak on ordinary nouns): "ratio" recurs across
+    /// several UNRELATED rows of this project's own text — a compression
+    /// note, a logging note, a UI note — so it clears both the rarity and
+    /// enrichment bars honestly (it really is locally rare and locally
+    /// concentrated), yet no single one of those rows is "about" ratios.
+    /// A long prompt that shares ONLY that one coincidental noun with the
+    /// project — every other word alien to the store — must not pass. The
+    /// SAME word alone, as a short keyword-style query, must still pass:
+    /// the tightened floor scales with prompt length, it does not ban any
+    /// term outright.
+    #[test]
+    fn distinctive_terms_requires_more_mass_for_longer_diluted_prompts() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        // "ratio" shows up in three unrelated snippets — a generic noun,
+        // not a topic this project is about.
+        store
+            .save("p1", "note", "compression ratio tuning notes")
+            .unwrap();
+        store
+            .save("p1", "note", "signal to noise ratio in the logs")
+            .unwrap();
+        store
+            .save("p1", "note", "aspect ratio for the dashboard chart")
+            .unwrap();
+        // Padding so the project isn't trivially small (keeps the √rows
+        // rarity floor meaningful rather than admitting everything).
+        for i in 0..20 {
+            store
+                .save("p1", "note", &format!("routine status entry {i}"))
+                .unwrap();
+        }
+        // A genuinely project-specific multi-word topic.
+        store
+            .save("p1", "note", "gateway proxy filter pipeline design")
+            .unwrap();
+
+        // Long prompt sharing ONLY "ratio" with the project — every other
+        // word (salting/cabbage/brine/percentage/kimchi) has zero document
+        // frequency anywhere in the store.
+        let diluted = store
+            .distinctive_terms("p1", "salting cabbage brine ratio percentage kimchi")
+            .unwrap();
+        assert!(
+            diluted.is_empty(),
+            "one coincidental generic-noun match diluted across a long, otherwise \
+             alien prompt must not clear the floor: {diluted:?}"
+        );
+
+        // The same word as a short, keyword-style query still counts as
+        // real signal — short queries are not held to the multi-term bar.
+        let short = store.distinctive_terms("p1", "ratio").unwrap();
+        assert_eq!(short, vec!["ratio".to_string()], "{short:?}");
+
+        // A prompt carrying real distinctive mass (several project-specific
+        // words, not just one) still clears the floor — the tightened rule
+        // must not regress genuine topical overlap.
+        let genuine = store
+            .distinctive_terms("p1", "how does the gateway proxy filter pipeline work")
+            .unwrap();
+        assert!(
+            genuine.len() >= 2,
+            "a genuinely on-topic multi-word prompt must clear the floor: {genuine:?}"
+        );
     }
 
     #[cfg(feature = "ollama-embed")]

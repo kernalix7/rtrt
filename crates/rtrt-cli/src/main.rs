@@ -20,7 +20,9 @@ use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
     TeamConfig, TeamMode, ToolKind,
 };
-use rtrt_memory::{LlmSummariser, MemoryStore, is_synthetic_prompt};
+use rtrt_memory::{
+    Embedder, LlmSummariser, MemoryStore, OllamaEmbedder, is_synthetic_prompt, truncate_for_embed,
+};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
@@ -821,6 +823,46 @@ enum MemoryCmd {
         /// Source file. `-` (or omit) reads from stdin.
         #[arg(long = "in")]
         input: Option<PathBuf>,
+    },
+    /// Re-embed every memory row whose stored `embeddings.model` differs
+    /// from the configured / `--model` embedder. Needed when switching the
+    /// embedding model (e.g. `nomic-embed-text` → `bge-m3`): old cosine
+    /// vectors live in a different space, so recall must filter on the
+    /// model name and the old rows must be overwritten with new vectors.
+    /// Pulls `[unembedded backlog ∪ stale-model rows]` in bounded batches,
+    /// embeds each batch in one round-trip, and writes via
+    /// `INSERT OR REPLACE` so resuming after an interrupt skips nothing
+    /// already upgraded. Stays a no-op when no row is stale.
+    Reembed {
+        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
+        store: PathBuf,
+        /// Limit the sweep to one project. Omit (or pass `--all`) to sweep
+        /// the whole store in `id ASC` order.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        all: bool,
+        /// Override the configured embedder's model id. Defaults to
+        /// `embeddings.effective_model()` from `~/.rtrt/config.toml`.
+        #[arg(long, env = "RTRT_EMBED_MODEL")]
+        model: Option<String>,
+        /// Override the configured Ollama base URL.
+        #[arg(long, env = "RTRT_EMBED_BASE_URL")]
+        base_url: Option<String>,
+        /// Rows fetched per round-trip. Larger = faster but more memory;
+        /// default scales with the backlog (so a small backlog doesn't try
+        /// to allocate a 200k batch one ask at a time, and a huge backlog
+        /// doesn't blow the heap).
+        #[arg(long, default_value_t = 256)]
+        batch: usize,
+        /// Print what would be re-embedded and exit (no writes, no embeds).
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after the first stale batch (debugging probe — emits a sample
+        /// of the ids and the old/new models, then exits non-zero so a CI can
+        /// gate on "store is fully migrated").
+        #[arg(long)]
+        probe: bool,
     },
     /// Extract atomic facts from a passage via LLM and save each.
     Extract {
@@ -7224,6 +7266,28 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             };
             eprintln!("[rtrt memory import] {count} records");
         }
+        MemoryCmd::Reembed {
+            store: store_path,
+            project,
+            all,
+            model,
+            base_url,
+            batch,
+            dry_run,
+            probe,
+        } => {
+            run_memory_reembed(
+                &store_path,
+                project.as_deref(),
+                all,
+                model.as_deref(),
+                base_url.as_deref(),
+                batch,
+                dry_run,
+                probe,
+            )
+            .await?;
+        }
         MemoryCmd::Extract {
             project,
             kind,
@@ -7276,6 +7340,149 @@ fn read_body_or_stdin(body: Option<String>) -> Result<String> {
     }
 }
 
+/// Implementation of `rtrt memory reembed` — see [`MemoryCmd::Reembed`].
+///
+/// Loads the configured (or `--model` overridden) ollama embedder, opens the
+/// store read/write, and sweeps `[unembedded backlog ∪ stale-model rows]` in
+/// bounded batches. Each batch is fetched in a single SQL query, embedded in a
+/// single Ollama round-trip, and written back row-by-row with
+/// [`MemoryStore::store_embedding_replace`] (an `INSERT OR REPLACE`) so the
+/// row's `embeddings.model` column is upgraded atomically — that's what keeps
+/// a crash/resume safe: a half-upgraded row set never appears to recall paths
+/// filtering on the active model.
+///
+/// The legacy-vs-new row selection is itself safe across runs: rows still on
+/// `nomic-embed-text` match `e.model <> target`, get re-embedded as `bge-m3`,
+/// and on the next pass no longer match, so they are skipped. Unembedded rows
+/// match `e.model IS NULL` in the same query, so a fresh `rtrt memory save`
+/// during the run also gets picked up without dropping coverage in the recall
+/// filter.
+#[allow(clippy::too_many_arguments)]
+async fn run_memory_reembed(
+    store_path: &std::path::Path,
+    project: Option<&str>,
+    all: bool,
+    model_override: Option<&str>,
+    base_url_override: Option<&str>,
+    batch: usize,
+    dry_run: bool,
+    probe: bool,
+) -> Result<()> {
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let base_url = match base_url_override {
+        Some(u) => u.to_string(),
+        None => cfg
+            .embeddings
+            .resolved_base_url(cfg.auto_compress.base_url.as_deref()),
+    };
+    let model = match model_override {
+        Some(m) => m.to_string(),
+        None => cfg.embeddings.effective_model(),
+    };
+
+    // Excludes a SINGLE project when --project was passed (so the sweep covers
+    // the chosen project only — NULL `[embeddings].model` would still match
+    // both legs, the difference is the WHERE clause targets just that project).
+    // When `--all` (or neither) is set we sweep everything: [] exclude list.
+    let (only_project, exclude) = match project {
+        Some(p) => (Some(p.to_string()), Vec::<&str>::new()),
+        None => (None, Vec::<&str>::new()),
+    };
+    let _ = all;
+
+    let store = MemoryStore::open(store_path)?;
+
+    let pending_total = store.reembed_pending_count(&model, exclude.as_slice())?;
+    let _ = &only_project;
+
+    if pending_total == 0 {
+        println!("[rtrt memory reembed] store is already on model `{model}` — nothing to do");
+        return Ok(());
+    }
+
+    println!(
+        "[rtrt memory reembed] {pending_total} row(s) pending switch to `{model}` (target={}{})",
+        if let Some(p) = &only_project {
+            format!(", project=`{p}`")
+        } else {
+            String::from(", all projects")
+        },
+        if dry_run { " [dry-run]" } else { "" },
+    );
+
+    if dry_run {
+        // Show a sample of one batch of stale rows so the operator can sanity
+        // check that the count is plausible (e.g. not 0 because of a wrongly
+        // typed model name, or not 200k because of a half-broken JOIN).
+        let sample = store.reembed_batch(&model, exclude.as_slice(), batch.min(8))?;
+        for (id, p, body) in sample {
+            let preview: String = body.chars().take(80).collect();
+            println!("  id={id} project=`{p}` body={preview:?}");
+        }
+        return Ok(());
+    }
+
+    if probe {
+        println!(
+            "[rtrt memory reembed] probe: stale rows still present — run without --probe to sweep."
+        );
+        // Non-zero exit prompts any CI gating on "fully migrated".
+        std::process::exit(1);
+    }
+
+    let embedder = OllamaEmbedder::new(&base_url, model.clone());
+    let model_active = embedder.model_name().to_string();
+    let batch_cap = batch.max(1);
+    let mut done = 0usize;
+    let mut pass = 0usize;
+    let t0 = std::time::Instant::now();
+    loop {
+        let rows = store.reembed_batch(&model_active, exclude.as_slice(), batch_cap)?;
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len();
+        // Cap each body the same way as the auto-embed daemon so a 30k-char
+        // body doesn't OOM the embedder; only the leading context window of
+        // the row contributes to the dense vector anyway.
+        let mut texts: Vec<std::borrow::Cow<'_, str>> = Vec::with_capacity(n);
+        for (_, _, body) in &rows {
+            texts.push(truncate_for_embed(body));
+        }
+        let owned: Vec<String> = texts.iter().map(|c| c.to_string()).collect();
+        let borrowed: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let vectors = embedder.embed(&borrowed)?;
+        if vectors.len() != n {
+            anyhow::bail!("embedder returned {} vectors for {n} texts", vectors.len());
+        }
+        for ((id, _, _), v) in rows.iter().zip(vectors) {
+            store.store_embedding_replace(*id, &model_active, &v)?;
+        }
+        done += n;
+        pass += 1;
+        // Reload the pending count every pass — the count moved during the
+        // batch, so showing a fraction `done/pending_total` would lie about
+        // progress when fresh rows got appended concurrently. The count itself
+        // is a fast indexed `COUNT(*)+LEFT JOIN` against ~160k rows.
+        let remaining = store.reembed_pending_count(&model_active, exclude.as_slice())?;
+        let elapsed = t0.elapsed().as_secs_f32();
+        let rate = if elapsed > 0.0 {
+            done as f32 / elapsed
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[reembed] pass={pass} embedded={done} remaining={remaining} elapsed={elapsed:.1}s rate={rate:.0}/s model=`{model_active}`"
+        );
+        std::io::Write::flush(&mut std::io::stderr())?;
+    }
+
+    println!(
+        "[rtrt memory reembed] done: {done} row(s) re-embedded across {pass} batch(es) in {:.1}s; store now on `{model_active}`",
+        t0.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
 fn build_provider(
     kind: ProviderArg,
     base_url: Option<String>,

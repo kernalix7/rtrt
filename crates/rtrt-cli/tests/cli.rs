@@ -5,6 +5,8 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 
 /// A `rtrt` command with HOME isolated to `home`.
 fn rtrt(home: &std::path::Path) -> Command {
@@ -106,6 +108,204 @@ fn punctuated_recall_query_does_not_error() {
         .assert()
         .success()
         .stderr(predicate::str::contains("fts5").not());
+}
+
+#[test]
+fn memory_reembed_dry_run_honours_project_scope() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join("mem.sqlite");
+    let store_s = store.to_str().unwrap();
+
+    for (project, body) in [("p1", "project one row"), ("p2", "project two row")] {
+        rtrt(home.path())
+            .args([
+                "memory",
+                "save",
+                "--store",
+                store_s,
+                "--project",
+                project,
+                body,
+            ])
+            .assert()
+            .success();
+    }
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 row(s) pending"))
+        .stdout(predicate::str::contains("project=`p1`"))
+        .stdout(predicate::str::contains("project two row").not());
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--all",
+            "--model",
+            "bge-m3",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 row(s) pending"))
+        .stdout(predicate::str::contains("all projects"));
+}
+
+#[test]
+fn memory_reembed_rejects_invalid_batch_and_conflicting_scope() {
+    let home = tempfile::tempdir().unwrap();
+
+    rtrt(home.path())
+        .args(["memory", "reembed", "--batch", "0", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--batch"));
+
+    rtrt(home.path())
+        .args(["memory", "reembed", "--project", "p1", "--all", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn memory_reembed_probe_reports_pending_rows() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join("mem.sqlite");
+    let store_s = store.to_str().unwrap();
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "save",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "pending row",
+        ])
+        .assert()
+        .success();
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--probe",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale rows still present"));
+}
+
+#[test]
+fn memory_reembed_rejects_malformed_config() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".rtrt");
+    std::fs::create_dir(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), "not valid = [toml").unwrap();
+
+    rtrt(home.path())
+        .args(["memory", "reembed", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config"));
+}
+
+#[test]
+fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join("mem.sqlite");
+    let store_s = store.to_str().unwrap();
+
+    for body in ["first row", "second row"] {
+        rtrt(home.path())
+            .args([
+                "memory",
+                "save",
+                "--store",
+                store_s,
+                "--project",
+                "p1",
+                body,
+            ])
+            .assert()
+            .success();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for (status, body) in [
+            ("200 OK", r#"{"embedding":[0.1,0.2]}"#),
+            ("500 Internal Server Error", r#"{"error":"failed"}"#),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--base-url",
+            &base_url,
+            "--batch",
+            "2",
+        ])
+        .assert()
+        .failure();
+    server.join().unwrap();
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 row(s) pending"));
 }
 
 #[test]

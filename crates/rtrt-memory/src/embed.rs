@@ -152,10 +152,22 @@ mod ollama_impl {
                 .ok_or_else(|| Error::Memory("ollama: missing `embedding` array".into()))?;
             let vec: Vec<f32> = arr
                 .iter()
-                .filter_map(|x| x.as_f64().map(|f| f as f32))
-                .collect();
+                .map(|x| {
+                    x.as_f64()
+                        .map(|f| f as f32)
+                        .ok_or_else(|| Error::Memory("ollama: nonnumeric embedding value".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
             if vec.is_empty() {
                 return Err(Error::Memory("ollama: empty embedding vector".into()));
+            }
+            if let Some(expected) = self.dim.get()
+                && vec.len() != *expected
+            {
+                return Err(Error::Memory(format!(
+                    "ollama: embedding dimension changed from {expected} to {}",
+                    vec.len()
+                )));
             }
             Ok(vec)
         }
@@ -203,7 +215,8 @@ mod ollama_impl {
         if !cfg.embeddings.is_enabled() {
             return false;
         }
-        match store.embedding_coverage(project) {
+        let model = cfg.embeddings.effective_model();
+        match store.embedding_coverage_for_model(project, &model) {
             Ok((embedded, total)) => embedded > 0 && embedded.saturating_mul(2) >= total,
             Err(_) => false,
         }

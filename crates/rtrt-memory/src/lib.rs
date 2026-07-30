@@ -4256,6 +4256,35 @@ impl MemoryStore {
         Ok((embedded as usize, total as usize))
     }
 
+    /// `(embedded, total)` row counts for `project`, counting only vectors
+    /// produced by `model`. Used to avoid enabling hybrid recall from stale
+    /// coverage after the configured embedding model changes.
+    pub fn embedding_coverage_for_model(
+        &self,
+        project: &str,
+        model: &str,
+    ) -> Result<(usize, usize)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings e
+                   JOIN memories m ON m.id = e.memory_id
+                  WHERE m.project = ?1 AND e.model = ?2",
+                rusqlite::params![project, model],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok((embedded as usize, total as usize))
+    }
+
     /// Whole-project clustering over **dense embedding vectors** instead of
     /// lexical token overlap. This is the semantic clustering: it loads every
     /// row that has a stored embedding, builds an HNSW index over those vectors,
@@ -5023,59 +5052,60 @@ impl MemoryStore {
     /// `(id, project, body)` triples the caller embeds with the new model
     /// and writes back via [`store_embedding_replace`](Self::store_embedding_replace).
     ///
-    /// `exclude_projects` skips rows the caller isn't re-embedding right now
-    /// (e.g. when sweeping one project at a time so a partial run is
-    /// resumable); pass `&[]` to sweep the whole store. A
+    /// `project` limits the sweep to one project; `None` sweeps the whole
+    /// store. A
     /// `LEFT JOIN ... WHERE e.model IS NULL OR e.model <> ?` so both the
     /// unembedded backlog AND stale-model rows surface in one scan, ordered
     /// by `id ASC` for stable resumption.
     pub fn reembed_batch(
         &self,
         target_model: &str,
-        exclude_projects: &[&str],
+        project: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(i64, String, String)>> {
-        let exclude_clause = if exclude_projects.is_empty() {
-            String::from("1=1")
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = if project.is_some() {
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.body
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE m.project = ?1 AND (e.model IS NULL OR e.model <> ?2)
+                      ORDER BY m.id ASC
+                      LIMIT ?3",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
         } else {
-            let placeholders = (0..exclude_projects.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("m.project NOT IN ({placeholders})")
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.body
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE e.model IS NULL OR e.model <> ?1
+                      ORDER BY m.id ASC
+                      LIMIT ?2",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
         };
-        // Bind the model first, then project excludes, then the limit. The
-        // dynamic placeholders are appended after the model param.
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        params.push(Box::new(target_model.to_string()));
-        for p in exclude_projects {
-            params.push(Box::new((*p).to_string()));
-        }
-        params.push(Box::new(limit as i64));
-        let sql = format!(
-            "SELECT m.id, m.project, m.body
-               FROM memories m
-               LEFT JOIN embeddings e ON e.memory_id = m.id
-              WHERE ({exclude_clause}) AND (e.model IS NULL OR e.model <> ?)
-              ORDER BY m.id ASC
-              LIMIT ?"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| Error::Memory(e.to_string()))?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| Error::Memory(e.to_string()))?;
+        let rows = if let Some(project) = project {
+            stmt.query_map(
+                rusqlite::params![project, target_model, limit],
+                Self::parse_reembed_row,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            stmt.query_map(
+                rusqlite::params![target_model, limit],
+                Self::parse_reembed_row,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?
+        };
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    fn parse_reembed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String)> {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     }
 
     /// Counts rows that still need re-embedding (see
@@ -5084,33 +5114,31 @@ impl MemoryStore {
     pub fn reembed_pending_count(
         &self,
         target_model: &str,
-        exclude_projects: &[&str],
+        project: Option<&str>,
     ) -> Result<usize> {
-        let exclude_clause = if exclude_projects.is_empty() {
-            String::from("1=1")
+        let n: i64 = if let Some(project) = project {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE m.project = ?1 AND (e.model IS NULL OR e.model <> ?2)",
+                    rusqlite::params![project, target_model],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
         } else {
-            let placeholders = (0..exclude_projects.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("m.project NOT IN ({placeholders})")
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE e.model IS NULL OR e.model <> ?1",
+                    rusqlite::params![target_model],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
         };
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        params.push(Box::new(target_model.to_string()));
-        for p in exclude_projects {
-            params.push(Box::new((*p).to_string()));
-        }
-        let sql = format!(
-            "SELECT COUNT(*)
-               FROM memories m
-               LEFT JOIN embeddings e ON e.memory_id = m.id
-              WHERE ({exclude_clause}) AND (e.model IS NULL OR e.model <> ?)"
-        );
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let n: i64 = self
-            .conn
-            .query_row(&sql, param_refs.as_slice(), |r| r.get(0))
-            .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(n as usize)
     }
 
@@ -7025,6 +7053,9 @@ mod tests {
         store
             .save_embedded("p1", "note", "npm installs javascript packages", &b)
             .unwrap();
+        store
+            .save_embedded("p2", "note", "python installs packages", &b)
+            .unwrap();
         // Recall via the test-word-hash (current) embedder sees NOTHING:
         // both rows are tagged with the legacy model.
         let hits_new = store.recall_vector("p1", "rust", 5, &a).unwrap();
@@ -7057,17 +7088,28 @@ mod tests {
         );
         // Reembed_pending_count for the new model returns 1 (npm row still on
         // legacy); for the legacy model returns 0 (npm row already on legacy).
-        let pending_new = store.reembed_pending_count(a.model_name(), &[]).unwrap();
+        let pending_new = store
+            .reembed_pending_count(a.model_name(), Some("p1"))
+            .unwrap();
         assert_eq!(pending_new, 1);
-        let pending_legacy = store.reembed_pending_count(b.model_name(), &[]).unwrap();
+        assert_eq!(
+            store.reembed_pending_count(a.model_name(), None).unwrap(),
+            2,
+            "whole-store count includes the stale p2 row"
+        );
+        let pending_legacy = store
+            .reembed_pending_count(b.model_name(), Some("p1"))
+            .unwrap();
         // The legacy embedder's count is 1 (the upgraded rust row is no
         // longer on the legacy model, so it's "pending" if rolling back to
         // it). Pendingness is symmetric: a row not on the target counts.
         assert_eq!(pending_legacy, 1);
         // reembed_batch surfaces the still-stale row in id ASC order.
-        let batch = store.reembed_batch(a.model_name(), &[], 4).unwrap();
+        let batch = store.reembed_batch(a.model_name(), Some("p1"), 4).unwrap();
         assert_eq!(batch.len(), 1);
         assert!(batch[0].2.contains("npm"));
+        let all = store.reembed_batch(a.model_name(), None, 4).unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]
@@ -7620,8 +7662,16 @@ mod tests {
         let b = store.save("p", "note", "beta").unwrap();
         assert!(!hybrid_recall_ready(&store, "p", &cfg));
 
-        // Embed exactly half (1/2): embedded*2 >= total -> ready.
-        store.store_embedding(b, "test-model", &[0.1, 0.2]).unwrap();
+        // Stale coverage from another model must not enable hybrid recall.
+        store
+            .store_embedding(b, "legacy-model", &[0.1, 0.2])
+            .unwrap();
+        assert!(!hybrid_recall_ready(&store, "p", &cfg));
+
+        // Embed exactly half with the active model (1/2): ready.
+        store
+            .store_embedding_replace(b, &cfg.embeddings.effective_model(), &[0.1, 0.2])
+            .unwrap();
         assert!(hybrid_recall_ready(&store, "p", &cfg));
 
         // A different, still-empty project isn't affected by "p"'s coverage.

@@ -1930,6 +1930,7 @@ mod tests {
         let path = temp_store_path("ready");
         let mut cfg = rtrt_core::Config::default();
         cfg.embeddings.enabled = true;
+        cfg.embeddings.model = MockEmbedder.model_name().to_string();
         let state = test_state(path.clone(), cfg, Some(Arc::new(MockEmbedder)));
 
         {

@@ -111,6 +111,8 @@ rtrt discover                                   # find proxy candidates in Claud
 rtrt templates                                  # list built-in templates
 rtrt new rust-cli ./hello --var project_name=hello
 rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
+rtrt setup --agent opencode --team --apply       # install the OpenCode team orchestrator
+rtrt team check-manager                          # verify the local manager's exact tool call
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
 rtrt memory extract --project p --provider openai-compat \

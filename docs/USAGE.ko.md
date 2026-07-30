@@ -107,6 +107,31 @@ rtrt setup --agent claude --apply
 rtrt hook proxy-rewrite
 ```
 
+### OpenCode 팀 오케스트레이션
+
+OpenCode와 rtrt 설치 후 전체 팀 통합을 설치합니다.
+
+```bash
+rtrt setup --agent opencode --team --apply
+rtrt team show
+rtrt team check-manager
+```
+
+setup은 `~/.rtrt/config.toml`의 `[team]`을 활성화하고, `~/.config/opencode/opencode.jsonc`에 Ollama provider와 rtrt MCP 항목을 병합하며, Claude leader용 동일 MCP server를 `~/.claude.json`에도 등록하고, 기본 agent를 `rtrt-orchestrator`로 지정합니다. worker agents와 원문 보존 relay plugin도 함께 생성합니다. 반복 실행해도 안전하며 OpenCode를 완전히 재설치한 뒤에도 같은 명령으로 전체 통합을 재생성합니다. 첫 기록은 `.bak`으로 백업합니다.
+
+텍스트 prompt는 byte 단위로 그대로 전달합니다. OpenCode 파일 attachment는 worker가 로컬 파일을 열 수 있도록 `mime` / `filename` / `url` metadata로 전달하며, inline image data를 provider-native multimodal message로 변환하지는 않습니다.
+
+기본 로컬 manager는 `ollama/granite4:350m`입니다. setup 시 `--team-manager-provider`, `--team-manager-model`로 변경할 수 있습니다. RTRT는 설정된 leader 순서를 따르며 가용성·quota·rate-limit·server·timeout처럼 재시도 가능한 실패에서만 다음 leader로 넘어갑니다. Claude member는 Anthropic API가 아니라 Claude CLI 구독 경로인 `claude -p --model opus|sonnet`으로 실행합니다.
+
+로컬 stdio MCP 자동 캡처는 linked worktree를 main Git 저장소 project로 귀속합니다. 공유 HTTP MCP server의 자동 캡처 tool은 명시적 `project`를 받을 수 있으며, 없으면 잘못된 project를 만들거나 오염시키지 않고 캡처를 건너뜁니다.
+
+진단·자동화에서는 직접 dispatch할 수 있습니다.
+
+```bash
+rtrt team dispatch "이 저장소를 검토하고 테스트해"
+rtrt team dispatch --json --timeout 180 "요청한 변경을 구현해"
+```
+
 ### `rtrt gain`
 
 `~/.rtrt/proxy-stats.sqlite`에 저장된 Command Optimizer 절감량을 보여줍니다. 토큰 수는 `chars / 4` 기준의 라벨 달린 추정치입니다.

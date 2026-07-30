@@ -19,6 +19,7 @@ pub mod openai;
 pub mod openai_compatible;
 pub mod router;
 pub mod stream;
+pub mod team;
 pub mod usage;
 pub mod usage_ledger;
 
@@ -41,6 +42,7 @@ pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
 };
+pub use team::{build_team_leader_prompt, dispatch_team};
 pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
     LedgerRow, TargetHeadroom, TargetWindows, WindowUsage, estimate_tokens, headroom_for_target,

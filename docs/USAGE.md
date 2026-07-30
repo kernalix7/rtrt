@@ -99,6 +99,31 @@ The hook implementation can also be invoked directly by hook runners:
 rtrt hook proxy-rewrite
 ```
 
+### OpenCode team orchestration
+
+Install the complete team integration after installing OpenCode and rtrt:
+
+```bash
+rtrt setup --agent opencode --team --apply
+rtrt team show
+rtrt team check-manager
+```
+
+Setup enables `[team]` in `~/.rtrt/config.toml`, merges the Ollama provider and rtrt MCP entry into `~/.config/opencode/opencode.jsonc`, registers the same MCP server in `~/.claude.json` for Claude leaders, selects `rtrt-orchestrator` as the default agent, and generates its worker agents plus the exact-relay plugin. It is idempotent and recreates the complete integration after a clean OpenCode reinstall; first writes retain `.bak` backups.
+
+Text prompts are forwarded byte-for-byte. OpenCode file attachments are forwarded as `mime` / `filename` / `url` metadata so workers can open local files; inline image data is not converted into a provider-native multimodal message.
+
+The default local manager is `ollama/granite4:350m`. Override it during setup with `--team-manager-provider` and `--team-manager-model`. RTRT tries leaders in configured order and falls over only on retryable availability, quota, rate-limit, server, or timeout failures. Claude members run through `claude -p --model opus|sonnet`, using the Claude CLI subscription rather than the Anthropic API.
+
+Local stdio MCP auto-capture resolves linked worktrees to their main Git repository project. On shared HTTP MCP servers, auto-capturing tools accept an explicit `project`; without one, auto-capture is skipped rather than creating or polluting a wrong project.
+
+Dispatch directly for diagnostics or automation:
+
+```bash
+rtrt team dispatch "Review this repository and run its tests"
+rtrt team dispatch --json --timeout 180 "Implement the requested change"
+```
+
 ### `rtrt gain`
 
 Show Command Optimizer savings from `~/.rtrt/proxy-stats.sqlite`. Token counts are labelled estimates using `chars / 4`.

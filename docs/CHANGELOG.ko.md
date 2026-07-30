@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+### 추가
+
+- **OpenCode 팀 오케스트레이터**: `rtrt setup --agent opencode --team --apply`가 재현 가능하고 반복 실행에 안전한 전체 팀 설정을 설치합니다. 커스터마이즈 가능한 로컬 manager(기본 `ollama/granite4:350m`), 순서 기반 leader failover, 역할 기반 worker, 생성형 OpenCode agents, Claude MCP 등록, 소형 모델의 prompt 복사에 의존하지 않고 사용자 원문을 한 번 전달하는 exact-relay plugin을 포함합니다. 새 `rtrt team show`, `check-manager`, `dispatch` 명령과 MCP `team_dispatch`를 제공합니다. Claude leader는 `claude -p --model opus|sonnet` 구독 CLI 경로를 사용하며, 재시도 가능한 quota·rate-limit·server·timeout 실패에서 다음 leader로 넘어갑니다. MCP 자동 캡처는 linked worktree를 main 저장소로 귀속하며, 공유 HTTP dispatch는 명시적 project가 없으면 stray project 생성 대신 캡처를 건너뜁니다.
+
 ### Highlights — 대시보드 URL 라우팅 / 딥링크
 
 **대시보드의 모든 페이지가 진짜 URL이 됩니다.**

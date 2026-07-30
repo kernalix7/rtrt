@@ -13,8 +13,10 @@ use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const PROMPT_PLACEHOLDER: &str = "{prompt}";
 const MODEL_PLACEHOLDER: &str = "{model}";
+const MODEL_ARGS_PLACEHOLDER: &str = "{model_args}";
 const ASCII_SPINNER_CHARS: &[char] = &['|', '/', '-', '\\'];
 const BRAILLE_SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -102,12 +104,15 @@ pub async fn invoke_agent(
                 }
             };
             match run_cli_argv(&argv, opts.timeout).await {
-                Ok((output, exit_code)) => {
+                Ok((output, Some(0))) => {
                     // CLI shell-outs report no usage; estimate from chars/4 and
-                    // mark the row as estimated. `ok` follows the exit code.
-                    let ok = exit_code.unwrap_or(0) == 0;
-                    record_cli(&tool.name, &ledger_model, prompt, &output, ok);
-                    (output, exit_code)
+                    // mark the row as estimated.
+                    record_cli(&tool.name, &ledger_model, prompt, &output, true);
+                    (output, Some(0))
+                }
+                Ok((output, exit_code)) => {
+                    record_cli(&tool.name, &ledger_model, prompt, &output, false);
+                    return Err(cli_exit_error(&argv[0], exit_code, &output));
                 }
                 Err(err) => {
                     record_cli(&tool.name, &ledger_model, prompt, "", false);
@@ -183,6 +188,8 @@ pub async fn invoke_agent(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverAttempt {
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub retryable: bool,
     pub error: String,
 }
@@ -206,18 +213,24 @@ impl FailoverOutcome {
     /// A one-line audit string, e.g. `served by openai after 2 fell over
     /// (ollama: retryable, claude: retryable)`.
     pub fn summary(&self) -> String {
+        let served_by = target_label(&self.outcome.target, self.outcome.model.as_deref());
         if self.failed_over.is_empty() {
-            return format!("served by {} (no failover)", self.outcome.target);
+            return format!("served by {served_by} (no failover)");
         }
         let trail = self
             .failed_over
             .iter()
-            .map(|a| format!("{}: {}", a.target, classify_label(a.retryable)))
+            .map(|a| {
+                format!(
+                    "{}: {}",
+                    target_label(&a.target, a.model.as_deref()),
+                    classify_label(a.retryable)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "served by {} after {} fell over ({trail})",
-            self.outcome.target,
+            "served by {served_by} after {} fell over ({trail})",
             self.failed_over.len()
         )
     }
@@ -228,9 +241,8 @@ impl FailoverOutcome {
 ///
 /// We are deliberately conservative: only failures that another provider could
 /// plausibly satisfy are retryable. Rate-limit / quota / 429 / 5xx / timeouts /
-/// process-spawn failures fall over. Auth, other 4xx, empty-prompt, and
-/// unknown-target are user/config errors — falling over would just repeat the
-/// same mistake — so they are terminal.
+/// process-spawn and unavailable-target failures fall over. Auth, other 4xx,
+/// empty-prompt, disabled-target, and unsupported-mode errors are terminal.
 pub fn is_retryable_error(err: &Error) -> bool {
     // Errors surface as `Error::Provider(String)`; we classify on the message.
     let Error::Provider(message) = err else {
@@ -251,14 +263,14 @@ pub fn is_retryable_error(err: &Error) -> bool {
         "authentication",
         "api key",
         "not detected",
-        "not installed",
+        "model not found",
+        "model-not-found",
         "disabled",
         "does not support",
         "requires --model",
         "needs --model",
         "no cli invocation",
         "is empty",
-        "available targets",
     ];
     if TERMINAL_MARKERS.iter().any(|m| lower.contains(m)) {
         return false;
@@ -272,31 +284,66 @@ pub fn is_retryable_error(err: &Error) -> bool {
         "rate-limit",
         "ratelimit",
         "quota",
+        "weekly",
+        "usage",
+        "hit your",
+        "limit reached",
+        "credits exhausted",
         "overloaded",
         "capacity",
         "too many requests",
         "timed out",
         "timeout",
         "spawn",
-        "500",
-        "502",
-        "503",
-        "504",
+        "not installed",
         "budget exceeded",
     ];
-    RETRYABLE_MARKERS.iter().any(|m| lower.contains(m))
+    RETRYABLE_MARKERS.iter().any(|m| lower.contains(m)) || contains_server_status(&lower)
+}
+
+fn contains_server_status(message: &str) -> bool {
+    const SERVER_CONTEXT: &[&str] = &[
+        "http",
+        "server",
+        "service unavailable",
+        "status",
+        "upstream",
+        "overload",
+    ];
+    if !SERVER_CONTEXT.iter().any(|marker| message.contains(marker)) {
+        return false;
+    }
+    let bytes = message.as_bytes();
+    bytes.windows(3).enumerate().any(|(index, code)| {
+        code[0] == b'5'
+            && code[1].is_ascii_digit()
+            && code[2].is_ascii_digit()
+            && index
+                .checked_sub(1)
+                .is_none_or(|before| !bytes[before].is_ascii_digit())
+            && bytes
+                .get(index + 3)
+                .is_none_or(|after| !after.is_ascii_digit())
+    })
 }
 
 fn classify_label(retryable: bool) -> &'static str {
     if retryable { "retryable" } else { "terminal" }
 }
 
+fn target_label(target: &str, model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("{target}[{model}]"),
+        None => target.to_string(),
+    }
+}
+
 /// Invoke targets in ranked order with automatic cross-provider failover.
 ///
 /// Tries each [`RankedTarget`] at most once. On a **retryable** failure
-/// (rate-limit / quota / 429 / 5xx / timeout / spawn) it records the attempt and
-/// falls through to the next candidate. On a **terminal** failure (auth, other
-/// 4xx, empty prompt, unknown/disabled target) it stops immediately and returns
+/// (rate-limit / quota / 429 / 5xx / timeout / spawn / known but unavailable
+/// target) it records the attempt and falls through to the next candidate. On a
+/// **terminal** failure (auth, other 4xx, empty prompt, disabled target) it stops and returns
 /// that error — falling over would only repeat a user/config mistake. Returns
 /// the first success (with its failover trail), or an aggregated error listing
 /// every attempt if all candidates fail.
@@ -333,6 +380,7 @@ pub async fn invoke_with_failover(
                 let retryable = is_retryable_error(&err);
                 failed_over.push(FailoverAttempt {
                     target: candidate.target.clone(),
+                    model: candidate.model.clone(),
                     retryable,
                     error: err.to_string(),
                 });
@@ -356,7 +404,7 @@ fn aggregated_error(attempts: &[FailoverAttempt]) -> Error {
         .map(|a| {
             format!(
                 "{} ({}): {}",
-                a.target,
+                target_label(&a.target, a.model.as_deref()),
                 classify_label(a.retryable),
                 a.error
             )
@@ -403,6 +451,12 @@ pub fn template_to_argv(template: &str, prompt: &str, model: Option<&str>) -> Re
                     Error::Provider("invoke: CLI template requires --model".to_string())
                 })?;
                 argv.push(model.to_string());
+            }
+            MODEL_ARGS_PLACEHOLDER => {
+                if let Some(model) = model {
+                    argv.push("--model".to_string());
+                    argv.push(model.to_string());
+                }
             }
             literal => argv.push(literal.to_string()),
         }
@@ -502,6 +556,7 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
     })?;
     let mut child = Command::new(program)
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -515,8 +570,8 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = join_reader(stdout_reader).await;
-            let _ = join_reader(stderr_reader).await;
+            drain_reader_bounded(stdout_reader).await;
+            drain_reader_bounded(stderr_reader).await;
             return Err(Error::Provider(format!(
                 "invoke: command '{}' timed out after {}s",
                 program,
@@ -532,6 +587,20 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
     output.push_str(&String::from_utf8_lossy(&stderr));
     let output = sanitize_cli_output(&output);
     Ok((output, status.code()))
+}
+
+fn cli_exit_error(program: &str, exit_code: Option<i32>, output: &str) -> Error {
+    let status = match exit_code {
+        Some(code) => format!("exited with status {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    let output = sanitize_cli_output(output);
+    let detail = if output.is_empty() {
+        String::new()
+    } else {
+        format!(": {output}")
+    };
+    Error::Provider(format!("invoke: command '{program}' {status}{detail}"))
 }
 
 fn sanitize_cli_output(input: &str) -> String {
@@ -645,6 +714,13 @@ async fn join_reader(reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>) -> Re
     Ok(bytes)
 }
 
+async fn drain_reader_bounded(reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>) {
+    let Some(reader) = reader else {
+        return;
+    };
+    let _ = tokio::time::timeout(PIPE_DRAIN_TIMEOUT, reader).await;
+}
+
 async fn wait_for_child(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
     loop {
         match child.try_wait() {
@@ -677,6 +753,37 @@ mod tests {
     }
 
     #[test]
+    fn optional_model_args_expand_to_flag_and_model() {
+        let argv = template_to_argv(
+            "opencode run {model_args} {prompt}",
+            "say hi",
+            Some("provider/model"),
+        )
+        .expect("template should parse");
+
+        assert_eq!(
+            argv,
+            vec!["opencode", "run", "--model", "provider/model", "say hi"]
+        );
+    }
+
+    #[test]
+    fn optional_model_args_disappear_without_model() {
+        let argv = template_to_argv("claude -p {model_args} {prompt}", "say hi", None)
+            .expect("template should parse");
+
+        assert_eq!(argv, vec!["claude", "-p", "say hi"]);
+    }
+
+    #[test]
+    fn required_model_placeholder_still_rejects_missing_model() {
+        let err = template_to_argv("ollama run {model} {prompt}", "say hi", None)
+            .expect_err("required model should fail");
+
+        assert!(err.to_string().contains("requires --model"));
+    }
+
+    #[test]
     fn auto_mode_prefers_flat_or_free_cli_and_uses_api_otherwise() {
         let cli_tool = tool_for_mode(
             vec![InvocationMode::Cli, InvocationMode::Api],
@@ -698,11 +805,17 @@ mod tests {
         for message in [
             "anthropic 429: rate limit exceeded",
             "openai 503 Service Unavailable",
+            "openai 529 overloaded",
+            "invalid upstream response: 503",
             "gateway: budget exceeded for openai",
             "invoke: command 'ollama' timed out after 120s",
             "invoke: spawn 'codex': No such file or directory",
             "provider overloaded, retry later",
             "daily quota reached",
+            "you have hit your weekly usage limit",
+            "weekly limit reached",
+            "credits exhausted",
+            "invoke: target 'claude' is not installed; available targets: opencode",
         ] {
             let err = Error::Provider(message.to_string());
             assert!(
@@ -717,7 +830,7 @@ mod tests {
         for message in [
             "anthropic 401: invalid api key",
             "openai 403: forbidden",
-            "invoke: target 'foo' is not detected; available targets: claude",
+            "invoke: target 'typo' is not detected; available targets: claude",
             "invoke: target 'claude' does not support API mode",
             "invoke: target 'openai' API mode requires --model",
             "rtrt call: prompt is empty",
@@ -731,26 +844,72 @@ mod tests {
     }
 
     #[test]
+    fn standalone_numbers_are_not_treated_as_http_statuses() {
+        assert!(!is_retryable_error(&Error::Provider(
+            "configuration requires 512 tokens".to_string()
+        )));
+    }
+
+    #[test]
     fn terminal_markers_win_over_status_substrings() {
         // A 401 that also mentions "rate limit" must stay terminal: an auth
         // failure will not be fixed by falling over to another provider.
         let err = Error::Provider("anthropic 401: rate limit note".to_string());
         assert!(!is_retryable_error(&err));
+
+        for message in ["model-not-found: 429 rate limit", "invalid api key: 503"] {
+            assert!(
+                !is_retryable_error(&Error::Provider(message.to_string())),
+                "expected terminal for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_exit_error_is_sanitized_and_classified_from_output() {
+        let err = cli_exit_error(
+            "opencode",
+            Some(7),
+            "\x1b[31mweekly usage limit reached\x1b[0m",
+        );
+        let message = err.to_string();
+
+        assert!(message.contains("exited with status 7"));
+        assert!(message.contains("weekly usage limit reached"));
+        assert!(!message.contains('\x1b'));
+        assert!(is_retryable_error(&err));
+    }
+
+    #[test]
+    fn signal_exit_is_an_error() {
+        let err = cli_exit_error("claude", None, "terminated");
+
+        assert!(err.to_string().contains("terminated by signal: terminated"));
     }
 
     #[tokio::test]
-    async fn failover_stops_immediately_on_terminal_first_candidate() {
-        // An unknown target yields a terminal "not detected" error; failover
-        // must return immediately without walking the (healthy) second target.
+    async fn timeout_pipe_drain_is_bounded() {
+        let reader = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(Vec::new())
+        });
+        let started = Instant::now();
+
+        drain_reader_bounded(Some(reader)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn failover_stops_on_unknown_target() {
         let targets = vec![
             ranked("__definitely_not_a_real_target__"),
             ranked("__second_unreachable_target__"),
         ];
         let err = invoke_with_failover(&targets, "hi", Duration::from_secs(1))
             .await
-            .expect_err("terminal first candidate should fail");
+            .expect_err("unknown target should be terminal");
         let msg = err.to_string();
-        // Exactly one attempt recorded — the second target was never tried.
         assert!(msg.contains("all 1 candidate(s) failed"), "got: {msg}");
         assert!(msg.contains("__definitely_not_a_real_target__"));
         assert!(!msg.contains("__second_unreachable_target__"));
@@ -777,14 +936,57 @@ mod tests {
             },
             failed_over: vec![FailoverAttempt {
                 target: "ollama".to_string(),
+                model: None,
                 retryable: true,
                 error: "ollama 429".to_string(),
             }],
         };
         assert_eq!(outcome.fell_over(), 1);
         let summary = outcome.summary();
-        assert!(summary.contains("served by openai after 1 fell over"));
+        assert!(summary.contains("served by openai[gpt-x] after 1 fell over"));
         assert!(summary.contains("ollama: retryable"));
+    }
+
+    #[test]
+    fn failover_summary_distinguishes_duplicate_targets_by_model() {
+        let outcome = FailoverOutcome {
+            outcome: InvokeOutcome {
+                target: "opencode".to_string(),
+                mode_used: Mode::Cli,
+                model: Some("provider/model-c".to_string()),
+                output: "ok".to_string(),
+                exit_code: Some(0),
+                ms: 1,
+            },
+            failed_over: vec![
+                FailoverAttempt {
+                    target: "opencode".to_string(),
+                    model: Some("provider/model-a".to_string()),
+                    retryable: true,
+                    error: "weekly limit reached".to_string(),
+                },
+                FailoverAttempt {
+                    target: "opencode".to_string(),
+                    model: Some("provider/model-b".to_string()),
+                    retryable: true,
+                    error: "weekly limit reached".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            outcome.summary(),
+            "served by opencode[provider/model-c] after 2 fell over (opencode[provider/model-a]: retryable, opencode[provider/model-b]: retryable)"
+        );
+    }
+
+    #[test]
+    fn failover_attempt_deserializes_without_model() {
+        let attempt: FailoverAttempt =
+            serde_json::from_str(r#"{"target":"opencode","retryable":true,"error":"limited"}"#)
+                .expect("legacy attempt should deserialize");
+
+        assert_eq!(attempt.model, None);
     }
 
     fn ranked(name: &str) -> RankedTarget {

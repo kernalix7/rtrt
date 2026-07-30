@@ -29,8 +29,211 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default, skip_serializing_if = "TeamConfig::is_default")]
+    pub team: TeamConfig,
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamMode {
+    Cli,
+    Api,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamMember {
+    pub name: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub mode: TeamMode,
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_team_manager_provider")]
+    pub manager_provider: String,
+    #[serde(default = "default_team_manager_model")]
+    pub manager_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_base_url: Option<String>,
+    #[serde(default = "default_team_leader_order")]
+    pub leader_order: Vec<String>,
+    #[serde(default = "default_team_members")]
+    pub members: Vec<TeamMember>,
+}
+
+impl Default for TeamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manager_provider: default_team_manager_provider(),
+            manager_model: default_team_manager_model(),
+            manager_base_url: None,
+            leader_order: default_team_leader_order(),
+            members: default_team_members(),
+        }
+    }
+}
+
+impl TeamConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_team_value("manager_provider", &self.manager_provider)?;
+        validate_team_value("manager_model", &self.manager_model)?;
+        if let Some(base_url) = &self.manager_base_url {
+            validate_team_value("manager_base_url", base_url)?;
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.leader_order.is_empty() {
+            return Err(Error::Config(
+                "team.leader_order must not be empty when team is enabled".to_string(),
+            ));
+        }
+        if self.members.is_empty() {
+            return Err(Error::Config(
+                "team.members must not be empty when team is enabled".to_string(),
+            ));
+        }
+
+        let mut member_names = std::collections::BTreeSet::new();
+        let mut member_targets = std::collections::BTreeSet::new();
+        for (index, member) in self.members.iter().enumerate() {
+            validate_team_value(&format!("members[{index}].name"), &member.name)?;
+            validate_team_value(&format!("members[{index}].target"), &member.target)?;
+            if let Some(model) = &member.model {
+                validate_team_value(&format!("members[{index}].model"), model)?;
+            }
+            if member.roles.is_empty() {
+                return Err(Error::Config(format!(
+                    "team.members[{index}].roles must not be empty"
+                )));
+            }
+            for (role_index, role) in member.roles.iter().enumerate() {
+                validate_team_value(&format!("members[{index}].roles[{role_index}]"), role)?;
+            }
+            if !member_names.insert(member.name.as_str()) {
+                return Err(Error::Config(format!(
+                    "duplicate team member name at index {index}: {}",
+                    member.name
+                )));
+            }
+            if !member_targets.insert((
+                member.target.as_str(),
+                member.model.as_deref(),
+                member.mode,
+            )) {
+                return Err(Error::Config(format!(
+                    "duplicate team member at index {index}: target/model/mode must be unique"
+                )));
+            }
+        }
+
+        let mut leaders = std::collections::BTreeSet::new();
+        for (index, leader) in self.leader_order.iter().enumerate() {
+            validate_team_value(&format!("leader_order[{index}]"), leader)?;
+            if !leaders.insert(leader.as_str()) {
+                return Err(Error::Config(format!(
+                    "duplicate team leader at index {index}: {leader}"
+                )));
+            }
+            if !member_names.contains(leader.as_str()) {
+                return Err(Error::Config(format!(
+                    "team.leader_order[{index}] references unknown member: {leader}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_team_value(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::Config(format!("team.{name} must not be empty")));
+    }
+    if value.contains('\0') {
+        return Err(Error::Config(format!("team.{name} must not contain NUL")));
+    }
+    Ok(())
+}
+
+fn default_team_manager_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_team_manager_model() -> String {
+    "granite4:350m".to_string()
+}
+
+fn default_team_leader_order() -> Vec<String> {
+    ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_team_members() -> Vec<TeamMember> {
+    vec![
+        team_member(
+            "opus",
+            "claude",
+            "opus",
+            &["lead", "architecture", "integration"],
+        ),
+        team_member(
+            "gpt-sol",
+            "opencode",
+            "openai/gpt-5.6-sol",
+            &["deputy", "hard-implementation", "debugging"],
+        ),
+        team_member(
+            "glm-go",
+            "opencode",
+            "opencode-go/glm-5.2",
+            &["routine", "boilerplate", "bulk-edit"],
+        ),
+        team_member(
+            "glm-cloud",
+            "opencode",
+            "ollama/glm-5.2:cloud",
+            &["routine", "overflow", "bulk-edit"],
+        ),
+        team_member(
+            "sonnet",
+            "claude",
+            "sonnet",
+            &["general-implementation", "tests", "review"],
+        ),
+        team_member(
+            "kimi-cloud",
+            "opencode",
+            "ollama/kimi-k2.7-code:cloud",
+            &["parallel-implementation", "research", "tests"],
+        ),
+    ]
+}
+
+fn team_member(name: &str, target: &str, model: &str, roles: &[&str]) -> TeamMember {
+    TeamMember {
+        name: name.to_string(),
+        target: target.to_string(),
+        model: Some(model.to_string()),
+        mode: TeamMode::Cli,
+        roles: roles.iter().map(|role| (*role).to_string()).collect(),
+    }
 }
 
 /// Global security defaults applied before any per-project binding. A project
@@ -499,7 +702,10 @@ fn default_true() -> bool {
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(|e| Error::Config(format!("config TOML: {e}")))
+        let config: Self =
+            toml::from_str(s).map_err(|e| Error::Config(format!("config TOML: {e}")))?;
+        config.team.validate()?;
+        Ok(config)
     }
 
     /// Resolve the config file path: `$RTRT_CONFIG` if set, else
@@ -670,6 +876,261 @@ mod tests {
         assert!(!c.auto_compress.enabled);
         assert_eq!(c.auto_compress.model, "claude-haiku-4-5");
         assert_eq!(c.auto_compress.min_chars, 1);
+    }
+
+    #[test]
+    fn team_defaults_are_backward_compatible_and_ordered() {
+        let team = Config::from_toml_str("").unwrap().team;
+        assert!(!team.enabled);
+        assert_eq!(team.manager_provider, "ollama");
+        assert_eq!(team.manager_model, "granite4:350m");
+        assert_eq!(
+            team.leader_order,
+            ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
+        );
+        assert_eq!(
+            team.members
+                .iter()
+                .map(|member| (
+                    member.name.as_str(),
+                    member.target.as_str(),
+                    member.model.as_deref(),
+                    member.mode,
+                    member.roles.iter().map(String::as_str).collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "opus",
+                    "claude",
+                    Some("opus"),
+                    TeamMode::Cli,
+                    vec!["lead", "architecture", "integration"]
+                ),
+                (
+                    "gpt-sol",
+                    "opencode",
+                    Some("openai/gpt-5.6-sol"),
+                    TeamMode::Cli,
+                    vec!["deputy", "hard-implementation", "debugging"]
+                ),
+                (
+                    "glm-go",
+                    "opencode",
+                    Some("opencode-go/glm-5.2"),
+                    TeamMode::Cli,
+                    vec!["routine", "boilerplate", "bulk-edit"]
+                ),
+                (
+                    "glm-cloud",
+                    "opencode",
+                    Some("ollama/glm-5.2:cloud"),
+                    TeamMode::Cli,
+                    vec!["routine", "overflow", "bulk-edit"]
+                ),
+                (
+                    "sonnet",
+                    "claude",
+                    Some("sonnet"),
+                    TeamMode::Cli,
+                    vec!["general-implementation", "tests", "review"]
+                ),
+                (
+                    "kimi-cloud",
+                    "opencode",
+                    Some("ollama/kimi-k2.7-code:cloud"),
+                    TeamMode::Cli,
+                    vec!["parallel-implementation", "research", "tests"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_team_config_keeps_field_defaults() {
+        let team = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            manager_model = "qwen3:8b"
+            "#,
+        )
+        .unwrap()
+        .team;
+
+        assert!(team.enabled);
+        assert_eq!(team.manager_provider, "ollama");
+        assert_eq!(team.manager_model, "qwen3:8b");
+        assert_eq!(team.leader_order, default_team_leader_order());
+        assert_eq!(team.members, default_team_members());
+    }
+
+    #[test]
+    fn team_manager_base_url_roundtrips() {
+        let config =
+            Config::from_toml_str("[team]\nmanager_base_url = \"https://manager.example/v1\"\n")
+                .unwrap();
+
+        assert_eq!(
+            config.team.manager_base_url.as_deref(),
+            Some("https://manager.example/v1")
+        );
+        let roundtripped = Config::from_toml_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            roundtripped.team.manager_base_url,
+            config.team.manager_base_url
+        );
+    }
+
+    #[test]
+    fn customized_team_roundtrip_preserves_member_and_leader_order() {
+        let config = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            manager_provider = "openai"
+            manager_model = "gpt-5"
+            leader_order = ["second", "first"]
+
+            [[team.members]]
+            name = "first"
+            target = "opencode"
+            model = "first"
+            mode = "api"
+            roles = ["worker"]
+
+            [[team.members]]
+            name = "second"
+            target = "claude"
+            mode = "auto"
+            roles = ["lead", "review"]
+            "#,
+        )
+        .unwrap();
+
+        let serialized = toml::to_string(&config).unwrap();
+        let roundtripped = Config::from_toml_str(&serialized).unwrap();
+        assert_eq!(roundtripped.team, config.team);
+        assert_eq!(roundtripped.team.members[0].name, "first");
+        assert_eq!(roundtripped.team.members[1].name, "second");
+        assert_eq!(roundtripped.team.leader_order, ["second", "first"]);
+    }
+
+    #[test]
+    fn workers_remain_available_outside_leader_order() {
+        let team = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            leader_order = ["opus"]
+            "#,
+        )
+        .unwrap()
+        .team;
+
+        assert_eq!(team.leader_order, ["opus"]);
+        assert!(team.members.iter().any(|member| member.name == "glm-cloud"));
+        assert!(!team.leader_order.iter().any(|name| name == "glm-cloud"));
+    }
+
+    #[test]
+    fn invalid_team_values_and_duplicates_are_rejected() {
+        let enabled_team = || TeamConfig {
+            enabled: true,
+            ..TeamConfig::default()
+        };
+        for invalid in [
+            "[team]\nmanager_provider = \" \"",
+            "[team]\nmanager_model = \"\"",
+            "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"shell\", roles = [\"lead\"] }]",
+            "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"cli\", roles = [\"lead\"], command = \"rm\" }]",
+        ] {
+            assert!(
+                Config::from_toml_str(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        let empty_leaders = TeamConfig {
+            enabled: true,
+            leader_order: Vec::new(),
+            ..TeamConfig::default()
+        };
+        assert!(empty_leaders.validate().is_err());
+
+        let empty_members = TeamConfig {
+            enabled: true,
+            members: Vec::new(),
+            ..TeamConfig::default()
+        };
+        assert!(empty_members.validate().is_err());
+
+        let mut duplicate_name = enabled_team();
+        let mut member = duplicate_name.members[0].clone();
+        member.target = "other".to_string();
+        duplicate_name.members.push(member);
+        assert!(duplicate_name.validate().is_err());
+
+        let mut duplicate_target = enabled_team();
+        let mut member = duplicate_target.members[0].clone();
+        member.name = "other".to_string();
+        duplicate_target.members.push(member);
+        assert!(duplicate_target.validate().is_err());
+
+        let mut duplicate_leader = enabled_team();
+        duplicate_leader.leader_order.push("opus".to_string());
+        assert!(duplicate_leader.validate().is_err());
+
+        let mut unknown_leader = enabled_team();
+        unknown_leader.leader_order.push("missing".to_string());
+        assert!(unknown_leader.validate().is_err());
+
+        let mut empty_roles = enabled_team();
+        empty_roles.members[0].roles.clear();
+        assert!(empty_roles.validate().is_err());
+
+        let mut blank_role = enabled_team();
+        blank_role.members[0].roles[0] = " ".to_string();
+        assert!(blank_role.validate().is_err());
+
+        let mut blank_name = enabled_team();
+        blank_name.members[0].name = " ".to_string();
+        assert!(blank_name.validate().is_err());
+
+        let mut blank_target = enabled_team();
+        blank_target.members[0].target.clear();
+        assert!(blank_target.validate().is_err());
+
+        let mut blank_model = enabled_team();
+        blank_model.members[0].model = Some(String::new());
+        assert!(blank_model.validate().is_err());
+
+        let mut nul = enabled_team();
+        nul.members[0].target.push('\0');
+        assert!(nul.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_team_allows_incomplete_topology() {
+        let config =
+            Config::from_toml_str("[team]\nenabled = false\nleader_order = []\nmembers = []\n")
+                .unwrap();
+
+        assert!(!config.team.enabled);
+        assert!(config.team.leader_order.is_empty());
+        assert!(config.team.members.is_empty());
+    }
+
+    #[test]
+    fn default_team_is_omitted_from_serialization() {
+        let serialized = toml::to_string(&Config::default()).unwrap();
+        let value: toml::Value = toml::from_str(&serialized).unwrap();
+        assert!(value.get("team").is_none());
+
+        let mut config = Config::default();
+        config.team.manager_model = "custom".to_string();
+        let value: toml::Value = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(value.get("team").is_some());
     }
 
     #[test]

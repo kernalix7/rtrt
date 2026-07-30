@@ -18,14 +18,14 @@ use rtrt_compress::{
 };
 use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
-    ToolKind,
+    TeamConfig, TeamMode, ToolKind,
 };
 use rtrt_memory::{LlmSummariser, MemoryStore, is_synthetic_prompt};
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
     Mode as InvokeMode, OpenAICompatibleProvider, OpenAIProvider, Prefer, Provider, RankedTarget,
-    Role, RouteDecision, RouteRequest, TargetHeadroom, TargetWindows, UsageSnapshot,
+    Role, RouteDecision, RouteRequest, TargetHeadroom, TargetWindows, UsageSnapshot, dispatch_team,
     gateway_default_timeout, invoke_agent, invoke_with_failover, provider_usage_windows,
     record_invocation, select_route, serve_gateway, target_headroom,
 };
@@ -45,7 +45,7 @@ Command groups (run `rtrt <command> --help` for details):
   Savings & Analytics  compress, stats, gain, proxy, proxy-run, discover,
                        benchmark, repo-map, run, context
   Memory               memory
-  Routing & Providers  provider, call, route, usage, diagnose
+  Routing & Providers  provider, call, route, team, usage, diagnose
   Project              templates, new, init, migrate, project, docs, security
   Setup & Install      setup, uninstall, mcp, service, detect, config, info,
                        doctor, prompt
@@ -302,6 +302,12 @@ enum Cmd {
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
+    /// Dispatch work through the configured manager and leader team.
+    #[command(hide = true)]
+    Team {
+        #[command(subcommand)]
+        cmd: TeamCmd,
+    },
     /// Show per-target windowed provider usage and headroom.
     ///
     /// Windowed provider usage (5h / 24h / 7d) and the headroom remaining
@@ -426,6 +432,15 @@ enum Cmd {
         /// (only valid with `--agent claude`).
         #[arg(long)]
         plugin: bool,
+        /// Enable and configure the RTRT team integration (OpenCode only).
+        #[arg(long)]
+        team: bool,
+        /// Override the team manager model (requires --team).
+        #[arg(long, requires = "team")]
+        team_manager_model: Option<String>,
+        /// Override the team manager provider (requires --team).
+        #[arg(long, requires = "team")]
+        team_manager_provider: Option<String>,
     },
     /// Run `rtrt-dashboard` as a background OS service.
     ///
@@ -593,6 +608,26 @@ enum GatewayCmd {
         #[arg(long, env = "RTRT_GATEWAY_TOKEN")]
         token: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum TeamCmd {
+    /// Dispatch the prompt through the configured leader order with failover.
+    Dispatch {
+        /// Timeout in seconds for each manager or leader invocation.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
+        timeout: u64,
+        /// Emit the complete dispatch result as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Prompt text. When omitted, reads stdin.
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+    /// Show the effective manager, leader order, and member roles.
+    Show,
+    /// Verify that the configured Ollama manager emits the expected tool call.
+    CheckManager,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1286,6 +1321,9 @@ fn run_migrate(
         memory_path: None,
         binary: mcp_binary,
         plugin: true,
+        team: false,
+        team_manager_model: None,
+        team_manager_provider: None,
     })?;
 
     println!("\nSTEP 3 — Audit whole-project consistency");
@@ -2627,6 +2665,7 @@ async fn run(command: Cmd) -> Result<()> {
             })
             .await?;
         }
+        Cmd::Team { cmd } => run_team(cmd).await?,
         Cmd::Usage { format } => run_usage(format)?,
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory { cmd } => run_memory(cmd).await?,
@@ -2844,6 +2883,9 @@ async fn run(command: Cmd) -> Result<()> {
             memory,
             binary,
             plugin,
+            team,
+            team_manager_model,
+            team_manager_provider,
         } => {
             let binary = binary.unwrap_or_else(|| {
                 // Best-effort: assume `rtrt-mcp` is on PATH at the same prefix as the running CLI.
@@ -2858,6 +2900,9 @@ async fn run(command: Cmd) -> Result<()> {
                 memory_path: memory,
                 binary,
                 plugin,
+                team,
+                team_manager_model,
+                team_manager_provider,
             })?;
         }
         Cmd::Service { cmd } => {
@@ -4039,6 +4084,190 @@ struct RouteCliOptions {
     dry_run: bool,
     failover: bool,
     prompt: Vec<String>,
+}
+
+const MANAGER_CHECK_PROMPT: &str = "rtrt-manager-tool-check";
+
+async fn run_team(cmd: TeamCmd) -> Result<()> {
+    let config = rtrt_core::Config::load_effective(cwd_repo_root().as_deref())
+        .context("load effective team config")?;
+    match cmd {
+        TeamCmd::Dispatch {
+            timeout,
+            json,
+            prompt,
+        } => {
+            let prompt = read_team_prompt(prompt, std::io::stdin())?;
+            let outcome = dispatch_team(
+                &config.team,
+                &prompt,
+                std::time::Duration::from_secs(timeout),
+            )
+            .await
+            .context("rtrt team dispatch")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                print!("{}", outcome.outcome.output);
+                eprintln!("team: {}", outcome.summary());
+            }
+        }
+        TeamCmd::Show => print_team_config(&config.team),
+        TeamCmd::CheckManager => check_team_manager(&config).await?,
+    }
+    Ok(())
+}
+
+fn read_team_prompt(args: Vec<String>, mut input: impl Read) -> Result<String> {
+    let prompt = if args.is_empty() {
+        let mut prompt = String::new();
+        input
+            .read_to_string(&mut prompt)
+            .context("read team prompt from stdin")?;
+        prompt
+    } else {
+        args.join(" ")
+    };
+    if prompt.trim().is_empty() {
+        bail!("rtrt team dispatch: prompt is empty");
+    }
+    Ok(prompt)
+}
+
+fn print_team_config(team: &TeamConfig) {
+    println!("enabled: {}", team.enabled);
+    println!("manager: {}/{}", team.manager_provider, team.manager_model);
+    println!("leader order: {}", team.leader_order.join(" -> "));
+    println!("members:");
+    for member in &team.members {
+        println!(
+            "  {}: target={} model={} mode={} roles={}",
+            member.name,
+            member.target,
+            member.model.as_deref().unwrap_or("-"),
+            team_mode_label(member.mode),
+            member.roles.join(", ")
+        );
+    }
+}
+
+fn team_mode_label(mode: TeamMode) -> &'static str {
+    match mode {
+        TeamMode::Cli => "cli",
+        TeamMode::Api => "api",
+        TeamMode::Auto => "auto",
+    }
+}
+
+async fn check_team_manager(config: &rtrt_core::Config) -> Result<()> {
+    let team = &config.team;
+    if !team.manager_provider.eq_ignore_ascii_case("ollama") {
+        bail!(
+            "rtrt team check-manager requires manager_provider=ollama (configured: {})",
+            team.manager_provider
+        );
+    }
+
+    let expected_arguments = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
+    let request = serde_json::json!({
+        "model": team.manager_model,
+        "messages": [{
+            "role": "user",
+            "content": format!(
+                "Call team_dispatch exactly once with this exact JSON argument and do not answer in text: {expected_arguments}"
+            )
+        }],
+        "stream": false,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "team_dispatch",
+                "description": "Dispatch a prompt unchanged to the configured RTRT team.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "Prompt to dispatch unchanged."
+                        }
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }
+            }
+        }],
+        "options": { "temperature": 0 }
+    });
+    let url = format!("{}/api/chat", ollama_base_url(config));
+    let http = OpenAIProvider::new(String::new()).http;
+    let response = http
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .json(&request)
+        .send()
+        .await
+        .with_context(|| format!("probe Ollama manager at {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("Ollama manager probe {status}: {body}");
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("decode Ollama manager response")?;
+    let (exact, received) = exact_manager_tool_call(&body, &expected_arguments);
+    println!("manager: {}/{}", team.manager_provider, team.manager_model);
+    println!("exact_tool_call: {exact}");
+    println!("expected: team_dispatch {expected_arguments}");
+    println!("received: {received}");
+    if !exact {
+        bail!("configured manager did not emit the exact team_dispatch tool call");
+    }
+    Ok(())
+}
+
+fn ollama_base_url(config: &rtrt_core::Config) -> String {
+    let fallback = config
+        .embeddings
+        .resolved_base_url(config.auto_compress.base_url.as_deref());
+    let raw = config.team.manager_base_url.as_deref().unwrap_or(&fallback);
+    raw.trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn exact_manager_tool_call(
+    body: &serde_json::Value,
+    expected_arguments: &serde_json::Value,
+) -> (bool, String) {
+    let Some(calls) = body
+        .pointer("/message/tool_calls")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return (false, "(none)".to_string());
+    };
+    let received = serde_json::to_string(calls).unwrap_or_else(|_| "(invalid)".to_string());
+    if calls.len() != 1 {
+        return (false, received);
+    }
+    let function = &calls[0]["function"];
+    let name_matches =
+        function.get("name").and_then(serde_json::Value::as_str) == Some("team_dispatch");
+    let arguments = function.get("arguments").and_then(normalize_tool_arguments);
+    (
+        name_matches && arguments.as_ref() == Some(expected_arguments),
+        received,
+    )
+}
+
+fn normalize_tool_arguments(arguments: &serde_json::Value) -> Option<serde_json::Value> {
+    match arguments {
+        serde_json::Value::Object(_) => Some(arguments.clone()),
+        serde_json::Value::String(raw) => serde_json::from_str(raw).ok(),
+        _ => None,
+    }
 }
 
 async fn run_route(opts: RouteCliOptions) -> Result<()> {
@@ -7159,6 +7388,159 @@ fn detect_provider(model: &str) -> ProviderArg {
         ProviderArg::Openai
     } else {
         ProviderArg::OpenaiCompat
+    }
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::*;
+
+    #[test]
+    fn parses_opencode_team_setup_overrides() {
+        let cli = Cli::try_parse_from([
+            "rtrt",
+            "setup",
+            "--agent",
+            "opencode",
+            "--team",
+            "--team-manager-provider",
+            "ollama",
+            "--team-manager-model",
+            "qwen3:8b",
+        ])
+        .unwrap();
+        let Some(Cmd::Setup {
+            agent: AgentKind::Opencode,
+            team,
+            team_manager_provider,
+            team_manager_model,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected OpenCode team setup");
+        };
+        assert!(team);
+        assert_eq!(team_manager_provider.as_deref(), Some("ollama"));
+        assert_eq!(team_manager_model.as_deref(), Some("qwen3:8b"));
+    }
+
+    #[test]
+    fn setup_manager_overrides_require_team_flag() {
+        assert!(
+            Cli::try_parse_from([
+                "rtrt",
+                "setup",
+                "--agent",
+                "opencode",
+                "--team-manager-model",
+                "qwen3:8b",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_team_dispatch_flags_and_prompt_words() {
+        let cli = Cli::try_parse_from([
+            "rtrt",
+            "team",
+            "dispatch",
+            "--timeout",
+            "9",
+            "--json",
+            "fix",
+            "the build",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Team {
+            cmd:
+                TeamCmd::Dispatch {
+                    timeout,
+                    json,
+                    prompt,
+                },
+        }) = cli.command
+        else {
+            panic!("expected team dispatch");
+        };
+        assert_eq!(timeout, 9);
+        assert!(json);
+        assert_eq!(prompt, ["fix", "the build"]);
+    }
+
+    #[test]
+    fn team_dispatch_allows_stdin_prompt() {
+        let cli = Cli::try_parse_from(["rtrt", "team", "dispatch"]).unwrap();
+        let Some(Cmd::Team {
+            cmd: TeamCmd::Dispatch { prompt, .. },
+        }) = cli.command
+        else {
+            panic!("expected team dispatch");
+        };
+        assert!(prompt.is_empty());
+        assert_eq!(
+            read_team_prompt(prompt, "stdin prompt\n".as_bytes()).unwrap(),
+            "stdin prompt\n"
+        );
+        assert!(read_team_prompt(Vec::new(), " \n".as_bytes()).is_err());
+    }
+
+    #[test]
+    fn exact_manager_call_accepts_object_or_json_string_arguments() {
+        let expected = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
+        for arguments in [
+            expected.clone(),
+            serde_json::Value::String(expected.to_string()),
+        ] {
+            let body = serde_json::json!({
+                "message": {
+                    "tool_calls": [{
+                        "function": {
+                            "name": "team_dispatch",
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            });
+            assert!(exact_manager_tool_call(&body, &expected).0);
+        }
+    }
+
+    #[test]
+    fn exact_manager_call_rejects_wrong_or_multiple_calls() {
+        let expected = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
+        let wrong = serde_json::json!({
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "team_dispatch",
+                        "arguments": { "prompt": "changed" }
+                    }
+                }]
+            }
+        });
+        assert!(!exact_manager_tool_call(&wrong, &expected).0);
+
+        let multiple = serde_json::json!({
+            "message": {
+                "tool_calls": [
+                    { "function": { "name": "team_dispatch", "arguments": expected } },
+                    { "function": { "name": "team_dispatch", "arguments": expected } }
+                ]
+            }
+        });
+        assert!(!exact_manager_tool_call(&multiple, &expected).0);
+    }
+
+    #[test]
+    fn ollama_base_uses_effective_config_and_strips_v1() {
+        let mut config = rtrt_core::Config::default();
+        config.auto_compress.base_url = Some("http://localhost:11434/v1/".to_string());
+        assert_eq!(ollama_base_url(&config), "http://localhost:11434");
+
+        config.team.manager_base_url = Some("https://manager.example/v1/".to_string());
+        assert_eq!(ollama_base_url(&config), "https://manager.example");
     }
 }
 

@@ -30,7 +30,7 @@ use rtrt_core::{Capability, CompressionLevel};
 use rtrt_memory::{Embedder, MemoryStore};
 use rtrt_providers::{
     ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvokeOptions, Mode as InvokeMode,
-    Prefer, Role, RouteRequest, UsageSnapshot, invoke_agent, select_route,
+    Prefer, Role, RouteRequest, UsageSnapshot, dispatch_team, invoke_agent, select_route,
 };
 use rtrt_templates::PromptRegistry;
 use serde::Deserialize;
@@ -111,6 +111,7 @@ struct RtrtState {
     prompts: Option<Arc<PromptRegistry>>,
     auto_capture: bool,
     auto_redact: bool,
+    require_project_override: bool,
     default_project: String,
     session_id: String,
     dedup_window_sec: i64,
@@ -183,7 +184,12 @@ impl RtrtState {
         if !self.auto_capture {
             return;
         }
-        let project = project_override.unwrap_or(self.default_project.as_str());
+        let project = match project_override {
+            Some(project) if !project.trim().is_empty() => project,
+            Some(_) => return,
+            None if self.require_project_override => return,
+            None => self.default_project.as_str(),
+        };
         let filtered = if self.auto_redact {
             rtrt_compress::redact_secrets(body)
         } else {
@@ -216,6 +222,9 @@ struct CompressArgs {
     /// One of `lite`, `full`, `ultra`. Defaults to `full`.
     #[serde(default)]
     level: Option<String>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -250,6 +259,9 @@ struct CompressMlArgs {
     /// Target ratio (kept-token fraction) in (0.05, 1.0]. Defaults to 0.5.
     #[serde(default)]
     ratio: Option<f32>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -266,6 +278,9 @@ struct ProxyArgs {
     /// Context-line count for `errors_only` (default 3).
     #[serde(default)]
     context: Option<u32>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -384,6 +399,9 @@ struct ProviderChatArgs {
     /// Optional sampling temperature.
     #[serde(default)]
     temperature: Option<f32>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -400,6 +418,9 @@ struct AgentCallArgs {
     mode: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -413,6 +434,23 @@ struct AgentRouteArgs {
     dry_run: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TeamDispatchArgs {
+    prompt: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Project used for auto-capture. Required for shared HTTP servers.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+fn team_dispatch_timeout(timeout_secs: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
 }
 
 fn parse_agent_route_prefer(value: Option<&str>) -> Result<Prefer, McpError> {
@@ -498,7 +536,9 @@ impl RtrtMcp {
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
-        self.state.auto_capture("compress", None, &out).await;
+        self.state
+            .auto_capture("compress", args.project.as_deref(), &out)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -521,7 +561,9 @@ impl RtrtMcp {
             "original_len": args.text.chars().count(),
             "compressed_len": out.chars().count(),
         });
-        self.state.auto_capture("compress_ml", None, &out).await;
+        self.state
+            .auto_capture("compress_ml", args.project.as_deref(), &out)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -564,7 +606,9 @@ impl RtrtMcp {
             "filtered_len": filtered,
             "saved_chars": original.saturating_sub(filtered),
         });
-        self.state.auto_capture("proxy", None, &out).await;
+        self.state
+            .auto_capture("proxy", args.project.as_deref(), &out)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -992,6 +1036,7 @@ impl RtrtMcp {
         &self,
         Parameters(args): Parameters<ProviderChatArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let project = args.project.clone();
         let messages = args
             .messages
             .into_iter()
@@ -1028,7 +1073,7 @@ impl RtrtMcp {
             "output_tokens": resp.usage.output_tokens,
         });
         self.state
-            .auto_capture("provider_chat", None, &resp.content)
+            .auto_capture("provider_chat", project.as_deref(), &resp.content)
             .await;
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -1042,6 +1087,7 @@ impl RtrtMcp {
         &self,
         Parameters(args): Parameters<AgentCallArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let project = args.project.clone();
         let mode = match args.mode.as_deref() {
             Some(value) => Some(
                 InvokeMode::parse_label(value)
@@ -1063,7 +1109,7 @@ impl RtrtMcp {
         let body = serde_json::to_string(&outcome)
             .map_err(|e| McpError::internal_error(format!("agent_call serialize: {e}"), None))?;
         self.state
-            .auto_capture("agent_call", None, &outcome.output)
+            .auto_capture("agent_call", project.as_deref(), &outcome.output)
             .await;
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
@@ -1075,6 +1121,7 @@ impl RtrtMcp {
         &self,
         Parameters(args): Parameters<AgentRouteArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let project = args.project.clone();
         let req = RouteRequest {
             capability: parse_agent_route_capability(args.capability.as_deref())?,
             prefer: parse_agent_route_prefer(args.prefer.as_deref())?,
@@ -1118,8 +1165,56 @@ impl RtrtMcp {
         body["exit_code"] = serde_json::json!(outcome.exit_code);
         body["ms"] = serde_json::json!(outcome.ms);
         self.state
-            .auto_capture("agent_route", None, &outcome.output)
+            .auto_capture("agent_route", project.as_deref(), &outcome.output)
             .await;
+        Ok(CallToolResult::success(vec![Content::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Dispatch a task to RTRT's configured team. The local manager forwards the raw task and RTRT selects an available leader; the selected leader dynamically delegates workers by roles."
+    )]
+    async fn team_dispatch(
+        &self,
+        Parameters(args): Parameters<TeamDispatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = rtrt_core::Config::load_effective_for_cwd();
+        if !cfg.team.enabled {
+            return Err(McpError::invalid_params(
+                "team_dispatch: team is disabled; set [team] enabled = true",
+                None,
+            ));
+        }
+        if args.prompt.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "team_dispatch: prompt is empty",
+                None,
+            ));
+        }
+
+        let outcome = dispatch_team(
+            &cfg.team,
+            &args.prompt,
+            team_dispatch_timeout(args.timeout_secs),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("team_dispatch: {e}"), None))?;
+        let summary = outcome.summary();
+        self.state
+            .auto_capture(
+                "team_dispatch",
+                args.project.as_deref(),
+                &outcome.outcome.output,
+            )
+            .await;
+        let body = serde_json::json!({
+            "output": outcome.outcome.output,
+            "target": outcome.outcome.target,
+            "model": outcome.outcome.model,
+            "failed_over": outcome.failed_over,
+            "summary": summary,
+        });
         Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
         )]))
@@ -1239,7 +1334,8 @@ impl ServerHandler for RtrtMcp {
                  proxy (command output filters). \
                  Code tools: repo_map (tree-sitter signatures). \
                  Project tools: templates_list / templates_scaffold. \
-                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible) / agent_call (detected CLI/API agent bridge). \
+                 LLM tools: provider_chat (Anthropic / OpenAI / OpenAI-compatible) / agent_call (detected CLI/API agent bridge) / \
+                 team_dispatch (local manager forwards raw task; RTRT selects an available leader, which dynamically delegates workers by roles). \
                  Security tools: security_scan (profile-driven secrets / license / dependency / pattern / AI-artifact scan; profiles map to CWE/OWASP/NIST/CIS/SLSA/EU-AI-Act). \
                  Prompts: every entry in the local PromptRegistry (~/.rtrt/prompts) is exposed via prompts/list + prompts/get with handlebars argument substitution. \
                  Resources: memory://<project>/timeline lists recent rows, memory://<project>/block/<name> reads a Letta block."
@@ -1563,13 +1659,7 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(300);
     let default_project = std::env::var("RTRT_DEFAULT_PROJECT")
-        .or_else(|_| {
-            std::env::current_dir().map(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "default".to_string())
-            })
-        })
+        .or_else(|_| std::env::current_dir().map(|p| rtrt_core::project_for_cwd(&p)))
         .unwrap_or_else(|_| "default".to_string());
     let session_id = Uuid::new_v4().to_string();
     let shared_state = Arc::new(RtrtState {
@@ -1581,6 +1671,7 @@ async fn main() -> Result<()> {
         prompts,
         auto_capture,
         auto_redact,
+        require_project_override: matches!(cli.transport, Transport::Http),
         default_project,
         session_id,
         dedup_window_sec,
@@ -1690,6 +1781,26 @@ mod tests {
     }
 
     #[test]
+    fn team_dispatch_timeout_defaults_and_accepts_override() {
+        assert_eq!(
+            team_dispatch_timeout(None),
+            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            team_dispatch_timeout(Some(45)),
+            std::time::Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn team_dispatch_args_allow_omitted_timeout() {
+        let args: TeamDispatchArgs =
+            serde_json::from_str(r#"{"prompt":"ship it"}"#).expect("valid arguments");
+        assert_eq!(args.prompt, "ship it");
+        assert_eq!(args.timeout_secs, None);
+    }
+
+    #[test]
     fn ollama_reachable_returns_false_for_a_closed_port() {
         // Port 1 is a well-known reserved port almost never listened on: the
         // connection is refused outright (not merely slow), so this returns
@@ -1757,10 +1868,30 @@ mod tests {
             prompts: None,
             auto_capture: false,
             auto_redact: true,
+            require_project_override: false,
             default_project: "test".to_string(),
             session_id: "test-session".to_string(),
             dedup_window_sec: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn shared_transport_capture_requires_explicit_project() {
+        let path = temp_store_path("shared-project");
+        let mut state = test_state(path.clone(), rtrt_core::Config::default(), None);
+        state.auto_capture = true;
+        state.require_project_override = true;
+
+        state.auto_capture("agent_call", None, "skipped").await;
+        state
+            .auto_capture("agent_call", Some("actual-project"), "saved")
+            .await;
+
+        let store = state.memory.lock().await;
+        assert_eq!(store.count_by_project("test").unwrap(), 0);
+        assert_eq!(store.count_by_project("actual-project").unwrap(), 1);
+        drop(store);
+        cleanup_store(&path);
     }
 
     #[tokio::test]

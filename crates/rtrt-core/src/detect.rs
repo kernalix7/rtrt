@@ -156,7 +156,9 @@ const REGISTRY: &[ToolDescriptor] = &[
         binaries: &["claude"],
         version_args: VERSION_FLAG,
         invocation_modes: CLI_MODE,
-        cli_invocation: Some("claude -p {prompt}"),
+        cli_invocation: Some(
+            "claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call",
+        ),
         cost_class: CostClass::SubscriptionFlat,
         capabilities: CODING_CAPS,
         config_path: Some("~/.claude.json"),
@@ -182,7 +184,10 @@ const REGISTRY: &[ToolDescriptor] = &[
         binaries: &["opencode"],
         version_args: VERSION_FLAG,
         invocation_modes: CLI_MODE,
-        cli_invocation: Some("opencode run {prompt}"),
+        // Always use the built-in worker agent. The user's default agent may
+        // itself be the RTRT orchestrator, which would recurse back into team
+        // dispatch if an internal worker inherited it.
+        cli_invocation: Some("opencode run {model_args} --agent build {prompt}"),
         cost_class: CostClass::SubscriptionFlat,
         capabilities: CODING_CAPS,
         config_path: Some("~/.config/opencode"),
@@ -835,6 +840,26 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn cli_templates_forward_optional_models_where_supported() {
+        let template = |name| {
+            REGISTRY
+                .iter()
+                .find(|descriptor| descriptor.name == name)
+                .and_then(|descriptor| descriptor.cli_invocation)
+        };
+
+        assert_eq!(
+            template("claude"),
+            Some("claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call")
+        );
+        assert_eq!(
+            template("opencode"),
+            Some("opencode run {model_args} --agent build {prompt}")
+        );
+        assert_eq!(template("ollama"), Some("ollama run {model} {prompt}"));
     }
 
     #[test]

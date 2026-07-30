@@ -177,6 +177,18 @@ fn memory_reembed_rejects_invalid_batch_and_conflicting_scope() {
         .stderr(predicate::str::contains("--batch"));
 
     rtrt(home.path())
+        .args(["memory", "reembed", "--batch", "257", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must not exceed 256"));
+
+    rtrt(home.path())
+        .args(["memory", "reembed", "--workers", "33", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must not exceed 32"));
+
+    rtrt(home.path())
         .args(["memory", "reembed", "--project", "p1", "--all", "--dry-run"])
         .assert()
         .failure()
@@ -239,7 +251,7 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
-    for body in ["first row", "second row"] {
+    for body in ["first row", "second row", "third row"] {
         rtrt(home.path())
             .args([
                 "memory",
@@ -258,7 +270,7 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         for (status, body) in [
-            ("200 OK", r#"{"embedding":[0.1,0.2]}"#),
+            ("200 OK", r#"{"embeddings":[[0.1,0.2],[0.3,0.4]]}"#),
             ("500 Internal Server Error", r#"{"error":"failed"}"#),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
@@ -286,10 +298,32 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
             &base_url,
             "--batch",
             "2",
+            "--workers",
+            "1",
         ])
         .assert()
         .failure();
     server.join().unwrap();
+
+    let conn = rusqlite::Connection::open(&store).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.vector FROM embeddings e
+               JOIN memories m ON m.id = e.memory_id
+              WHERE m.project = 'p1' AND e.model = 'bge-m3'
+              ORDER BY m.id",
+        )
+        .unwrap();
+    let blobs = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let vectors = blobs
+        .iter()
+        .map(|blob| rtrt_memory::vector_from_blob(blob).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(vectors, [vec![0.1, 0.2], vec![0.3, 0.4]]);
 
     rtrt(home.path())
         .args([
@@ -306,6 +340,83 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
         .assert()
         .success()
         .stdout(predicate::str::contains("1 row(s) pending"));
+}
+
+#[test]
+fn memory_reembed_falls_back_to_legacy_ollama_endpoint() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join("mem.sqlite");
+    let store_s = store.to_str().unwrap();
+
+    for body in ["first row", "second row"] {
+        rtrt(home.path())
+            .args([
+                "memory",
+                "save",
+                "--store",
+                store_s,
+                "--project",
+                "p1",
+                body,
+            ])
+            .assert()
+            .success();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for (status, body) in [
+            ("404 Not Found", r#"{"error":"not found"}"#),
+            ("200 OK", r#"{"embedding":[0.1,0.2]}"#),
+            ("200 OK", r#"{"embedding":[0.3,0.4]}"#),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--base-url",
+            &base_url,
+            "--batch",
+            "2",
+            "--workers",
+            "1",
+        ])
+        .assert()
+        .success();
+    server.join().unwrap();
+
+    rtrt(home.path())
+        .args([
+            "memory",
+            "reembed",
+            "--store",
+            store_s,
+            "--project",
+            "p1",
+            "--model",
+            "bge-m3",
+            "--probe",
+        ])
+        .assert()
+        .success();
 }
 
 #[test]

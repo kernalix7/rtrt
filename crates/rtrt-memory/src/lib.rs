@@ -1263,6 +1263,10 @@ impl MemoryStore {
                     model       TEXT NOT NULL,
                     vector      BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS embedding_models (
+                    model       TEXT PRIMARY KEY,
+                    dimension   INTEGER NOT NULL CHECK (dimension > 0)
+                );
                 CREATE TABLE IF NOT EXISTS edges (
                     src_id      INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
                     dst_id      INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -1270,6 +1274,22 @@ impl MemoryStore {
                     PRIMARY KEY (src_id, dst_id, relation)
                 );
                 "#,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        // Backfill the dimension registry for existing, internally consistent
+        // models. Mixed or malformed legacy vectors are intentionally omitted
+        // so the next write/read reports them instead of blessing corruption.
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO embedding_models(model, dimension)
+                 SELECT model, length(vector) / 4
+                   FROM embeddings
+                  GROUP BY model
+                 HAVING COUNT(DISTINCT length(vector)) = 1
+                    AND MIN(length(vector) % 4) = 0
+                    AND MIN(length(vector)) > 0",
+                [],
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
 
@@ -2054,12 +2074,7 @@ impl MemoryStore {
         // Auto-embed when an embedder is attached.
         if let Some(e) = self.embedder.clone() {
             let vector = e.embed_one(body)?;
-            self.conn
-                .execute(
-                    "INSERT INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id, e.model_name(), vector_to_blob(&vector)],
-                )
-                .map_err(|e| Error::Memory(e.to_string()))?;
+            self.store_embedding(id, e.model_name(), &vector)?;
         }
         Ok(id)
     }
@@ -2223,12 +2238,7 @@ impl MemoryStore {
     ) -> Result<i64> {
         let id = self.save(project, kind, body)?;
         let vector = embedder.embed_one(body)?;
-        self.conn
-            .execute(
-                "INSERT INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, embedder.model_name(), vector_to_blob(&vector)],
-            )
-            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.store_embedding(id, embedder.model_name(), &vector)?;
         Ok(id)
     }
 
@@ -4970,13 +4980,7 @@ impl MemoryStore {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let blob = vector_to_blob(&vec);
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![rec.id, embedder.model_name(), blob],
-                )
-                .map_err(|e| Error::Memory(e.to_string()))?;
+            self.store_embedding(rec.id, embedder.model_name(), &vec)?;
             embedded += 1;
         }
         Ok(embedded)
@@ -5014,6 +5018,7 @@ impl MemoryStore {
     /// error. Companion to [`unembedded_batch`](Self::unembedded_batch): the
     /// daemon pulls a batch, embeds each body, then calls this per row.
     pub fn store_embedding(&self, memory_id: i64, model: &str, vector: &[f32]) -> Result<()> {
+        self.ensure_embedding_model_dimension(model, vector.len())?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
@@ -5037,6 +5042,7 @@ impl MemoryStore {
         model: &str,
         vector: &[f32],
     ) -> Result<()> {
+        self.ensure_embedding_model_dimension(model, vector.len())?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
@@ -5044,6 +5050,116 @@ impl MemoryStore {
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Store a replacement only when its dimension matches the target model's
+    /// persisted invariant established by the migration caller.
+    pub fn store_embedding_replace_checked(
+        &self,
+        memory_id: i64,
+        model: &str,
+        vector: &[f32],
+        expected_dimension: usize,
+    ) -> Result<()> {
+        if vector.len() != expected_dimension {
+            return Err(Error::Memory(format!(
+                "embedding dimension {} does not match `{model}` dimension {expected_dimension}",
+                vector.len()
+            )));
+        }
+        self.store_embedding_replace(memory_id, model, vector)
+    }
+
+    fn ensure_embedding_model_dimension(&self, model: &str, dimension: usize) -> Result<()> {
+        if dimension == 0 {
+            return Err(Error::Memory("embedding vector must not be empty".into()));
+        }
+        let registered = self
+            .conn
+            .query_row(
+                "SELECT dimension FROM embedding_models WHERE model = ?1",
+                rusqlite::params![model],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        if let Some(registered) = registered {
+            let registered = usize::try_from(registered)
+                .map_err(|_| Error::Memory("registered embedding dimension overflow".into()))?;
+            if registered != dimension {
+                return Err(Error::Memory(format!(
+                    "embedding dimension {dimension} does not match `{model}` dimension {registered}"
+                )));
+            }
+            return Ok(());
+        }
+
+        // Registry-less legacy model: validate its existing vectors before
+        // claiming the model name. INSERT OR IGNORE then resolves races between
+        // separate MemoryStore connections; the read-back is authoritative.
+        if let Some(existing) = self.embedding_dimension_for_model(model)?
+            && existing != dimension
+        {
+            return Err(Error::Memory(format!(
+                "embedding dimension {dimension} does not match stored `{model}` dimension {existing}"
+            )));
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO embedding_models(model, dimension) VALUES (?1, ?2)",
+                rusqlite::params![model, i64::try_from(dimension).unwrap_or(i64::MAX)],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let registered: i64 = self
+            .conn
+            .query_row(
+                "SELECT dimension FROM embedding_models WHERE model = ?1",
+                rusqlite::params![model],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let registered = usize::try_from(registered)
+            .map_err(|_| Error::Memory("registered embedding dimension overflow".into()))?;
+        if registered != dimension {
+            return Err(Error::Memory(format!(
+                "embedding dimension {dimension} does not match `{model}` dimension {registered}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Dimension of an existing vector produced by `model`, if any. Migration
+    /// callers use this persisted invariant across process restarts so one
+    /// model name can never accumulate vectors with incompatible dimensions.
+    pub fn embedding_dimension_for_model(&self, model: &str) -> Result<Option<usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT length(vector) FROM embeddings WHERE model = ?1")
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let byte_lengths = stmt
+            .query_map(rusqlite::params![model], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let mut dimension = None;
+        for byte_length in byte_lengths {
+            if byte_length < 0 || byte_length % 4 != 0 {
+                return Err(Error::Memory(format!(
+                    "stored `{model}` vector has invalid byte length {byte_length}"
+                )));
+            }
+            let current = usize::try_from(byte_length / 4)
+                .map_err(|_| Error::Memory("embedding dimension overflow".into()))?;
+            if let Some(expected) = dimension
+                && current != expected
+            {
+                return Err(Error::Memory(format!(
+                    "stored `{model}` vectors have mixed dimensions {expected} and {current}"
+                )));
+            }
+            dimension = Some(current);
+        }
+        Ok(dimension)
     }
 
     /// Pulls a bounded batch of memory rows whose stored embedding (if any)
@@ -7077,6 +7193,10 @@ mod tests {
         store
             .store_embedding_replace(rust_id, a.model_name(), &v)
             .unwrap();
+        assert_eq!(
+            store.embedding_dimension_for_model(a.model_name()).unwrap(),
+            Some(v.len())
+        );
         let hits_after = store.recall_vector("p1", "rust", 5, &a).unwrap();
         assert_eq!(hits_after.len(), 1, "one row re-embedded to the new model");
         assert!(hits_after[0].record.body.contains("cargo"));
@@ -7110,6 +7230,31 @@ mod tests {
         assert!(batch[0].2.contains("npm"));
         let all = store.reembed_batch(a.model_name(), None, 4).unwrap();
         assert_eq!(all.len(), 2);
+
+        assert!(
+            store
+                .store_embedding_replace_checked(rust_id, a.model_name(), &[1.0, 2.0, 3.0], v.len())
+                .is_err(),
+            "checked storage must reject a different dimension"
+        );
+        let mixed_id = store.save("p1", "note", "mixed dimension").unwrap();
+        assert!(
+            store
+                .store_embedding_replace(mixed_id, a.model_name(), &[1.0, 2.0, 3.0])
+                .is_err(),
+            "all embedding write paths must enforce the registered dimension"
+        );
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                rusqlite::params![mixed_id, a.model_name(), vector_to_blob(&[1.0, 2.0, 3.0])],
+            )
+            .unwrap();
+        assert!(
+            store.embedding_dimension_for_model(a.model_name()).is_err(),
+            "persisted mixed dimensions must be detected on resume"
+        );
     }
 
     #[test]

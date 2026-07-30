@@ -41,8 +41,8 @@ llm = ["dep:rtrt-providers"]
 # beyond ~50k.
 hnsw = ["dep:instant-distance"]
 # Lightweight Ollama-backed embedder. Uses `ureq` (sync) so the caller does not
-# need an async runtime to create the embedder. The embedder loops per text
-# because Ollama's /api/embeddings endpoint accepts a single string at a time.
+# need an async runtime. Prefers batched `/api/embed`, with a one-time fallback
+# to legacy per-text `/api/embeddings` for old Ollama versions.
 ollama-embed = ["dep:ureq"]
 
 [dev-dependencies]

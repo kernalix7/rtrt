@@ -31,7 +31,7 @@ pub trait Embedder: Send + Sync {
     not(any(feature = "ollama-embed", feature = "embeddings", test)),
     allow(dead_code)
 )]
-pub(crate) const EMBED_CHAR_CAP: usize = 2000;
+pub const EMBED_CHAR_CAP: usize = 2000;
 
 /// Returns `text` capped to the first [`EMBED_CHAR_CAP`] chars. Cheap no-op when
 /// the text is already short (borrows instead of allocating).
@@ -39,7 +39,7 @@ pub(crate) const EMBED_CHAR_CAP: usize = 2000;
     not(any(feature = "ollama-embed", feature = "embeddings", test)),
     allow(dead_code)
 )]
-pub(crate) fn truncate_for_embed(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn truncate_for_embed(text: &str) -> std::borrow::Cow<'_, str> {
     if text.chars().count() <= EMBED_CHAR_CAP {
         std::borrow::Cow::Borrowed(text)
     } else {
@@ -99,13 +99,26 @@ mod ollama_impl {
 
     use super::Embedder;
 
-    /// Ollama-backed embedder. Calls `POST {base_url}/api/embeddings` for each
-    /// text (Ollama accepts one string per call, so `embed` loops). The
-    /// dimension is detected on first call and cached; if the probe fails it
+    #[derive(Clone, Copy)]
+    enum OllamaApi {
+        Batch,
+        Legacy,
+    }
+
+    enum OllamaProbe {
+        Batch(Box<ureq::Response>),
+        Legacy,
+    }
+
+    /// Ollama-backed embedder. Uses the modern `/api/embed` array endpoint and
+    /// falls back once to legacy per-text `/api/embeddings` on old servers.
+    /// The dimension is detected on first success and cached; before that it
     /// defaults to 1024 (the bge-m3 native size).
     pub struct OllamaEmbedder {
         base_url: String,
         model: String,
+        agent: ureq::Agent,
+        api: std::sync::Mutex<Option<OllamaApi>>,
         // `None` until the first successful embed; then locked in forever.
         dim: std::sync::OnceLock<usize>,
     }
@@ -126,23 +139,65 @@ mod ollama_impl {
             Self {
                 base_url: url,
                 model: model.into(),
+                agent: ureq::AgentBuilder::new().build(),
+                api: std::sync::Mutex::new(None),
                 dim: std::sync::OnceLock::new(),
             }
         }
 
-        fn embed_one_text(&self, text: &str) -> Result<Vec<f32>> {
+        fn parse_vector(&self, values: &[serde_json::Value]) -> Result<Vec<f32>> {
+            let vector = values
+                .iter()
+                .map(|value| {
+                    let value = value.as_f64().ok_or_else(|| {
+                        Error::Memory("ollama: nonnumeric embedding value".into())
+                    })?;
+                    let value = value as f32;
+                    if !value.is_finite() {
+                        return Err(Error::Memory("ollama: non-finite embedding value".into()));
+                    }
+                    Ok(value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if vector.is_empty() {
+                return Err(Error::Memory("ollama: empty embedding vector".into()));
+            }
+            Ok(vector)
+        }
+
+        fn validate_and_latch(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>> {
+            let Some(first) = vectors.first() else {
+                return Ok(vectors);
+            };
+            let dimension = first.len();
+            if vectors.iter().any(|vector| vector.len() != dimension) {
+                return Err(Error::Memory(
+                    "ollama: inconsistent embedding dimensions in response".into(),
+                ));
+            }
+            let _ = self.dim.set(dimension);
+            let expected = *self.dim.get().unwrap_or(&dimension);
+            if dimension != expected {
+                return Err(Error::Memory(format!(
+                    "ollama: embedding dimension changed from {expected} to {dimension}"
+                )));
+            }
+            Ok(vectors)
+        }
+
+        fn embed_legacy_one(&self, text: &str) -> Result<Vec<f32>> {
             let url = format!("{}/api/embeddings", self.base_url);
-            // Cap the prompt: long bodies otherwise time out or fail at the
-            // model's context window, leaving rows unembedded.
             let prompt = super::truncate_for_embed(text);
             let body = serde_json::json!({
                 "model": self.model,
                 "prompt": prompt.as_ref(),
             });
-            let resp = ureq::post(&url)
+            let resp = self
+                .agent
+                .post(&url)
                 .set("Content-Type", "application/json")
                 .send_json(&body)
-                .map_err(|e| Error::Memory(format!("ollama embeddings request: {e}")))?;
+                .map_err(|error| Self::request_error("embeddings", error))?;
             let v: serde_json::Value = resp
                 .into_json()
                 .map_err(|e| Error::Memory(format!("ollama embeddings decode: {e}")))?;
@@ -150,14 +205,117 @@ mod ollama_impl {
                 .get("embedding")
                 .and_then(|e| e.as_array())
                 .ok_or_else(|| Error::Memory("ollama: missing `embedding` array".into()))?;
-            let vec: Vec<f32> = arr
+            self.parse_vector(arr)
+        }
+
+        fn embed_legacy(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            texts
                 .iter()
-                .filter_map(|x| x.as_f64().map(|f| f as f32))
-                .collect();
-            if vec.is_empty() {
-                return Err(Error::Memory("ollama: empty embedding vector".into()));
+                .map(|text| self.embed_legacy_one(text))
+                .collect()
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let url = format!("{}/api/embed", self.base_url);
+            let inputs = texts
+                .iter()
+                .map(|text| super::truncate_for_embed(text).into_owned())
+                .collect::<Vec<_>>();
+            let body = serde_json::json!({
+                "model": self.model,
+                "input": inputs,
+                "truncate": true,
+            });
+            let response = self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .send_json(&body)
+                .map_err(|error| Self::request_error("embed", error))?;
+            self.decode_batch_response(response, texts.len())
+        }
+
+        fn decode_batch_response(
+            &self,
+            response: ureq::Response,
+            expected_count: usize,
+        ) -> Result<Vec<Vec<f32>>> {
+            let value: serde_json::Value = response
+                .into_json()
+                .map_err(|error| Error::Memory(format!("ollama embed decode: {error}")))?;
+            let arrays = value
+                .get("embeddings")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Memory("ollama: missing `embeddings` array".into()))?;
+            if arrays.len() != expected_count {
+                return Err(Error::Memory(format!(
+                    "ollama: returned {} embeddings for {} inputs",
+                    arrays.len(),
+                    expected_count
+                )));
             }
-            Ok(vec)
+            arrays
+                .iter()
+                .map(|array| {
+                    let array = array
+                        .as_array()
+                        .ok_or_else(|| Error::Memory("ollama: embedding is not an array".into()))?;
+                    self.parse_vector(array)
+                })
+                .collect()
+        }
+
+        fn request_error(endpoint: &str, error: ureq::Error) -> Error {
+            match error {
+                ureq::Error::Status(status, response) => {
+                    let detail = response.into_string().unwrap_or_default();
+                    Error::Memory(format!(
+                        "ollama {endpoint} request returned HTTP {status}: {detail}"
+                    ))
+                }
+                error => Error::Memory(format!("ollama {endpoint} request: {error}")),
+            }
+        }
+
+        fn embed_unknown_api(&self, texts: &[&str]) -> Result<OllamaProbe> {
+            let url = format!("{}/api/embed", self.base_url);
+            let inputs = texts
+                .iter()
+                .map(|text| super::truncate_for_embed(text).into_owned())
+                .collect::<Vec<_>>();
+            let body = serde_json::json!({
+                "model": self.model,
+                "input": inputs,
+                "truncate": true,
+            });
+            match self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .send_json(&body)
+            {
+                Ok(response) => Ok(OllamaProbe::Batch(Box::new(response))),
+                Err(ureq::Error::Status(405 | 501, _)) => Ok(OllamaProbe::Legacy),
+                Err(ureq::Error::Status(404, response)) => {
+                    let detail = response.into_string().unwrap_or_default();
+                    let lower = detail.to_ascii_lowercase();
+                    if lower.contains("model") && lower.contains("not found") {
+                        Err(Error::Memory(format!(
+                            "ollama embed request returned HTTP 404: {detail}"
+                        )))
+                    } else {
+                        Ok(OllamaProbe::Legacy)
+                    }
+                }
+                Err(error) => Err(Self::request_error("embed", error)),
+            }
+        }
+
+        fn embed_known_api(&self, api: OllamaApi, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            match api {
+                OllamaApi::Batch => self.embed_batch(texts),
+                OllamaApi::Legacy => self.embed_legacy(texts),
+            }
         }
     }
 
@@ -173,14 +331,44 @@ mod ollama_impl {
         }
 
         fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            let mut out = Vec::with_capacity(texts.len());
-            for &text in texts {
-                let vec = self.embed_one_text(text)?;
-                // Latch the dimension on the first successful call.
-                let _ = self.dim.set(vec.len());
-                out.push(vec);
+            if texts.is_empty() {
+                return Ok(Vec::new());
             }
-            Ok(out)
+            let known_api = *self
+                .api
+                .lock()
+                .map_err(|_| Error::Memory("ollama API mode lock poisoned".into()))?;
+            let vectors = if let Some(api) = known_api {
+                self.embed_known_api(api, texts)?
+            } else {
+                // Serialize only the first capability probe. Once the mode is
+                // latched, requests run concurrently without holding the lock.
+                let mut api = self
+                    .api
+                    .lock()
+                    .map_err(|_| Error::Memory("ollama API mode lock poisoned".into()))?;
+                if let Some(known) = *api {
+                    drop(api);
+                    self.embed_known_api(known, texts)?
+                } else {
+                    match self.embed_unknown_api(texts)? {
+                        OllamaProbe::Batch(response) => {
+                            *api = Some(OllamaApi::Batch);
+                            drop(api);
+                            self.decode_batch_response(*response, texts.len())?
+                        }
+                        OllamaProbe::Legacy => {
+                            *api = Some(OllamaApi::Legacy);
+                            drop(api);
+                            tracing::warn!(
+                                "Ollama /api/embed unavailable; using legacy /api/embeddings"
+                            );
+                            self.embed_legacy(texts)?
+                        }
+                    }
+                }
+            };
+            self.validate_and_latch(vectors)
         }
     }
 
@@ -203,7 +391,8 @@ mod ollama_impl {
         if !cfg.embeddings.is_enabled() {
             return false;
         }
-        match store.embedding_coverage(project) {
+        let model = cfg.embeddings.effective_model();
+        match store.embedding_coverage_for_model(project, &model) {
             Ok((embedded, total)) => embedded > 0 && embedded.saturating_mul(2) >= total,
             Err(_) => false,
         }

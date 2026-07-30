@@ -26,7 +26,9 @@ pub use capture::is_synthetic_prompt;
 pub use capture_bucket::is_capture_bucket_name;
 #[cfg(feature = "embeddings")]
 pub use embed::FastEmbedder;
-pub use embed::{Embedder, cosine, vector_from_blob, vector_to_blob};
+pub use embed::{
+    EMBED_CHAR_CAP, Embedder, cosine, truncate_for_embed, vector_from_blob, vector_to_blob,
+};
 #[cfg(feature = "ollama-embed")]
 pub use embed::{OllamaEmbedder, hybrid_embedder_from_config, hybrid_recall_ready};
 #[cfg(feature = "hnsw")]
@@ -1261,6 +1263,10 @@ impl MemoryStore {
                     model       TEXT NOT NULL,
                     vector      BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS embedding_models (
+                    model       TEXT PRIMARY KEY,
+                    dimension   INTEGER NOT NULL CHECK (dimension > 0)
+                );
                 CREATE TABLE IF NOT EXISTS edges (
                     src_id      INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
                     dst_id      INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -1268,6 +1274,22 @@ impl MemoryStore {
                     PRIMARY KEY (src_id, dst_id, relation)
                 );
                 "#,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        // Backfill the dimension registry for existing, internally consistent
+        // models. Mixed or malformed legacy vectors are intentionally omitted
+        // so the next write/read reports them instead of blessing corruption.
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO embedding_models(model, dimension)
+                 SELECT model, length(vector) / 4
+                   FROM embeddings
+                  GROUP BY model
+                 HAVING COUNT(DISTINCT length(vector)) = 1
+                    AND MIN(length(vector) % 4) = 0
+                    AND MIN(length(vector)) > 0",
+                [],
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
 
@@ -2052,12 +2074,7 @@ impl MemoryStore {
         // Auto-embed when an embedder is attached.
         if let Some(e) = self.embedder.clone() {
             let vector = e.embed_one(body)?;
-            self.conn
-                .execute(
-                    "INSERT INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id, e.model_name(), vector_to_blob(&vector)],
-                )
-                .map_err(|e| Error::Memory(e.to_string()))?;
+            self.store_embedding(id, e.model_name(), &vector)?;
         }
         Ok(id)
     }
@@ -2221,12 +2238,7 @@ impl MemoryStore {
     ) -> Result<i64> {
         let id = self.save(project, kind, body)?;
         let vector = embedder.embed_one(body)?;
-        self.conn
-            .execute(
-                "INSERT INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, embedder.model_name(), vector_to_blob(&vector)],
-            )
-            .map_err(|e| Error::Memory(e.to_string()))?;
+        self.store_embedding(id, embedder.model_name(), &vector)?;
         Ok(id)
     }
 
@@ -2544,7 +2556,24 @@ impl MemoryStore {
         embedder: &dyn Embedder,
     ) -> Result<(Vec<ScoredRecord>, SimilarityBackground)> {
         let q = embedder.embed_one(query)?;
-        self.rank_by_vector(project, &q, limit)
+        self.rank_by_vector(project, &q, limit, Some(embedder.model_name()))
+    }
+
+    /// Row parser shared by both branches of [`MemoryStore::rank_by_vector`]:
+    /// extracts the [`MemoryRecord`] plus the raw embedding blob, so the
+    /// caller can cosine-rank the blob against the query vector.
+    fn parse_scored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(MemoryRecord, Vec<u8>)> {
+        let scope: String = row.get(5)?;
+        let record = MemoryRecord {
+            id: row.get(0)?,
+            project: row.get(1)?,
+            kind: row.get(2)?,
+            body: row.get(3)?,
+            created_at: row.get(4)?,
+            scope: MemoryScope::parse(&scope),
+        };
+        let blob: Vec<u8> = row.get(6)?;
+        Ok((record, blob))
     }
 
     /// Cosine-ranks every embedded row of `project` against an ALREADY
@@ -2553,36 +2582,50 @@ impl MemoryStore {
     /// [`recall_vector_scored`](Self::recall_vector_scored) so a caller that
     /// embeds several texts in one round-trip (the hybrid path embeds the
     /// prompt and its null probe together) does not pay for a second embed.
+    ///
+    /// `model` filters stored vectors to those emitted by the SAME embedder
+    /// whose query vector we are ranking against. This is load-bearing: the
+    /// `embeddings` table carries every row's `model` column, and cosine
+    /// similarity across two different embedding models is meaningless —
+    /// different dimensionality, incompatible spaces. Passing the active
+    /// embedder's `model_name()` here keeps a half-migrated store (some rows
+    /// still on `nomic-embed-text`, some re-embedded as `bge-m3`) from
+    /// silently comparing vectors from both spaces. `None` skips the filter
+    /// (legacy callers that haven't been threaded through yet); use the
+    /// `Some` path from every recall entry that has an embedder to hand.
     fn rank_by_vector(
         &self,
         project: &str,
         query_vector: &[f32],
         limit: usize,
+        model: Option<&str>,
     ) -> Result<(Vec<ScoredRecord>, SimilarityBackground)> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT m.id, m.project, m.kind, m.body, m.created_at, m.scope, e.vector
-                   FROM embeddings e
-                   JOIN memories m ON m.id = e.memory_id
-                  WHERE m.project = ?1",
-            )
-            .map_err(|e| Error::Memory(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![project], |row| {
-                let scope: String = row.get(5)?;
-                let record = MemoryRecord {
-                    id: row.get(0)?,
-                    project: row.get(1)?,
-                    kind: row.get(2)?,
-                    body: row.get(3)?,
-                    created_at: row.get(4)?,
-                    scope: MemoryScope::parse(&scope),
-                };
-                let blob: Vec<u8> = row.get(6)?;
-                Ok((record, blob))
-            })
-            .map_err(|e| Error::Memory(e.to_string()))?;
+        let mut stmt = if model.is_some() {
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.kind, m.body, m.created_at, m.scope, e.vector
+                       FROM embeddings e
+                       JOIN memories m ON m.id = e.memory_id
+                      WHERE m.project = ?1 AND e.model = ?2",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.kind, m.body, m.created_at, m.scope, e.vector
+                       FROM embeddings e
+                       JOIN memories m ON m.id = e.memory_id
+                      WHERE m.project = ?1",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        };
+        let rows = if let Some(m) = model {
+            stmt.query_map(rusqlite::params![project, m], Self::parse_scored_row)
+                .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            stmt.query_map(rusqlite::params![project], Self::parse_scored_row)
+                .map_err(|e| Error::Memory(e.to_string()))?
+        };
         let mut scored: Vec<ScoredRecord> = Vec::new();
         // Accumulate in f64: a 100k-row corpus sums enough f32 cosines for
         // the naive variance to lose its leading digits.
@@ -4223,6 +4266,35 @@ impl MemoryStore {
         Ok((embedded as usize, total as usize))
     }
 
+    /// `(embedded, total)` row counts for `project`, counting only vectors
+    /// produced by `model`. Used to avoid enabling hybrid recall from stale
+    /// coverage after the configured embedding model changes.
+    pub fn embedding_coverage_for_model(
+        &self,
+        project: &str,
+        model: &str,
+    ) -> Result<(usize, usize)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let embedded: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings e
+                   JOIN memories m ON m.id = e.memory_id
+                  WHERE m.project = ?1 AND e.model = ?2",
+                rusqlite::params![project, model],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok((embedded as usize, total as usize))
+    }
+
     /// Whole-project clustering over **dense embedding vectors** instead of
     /// lexical token overlap. This is the semantic clustering: it loads every
     /// row that has a stored embedding, builds an HNSW index over those vectors,
@@ -4908,13 +4980,7 @@ impl MemoryStore {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let blob = vector_to_blob(&vec);
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![rec.id, embedder.model_name(), blob],
-                )
-                .map_err(|e| Error::Memory(e.to_string()))?;
+            self.store_embedding(rec.id, embedder.model_name(), &vec)?;
             embedded += 1;
         }
         Ok(embedded)
@@ -4952,6 +5018,7 @@ impl MemoryStore {
     /// error. Companion to [`unembedded_batch`](Self::unembedded_batch): the
     /// daemon pulls a batch, embeds each body, then calls this per row.
     pub fn store_embedding(&self, memory_id: i64, model: &str, vector: &[f32]) -> Result<()> {
+        self.ensure_embedding_model_dimension(model, vector.len())?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
@@ -4959,6 +5026,236 @@ impl MemoryStore {
             )
             .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Like [`store_embedding`](Self::store_embedding) but **overwrites** any
+    /// existing embedding for `memory_id` instead of being a no-op. Use when
+    /// upgrading a row from one embedder to another (the `rtrt memory reembed`
+    /// sweep): `INSERT OR IGNORE` would keep the OLD model's vector and the
+    /// new one would be silently dropped, leaving the row in the inactive
+    /// space. The `model` column is updated atomically alongside the vector,
+    /// so a row re-embedded as `bge-m3` is no longer visible to a recall path
+    /// filtering for the still-current `nomic-embed-text` mid-sweep.
+    pub fn store_embedding_replace(
+        &self,
+        memory_id: i64,
+        model: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        self.ensure_embedding_model_dimension(model, vector.len())?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                rusqlite::params![memory_id, model, vector_to_blob(vector)],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store a replacement only when its dimension matches the target model's
+    /// persisted invariant established by the migration caller.
+    pub fn store_embedding_replace_checked(
+        &self,
+        memory_id: i64,
+        model: &str,
+        vector: &[f32],
+        expected_dimension: usize,
+    ) -> Result<()> {
+        if vector.len() != expected_dimension {
+            return Err(Error::Memory(format!(
+                "embedding dimension {} does not match `{model}` dimension {expected_dimension}",
+                vector.len()
+            )));
+        }
+        self.store_embedding_replace(memory_id, model, vector)
+    }
+
+    fn ensure_embedding_model_dimension(&self, model: &str, dimension: usize) -> Result<()> {
+        if dimension == 0 {
+            return Err(Error::Memory("embedding vector must not be empty".into()));
+        }
+        let registered = self
+            .conn
+            .query_row(
+                "SELECT dimension FROM embedding_models WHERE model = ?1",
+                rusqlite::params![model],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        if let Some(registered) = registered {
+            let registered = usize::try_from(registered)
+                .map_err(|_| Error::Memory("registered embedding dimension overflow".into()))?;
+            if registered != dimension {
+                return Err(Error::Memory(format!(
+                    "embedding dimension {dimension} does not match `{model}` dimension {registered}"
+                )));
+            }
+            return Ok(());
+        }
+
+        // Registry-less legacy model: validate its existing vectors before
+        // claiming the model name. INSERT OR IGNORE then resolves races between
+        // separate MemoryStore connections; the read-back is authoritative.
+        if let Some(existing) = self.embedding_dimension_for_model(model)?
+            && existing != dimension
+        {
+            return Err(Error::Memory(format!(
+                "embedding dimension {dimension} does not match stored `{model}` dimension {existing}"
+            )));
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO embedding_models(model, dimension) VALUES (?1, ?2)",
+                rusqlite::params![model, i64::try_from(dimension).unwrap_or(i64::MAX)],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let registered: i64 = self
+            .conn
+            .query_row(
+                "SELECT dimension FROM embedding_models WHERE model = ?1",
+                rusqlite::params![model],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let registered = usize::try_from(registered)
+            .map_err(|_| Error::Memory("registered embedding dimension overflow".into()))?;
+        if registered != dimension {
+            return Err(Error::Memory(format!(
+                "embedding dimension {dimension} does not match `{model}` dimension {registered}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Dimension of an existing vector produced by `model`, if any. Migration
+    /// callers use this persisted invariant across process restarts so one
+    /// model name can never accumulate vectors with incompatible dimensions.
+    pub fn embedding_dimension_for_model(&self, model: &str) -> Result<Option<usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT length(vector) FROM embeddings WHERE model = ?1")
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let byte_lengths = stmt
+            .query_map(rusqlite::params![model], |row| row.get::<_, i64>(0))
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        let mut dimension = None;
+        for byte_length in byte_lengths {
+            if byte_length < 0 || byte_length % 4 != 0 {
+                return Err(Error::Memory(format!(
+                    "stored `{model}` vector has invalid byte length {byte_length}"
+                )));
+            }
+            let current = usize::try_from(byte_length / 4)
+                .map_err(|_| Error::Memory("embedding dimension overflow".into()))?;
+            if let Some(expected) = dimension
+                && current != expected
+            {
+                return Err(Error::Memory(format!(
+                    "stored `{model}` vectors have mixed dimensions {expected} and {current}"
+                )));
+            }
+            dimension = Some(current);
+        }
+        Ok(dimension)
+    }
+
+    /// Pulls a bounded batch of memory rows whose stored embedding (if any)
+    /// was produced by a model OTHER than `target_model` — i.e. either
+    /// unembedded, or embedded by a now-superseded embedder. Returns
+    /// `(id, project, body)` triples the caller embeds with the new model
+    /// and writes back via [`store_embedding_replace`](Self::store_embedding_replace).
+    ///
+    /// `project` limits the sweep to one project; `None` sweeps the whole
+    /// store. A
+    /// `LEFT JOIN ... WHERE e.model IS NULL OR e.model <> ?` so both the
+    /// unembedded backlog AND stale-model rows surface in one scan, ordered
+    /// by `id ASC` for stable resumption.
+    pub fn reembed_batch(
+        &self,
+        target_model: &str,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = if project.is_some() {
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.body
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE m.project = ?1 AND (e.model IS NULL OR e.model <> ?2)
+                      ORDER BY m.id ASC
+                      LIMIT ?3",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            self.conn
+                .prepare(
+                    "SELECT m.id, m.project, m.body
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE e.model IS NULL OR e.model <> ?1
+                      ORDER BY m.id ASC
+                      LIMIT ?2",
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        };
+        let rows = if let Some(project) = project {
+            stmt.query_map(
+                rusqlite::params![project, target_model, limit],
+                Self::parse_reembed_row,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            stmt.query_map(
+                rusqlite::params![target_model, limit],
+                Self::parse_reembed_row,
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?
+        };
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    fn parse_reembed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String)> {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    }
+
+    /// Counts rows that still need re-embedding (see
+    /// [`reembed_batch`](Self::reembed_batch)) for progress display and the
+    /// `--dry-run` preview.
+    pub fn reembed_pending_count(
+        &self,
+        target_model: &str,
+        project: Option<&str>,
+    ) -> Result<usize> {
+        let n: i64 = if let Some(project) = project {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE m.project = ?1 AND (e.model IS NULL OR e.model <> ?2)",
+                    rusqlite::params![project, target_model],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM memories m
+                       LEFT JOIN embeddings e ON e.memory_id = m.id
+                      WHERE e.model IS NULL OR e.model <> ?1",
+                    rusqlite::params![target_model],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?
+        };
+        Ok(n as usize)
     }
 
     /// Global count of rows with **no** entry in the `embeddings` table — the
@@ -5123,7 +5420,8 @@ impl MemoryStore {
             .map(|probe| cosine(&query_vector, probe));
 
         let bm25 = self.recall_bm25(project, query.bm25, fetch)?;
-        let (vector, background) = self.rank_by_vector(project, &query_vector, fetch)?;
+        let (vector, background) =
+            self.rank_by_vector(project, &query_vector, fetch, Some(embedder.model_name()))?;
 
         let rrf_k = 60.0f32;
         let mut fused: std::collections::HashMap<i64, HybridHit> = std::collections::HashMap::new();
@@ -6842,6 +7140,123 @@ mod tests {
         assert!(hits[0].record.body.contains("cargo"), "{:?}", hits);
     }
 
+    /// After re-embedding under a different model name, recall via the new
+    /// model must SEE only the re-embedded rows; recall via the OLD model
+    /// must find nothing (its `e.model` filter excludes the upgraded rows).
+    /// This is the property that keeps a half-migrated store from silently
+    /// fusing vectors across two incompatible embedding spaces.
+    #[test]
+    fn recall_filters_by_stored_embedder_model() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let a = WordHashEmbedder;
+        // Same dimensions, different model_name → acts as "old model" vectors.
+        struct LegacyEmbedder;
+        impl Embedder for LegacyEmbedder {
+            fn dimension(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "test-legacy"
+            }
+            fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|t| word_hash_vec(t)).collect())
+            }
+        }
+        let b = LegacyEmbedder;
+        store
+            .save_embedded("p1", "note", "cargo builds rust", &b)
+            .unwrap();
+        store
+            .save_embedded("p1", "note", "npm installs javascript packages", &b)
+            .unwrap();
+        store
+            .save_embedded("p2", "note", "python installs packages", &b)
+            .unwrap();
+        // Recall via the test-word-hash (current) embedder sees NOTHING:
+        // both rows are tagged with the legacy model.
+        let hits_new = store.recall_vector("p1", "rust", 5, &a).unwrap();
+        assert!(
+            hits_new.is_empty(),
+            "recall via word-hash must skip legacy-tagged rows, got {hits_new:?}"
+        );
+        // Recall via the legacy embedder sees both.
+        let hits_old = store.recall_vector("p1", "rust", 5, &b).unwrap();
+        assert_eq!(hits_old.len(), 2, "legacy recall sees legacy-tagged rows");
+        // Upgrade ONE row via store_embedding_replace; now the new embedder
+        // sees that one and the legacy embedder sees the other.
+        let rust_id = hits_old
+            .iter()
+            .find(|h| h.record.body.contains("cargo"))
+            .map(|h| h.record.id)
+            .expect("rust row present");
+        let v = a.embed_one("cargo builds rust").unwrap();
+        store
+            .store_embedding_replace(rust_id, a.model_name(), &v)
+            .unwrap();
+        assert_eq!(
+            store.embedding_dimension_for_model(a.model_name()).unwrap(),
+            Some(v.len())
+        );
+        let hits_after = store.recall_vector("p1", "rust", 5, &a).unwrap();
+        assert_eq!(hits_after.len(), 1, "one row re-embedded to the new model");
+        assert!(hits_after[0].record.body.contains("cargo"));
+        let hits_old_after = store.recall_vector("p1", "rust", 5, &b).unwrap();
+        assert_eq!(
+            hits_old_after.len(),
+            1,
+            "legacy still sees the unchanged row"
+        );
+        // Reembed_pending_count for the new model returns 1 (npm row still on
+        // legacy); for the legacy model returns 0 (npm row already on legacy).
+        let pending_new = store
+            .reembed_pending_count(a.model_name(), Some("p1"))
+            .unwrap();
+        assert_eq!(pending_new, 1);
+        assert_eq!(
+            store.reembed_pending_count(a.model_name(), None).unwrap(),
+            2,
+            "whole-store count includes the stale p2 row"
+        );
+        let pending_legacy = store
+            .reembed_pending_count(b.model_name(), Some("p1"))
+            .unwrap();
+        // The legacy embedder's count is 1 (the upgraded rust row is no
+        // longer on the legacy model, so it's "pending" if rolling back to
+        // it). Pendingness is symmetric: a row not on the target counts.
+        assert_eq!(pending_legacy, 1);
+        // reembed_batch surfaces the still-stale row in id ASC order.
+        let batch = store.reembed_batch(a.model_name(), Some("p1"), 4).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(batch[0].2.contains("npm"));
+        let all = store.reembed_batch(a.model_name(), None, 4).unwrap();
+        assert_eq!(all.len(), 2);
+
+        assert!(
+            store
+                .store_embedding_replace_checked(rust_id, a.model_name(), &[1.0, 2.0, 3.0], v.len())
+                .is_err(),
+            "checked storage must reject a different dimension"
+        );
+        let mixed_id = store.save("p1", "note", "mixed dimension").unwrap();
+        assert!(
+            store
+                .store_embedding_replace(mixed_id, a.model_name(), &[1.0, 2.0, 3.0])
+                .is_err(),
+            "all embedding write paths must enforce the registered dimension"
+        );
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO embeddings(memory_id, model, vector) VALUES (?1, ?2, ?3)",
+                rusqlite::params![mixed_id, a.model_name(), vector_to_blob(&[1.0, 2.0, 3.0])],
+            )
+            .unwrap();
+        assert!(
+            store.embedding_dimension_for_model(a.model_name()).is_err(),
+            "persisted mixed dimensions must be detected on resume"
+        );
+    }
+
     #[test]
     fn scope_filtering() {
         let store = MemoryStore::open_in_memory().unwrap();
@@ -7392,8 +7807,16 @@ mod tests {
         let b = store.save("p", "note", "beta").unwrap();
         assert!(!hybrid_recall_ready(&store, "p", &cfg));
 
-        // Embed exactly half (1/2): embedded*2 >= total -> ready.
-        store.store_embedding(b, "test-model", &[0.1, 0.2]).unwrap();
+        // Stale coverage from another model must not enable hybrid recall.
+        store
+            .store_embedding(b, "legacy-model", &[0.1, 0.2])
+            .unwrap();
+        assert!(!hybrid_recall_ready(&store, "p", &cfg));
+
+        // Embed exactly half with the active model (1/2): ready.
+        store
+            .store_embedding_replace(b, &cfg.embeddings.effective_model(), &[0.1, 0.2])
+            .unwrap();
         assert!(hybrid_recall_ready(&store, "p", &cfg));
 
         // A different, still-empty project isn't affected by "p"'s coverage.

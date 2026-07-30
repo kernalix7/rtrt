@@ -6,15 +6,45 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 
 /// A `rtrt` command with HOME isolated to `home`.
 fn rtrt(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("rtrt").expect("rtrt binary builds");
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        .env("RTRT_CONFIG", home.join(".rtrt").join("config.toml"))
         .env_remove("RTRT_MEMORY_PATH");
     cmd
+}
+
+fn read_http_request(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let body_start = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if request.len() >= body_start + content_length {
+            break;
+        }
+    }
 }
 
 #[test]
@@ -274,8 +304,7 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
             ("500 Internal Server Error", r#"{"error":"failed"}"#),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
+            read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -372,8 +401,7 @@ fn memory_reembed_falls_back_to_legacy_ollama_endpoint() {
             ("200 OK", r#"{"embedding":[0.3,0.4]}"#),
         ] {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
+            read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

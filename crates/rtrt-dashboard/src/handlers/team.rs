@@ -15,17 +15,26 @@
 //! Both accept the same `?project=` / `?scope=` selector as every other
 //! config endpoint (see `handlers::scope`) and answer with the same
 //! `scope` / `custom` / `inherited` triple, so the UI's shared
-//! "Follow global / Custom (this project)" helper drives them unchanged.
-//! Orchestration currently has NO per-project layer — `ProjectConfig` carries
-//! no `[team]` / `[failover]` override — so a project scope always resolves to
-//! the global value. `project_overridable: false` says so explicitly instead of
-//! letting the UI guess, and the day a project layer lands the endpoint shape
-//! does not have to change.
+//! "Follow global / Custom (this project)" helper drives them unchanged:
 //!
-//! Every write runs [`TeamConfig::validate`] BEFORE touching the config file:
+//!   * `GET` reports whether THIS project pins its own `[team]` / `[failover]`
+//!     in `<repo>/.rtrt/config.toml`, and serves the effective section either
+//!     way (`Config::load_effective`).
+//!   * `POST` with a project writes that project's override.
+//!   * `POST ?scope=global` clears only this project's override, preserving any
+//!     coexisting overrides in the same file.
+//!   * `POST` with no project writes the global section, as before.
+//!
+//! A project override REPLACES the global section wholesale rather than merging
+//! into it (see `rtrt_core::config::ProjectConfig::team`), which is what keeps
+//! the validation below meaningful: the roster this handler checks is exactly
+//! the roster that becomes effective.
+//!
+//! Every write runs [`TeamConfig::validate`] BEFORE touching any config file:
 //! an invalid roster (fallback cycle, unknown lane name, mismatched sibling,
 //! design-only lane in an implementing tier…) comes back as a 400 carrying the
-//! validator's own message and nothing is persisted.
+//! validator's own message and nothing is persisted. `Config::save_project`
+//! re-checks the same invariant at the core boundary.
 #![allow(unused_imports)]
 
 use std::collections::BTreeMap;
@@ -252,32 +261,63 @@ fn clean_flags(flags: BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The config file these sections are written to.
-fn config_path_string() -> String {
-    rtrt_core::Config::default_path()
-        .map(|p| p.to_string_lossy().into_owned())
+/// The config file the section being reported lives in: the project's own
+/// override file when the scope is Custom, else the global config.
+fn config_path_string(repo: Option<&Path>, custom: bool) -> String {
+    match repo.filter(|_| custom) {
+        Some(path) => rtrt_core::Config::project_config_path(path)
+            .to_string_lossy()
+            .into_owned(),
+        None => rtrt_core::Config::default_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// Which sections a project pins for itself. Read once per request so a GET
+/// never parses `<repo>/.rtrt/config.toml` twice.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProjectOverrides {
+    team: bool,
+    failover: bool,
+}
+
+fn project_overrides(repo: Option<&Path>) -> ProjectOverrides {
+    let Some(path) = repo else {
+        return ProjectOverrides::default();
+    };
+    // An unreadable/invalid override file reports "no override"; the read of the
+    // section itself goes through `load_effective`, which surfaces the real
+    // error rather than letting this probe swallow it.
+    rtrt_core::Config::load_project(path)
+        .map(|p| ProjectOverrides {
+            team: p.team.is_some(),
+            failover: p.failover.is_some(),
+        })
         .unwrap_or_default()
 }
 
-/// The shared scope triple.
-///
-/// `custom` is false unconditionally: orchestration has no per-project layer in
-/// `ProjectConfig`, so a selected project always reads the global roster. The
-/// shape still matches the other config endpoints so the UI helper is reusable
-/// and a future project layer is a value change, not a contract change.
-fn scope_fields(repo: Option<&Path>) -> serde_json::Value {
-    let custom = false;
+/// The shared scope triple, identical in shape and meaning to the other
+/// per-project settings: `custom` is true when THIS project carries its own
+/// override, `inherited` when a project is selected but follows the global.
+fn scope_fields(repo: Option<&Path>, custom: bool) -> serde_json::Value {
     serde_json::json!({
         "scope": if custom { "custom" } else { "global" },
         "custom": custom,
-        "inherited": repo.is_some(),
-        "project_overridable": false,
+        "inherited": repo.is_some() && !custom,
     })
 }
 
 /// Merge the scope triple into a response object.
-fn with_scope(mut value: serde_json::Value, repo: Option<&Path>) -> serde_json::Value {
-    if let (Some(target), Some(scope)) = (value.as_object_mut(), scope_fields(repo).as_object()) {
+fn with_scope(
+    mut value: serde_json::Value,
+    repo: Option<&Path>,
+    custom: bool,
+) -> serde_json::Value {
+    if let (Some(target), Some(scope)) = (
+        value.as_object_mut(),
+        scope_fields(repo, custom).as_object(),
+    ) {
         for (key, val) in scope {
             target.insert(key.clone(), val.clone());
         }
@@ -293,7 +333,7 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
 // GET/POST /api/team/config
 // ---------------------------------------------------------------------------
 
-fn team_json(team: &TeamConfig) -> serde_json::Value {
+fn team_json(team: &TeamConfig, repo: Option<&Path>, custom: bool) -> serde_json::Value {
     serde_json::json!({
         "enabled": team.enabled,
         "manager_provider": team.manager_provider,
@@ -310,7 +350,7 @@ fn team_json(team: &TeamConfig) -> serde_json::Value {
         }).collect::<Vec<_>>(),
         "policy": TeamPolicyView::from_policy(&team.policy),
         "effective": effective_view(team),
-        "path": config_path_string(),
+        "path": config_path_string(repo, custom),
     })
 }
 
@@ -318,11 +358,17 @@ pub(crate) async fn get_team_config(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
 ) -> axum::response::Response {
     let repo = resolve_project_repo(q.project.as_deref());
+    let custom = project_overrides(repo.as_deref()).team;
     let cfg = match rtrt_core::Config::load_effective(repo.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    Json(with_scope(team_json(&cfg.team), repo.as_deref())).into_response()
+    Json(with_scope(
+        team_json(&cfg.team, repo.as_deref(), custom),
+        repo.as_deref(),
+        custom,
+    ))
+    .into_response()
 }
 
 /// Full-replace write: the body carries the whole desired roster, so removing a
@@ -363,23 +409,55 @@ pub(crate) async fn post_team_config(
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("global"));
 
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    // "Follow global": CLEAR this project's `[team]` override only. Everything
+    // else in the same `<repo>/.rtrt/config.toml` (statusline / output_level /
+    // compression / providers / agents / failover) is preserved — the file is
+    // rewritten from the whole `ProjectConfig`, and removed only once nothing
+    // is overridden at all.
+    if follow_global && repo.is_some() {
+        let path = repo.as_deref().expect("repo is some");
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.team = None;
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        let cfg = match rtrt_core::Config::load_effective(Some(path)) {
+            Ok(cfg) => cfg,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        return Json(with_scope(
+            team_json(&cfg.team, Some(path), false),
+            Some(path),
+            false,
+        ))
+        .into_response();
+    }
 
-    // "Follow global": there is no project-level `[team]` to clear, so this
-    // just re-reads the global roster. Kept so the UI's shared scope handler
-    // can call it without special-casing this page.
+    // The layer the form was populated from, used only to fill in identity
+    // fields a partial client omitted. Falling back to the global config keeps
+    // a project whose stored override is unreadable repairable from the UI.
+    let current = rtrt_core::Config::load_effective(repo.as_deref())
+        .or_else(|_| rtrt_core::Config::load())
+        .unwrap_or_default()
+        .team;
+
+    // `?scope=global` with no project selected has nothing to clear; fall
+    // through to the plain global write, as the other scoped endpoints do.
     if follow_global {
-        return Json(with_scope(team_json(&cfg.team), repo.as_deref())).into_response();
+        let cfg = match rtrt_core::Config::load() {
+            Ok(cfg) => cfg,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        return Json(with_scope(team_json(&cfg.team, None, false), None, false)).into_response();
     }
 
     let Some(Json(req)) = body else {
         return error_response(StatusCode::BAD_REQUEST, "missing body");
     };
 
-    let current = cfg.team.clone();
     let team = TeamConfig {
         enabled: req.enabled,
         manager_provider: non_empty(req.manager_provider).unwrap_or(current.manager_provider),
@@ -404,22 +482,52 @@ pub(crate) async fn post_team_config(
     };
 
     // Validate BEFORE writing: an invalid roster must never reach the file.
+    // Because a project override REPLACES the global `[team]`, this roster is
+    // exactly the one that becomes effective for the scope being written — so
+    // validating it here validates the effective config, for both scopes.
     if let Err(e) = team.validate() {
         return error_response(StatusCode::BAD_REQUEST, e.to_string());
     }
 
+    // Per-project write.
+    if let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.team = Some(team.clone());
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        return Json(with_scope(
+            team_json(&team, Some(path), true),
+            Some(path),
+            true,
+        ))
+        .into_response();
+    }
+
+    // Global write.
+    let mut cfg = match rtrt_core::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     cfg.team = team;
     if let Err((status, msg)) = write_config_file(&cfg) {
         return error_response(status, msg);
     }
-    Json(with_scope(team_json(&cfg.team), repo.as_deref())).into_response()
+    Json(with_scope(team_json(&cfg.team, None, false), None, false)).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // GET/POST /api/failover/config
 // ---------------------------------------------------------------------------
 
-fn failover_json(failover: &FailoverConfig) -> serde_json::Value {
+fn failover_json(
+    failover: &FailoverConfig,
+    repo: Option<&Path>,
+    custom: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "fatal": failover.fatal,
         "quota": failover.quota,
@@ -427,7 +535,7 @@ fn failover_json(failover: &FailoverConfig) -> serde_json::Value {
         "transient_retries": failover.transient_retries,
         "backoff_divisor": failover.backoff_divisor,
         "backoff_ms": failover.backoff_ms,
-        "path": config_path_string(),
+        "path": config_path_string(repo, custom),
     })
 }
 
@@ -435,11 +543,17 @@ pub(crate) async fn get_failover_config(
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
 ) -> axum::response::Response {
     let repo = resolve_project_repo(q.project.as_deref());
+    let custom = project_overrides(repo.as_deref()).failover;
     let cfg = match rtrt_core::Config::load_effective(repo.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    Json(with_scope(failover_json(&cfg.failover), repo.as_deref())).into_response()
+    Json(with_scope(
+        failover_json(&cfg.failover, repo.as_deref(), custom),
+        repo.as_deref(),
+        custom,
+    ))
+    .into_response()
 }
 
 /// Full-replace write. An omitted marker list clears that class; the numeric
@@ -470,22 +584,52 @@ pub(crate) async fn post_failover_config(
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("global"));
 
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    if follow_global {
-        return Json(with_scope(failover_json(&cfg.failover), repo.as_deref())).into_response();
+    // "Follow global": clear only this project's `[failover]` override; a
+    // coexisting `[team]` override (or any other) in the same file survives.
+    if follow_global && repo.is_some() {
+        let path = repo.as_deref().expect("repo is some");
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.failover = None;
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        let cfg = match rtrt_core::Config::load_effective(Some(path)) {
+            Ok(cfg) => cfg,
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        return Json(with_scope(
+            failover_json(&cfg.failover, Some(path), false),
+            Some(path),
+            false,
+        ))
+        .into_response();
     }
 
     let Some(Json(req)) = body else {
+        // `?scope=global` in the global scope has nothing to clear and carries
+        // no body; report the global policy rather than erroring.
+        if follow_global {
+            let cfg = match rtrt_core::Config::load() {
+                Ok(cfg) => cfg,
+                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            return Json(with_scope(
+                failover_json(&cfg.failover, None, false),
+                None,
+                false,
+            ))
+            .into_response();
+        }
         return error_response(StatusCode::BAD_REQUEST, "missing body");
     };
 
     // A zero divisor would divide the per-call timeout by zero when deriving
     // the backoff; reject it here rather than shipping a config that panics or
-    // silently falls back at invoke time.
+    // silently falls back at invoke time. Checked BEFORE any write, for both
+    // scopes.
     if req.backoff_divisor == Some(0) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -493,7 +637,7 @@ pub(crate) async fn post_failover_config(
         );
     }
 
-    cfg.failover = FailoverConfig {
+    let failover = FailoverConfig {
         fatal: clean_list(req.fatal),
         quota: clean_list(req.quota),
         transient: clean_list(req.transient),
@@ -501,10 +645,40 @@ pub(crate) async fn post_failover_config(
         backoff_divisor: req.backoff_divisor,
         backoff_ms: req.backoff_ms,
     };
+
+    // Per-project write.
+    if let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.failover = Some(failover.clone());
+        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            return clear_field_error(e);
+        }
+        return Json(with_scope(
+            failover_json(&failover, Some(path), true),
+            Some(path),
+            true,
+        ))
+        .into_response();
+    }
+
+    // Global write.
+    let mut cfg = match rtrt_core::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    cfg.failover = failover;
     if let Err((status, msg)) = write_config_file(&cfg) {
         return error_response(status, msg);
     }
-    Json(with_scope(failover_json(&cfg.failover), repo.as_deref())).into_response()
+    Json(with_scope(
+        failover_json(&cfg.failover, None, false),
+        None,
+        false,
+    ))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -577,7 +751,7 @@ mod tests {
             ("z-last", vec![first.clone()]),
             ("a-first", vec![second.clone()]),
         ]);
-        let json = team_json(&team);
+        let json = team_json(&team, None, false);
         let tiers = json["tiers"].as_array().expect("tiers is a list");
         // A JSON object would leave rung ordering to the consumer; the list
         // form keeps the declared difficulty order.
@@ -587,16 +761,42 @@ mod tests {
 
     #[test]
     fn the_scope_triple_matches_the_other_config_endpoints() {
-        let global = scope_fields(None);
+        let repo = Path::new("/nonexistent/repo");
+        let global = scope_fields(None, false);
         assert_eq!(global["scope"], "global");
         assert_eq!(global["custom"], false);
+        // Nothing to inherit from in the global scope.
         assert_eq!(global["inherited"], false);
-        let project = scope_fields(Some(Path::new("/tmp/repo")));
-        assert_eq!(project["scope"], "global");
-        assert_eq!(project["custom"], false);
-        // A selected project inherits the global roster — there is no
-        // per-project `[team]` layer to override it with.
-        assert_eq!(project["inherited"], true);
-        assert_eq!(project["project_overridable"], false);
+
+        // A selected project that pins no `[team]` INHERITS the global roster…
+        let inherited = scope_fields(Some(repo), false);
+        assert_eq!(inherited["scope"], "global");
+        assert_eq!(inherited["custom"], false);
+        assert_eq!(inherited["inherited"], true);
+
+        // …and one that pins its own is Custom, never both.
+        let custom = scope_fields(Some(repo), true);
+        assert_eq!(custom["scope"], "custom");
+        assert_eq!(custom["custom"], true);
+        assert_eq!(custom["inherited"], false);
+    }
+
+    #[test]
+    fn the_reported_path_follows_the_scope() {
+        let repo = Path::new("/nonexistent/repo");
+        // Custom → the project's own override file, so the UI hint names the
+        // file the save actually lands in.
+        let custom = config_path_string(Some(repo), true);
+        assert_eq!(
+            custom,
+            rtrt_core::Config::project_config_path(repo)
+                .to_string_lossy()
+                .into_owned()
+        );
+        // Following global → the global config, same as the global scope.
+        assert_eq!(
+            config_path_string(Some(repo), false),
+            config_path_string(None, false)
+        );
     }
 }

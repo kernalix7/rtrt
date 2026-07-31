@@ -5,11 +5,15 @@
 //! - `cursor`   — `~/.cursor/mcp.json` (`mcpServers.rtrt`)
 //! - `windsurf` — `~/.windsurf/mcp_config.json` (`mcpServers.rtrt`)
 //! - `codex`    — `~/.codex/config.toml` (`[mcp_servers.rtrt]`)
-//! - `opencode` — `~/.config/opencode/opencode.jsonc` (`mcp.rtrt`, `type:
-//!   "local"`); rules to `~/.config/opencode/AGENTS.md`. The config is
-//!   JSONC — a strict-JSON file round-trips through `serde_json`; a file
-//!   with comments/trailing commas falls back to a best-effort textual
-//!   insert that leaves the rest of the file (including comments) alone.
+//! - `opencode` — targets whichever of `~/.config/opencode/opencode.json` /
+//!   `opencode.jsonc` already exists (preferring `.json`; opencode itself
+//!   reads `.json` first and a fresh install creates only that file, so
+//!   `.jsonc` is picked up only when it's the sole file present). `mcp.rtrt`,
+//!   `type: "local"`; rules to `~/.config/opencode/AGENTS.md`. Both
+//!   extensions can carry JSONC content — a strict-JSON file round-trips
+//!   through `serde_json`; a file with comments/trailing commas falls back
+//!   to a best-effort textual insert that leaves the rest of the file
+//!   (including comments) alone.
 //! - `aider`    — prints env-var hint; aider has no MCP config file.
 //!
 //! Default behaviour is **dry-run**: print the path + snippet so the user can
@@ -19,7 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rtrt_core::{Config, OutputStyleLevel, TeamConfig};
+use rtrt_core::OutputStyleLevel;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum AgentKind {
@@ -37,9 +41,6 @@ pub struct SetupPlan {
     pub memory_path: Option<PathBuf>,
     pub binary: PathBuf,
     pub plugin: bool,
-    pub team: bool,
-    pub team_manager_model: Option<String>,
-    pub team_manager_provider: Option<String>,
 }
 
 /// Events that Claude Code's hook engine recognises today. Each one becomes
@@ -69,15 +70,9 @@ const CLAUDE_AGENTS_ROOT_REL: &str = "~/.claude/agents";
 const CURSOR_RULES_REL: &str = "~/.cursor/rules/rtrt-output-optimizer.mdc";
 const WINDSURF_RULES_REL: &str = "~/.codeium/windsurf/memories/global_rules.md";
 const CODEX_RULES_REL: &str = "~/.codex/AGENTS.md";
-const OPENCODE_MCP_CONFIG_REL: &str = "~/.config/opencode/opencode.jsonc";
+const OPENCODE_MCP_CONFIG_JSON_REL: &str = "~/.config/opencode/opencode.json";
+const OPENCODE_MCP_CONFIG_JSONC_REL: &str = "~/.config/opencode/opencode.jsonc";
 const OPENCODE_RULES_REL: &str = "~/.config/opencode/AGENTS.md";
-const OPENCODE_AGENTS_REL: &str = "~/.config/opencode/agents";
-const OPENCODE_LEGACY_AGENTS_REL: &str = "~/.config/opencode/agent";
-const OPENCODE_PLUGINS_REL: &str = "~/.config/opencode/plugins";
-const OPENCODE_ORCHESTRATOR: &str = "rtrt-orchestrator";
-const OPENCODE_TEAM_RELAY_PLUGIN: &str = "rtrt-team-relay.js";
-const OLLAMA_OPENCODE_NPM: &str = "@ai-sdk/openai-compatible";
-const OLLAMA_OPENCODE_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const AIDER_RULES_REL: &str = "~/.aider/conventions.md";
 const TERSE_BLOCK_BEGIN: &str = "# BEGIN rtrt-output-optimizer";
 const TERSE_BLOCK_END: &str = "# END rtrt-output-optimizer";
@@ -277,16 +272,6 @@ fn terse_rules_block() -> String {
 }
 
 pub fn run(plan: SetupPlan) -> Result<()> {
-    validate_setup_flags(&plan)?;
-    let mut team_config = if plan.team {
-        let config = load_team_setup_config(&plan)?;
-        // A team setup needs several nested config edits. Refuse commented or
-        // otherwise non-strict JSONC before any setup action can write.
-        preflight_opencode_team_config(&expand_home(OPENCODE_MCP_CONFIG_REL)?)?;
-        Some(config)
-    } else {
-        None
-    };
     let binary = plan.binary.to_string_lossy().to_string();
     // Default to ~/.rtrt/memory.sqlite (absolute) so the MCP server, the
     // plugin hooks (via `_common.sh`'s same default), and any ad-hoc CLI
@@ -303,11 +288,6 @@ pub fn run(plan: SetupPlan) -> Result<()> {
     // invocation regardless of the branch below.
     if let Err(e) = maybe_enable_embeddings_from_ollama(plan.apply) {
         println!("embeddings: skipped ({e})");
-    }
-    if plan.team {
-        // Embedding auto-setup may have just updated the same global config.
-        // Reload before persisting team settings so both changes survive.
-        team_config = Some(load_team_setup_config(&plan)?);
     }
     if plan.plugin && !matches!(plan.agent, AgentKind::Claude) {
         bail!("--plugin is only valid with --agent claude");
@@ -352,53 +332,9 @@ pub fn run(plan: SetupPlan) -> Result<()> {
         }
         AgentKind::Opencode => {
             install_terse_rules(plan.agent, plan.apply)?;
-            if let Some(config) = &team_config {
-                if config
-                    .team
-                    .members
-                    .iter()
-                    .any(|member| member.target == "claude")
-                {
-                    apply_json(&plan, "~/.claude.json", &binary, &memory_path)?;
-                }
-                apply_opencode_team(&plan, &binary, &memory_path, config)
-            } else {
-                apply_opencode_jsonc(&plan, &binary, &memory_path)
-            }
+            apply_opencode_jsonc(&plan, &binary, &memory_path)
         }
     }
-}
-
-fn load_team_setup_config(plan: &SetupPlan) -> Result<Config> {
-    let mut config = Config::load().context("load global config for team setup")?;
-    config.team.enabled = true;
-    if let Some(provider) = &plan.team_manager_provider {
-        config.team.manager_provider = provider.clone();
-    }
-    if let Some(model) = &plan.team_manager_model {
-        config.team.manager_model = model.clone();
-    }
-    if config.team.manager_provider.eq_ignore_ascii_case("ollama")
-        && config.team.manager_base_url.is_none()
-    {
-        let opencode = load_strict_opencode_config(&expand_home(OPENCODE_MCP_CONFIG_REL)?)?;
-        config.team.manager_base_url = opencode
-            .pointer("/provider/ollama/options/baseURL")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-    }
-    config.team.validate().context("validate team setup")?;
-    Ok(config)
-}
-
-fn validate_setup_flags(plan: &SetupPlan) -> Result<()> {
-    if plan.team && !matches!(plan.agent, AgentKind::Opencode) {
-        bail!("--team is only valid with --agent opencode");
-    }
-    if !plan.team && (plan.team_manager_model.is_some() || plan.team_manager_provider.is_some()) {
-        bail!("--team-manager-model and --team-manager-provider require --team");
-    }
-    Ok(())
 }
 
 /// Ollama model name substrings that mark it as embedding-capable — matches
@@ -638,389 +574,63 @@ fn render_opencode_snippet(binary: &str, memory_path: &Option<PathBuf>) -> Strin
     serde_json::to_string_pretty(&wrapped).unwrap_or_else(|_| String::new())
 }
 
-struct OpencodeTeamPaths {
-    config: PathBuf,
-    opencode: PathBuf,
-    agents: PathBuf,
-    legacy_agents: PathBuf,
-    plugins: PathBuf,
+/// Resolves the config file opencode will actually load.
+///
+/// opencode's own loader reads `~/.config/opencode/opencode.json` — a fresh
+/// `opencode` install creates only that file, and `strings $(which opencode)
+/// | grep -oE "opencode\.jsonc?"` shows far more references to `.json` than
+/// `.jsonc` in the binary. `.jsonc` is opencode's documented *comments*
+/// variant, read only when `.json` is absent. Earlier `rtrt setup` builds
+/// hardcoded `.jsonc`, so on a machine where opencode had already created its
+/// own `.json` the `mcp.rtrt` entry landed in a file opencode never opens.
+///
+/// Picks whichever file already exists, preferring `.json`; when neither
+/// exists yet, targets `.json` — matching what a fresh opencode install
+/// itself creates.
+fn resolve_opencode_config_path() -> Result<PathBuf> {
+    let home = dirs_home()?;
+    Ok(resolve_opencode_config_path_in(&home))
 }
 
-fn opencode_team_paths() -> Result<OpencodeTeamPaths> {
-    Ok(OpencodeTeamPaths {
-        config: Config::default_path()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine global config path"))?,
-        opencode: expand_home(OPENCODE_MCP_CONFIG_REL)?,
-        agents: expand_home(OPENCODE_AGENTS_REL)?,
-        legacy_agents: expand_home(OPENCODE_LEGACY_AGENTS_REL)?,
-        plugins: expand_home(OPENCODE_PLUGINS_REL)?,
-    })
-}
-
-fn preflight_opencode_team_config(path: &Path) -> Result<()> {
-    let _ = load_strict_opencode_config(path)?;
-    Ok(())
-}
-
-fn load_strict_opencode_config(path: &Path) -> Result<serde_json::Value> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
+/// Home-parameterized core of `resolve_opencode_config_path`, split out so
+/// tests can exercise the resolution logic against a temp directory instead
+/// of the real `$HOME`.
+fn resolve_opencode_config_path_in(home: &Path) -> PathBuf {
+    let json = expand_in_home(home, OPENCODE_MCP_CONFIG_JSON_REL);
+    if json.exists() {
+        return json;
     }
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    if raw.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+    let jsonc = expand_in_home(home, OPENCODE_MCP_CONFIG_JSONC_REL);
+    if jsonc.exists() {
+        return jsonc;
     }
-    let root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!(
-            "{}: team setup requires strict JSON because nested JSONC edits cannot be made safely ({e}); remove comments/trailing commas or update the file manually",
-            path.display()
-        )
-    })?;
-    if !root.is_object() {
-        bail!("{}: root is not a JSON object", path.display());
-    }
-    Ok(root)
-}
-
-fn apply_opencode_team(
-    plan: &SetupPlan,
-    binary: &str,
-    memory_path: &Option<PathBuf>,
-    config: &Config,
-) -> Result<()> {
-    let paths = opencode_team_paths()?;
-    apply_opencode_team_at(&paths, plan.apply, binary, memory_path, config)
-}
-
-fn apply_opencode_team_at(
-    paths: &OpencodeTeamPaths,
-    apply: bool,
-    binary: &str,
-    memory_path: &Option<PathBuf>,
-    config: &Config,
-) -> Result<()> {
-    let mut root = load_strict_opencode_config(&paths.opencode)?;
-    let patch = opencode_team_config_patch(binary, memory_path, &config.team, &root);
-    deep_merge_json(&mut root, patch);
-    let agents = render_opencode_team_agents(&config.team)?;
-    let relay_plugin = paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN);
-
-    if !apply {
-        println!(
-            "[dry-run] would enable team manager {}/{} in {}",
-            config.team.manager_provider,
-            config.team.manager_model,
-            paths.config.display()
-        );
-        println!(
-            "[dry-run] would merge mcp.rtrt and default_agent={OPENCODE_ORCHESTRATOR} into {}",
-            paths.opencode.display()
-        );
-        if team_uses_ollama(&config.team) {
-            println!("[dry-run] would ensure provider.ollama at {OLLAMA_OPENCODE_BASE_URL}");
-        }
-        for (name, _) in &agents {
-            println!(
-                "[dry-run] would write OpenCode agent {}",
-                opencode_team_agent_path(paths, name).display()
-            );
-        }
-        println!(
-            "[dry-run] would write OpenCode exact-relay plugin {}",
-            relay_plugin.display()
-        );
-        println!("Re-run with --apply to write team configuration.");
-        return Ok(());
-    }
-
-    write_serialized_config(&paths.config, config)?;
-    write_json_file(&paths.opencode, &root)?;
-    for (name, body) in agents {
-        let path = opencode_team_agent_path(paths, &name);
-        write_managed_file(&path, &body)?;
-    }
-    write_managed_file(&relay_plugin, &render_opencode_team_relay_plugin(binary)?)?;
-    println!(
-        "enabled OpenCode team manager {}/{}",
-        config.team.manager_provider, config.team.manager_model
-    );
-    Ok(())
-}
-
-fn opencode_team_config_patch(
-    binary: &str,
-    memory_path: &Option<PathBuf>,
-    team: &TeamConfig,
-    existing: &serde_json::Value,
-) -> serde_json::Value {
-    let mut patch = serde_json::json!({
-        "mcp": { "rtrt": build_opencode_entry(binary, memory_path) },
-        "default_agent": OPENCODE_ORCHESTRATOR,
-    });
-    let mut models = serde_json::Map::new();
-    if team.manager_provider.eq_ignore_ascii_case("ollama") {
-        models.insert(
-            strip_ollama_prefix(&team.manager_model).to_string(),
-            serde_json::json!({}),
-        );
-    }
-    for model in team
-        .members
-        .iter()
-        .filter_map(|member| member.model.as_deref())
-        .filter_map(|model| model.strip_prefix("ollama/"))
-    {
-        models.insert(model.to_string(), serde_json::json!({}));
-    }
-    if !models.is_empty() {
-        let existing_ollama = existing.pointer("/provider/ollama");
-        let mut ollama = serde_json::Map::new();
-        ollama.insert("models".to_string(), serde_json::Value::Object(models));
-        if existing_ollama.and_then(|value| value.get("npm")).is_none() {
-            ollama.insert(
-                "npm".to_string(),
-                serde_json::Value::String(OLLAMA_OPENCODE_NPM.to_string()),
-            );
-        }
-        if existing_ollama
-            .and_then(|value| value.pointer("/options/baseURL"))
-            .is_none()
-        {
-            let base_url = if team.manager_provider.eq_ignore_ascii_case("ollama") {
-                team.manager_base_url
-                    .as_deref()
-                    .unwrap_or(OLLAMA_OPENCODE_BASE_URL)
-            } else {
-                OLLAMA_OPENCODE_BASE_URL
-            };
-            ollama.insert(
-                "options".to_string(),
-                serde_json::json!({ "baseURL": base_url }),
-            );
-        }
-        patch["provider"] = serde_json::json!({
-            "ollama": serde_json::Value::Object(ollama)
-        });
-    }
-    patch
-}
-
-fn strip_ollama_prefix(model: &str) -> &str {
-    model.strip_prefix("ollama/").unwrap_or(model)
-}
-
-fn team_uses_ollama(team: &TeamConfig) -> bool {
-    team.manager_provider.eq_ignore_ascii_case("ollama")
-        || team.members.iter().any(|member| {
-            member
-                .model
-                .as_deref()
-                .is_some_and(|model| model.starts_with("ollama/"))
-        })
-}
-
-fn deep_merge_json(target: &mut serde_json::Value, patch: serde_json::Value) {
-    match (target, patch) {
-        (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
-            for (key, value) in patch {
-                if let Some(existing) = target.get_mut(&key) {
-                    deep_merge_json(existing, value);
-                } else {
-                    target.insert(key, value);
-                }
-            }
-        }
-        (target, patch) => *target = patch,
-    }
-}
-
-fn render_opencode_team_agents(team: &TeamConfig) -> Result<Vec<(String, String)>> {
-    let manager_model = format!("{}/{}", team.manager_provider, team.manager_model);
-    let mut agents = vec![(
-        OPENCODE_ORCHESTRATOR.to_string(),
-        format!(
-            "---\ndescription: RTRT primary team orchestrator\nmode: primary\nmodel: {}\ntemperature: 0\nsteps: 1\ntools:\n  \"*\": false\n---\n\nThe RTRT relay plugin has already dispatched the complete user message. Reply with `RTRT_RELAY_PENDING` only. Do not analyze the request or call tools. The plugin replaces this placeholder with the selected leader's exact output.\n",
-            serde_json::to_string(&manager_model)?
-        ),
-    )];
-    let worker_specs = [
-        (
-            "hard-gpt-worker",
-            "gpt-sol",
-            "Hard implementation and debugging worker.",
-        ),
-        (
-            "glm-go-worker",
-            "glm-go",
-            "Routine implementation and bulk-edit worker.",
-        ),
-        (
-            "glm-cloud-worker",
-            "glm-cloud",
-            "Overflow implementation and bulk-edit worker.",
-        ),
-        (
-            "kimi-cloud-worker",
-            "kimi-cloud",
-            "Parallel implementation, research, and test worker.",
-        ),
-        (
-            "review-gpt",
-            "gpt-sol",
-            "Focused code review worker. Report defects before summaries.",
-        ),
-    ];
-    for (agent_name, member_name, prompt) in worker_specs {
-        let Some(model) = team
-            .members
-            .iter()
-            .find(|member| member.name == member_name && member.target == "opencode")
-            .and_then(|member| member.model.as_deref())
-        else {
-            continue;
-        };
-        agents.push((
-            agent_name.to_string(),
-            format!(
-                "---\ndescription: RTRT {agent_name}\nmode: subagent\nmodel: {}\n---\n\n{prompt}\n",
-                serde_json::to_string(model)?
-            ),
-        ));
-    }
-    Ok(agents)
-}
-
-fn render_opencode_team_relay_plugin(mcp_binary: &str) -> Result<String> {
-    let cli_binary = companion_rtrt_binary(mcp_binary);
-    let cli_binary = serde_json::to_string(&cli_binary.to_string_lossy())?;
-    Ok(format!(
-        r#"const RTRT_BINARY = {cli_binary}
-
-export const RtrtTeamRelay = async ({{ directory }}) => {{
-  const pending = new Map()
-
-  return {{
-    "chat.message": async (input, output) => {{
-      const agent = input.agent ?? output.message?.agent
-      if (agent !== "rtrt-orchestrator") {{
-        pending.delete(input.sessionID)
-        return
-      }}
-      const text = output.parts
-        .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
-        .map((part) => part.text)
-        .join("")
-      const attachments = output.parts
-        .filter((part) => part.type === "file")
-        .map((part) => ({{ mime: part.mime, filename: part.filename, url: part.url }}))
-      const prompt = attachments.length === 0
-        ? text
-        : `${{text}}\n\n<opencode_attachments>\n${{JSON.stringify(attachments)}}\n</opencode_attachments>`
-      const state = {{ output: undefined }}
-      pending.set(input.sessionID, state)
-
-      const child = Bun.spawn(
-        [RTRT_BINARY, "team", "dispatch", "--json"],
-        {{ cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "pipe" }},
-      )
-      child.stdin.write(prompt)
-      child.stdin.end()
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ])
-      if (exitCode !== 0) {{
-        throw new Error(`rtrt team dispatch failed (${{exitCode}}): ${{stderr.trim()}}`)
-      }}
-      const result = JSON.parse(stdout)
-      if (typeof result?.outcome?.output !== "string") {{
-        throw new Error("rtrt team dispatch returned no leader output")
-      }}
-      state.output = result.outcome.output
-    }},
-    "experimental.text.complete": async (input, output) => {{
-      const state = pending.get(input.sessionID)
-      if (state?.output !== undefined) {{
-        output.text = state.output
-        pending.delete(input.sessionID)
-      }}
-    }},
-  }}
-}}
-"#
-    ))
-}
-
-fn companion_rtrt_binary(mcp_binary: &str) -> PathBuf {
-    let path = Path::new(mcp_binary);
-    let file_name = if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".exe"))
-    {
-        "rtrt.exe"
-    } else {
-        "rtrt"
-    };
-    path.with_file_name(file_name)
-}
-
-fn opencode_team_agent_path(paths: &OpencodeTeamPaths, name: &str) -> PathBuf {
-    let legacy = paths.legacy_agents.join(format!("{name}.md"));
-    if legacy.exists() {
-        legacy
-    } else {
-        paths.agents.join(format!("{name}.md"))
-    }
-}
-
-fn write_serialized_config(path: &Path, config: &Config) -> Result<()> {
-    let rendered =
-        toml::to_string_pretty(config).map_err(|e| anyhow::anyhow!("serialize config: {e}"))?;
-    write_managed_file(path, &rendered)
-}
-
-fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let rendered = format!("{}\n", serde_json::to_string_pretty(value)?);
-    write_managed_file(path, &rendered)
-}
-
-fn write_managed_file(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    if path.exists() {
-        backup_if_needed(path)?;
-    }
-    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    println!("wrote {}", path.display());
-    Ok(())
+    json
 }
 
 /// Applies (or dry-run previews) the `mcp.rtrt` entry into opencode's global
-/// `~/.config/opencode/opencode.jsonc`.
+/// config — see [`resolve_opencode_config_path`] for which file that is.
 ///
-/// opencode's config is JSONC (comments + trailing commas allowed), but a
-/// freshly-generated one — and most hand-edited ones in practice — is plain
-/// JSON. So the primary path parses the file strictly with `serde_json` and
-/// does a full object-model merge, same as every other agent's config file
-/// here. Only when strict parsing fails (a real sign of comments / trailing
-/// commas) does this fall back to `upsert_opencode_mcp_text`, a best-effort
-/// textual insert that never re-serializes the whole document — so existing
-/// comments and formatting survive untouched.
+/// Both `opencode.json` and `opencode.jsonc` can carry JSONC content
+/// (comments + trailing commas allowed), but a freshly-generated file — and
+/// most hand-edited ones in practice — is plain JSON. So the primary path
+/// parses the file strictly with `serde_json` and does a full object-model
+/// merge, same as every other agent's config file here. Only when strict
+/// parsing fails (a real sign of comments / trailing commas) does this fall
+/// back to `upsert_opencode_mcp_text`, a best-effort textual insert that
+/// never re-serializes the whole document — so existing comments and
+/// formatting survive untouched.
 fn apply_opencode_jsonc(
     plan: &SetupPlan,
     binary: &str,
     memory_path: &Option<PathBuf>,
 ) -> Result<()> {
-    let path = expand_home(OPENCODE_MCP_CONFIG_REL)?;
+    let path = resolve_opencode_config_path()?;
     apply_opencode_jsonc_at(&path, plan.apply, binary, memory_path)
 }
 
 /// Path-parameterized core of `apply_opencode_jsonc`, split out so tests can
 /// exercise the real read/backup/write flow against a temp file instead of
-/// `~/.config/opencode/opencode.jsonc`.
+/// the real opencode config path.
 fn apply_opencode_jsonc_at(
     path: &Path,
     apply: bool,
@@ -1228,7 +838,7 @@ fn upsert_opencode_mcp_text(raw: &str, entry: &serde_json::Value) -> Result<Stri
 /// fallback — an automated deletion risks corrupting a hand-edited file more
 /// than an automated addition does.
 fn drop_opencode_jsonc(apply: bool) -> Result<()> {
-    let path = expand_home(OPENCODE_MCP_CONFIG_REL)?;
+    let path = resolve_opencode_config_path()?;
     drop_opencode_jsonc_at(&path, apply)
 }
 
@@ -1251,15 +861,6 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
             if let Some(mcp) = root.get_mut("mcp").and_then(|v| v.as_object_mut())
                 && mcp.remove("rtrt").is_some()
             {
-                removed = true;
-            }
-            if root
-                .get("default_agent")
-                .and_then(serde_json::Value::as_str)
-                == Some(OPENCODE_ORCHESTRATOR)
-                && let Some(object) = root.as_object_mut()
-            {
-                object.remove("default_agent");
                 removed = true;
             }
             if removed {
@@ -1287,10 +888,16 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
 
 fn expand_home(rel: &str) -> Result<PathBuf> {
     let home = dirs_home()?;
+    Ok(expand_in_home(&home, rel))
+}
+
+/// Home-parameterized core of `expand_home`, split out so tests can resolve
+/// `~/`-relative paths against a temp directory instead of the real `$HOME`.
+fn expand_in_home(home: &Path, rel: &str) -> PathBuf {
     if let Some(rest) = rel.strip_prefix("~/") {
-        Ok(home.join(rest))
+        home.join(rest)
     } else {
-        Ok(PathBuf::from(rel))
+        PathBuf::from(rel)
     }
 }
 
@@ -1971,77 +1578,9 @@ pub fn uninstall_agent(agent: AgentKind, apply: bool) -> Result<()> {
         }
         AgentKind::Opencode => {
             remove_terse_rules(agent, apply)?;
-            remove_opencode_team_artifacts(apply)?;
             drop_opencode_jsonc(apply)
         }
     }
-}
-
-fn remove_opencode_team_artifacts(apply: bool) -> Result<()> {
-    let paths = opencode_team_paths()?;
-    remove_opencode_team_artifacts_at(&paths, apply)
-}
-
-fn remove_opencode_team_artifacts_at(paths: &OpencodeTeamPaths, apply: bool) -> Result<()> {
-    for name in [
-        OPENCODE_ORCHESTRATOR,
-        "hard-gpt-worker",
-        "glm-go-worker",
-        "glm-cloud-worker",
-        "kimi-cloud-worker",
-        "review-gpt",
-    ] {
-        let path = opencode_team_agent_path(paths, name);
-        remove_or_restore_managed_file(&path, "description: RTRT", apply)?;
-    }
-    remove_or_restore_managed_file(
-        &paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN),
-        "RtrtTeamRelay",
-        apply,
-    )?;
-
-    if paths.config.exists() {
-        let raw = std::fs::read_to_string(&paths.config)
-            .with_context(|| format!("read {}", paths.config.display()))?;
-        let mut config = Config::from_toml_str(&raw)?;
-        if config.team.enabled {
-            if apply {
-                config.team.enabled = false;
-                write_serialized_config(&paths.config, &config)?;
-            } else {
-                println!(
-                    "[dry-run] would disable [team] in {}",
-                    paths.config.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn remove_or_restore_managed_file(path: &Path, marker: &str, apply: bool) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    if !raw.contains(marker) {
-        println!("{}: preserving non-rtrt file", path.display());
-        return Ok(());
-    }
-    if !apply {
-        println!("[dry-run] would remove managed file {}", path.display());
-        return Ok(());
-    }
-    let backup = backup_path(path);
-    if backup.exists() {
-        std::fs::copy(&backup, path)
-            .with_context(|| format!("restore {} from {}", path.display(), backup.display()))?;
-        println!("restored {}", path.display());
-    } else {
-        std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-        println!("removed {}", path.display());
-    }
-    Ok(())
 }
 
 fn drop_json_entry(rel: &str, apply: bool) -> Result<()> {
@@ -2343,26 +1882,6 @@ pub fn memory_reachable_status(health: bool) -> (CheckState, String) {
 mod tests {
     use super::*;
 
-    fn test_team_paths(root: &Path) -> OpencodeTeamPaths {
-        OpencodeTeamPaths {
-            config: root.join(".rtrt/config.toml"),
-            opencode: root.join(".config/opencode/opencode.jsonc"),
-            agents: root.join(".config/opencode/agents"),
-            legacy_agents: root.join(".config/opencode/agent"),
-            plugins: root.join(".config/opencode/plugins"),
-        }
-    }
-
-    fn enabled_team_config() -> Config {
-        let mut config = Config::default();
-        config.team.enabled = true;
-        config
-    }
-
-    fn apply_test_team(paths: &OpencodeTeamPaths, apply: bool, config: &Config) -> Result<()> {
-        apply_opencode_team_at(paths, apply, "rtrt-mcp", &None, config)
-    }
-
     #[test]
     fn is_embedding_capable_model_matches_known_families_case_insensitively() {
         assert!(is_embedding_capable_model("bge-m3"));
@@ -2457,276 +1976,37 @@ mod tests {
     }
 
     #[test]
-    fn opencode_team_strict_merge_preserves_unrelated_config_models_and_mcp() {
+    fn resolve_opencode_config_path_prefers_json_when_both_exist() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        std::fs::create_dir_all(paths.opencode.parent().unwrap()).unwrap();
-        std::fs::write(
-            &paths.opencode,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "$schema": "https://opencode.ai/config.json",
-                "theme": "custom",
-                "mcp": {
-                    "other": { "type": "remote", "url": "https://example.test" },
-                    "rtrt": { "enabled": false, "environment": { "KEEP": "yes" } }
-                },
-                "provider": {
-                    "custom": { "npm": "custom-sdk", "options": { "token": "keep" } },
-                    "ollama": {
-                        "npm": "old-sdk",
-                        "options": { "baseURL": "http://old", "timeout": 30 },
-                        "models": {
-                            "existing": { "name": "Existing", "options": { "keep": true } }
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let opencode_dir = dir.path().join(".config/opencode");
+        std::fs::create_dir_all(&opencode_dir).unwrap();
+        std::fs::write(opencode_dir.join("opencode.json"), "{}").unwrap();
+        std::fs::write(opencode_dir.join("opencode.jsonc"), "{}").unwrap();
 
-        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
+        let resolved = resolve_opencode_config_path_in(dir.path());
 
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&paths.opencode).unwrap()).unwrap();
-        assert_eq!(root["theme"], "custom");
-        assert_eq!(root["default_agent"], OPENCODE_ORCHESTRATOR);
-        assert_eq!(root["mcp"]["other"]["url"], "https://example.test");
-        assert_eq!(root["mcp"]["rtrt"]["environment"]["KEEP"], "yes");
-        assert_eq!(root["mcp"]["rtrt"]["enabled"], true);
-        assert_eq!(root["provider"]["custom"]["npm"], "custom-sdk");
-        assert_eq!(root["provider"]["ollama"]["npm"], "old-sdk");
-        assert_eq!(root["provider"]["ollama"]["options"]["timeout"], 30);
-        assert_eq!(
-            root["provider"]["ollama"]["options"]["baseURL"],
-            "http://old"
-        );
-        assert_eq!(
-            root["provider"]["ollama"]["models"]["existing"]["options"]["keep"],
-            true
-        );
-        for model in ["granite4:350m", "glm-5.2:cloud", "kimi-k2.7-code:cloud"] {
-            assert!(root["provider"]["ollama"]["models"][model].is_object());
-        }
+        assert_eq!(resolved, opencode_dir.join("opencode.json"));
     }
 
     #[test]
-    fn opencode_team_defaults_enable_config_and_generate_native_agents() {
+    fn resolve_opencode_config_path_falls_back_to_jsonc_when_only_it_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
+        let opencode_dir = dir.path().join(".config/opencode");
+        std::fs::create_dir_all(&opencode_dir).unwrap();
+        std::fs::write(opencode_dir.join("opencode.jsonc"), "{}").unwrap();
 
-        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
+        let resolved = resolve_opencode_config_path_in(dir.path());
 
-        let persisted = Config::from_toml_str(&std::fs::read_to_string(&paths.config).unwrap())
-            .expect("persisted config");
-        assert!(persisted.team.enabled);
-        assert_eq!(persisted.team.manager_provider, "ollama");
-        assert_eq!(persisted.team.manager_model, "granite4:350m");
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&paths.opencode).unwrap()).unwrap();
-        assert_eq!(root["provider"]["ollama"]["npm"], OLLAMA_OPENCODE_NPM);
-        assert_eq!(
-            root["provider"]["ollama"]["options"]["baseURL"],
-            OLLAMA_OPENCODE_BASE_URL
-        );
-
-        let expected = [
-            OPENCODE_ORCHESTRATOR,
-            "hard-gpt-worker",
-            "glm-go-worker",
-            "glm-cloud-worker",
-            "kimi-cloud-worker",
-            "review-gpt",
-        ];
-        for name in expected {
-            assert!(paths.agents.join(format!("{name}.md")).exists(), "{name}");
-        }
-        let orchestrator =
-            std::fs::read_to_string(paths.agents.join("rtrt-orchestrator.md")).unwrap();
-        assert!(orchestrator.contains("mode: primary"));
-        assert!(orchestrator.contains("model: \"ollama/granite4:350m\""));
-        assert!(orchestrator.contains("steps: 1"));
-        assert!(orchestrator.contains("temperature: 0"));
-        assert!(orchestrator.contains("RTRT_RELAY_PENDING"));
-        assert!(!orchestrator.contains("rtrt_team_dispatch: true"));
-        let relay =
-            std::fs::read_to_string(paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN)).unwrap();
-        assert!(relay.contains("chat.message"));
-        assert!(relay.contains("const RTRT_BINARY = \"rtrt\""));
-        assert!(relay.contains("[RTRT_BINARY, \"team\", \"dispatch\", \"--json\"]"));
-        assert!(relay.contains("input.agent ?? output.message?.agent"));
-        assert!(relay.contains("child.stdin.write(prompt)"));
-        assert!(relay.contains("pending.delete(input.sessionID)"));
-        assert!(relay.contains("experimental.text.complete"));
-        assert!(!paths.agents.join("opus.md").exists());
-        assert!(!paths.agents.join("sonnet.md").exists());
+        assert_eq!(resolved, opencode_dir.join("opencode.jsonc"));
     }
 
     #[test]
-    fn opencode_team_relay_uses_cli_next_to_mcp_binary() {
-        assert_eq!(
-            companion_rtrt_binary("/opt/rtrt/bin/rtrt-mcp"),
-            PathBuf::from("/opt/rtrt/bin/rtrt")
-        );
-        assert_eq!(
-            companion_rtrt_binary("rtrt-mcp.exe"),
-            PathBuf::from("rtrt.exe")
-        );
-    }
-
-    #[test]
-    fn opencode_team_custom_manager_model_updates_config_agent_and_provider() {
+    fn resolve_opencode_config_path_defaults_to_json_when_neither_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        let mut config = enabled_team_config();
-        config.team.manager_model = "qwen3:8b".to_string();
-        config.team.manager_base_url = Some("https://manager.example/v1".to_string());
 
-        apply_test_team(&paths, true, &config).unwrap();
+        let resolved = resolve_opencode_config_path_in(dir.path());
 
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&paths.opencode).unwrap()).unwrap();
-        assert!(root["provider"]["ollama"]["models"]["qwen3:8b"].is_object());
-        assert_eq!(
-            root["provider"]["ollama"]["options"]["baseURL"],
-            "https://manager.example/v1"
-        );
-        let orchestrator =
-            std::fs::read_to_string(paths.agents.join("rtrt-orchestrator.md")).unwrap();
-        assert!(orchestrator.contains("model: \"ollama/qwen3:8b\""));
-        let persisted = Config::from_toml_str(&std::fs::read_to_string(&paths.config).unwrap())
-            .expect("persisted config");
-        assert_eq!(persisted.team.manager_model, "qwen3:8b");
-    }
-
-    #[test]
-    fn opencode_team_apply_is_idempotent_and_keeps_first_backups() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        std::fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(paths.opencode.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&paths.agents).unwrap();
-        std::fs::write(&paths.config, "# original config\n").unwrap();
-        std::fs::write(&paths.opencode, "{\"unrelated\":true}\n").unwrap();
-        let orchestrator_path = paths.agents.join("rtrt-orchestrator.md");
-        std::fs::write(&orchestrator_path, "original agent\n").unwrap();
-        let config = enabled_team_config();
-
-        apply_test_team(&paths, true, &config).unwrap();
-        let first_config = std::fs::read_to_string(&paths.config).unwrap();
-        let first_opencode = std::fs::read_to_string(&paths.opencode).unwrap();
-        let first_agent = std::fs::read_to_string(&orchestrator_path).unwrap();
-        apply_test_team(&paths, true, &config).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(&paths.config).unwrap(),
-            first_config
-        );
-        assert_eq!(
-            std::fs::read_to_string(&paths.opencode).unwrap(),
-            first_opencode
-        );
-        assert_eq!(
-            std::fs::read_to_string(&orchestrator_path).unwrap(),
-            first_agent
-        );
-        assert_eq!(
-            std::fs::read_to_string(paths.config.with_extension("toml.bak")).unwrap(),
-            "# original config\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(paths.opencode.with_extension("jsonc.bak")).unwrap(),
-            "{\"unrelated\":true}\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(orchestrator_path.with_extension("md.bak")).unwrap(),
-            "original agent\n"
-        );
-    }
-
-    #[test]
-    fn opencode_team_dry_run_writes_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(&dir.path().join("missing"));
-
-        apply_test_team(&paths, false, &enabled_team_config()).unwrap();
-
-        assert!(!paths.config.exists());
-        assert!(!paths.opencode.exists());
-        assert!(!paths.agents.exists());
-        assert!(!paths.legacy_agents.exists());
-    }
-
-    #[test]
-    fn opencode_team_invalid_flags_are_rejected_before_setup_actions() {
-        let plan = SetupPlan {
-            agent: AgentKind::Claude,
-            apply: true,
-            memory_path: None,
-            binary: PathBuf::from("rtrt-mcp"),
-            plugin: false,
-            team: true,
-            team_manager_model: None,
-            team_manager_provider: None,
-        };
-        assert_eq!(
-            validate_setup_flags(&plan).unwrap_err().to_string(),
-            "--team is only valid with --agent opencode"
-        );
-
-        let plan = SetupPlan {
-            agent: AgentKind::Opencode,
-            team: false,
-            team_manager_model: Some("custom".to_string()),
-            ..plan
-        };
-        assert_eq!(
-            validate_setup_flags(&plan).unwrap_err().to_string(),
-            "--team-manager-model and --team-manager-provider require --team"
-        );
-    }
-
-    #[test]
-    fn opencode_team_uses_existing_legacy_singular_agent_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        std::fs::create_dir_all(&paths.legacy_agents).unwrap();
-        let legacy = paths.legacy_agents.join("hard-gpt-worker.md");
-        std::fs::write(&legacy, "legacy\n").unwrap();
-
-        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
-
-        assert!(
-            std::fs::read_to_string(&legacy)
-                .unwrap()
-                .contains("openai/gpt-5.6-sol")
-        );
-        assert_eq!(
-            std::fs::read_to_string(legacy.with_extension("md.bak")).unwrap(),
-            "legacy\n"
-        );
-        assert!(!paths.agents.join("hard-gpt-worker.md").exists());
-    }
-
-    #[test]
-    fn opencode_team_refuses_commented_jsonc_without_writes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        std::fs::create_dir_all(paths.opencode.parent().unwrap()).unwrap();
-        let original = "{\n  // preserve\n  \"theme\": \"custom\"\n}\n";
-        std::fs::write(&paths.opencode, original).unwrap();
-
-        let error = apply_test_team(&paths, true, &enabled_team_config()).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("team setup requires strict JSON")
-        );
-        assert_eq!(std::fs::read_to_string(&paths.opencode).unwrap(), original);
-        assert!(!paths.config.exists());
-        assert!(!paths.agents.exists());
-        assert!(!paths.opencode.with_extension("jsonc.bak").exists());
+        assert_eq!(resolved, dir.path().join(".config/opencode/opencode.json"));
     }
 
     /// Writes an opencode config with a pre-existing `mcp.other` server to a
@@ -2862,13 +2142,16 @@ mod tests {
     }
 
     #[test]
-    fn opencode_uninstall_drops_rtrt_but_keeps_other_server() {
+    fn opencode_uninstall_drops_rtrt_but_keeps_other_server_and_unrelated_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("opencode.jsonc");
         std::fs::write(
             &path,
             serde_json::to_string_pretty(&serde_json::json!({
-                "default_agent": OPENCODE_ORCHESTRATOR,
+                // A user- or other-tool-owned key that happens to share a
+                // name rtrt once wrote; uninstall must never touch keys it
+                // doesn't itself own beyond `mcp.rtrt`.
+                "default_agent": "some-other-agent",
                 "mcp": {
                     "other": { "type": "local", "command": ["other-server"] },
                     "rtrt": { "type": "local", "command": ["rtrt-mcp"], "enabled": true }
@@ -2884,21 +2167,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("must be valid JSON");
         assert!(parsed.get("mcp").and_then(|m| m.get("rtrt")).is_none());
         assert!(parsed.get("mcp").and_then(|m| m.get("other")).is_some());
-        assert!(parsed.get("default_agent").is_none());
-    }
-
-    #[test]
-    fn opencode_team_uninstall_removes_managed_artifacts_and_disables_team() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = test_team_paths(dir.path());
-        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
-
-        remove_opencode_team_artifacts_at(&paths, true).unwrap();
-
-        assert!(!paths.agents.join("rtrt-orchestrator.md").exists());
-        assert!(!paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN).exists());
-        let config = Config::from_toml_str(&std::fs::read_to_string(&paths.config).unwrap())
-            .expect("persisted config");
-        assert!(!config.team.enabled);
+        assert_eq!(
+            parsed.get("default_agent").and_then(|v| v.as_str()),
+            Some("some-other-agent")
+        );
     }
 }

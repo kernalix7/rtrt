@@ -118,6 +118,7 @@
         <summary class="group">🔀 Routing</summary>
         <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
         <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · preview</span></span></a>
+        <a class="nav" data-page="orchestration"><span class="icon">⋔</span><span class="nav-copy"><span class="nav-label">Orchestration</span><span class="nav-sub">lanes · ladder · failover</span></span></a>
       </details>
       <div class="nav-divider">Connect</div>
       <details class="nav-group" open>
@@ -1364,6 +1365,200 @@
       </div>
     </section>
 
+    <!-- Orchestration (Tools › Orchestrate) — the editable `[team]` roster and
+         `[failover]` policy. Everything on this page is DATA: lane names, tier
+         names, targets and models all come from the config or from /api/detect,
+         never from a list baked into the UI. The roster rtrt ships is only a
+         starting point. -->
+    <section id="page-orchestration" class="page" hidden>
+      <div class="section-head">
+        <div class="section-title">
+          <h1>Orchestration</h1>
+          <div class="lede">Lanes, the difficulty ladder, and the failure policy rtrt follows when it delegates work across your detected tools.</div>
+        </div>
+      </div>
+
+      <!-- Validation banner. The roster is validated server-side before it is
+           written, so a rejected save lands here verbatim and NOTHING is
+           persisted. -->
+      <div class="card orch-error-card" id="orch-error-card" hidden>
+        <div class="head"><h2>Roster rejected — nothing was saved</h2><span class="badge err">invalid</span></div>
+        <p class="orch-error-text" id="orch-error-text"></p>
+      </div>
+
+      <!-- Manager, leaders, scope -->
+      <div class="card">
+        <div class="head"><h2>Manager &amp; leaders</h2><span class="hint" id="team-config-hint">~/.rtrt/config.toml</span></div>
+        <p class="lede">The local manager model that routes a task, and the order leaders are tried in. Leader names must be lanes from the roster below.</p>
+        <div class="settings-section" id="team-scope-section" hidden>
+          <h3>Scope</h3>
+          <div class="scope-toggle" role="radiogroup" aria-label="Orchestration scope">
+            <label class="segment-toggle">
+              <input type="radio" name="team-scope" id="team-scope-global" value="global" checked>
+              <span>Follow global</span>
+            </label>
+            <label class="segment-toggle">
+              <input type="radio" name="team-scope" id="team-scope-custom" value="custom" disabled>
+              <span>Custom (this project)</span>
+            </label>
+          </div>
+          <small class="placeholder-hint" id="team-scope-hint"></small>
+        </div>
+        <div class="orch-manager-fields" id="orch-manager-fields">
+          <label class="segment-toggle" style="margin-bottom:0.7rem;">
+            <input type="checkbox" id="orch-enabled">
+            <span>Orchestration enabled — rtrt may delegate to the lanes below</span>
+          </label>
+          <div class="orch-grid">
+            <label class="field-label">
+              <span>manager provider</span>
+              <input type="text" id="orch-manager-provider" list="orch-targets" autocomplete="off">
+            </label>
+            <label class="field-label">
+              <span>manager model</span>
+              <input type="text" id="orch-manager-model" list="orch-models-all" autocomplete="off">
+            </label>
+            <label class="field-label">
+              <span>manager base URL (optional)</span>
+              <input type="text" id="orch-manager-base-url" placeholder="provider default" autocomplete="off">
+            </label>
+          </div>
+          <div class="settings-section" style="margin-top:1rem;margin-bottom:0;">
+            <h3>Leader order</h3>
+            <div class="orch-chips" id="orch-leader-chips"></div>
+            <div class="orch-row">
+              <label class="field-label">
+                <span>add leader</span>
+                <select id="orch-leader-add"></select>
+              </label>
+              <button class="ghost" type="button" id="orch-leader-add-btn">Add leader</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="orch-editors">
+        <!-- Lanes -->
+        <div class="card">
+          <div class="head"><h2>Lanes</h2><span class="hint">[[team.members]]</span></div>
+          <p class="lede">One lane = a concrete target + model + invocation mode, plus the policy that decides when it is used. Target and model suggestions come from detection — any value you type is still accepted.</p>
+          <div id="orch-lanes"></div>
+          <div class="orch-row">
+            <button class="ghost" type="button" id="orch-add-lane">＋ Add lane</button>
+          </div>
+        </div>
+
+        <!-- Tier ladder -->
+        <div class="card">
+          <div class="head"><h2>Difficulty ladder</h2><span class="hint">[team.tiers]</span></div>
+          <p class="lede">Tier names are free text — rename, add, or remove rungs to match how you actually split work. Lanes are listed most-preferred first.</p>
+          <div id="orch-tiers-note" class="orch-note"></div>
+          <div id="orch-tiers"></div>
+          <div class="orch-row">
+            <label class="field-label">
+              <span>new tier name</span>
+              <input type="text" id="orch-tier-name" placeholder="name this rung" autocomplete="off">
+            </label>
+            <button class="ghost" type="button" id="orch-add-tier">＋ Add tier</button>
+            <button class="ghost" type="button" id="orch-pin-tiers" hidden>Start from the effective ladder</button>
+          </div>
+          <div class="settings-section" style="margin-top:1.1rem;margin-bottom:0;">
+            <h3>Effective ladder</h3>
+            <div class="orch-note">What is actually in force once the configured table and each lane's own tier declaration are combined.</div>
+            <div id="orch-effective-tiers" class="orch-chips"></div>
+          </div>
+        </div>
+
+        <!-- Policy -->
+        <div class="card">
+          <div class="head"><h2>Routing policy</h2><span class="hint">[team.policy]</span></div>
+          <p class="lede">How a leader climbs the ladder and recovers when a lane fails.</p>
+          <div class="orch-grid">
+            <label class="field-label">
+              <span>max retries (same lane, transient failure)</span>
+              <input type="number" id="orch-max-retries" min="0" step="1">
+            </label>
+            <label class="field-label">
+              <span>max fallback depth</span>
+              <input type="number" id="orch-max-depth" min="0" step="1" placeholder="auto">
+            </label>
+            <label class="field-label">
+              <span>default tier</span>
+              <select id="orch-default-tier"></select>
+            </label>
+          </div>
+          <div class="orch-row" style="margin-top:0.7rem;">
+            <label class="segment-toggle"><input type="checkbox" id="orch-redo"><span>Redo work on fallback</span></label>
+            <label class="segment-toggle"><input type="checkbox" id="orch-sibling"><span>Prefer sibling pool on quota</span></label>
+            <label class="segment-toggle"><input type="checkbox" id="orch-provenance"><span>Record provenance</span></label>
+          </div>
+          <div class="settings-section" style="margin-top:1.1rem;margin-bottom:0;">
+            <h3>Design-only tiers</h3>
+            <div class="orch-note">Rungs whose output is a plan, not an edit — the only rungs a lane that may not implement is allowed in.</div>
+            <label class="segment-toggle" style="margin:0.5rem 0;">
+              <input type="checkbox" id="orch-design-default">
+              <span>Follow the shipped default</span>
+            </label>
+            <div id="orch-design-tiers" class="orch-chips"></div>
+          </div>
+        </div>
+
+        <!-- Save bar -->
+        <div class="card">
+          <div class="orch-row" style="margin-top:0;">
+            <button id="orch-save-btn" class="primary" type="button">Save orchestration</button>
+            <button id="orch-reload-btn" class="ghost" type="button">Discard changes</button>
+            <span id="orch-save-result" class="out-meta"></span>
+          </div>
+        </div>
+
+        <!-- Failover markers -->
+        <div class="card">
+          <div class="head"><h2>Failure classification</h2><span class="hint" id="failover-config-hint">[failover]</span></div>
+          <p class="lede">Extra error markers, one per line, layered on top of the built-in classification. A marker listed here is matched first, so putting a built-in marker under a different class reclassifies it.</p>
+          <div class="orch-grid">
+            <label class="field-label">
+              <span>fatal — stop the walk, no retry, no failover</span>
+              <textarea id="orch-fail-fatal" rows="4" spellcheck="false"></textarea>
+            </label>
+            <label class="field-label">
+              <span>quota — fail over immediately, no retry</span>
+              <textarea id="orch-fail-quota" rows="4" spellcheck="false"></textarea>
+            </label>
+            <label class="field-label">
+              <span>transient — earn a backed-off retry</span>
+              <textarea id="orch-fail-transient" rows="4" spellcheck="false"></textarea>
+            </label>
+          </div>
+          <div class="orch-grid" style="margin-top:0.7rem;">
+            <label class="field-label">
+              <span>transient retries</span>
+              <input type="number" id="orch-fail-retries" min="0" step="1" placeholder="built-in">
+            </label>
+            <label class="field-label">
+              <span>backoff divisor (of the call timeout)</span>
+              <input type="number" id="orch-fail-divisor" min="1" step="1" placeholder="built-in">
+            </label>
+            <label class="field-label">
+              <span>fixed backoff (ms)</span>
+              <input type="number" id="orch-fail-backoff" min="0" step="1" placeholder="derived from timeout">
+            </label>
+          </div>
+          <div class="orch-row">
+            <button id="orch-fail-save-btn" class="primary" type="button">Save failure policy</button>
+            <span id="orch-fail-save-result" class="out-meta"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Detection-backed suggestion lists, rebuilt from /api/detect on load so
+           no target or model name is ever hardcoded in the markup. -->
+      <datalist id="orch-targets"></datalist>
+      <datalist id="orch-models-all"></datalist>
+      <datalist id="orch-lane-names"></datalist>
+      <datalist id="orch-tier-names"></datalist>
+    </section>
+
     <!-- Providers -->
     <section id="page-llm" class="page" hidden>
       <div class="section-head">
@@ -1610,6 +1805,9 @@
 <script src="/assets/js/api.js"></script>
 <script src="/assets/js/components.js"></script>
 <script src="/assets/js/pages.js"></script>
+<!-- Tools › Orchestration. After pages.js (it reuses the shared scope helpers)
+     and before app.js, which routes to the initial page on load. -->
+<script src="/assets/js/orchestration.js"></script>
 <script src="/assets/js/app.js"></script>
 </body>
 </html>

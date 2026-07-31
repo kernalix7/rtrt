@@ -751,7 +751,7 @@ const MODE_PAGES = {
   },
   tools: {
     default: 'llm',
-    pages: ['llm', 'chat', 'limits', 'environment', 'usage', 'connect'],
+    pages: ['llm', 'chat', 'limits', 'environment', 'usage', 'orchestration', 'connect'],
   },
 };
 const PAGE_MODE = {};

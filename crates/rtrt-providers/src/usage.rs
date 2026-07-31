@@ -4,8 +4,10 @@ use std::{
     process::Command,
 };
 
-use rtrt_core::Config;
+use rtrt_core::{Config, PoolKey};
 use serde::{Deserialize, Serialize};
+
+use crate::usage_ledger::PoolCap;
 
 const PROXY_STATS_DB_FILE_NAME: &str = "proxy-stats.sqlite";
 const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
@@ -33,12 +35,28 @@ impl Usage {
     }
 }
 
+/// Usage and limits, keyed by target *and* by pool.
+///
+/// The `*_by_target` maps are the original surface and keep their exact
+/// meaning. The `*_by_pool` maps are additive and keyed by
+/// [`PoolKey::canonical`] (`opencode#opencode-go`): the finer identity that
+/// separates two upstream quotas reached through one target. A pool only
+/// appears in `limits_by_pool` when a cap was configured *for that pool* — a
+/// target-wide cap is never split across its pools.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub usage_by_target: BTreeMap<String, u64>,
     pub limits_by_target: BTreeMap<String, u64>,
     pub requests_by_target: BTreeMap<String, u64>,
     pub request_limits_by_target: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub usage_by_pool: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub limits_by_pool: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub requests_by_pool: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub request_limits_by_pool: BTreeMap<String, u64>,
     pub proxy_runs: Option<ProxyUsage>,
     pub sources: Vec<String>,
 }
@@ -59,6 +77,22 @@ pub struct ProxyUsage {
     pub runs: u64,
     pub input_chars: u64,
     pub output_chars: u64,
+}
+
+/// Headroom for one pool inside a target.
+///
+/// `used` / `request_used` are this pool's own numbers. Each cap carries its
+/// own [`crate::usage_ledger::CapScope`], so a ceiling inherited from the target
+/// is reported as shared with the sibling pools instead of being presented as
+/// this pool's private allowance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolQuota {
+    /// [`PoolKey::canonical`] of the bucket.
+    pub key: String,
+    pub used: u64,
+    pub request_used: u64,
+    pub tokens: PoolCap,
+    pub requests: PoolCap,
 }
 
 impl UsageSnapshot {
@@ -82,8 +116,13 @@ impl UsageSnapshot {
     /// routing behavior is unchanged in P1. P2 wires it in to make routing
     /// usage-aware. Ledger windows replace the per-target counters they cover
     /// (the ledger is the authoritative recent-usage source for routing).
+    ///
+    /// The per-pool window is filled in at the same time from the same read.
+    /// Target-keyed consumers see byte-identical numbers, because the
+    /// target-level map is the fold of the pooled one.
     pub fn with_ledger_window(mut self) -> Self {
-        let windows = crate::usage_ledger::provider_usage_windows();
+        let pooled = crate::usage_ledger::pool_usage_windows();
+        let windows = crate::usage_ledger::fold_pools_to_targets(&pooled);
         for (target, window) in windows {
             let recent = window.last_24h;
             self.usage_by_target.insert(target.clone(), recent.tokens);
@@ -93,7 +132,66 @@ impl UsageSnapshot {
             "provider-usage-ledger: {} target(s) in the rolling 24h window",
             self.usage_by_target.len()
         ));
+        let mut pools = 0_usize;
+        for (key, window) in &pooled {
+            let recent = window.last_24h;
+            self.usage_by_pool.insert(key.clone(), recent.tokens);
+            self.requests_by_pool.insert(key.clone(), recent.requests);
+            if PoolKey::parse(key).is_pooled() {
+                pools = pools.saturating_add(1);
+            }
+        }
+        // Only reported when the ledger actually contains pooled rows, so a
+        // ledger written before pools existed produces the same source list it
+        // always did.
+        if pools > 0 {
+            self.sources.push(format!(
+                "provider-usage-ledger: {pools} pool(s) inside those targets"
+            ));
+        }
         self
+    }
+
+    /// Headroom for one pool, or `None` when no cap is configured at either the
+    /// pool or the target level — the same "never fabricate a ceiling" contract
+    /// as [`UsageSnapshot::headroom`].
+    pub fn pool_headroom(&self, key: &PoolKey) -> Option<PoolQuota> {
+        let canonical = key.canonical();
+        let target = key.target_key();
+        let pool_token_limit = self.limits_by_pool.get(&canonical).copied();
+        let pool_request_limit = self.request_limits_by_pool.get(&canonical).copied();
+        let target_token_limit = self.limits_by_target.get(target).copied();
+        let target_request_limit = self.request_limits_by_target.get(target).copied();
+        if pool_token_limit.is_none()
+            && pool_request_limit.is_none()
+            && target_token_limit.is_none()
+            && target_request_limit.is_none()
+        {
+            return None;
+        }
+        let used = self.usage_by_pool.get(&canonical).copied().unwrap_or(0);
+        let request_used = self.requests_by_pool.get(&canonical).copied().unwrap_or(0);
+        let target_used = self.usage_by_target.get(target).copied().unwrap_or(0);
+        let target_requests = self.requests_by_target.get(target).copied().unwrap_or(0);
+        Some(PoolQuota {
+            key: canonical,
+            used,
+            request_used,
+            // Same Pool / Shared / Unknown resolution the ledger uses, so the
+            // two surfaces cannot disagree about what a cap means.
+            tokens: crate::usage_ledger::axis_cap(
+                pool_token_limit,
+                target_token_limit,
+                used,
+                target_used,
+            ),
+            requests: crate::usage_ledger::axis_cap(
+                pool_request_limit,
+                target_request_limit,
+                request_used,
+                target_requests,
+            ),
+        })
     }
 
     /// The snapshot every routing surface (CLI, MCP `agent_route`, dashboard
@@ -151,10 +249,7 @@ impl UsageSnapshot {
                 .into_iter()
                 .map(|(target, limit)| (normalize_target(target), limit))
                 .collect(),
-            requests_by_target: BTreeMap::new(),
-            request_limits_by_target: BTreeMap::new(),
-            proxy_runs: None,
-            sources: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -182,8 +277,7 @@ impl UsageSnapshot {
                 .into_iter()
                 .map(|(target, limit)| (normalize_target(target), limit))
                 .collect(),
-            proxy_runs: None,
-            sources: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -294,6 +388,15 @@ impl UsageSnapshot {
                 target,
                 limit.daily_requests,
             );
+            for (pool, cap) in &limit.pools {
+                let key = PoolKey::new(target, Some(pool)).canonical();
+                if let Some(tokens) = cap.daily_tokens {
+                    self.limits_by_pool.insert(key.clone(), tokens);
+                }
+                if let Some(requests) = cap.daily_requests {
+                    self.request_limits_by_pool.insert(key, requests);
+                }
+            }
         }
         self.sources.push(format!(
             "limits: {} ({} token limits, {} request limits)",
@@ -301,6 +404,15 @@ impl UsageSnapshot {
             self.limits_by_target.len(),
             self.request_limits_by_target.len()
         ));
+        // Additive line, emitted only when per-pool caps exist, so a config
+        // without them reports exactly what it always has.
+        let pool_caps = self.limits_by_pool.len() + self.request_limits_by_pool.len();
+        if pool_caps > 0 {
+            self.sources.push(format!(
+                "limits: {} pool cap(s) nested under [limits.<target>.pools]",
+                pool_caps
+            ));
+        }
     }
 }
 
@@ -413,4 +525,120 @@ fn token_log_timestamp_fields() -> usize {
 
 fn token_log_min_fields() -> usize {
     token_log_timestamp_fields() + token_log_trailing_text_fields() + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage_ledger::CapScope;
+
+    /// Two pools under one target: 150 tokens / 1 request on `opencode-go`,
+    /// 600 tokens / 1 request on `ollama`, folded to 750 / 2 at target level.
+    fn pooled_snapshot() -> UsageSnapshot {
+        let mut snapshot = UsageSnapshot::default();
+        snapshot.usage_by_target.insert("opencode".into(), 750);
+        snapshot.requests_by_target.insert("opencode".into(), 2);
+        snapshot
+            .usage_by_pool
+            .insert("opencode#opencode-go".into(), 150);
+        snapshot.usage_by_pool.insert("opencode#ollama".into(), 600);
+        snapshot
+            .requests_by_pool
+            .insert("opencode#opencode-go".into(), 1);
+        snapshot
+            .requests_by_pool
+            .insert("opencode#ollama".into(), 1);
+        snapshot
+    }
+
+    fn go() -> PoolKey {
+        PoolKey::from_target_model("opencode", Some("opencode-go/glm-5.2"))
+    }
+
+    #[test]
+    fn pool_headroom_without_any_cap_is_none() {
+        let snapshot = pooled_snapshot();
+        assert!(snapshot.pool_headroom(&go()).is_none());
+        // The observed usage is still there — measured, not inferred.
+        assert_eq!(snapshot.usage_by_pool["opencode#opencode-go"], 150);
+    }
+
+    #[test]
+    fn target_cap_is_shared_across_pools_never_split() {
+        let mut snapshot = pooled_snapshot();
+        snapshot.limits_by_target.insert("opencode".into(), 1_000);
+        snapshot
+            .request_limits_by_target
+            .insert("opencode".into(), 10);
+
+        let quota = snapshot.pool_headroom(&go()).expect("target cap applies");
+        assert_eq!(quota.key, "opencode#opencode-go");
+        assert_eq!(quota.used, 150, "this pool's own usage");
+        assert_eq!(quota.tokens.scope, CapScope::Shared);
+        // The whole cap, drawn down by every sibling together.
+        assert_eq!(quota.tokens.limit, Some(1_000));
+        assert_eq!(quota.tokens.used, 750);
+        assert_eq!(quota.tokens.remaining, Some(250));
+        assert_eq!(quota.requests.scope, CapScope::Shared);
+        assert_eq!(quota.requests.remaining, Some(8));
+        // The target-keyed view is untouched by any of this.
+        let target = snapshot.headroom("opencode").expect("target headroom");
+        assert_eq!(target.used, 750);
+        assert_eq!(target.remaining, 250);
+    }
+
+    #[test]
+    fn configured_pool_cap_wins_and_charges_only_that_pool() {
+        let mut snapshot = pooled_snapshot();
+        snapshot.limits_by_target.insert("opencode".into(), 1_000);
+        snapshot
+            .limits_by_pool
+            .insert("opencode#opencode-go".into(), 400);
+
+        let quota = snapshot.pool_headroom(&go()).expect("pool cap applies");
+        assert_eq!(quota.tokens.scope, CapScope::Pool);
+        assert_eq!(quota.tokens.limit, Some(400));
+        assert_eq!(quota.tokens.used, 150);
+        assert_eq!(quota.tokens.remaining, Some(250));
+        // The uncapped axis stays honest about being shared.
+        assert_eq!(quota.requests.scope, CapScope::Unknown);
+
+        // The sibling keeps sharing the target cap.
+        let cloud = PoolKey::from_target_model("opencode", Some("ollama/glm-5.2:cloud"));
+        let sibling = snapshot.pool_headroom(&cloud).expect("shared cap applies");
+        assert_eq!(sibling.tokens.scope, CapScope::Shared);
+        assert_eq!(sibling.tokens.limit, Some(1_000));
+    }
+
+    #[test]
+    fn unpooled_key_reads_the_target_bucket() {
+        let mut snapshot = UsageSnapshot::default();
+        snapshot.usage_by_target.insert("ollama".into(), 150);
+        snapshot.usage_by_pool.insert("ollama".into(), 150);
+        snapshot.limits_by_target.insert("ollama".into(), 1_000);
+        let key = PoolKey::from_target_model("ollama", Some("granite4:350m"));
+        assert!(!key.is_pooled());
+        let quota = snapshot.pool_headroom(&key).expect("target cap applies");
+        assert_eq!(quota.key, "ollama");
+        assert_eq!(quota.used, 150);
+        assert_eq!(quota.tokens.remaining, Some(850));
+    }
+
+    #[test]
+    fn snapshots_serialized_before_pools_still_deserialize() {
+        let legacy = r#"{
+            "usage_by_target": {"openai": 150},
+            "limits_by_target": {"openai": 1000},
+            "requests_by_target": {"openai": 1},
+            "request_limits_by_target": {"openai": 10},
+            "proxy_runs": null,
+            "sources": ["token-log: unavailable"]
+        }"#;
+        let snapshot: UsageSnapshot = serde_json::from_str(legacy).expect("legacy snapshot parses");
+        assert_eq!(snapshot.usage_by_target["openai"], 150);
+        assert!(snapshot.usage_by_pool.is_empty());
+        assert!(snapshot.limits_by_pool.is_empty());
+        let headroom = snapshot.headroom("openai").expect("headroom");
+        assert_eq!(headroom.remaining, 850);
+    }
 }

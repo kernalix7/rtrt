@@ -434,15 +434,6 @@ enum Cmd {
         /// (only valid with `--agent claude`).
         #[arg(long)]
         plugin: bool,
-        /// Enable and configure the RTRT team integration (OpenCode only).
-        #[arg(long)]
-        team: bool,
-        /// Override the team manager model (requires --team).
-        #[arg(long, requires = "team")]
-        team_manager_model: Option<String>,
-        /// Override the team manager provider (requires --team).
-        #[arg(long, requires = "team")]
-        team_manager_provider: Option<String>,
     },
     /// Run `rtrt-dashboard` as a background OS service.
     ///
@@ -1366,9 +1357,6 @@ fn run_migrate(
         memory_path: None,
         binary: mcp_binary,
         plugin: true,
-        team: false,
-        team_manager_model: None,
-        team_manager_provider: None,
     })?;
 
     println!("\nSTEP 3 — Audit whole-project consistency");
@@ -2928,9 +2916,6 @@ async fn run(command: Cmd) -> Result<()> {
             memory,
             binary,
             plugin,
-            team,
-            team_manager_model,
-            team_manager_provider,
         } => {
             let binary = binary.unwrap_or_else(|| {
                 // Best-effort: assume `rtrt-mcp` is on PATH at the same prefix as the running CLI.
@@ -2945,9 +2930,6 @@ async fn run(command: Cmd) -> Result<()> {
                 memory_path: memory,
                 binary,
                 plugin,
-                team,
-                team_manager_model,
-                team_manager_provider,
             })?;
         }
         Cmd::Service { cmd } => {
@@ -7720,50 +7702,6 @@ fn detect_provider(model: &str) -> ProviderArg {
 #[cfg(test)]
 mod team_tests {
     use super::*;
-
-    #[test]
-    fn parses_opencode_team_setup_overrides() {
-        let cli = Cli::try_parse_from([
-            "rtrt",
-            "setup",
-            "--agent",
-            "opencode",
-            "--team",
-            "--team-manager-provider",
-            "ollama",
-            "--team-manager-model",
-            "qwen3:8b",
-        ])
-        .unwrap();
-        let Some(Cmd::Setup {
-            agent: AgentKind::Opencode,
-            team,
-            team_manager_provider,
-            team_manager_model,
-            ..
-        }) = cli.command
-        else {
-            panic!("expected OpenCode team setup");
-        };
-        assert!(team);
-        assert_eq!(team_manager_provider.as_deref(), Some("ollama"));
-        assert_eq!(team_manager_model.as_deref(), Some("qwen3:8b"));
-    }
-
-    #[test]
-    fn setup_manager_overrides_require_team_flag() {
-        assert!(
-            Cli::try_parse_from([
-                "rtrt",
-                "setup",
-                "--agent",
-                "opencode",
-                "--team-manager-model",
-                "qwen3:8b",
-            ])
-            .is_err()
-        );
-    }
 
     #[test]
     fn parses_team_dispatch_flags_and_prompt_words() {

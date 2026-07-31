@@ -3,20 +3,34 @@
 //! Handles both unary and SSE streaming. Usage on streaming is provided when the
 //! caller sets `stream_options.include_usage = true` on the request payload —
 //! we always set it so the final chunk carries the usage block.
+//!
+//! Every response also carries `x-ratelimit-*` headers stating the quota rtrt
+//! has left. They are captured into the rate-limit signal store on both the
+//! success and the error path — see [`OpenAIProvider::capture_rate_limit`].
 
 use async_trait::async_trait;
-use rtrt_core::{Error, Result};
+use rtrt_core::{Error, PoolKey, Result};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, Provider, Role, Usage, stream,
+    usage_ledger,
 };
+
+/// The quota bucket OpenAI API responses are filed under by default.
+pub const OPENAI_TARGET: &str = "openai";
 
 pub struct OpenAIProvider {
     pub api_key: String,
     pub base_url: String,
     pub http: reqwest::Client,
+    /// The quota bucket this endpoint's rate-limit headers are recorded under.
+    ///
+    /// Defaults to [`OPENAI_TARGET`]. [`crate::OpenAICompatibleProvider`]
+    /// overrides it with its own name, so a local llama.cpp server's headers are
+    /// never filed against OpenAI's quota.
+    pub usage_target: String,
 }
 
 impl OpenAIProvider {
@@ -25,6 +39,7 @@ impl OpenAIProvider {
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             http: reqwest::Client::new(),
+            usage_target: OPENAI_TARGET.to_string(),
         }
     }
 
@@ -36,6 +51,28 @@ impl OpenAIProvider {
     pub fn with_http(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
+    }
+
+    /// Record this endpoint's rate-limit signals under a different quota bucket
+    /// than `openai` — what an OpenAI-compatible server needs.
+    pub fn with_usage_target(mut self, target: impl Into<String>) -> Self {
+        self.usage_target = target.into();
+        self
+    }
+
+    /// File this response's rate-limit headers under the pool the call drew
+    /// from.
+    ///
+    /// Called on every response, success or failure: a 429 is exactly when the
+    /// remaining / reset numbers matter, and it is the one response guaranteed
+    /// to carry them. Best-effort by contract — the recorder never returns an
+    /// error and never fails the request.
+    fn capture_rate_limit(&self, model: &str, resp: &reqwest::Response) {
+        usage_ledger::record_response_rate_limit(
+            &PoolKey::from_target_model(&self.usage_target, Some(model)),
+            resp.status().as_u16(),
+            resp.headers(),
+        );
     }
 
     fn build_payload(&self, req: &ChatRequest, stream: bool) -> serde_json::Value {
@@ -72,7 +109,7 @@ impl OpenAIProvider {
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str {
-        "openai"
+        OPENAI_TARGET
     }
 
     fn supported_models(&self) -> &[&'static str] {
@@ -90,8 +127,9 @@ impl Provider for OpenAIProvider {
             .send()
             .await
             .map_err(|e| Error::Provider(format!("openai request: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        self.capture_rate_limit(&req.model, &resp);
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Provider(format!("openai {status}: {body}")));
         }
@@ -124,8 +162,9 @@ impl Provider for OpenAIProvider {
             .send()
             .await
             .map_err(|e| Error::Provider(format!("openai stream request: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        self.capture_rate_limit(&req.model, &resp);
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Provider(format!("openai {status}: {body}")));
         }

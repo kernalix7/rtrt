@@ -44,7 +44,7 @@ pub use lane::{
     LaneRoom, LaneRun, LaneRunner, LaneStep, LaneTask, LedgerRoom, RedoDirective, StaticRoom,
     UNKNOWN_ROOM, UnknownRoom, resolve_lane, resolve_leader_lane,
 };
-pub use openai::OpenAIProvider;
+pub use openai::{OPENAI_TARGET, OpenAIProvider};
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
@@ -52,10 +52,12 @@ pub use router::{
 pub use team::{build_team_leader_prompt, dispatch_team};
 pub use usage::{PoolQuota, ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
-    CapScope, LedgerRow, PoolCap, PoolHeadroom, PoolRanking, RoomBasis, RoomComparison,
-    TargetHeadroom, TargetWindows, WindowUsage, compare_room, estimate_tokens, headroom_for_pool,
-    headroom_for_target, pool_headroom, pool_usage_windows, provider_usage_windows,
-    rank_pools_by_room, rank_target_pools, record_invocation, target_headroom,
+    CapScope, LedgerRow, PoolCap, PoolHeadroom, PoolRanking, RateLimitAxis, RateLimitSignal,
+    RoomBasis, RoomComparison, TargetHeadroom, TargetWindows, WindowUsage, compare_room,
+    estimate_tokens, headroom_for_pool, headroom_for_target, pool_headroom, pool_usage_windows,
+    provider_usage_windows, rank_pools_by_room, rank_target_pools, rate_limit_signal,
+    rate_limit_signal_for, rate_limit_signals, record_invocation, record_rate_limit,
+    record_response_rate_limit, target_headroom,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

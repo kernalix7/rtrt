@@ -4,15 +4,37 @@
 //! array. Handles both unary and streaming responses. Usage is parsed from the
 //! `usage` field on unary, and from `message_start` / `message_delta` events on
 //! streaming.
+//!
+//! Every response also carries `anthropic-ratelimit-*` headers stating the
+//! quota rtrt has left. They are captured into the rate-limit signal store on
+//! both the success and the error path — see [`capture_rate_limit`].
 
 use async_trait::async_trait;
-use rtrt_core::{Error, Result};
+use rtrt_core::{Error, PoolKey, Result};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, Provider, Role, Usage, stream,
+    usage_ledger,
 };
+
+/// The quota bucket Anthropic API responses are filed under.
+const ANTHROPIC_TARGET: &str = "anthropic";
+
+/// File this response's rate-limit headers under the pool the call drew from.
+///
+/// Called on every response, success or failure: a 429 is exactly when the
+/// remaining / reset numbers matter, and it is the one response that is
+/// guaranteed to carry them. Best-effort by contract — the recorder never
+/// returns an error and never fails the request.
+fn capture_rate_limit(model: &str, resp: &reqwest::Response) {
+    usage_ledger::record_response_rate_limit(
+        &PoolKey::from_target_model(ANTHROPIC_TARGET, Some(model)),
+        resp.status().as_u16(),
+        resp.headers(),
+    );
+}
 
 pub struct AnthropicProvider {
     pub api_key: String,
@@ -89,7 +111,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
-        "anthropic"
+        ANTHROPIC_TARGET
     }
 
     fn supported_models(&self) -> &[&'static str] {
@@ -108,8 +130,9 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| Error::Provider(format!("anthropic request: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        capture_rate_limit(&req.model, &resp);
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Provider(format!("anthropic {status}: {body}")));
         }
@@ -149,8 +172,9 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| Error::Provider(format!("anthropic stream request: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        capture_rate_limit(&req.model, &resp);
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Provider(format!("anthropic {status}: {body}")));
         }

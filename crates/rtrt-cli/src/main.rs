@@ -18,7 +18,7 @@ use rtrt_compress::{
 };
 use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
-    TeamConfig, TeamMode, ToolKind,
+    PoolKey, TeamConfig, TeamMode, ToolKind,
 };
 use rtrt_memory::{
     Embedder, LlmSummariser, MemoryStore, OllamaEmbedder, is_synthetic_prompt, truncate_for_embed,
@@ -26,9 +26,10 @@ use rtrt_memory::{
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
-    Mode as InvokeMode, OpenAICompatibleProvider, OpenAIProvider, Prefer, Provider, RankedTarget,
-    Role, RouteDecision, RouteRequest, TargetHeadroom, TargetWindows, UsageSnapshot, dispatch_team,
-    gateway_default_timeout, invoke_agent, invoke_with_failover, provider_usage_windows,
+    Mode as InvokeMode, OpenAICompatibleProvider, OpenAIProvider, PoolCap, PoolHeadroom, Prefer,
+    Provider, RankedTarget, Role, RoomBasis, RouteDecision, RouteRequest, TargetHeadroom,
+    TargetWindows, UsageSnapshot, dispatch_team, gateway_default_timeout, headroom_for_pool,
+    invoke_agent, invoke_with_failover, provider_usage_windows, rank_pools_by_room,
     record_invocation, select_route, serve_gateway, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
@@ -295,9 +296,11 @@ enum Cmd {
         /// Print only the decision and do not invoke the target.
         #[arg(long)]
         dry_run: bool,
-        /// When invoking (no explicit --target), walk the ranked candidate list
-        /// with automatic failover on retryable errors. Ignored for --dry-run /
-        /// --explain and for an explicit --target.
+        /// When invoking, walk the ranked candidate list with automatic
+        /// failover on retryable errors. An explicit --target (or the
+        /// configured `[providers] active`) stays the primary pick and keeps
+        /// its sibling pools and the ranked alternatives behind it. Ignored for
+        /// --dry-run / --explain.
         #[arg(long)]
         failover: bool,
         /// Prompt text. Multiple words are joined with spaces.
@@ -4297,6 +4300,27 @@ fn normalize_tool_arguments(arguments: &serde_json::Value) -> Option<serde_json:
     }
 }
 
+/// The routing request behind one `rtrt route` invocation.
+///
+/// `--target` wins; otherwise the per-project `[providers] active` preference
+/// pins the route. `--failover` rides along with it instead of being dropped:
+/// an explicit target used to collapse the route to a single candidate, so
+/// merely configuring `active` turned `--failover` into a no-op. The router now
+/// keeps a pinned target FIRST and ranks its sibling pools and the other
+/// targets behind it, so the flag means the same thing pinned or not. Without
+/// `--failover` the request is byte-identical to the one this always built.
+fn route_request_for(opts: &RouteCliOptions, active: Option<&str>) -> RouteRequest {
+    let mode = InvokeMode::from(opts.mode);
+    RouteRequest {
+        capability: opts.capability.map(Capability::from),
+        prefer: Prefer::from(opts.prefer),
+        target: opts.target.clone().or_else(|| active.map(str::to_string)),
+        model: opts.model.clone(),
+        mode: (mode != InvokeMode::Auto).then_some(mode),
+        failover: opts.failover,
+    }
+}
+
 async fn run_route(opts: RouteCliOptions) -> Result<()> {
     let prompt = opts.prompt.join(" ");
     // `--explain` / `--dry-run` only print the decision, so they don't need a
@@ -4305,22 +4329,13 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
     if will_invoke && prompt.trim().is_empty() {
         bail!("rtrt route: prompt is empty");
     }
-    let mode = InvokeMode::from(opts.mode);
     // Effective config = global overlaid with `<repo>/.rtrt/config.toml`. It
     // drives two things: the per-project `[agents]`/`[providers]` enable map
     // (fed into detection so disabled targets drop out of the candidate set),
     // and the per-project `[providers] active` preference (used as the route
     // target when the user gave no explicit `--target`).
     let cfg = effective_config_for_cwd();
-    let target = opts.target.or_else(|| cfg.providers.active.clone());
-    let req = RouteRequest {
-        capability: opts.capability.map(Capability::from),
-        prefer: Prefer::from(opts.prefer),
-        target,
-        model: opts.model,
-        mode: (mode != InvokeMode::Auto).then_some(mode),
-        failover: false,
-    };
+    let req = route_request_for(&opts, cfg.providers.active.as_deref());
     let tools = rtrt_core::detect_tools_with_config(cfg);
     // Routing snapshot with the ledger's rolling 24h window so ranking is
     // headroom-aware: exhausted `[limits]` targets are demoted and near-limit
@@ -4334,7 +4349,8 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
         let ledger_cfg = effective_config_for_cwd();
         let windows = provider_usage_windows();
         let headroom = target_headroom(&ledger_cfg);
-        print_route_decision(&decision, opts.explain, &usage, &windows, &headroom);
+        let pools = candidate_pools(&decision, &ledger_cfg);
+        print_route_decision(&decision, opts.explain, &usage, &windows, &headroom, &pools);
     }
     // Stop before invoking on `--dry-run`, or on `--explain` with no prompt
     // (decision-only inspection).
@@ -4343,10 +4359,10 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
     }
 
     let timeout = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
-    // `--failover` (only meaningful without an explicit `--target`): walk the
-    // ranked candidate list, falling over on retryable failures. An explicit
-    // target produces a single-element ranked list, so it still targets exactly
-    // that one even with `--failover`.
+    // `--failover`: walk the ranked candidate list, falling over on retryable
+    // failures. A pinned target (explicit `--target` or the configured
+    // `[providers] active`) stays the primary pick and keeps its ranked
+    // fallbacks behind it, so pinning no longer silently disarms the flag.
     if opts.failover {
         let ranked = decision.ranked_targets();
         let result = invoke_with_failover(&ranked, &prompt, timeout)
@@ -4396,33 +4412,47 @@ async fn run_call_with_failover(
 
 /// Build the failover order for `rtrt call <target> --failover`: the explicit
 /// target stays the primary pick, then the remaining ranked, headroom-aware
-/// candidates (route with no explicit target) are appended, dropping the
-/// primary if it reappears. On any routing failure we fall back to a
-/// single-element list so the explicit call still runs exactly as before.
+/// candidates are appended behind it.
+///
+/// The pin is handed to the router as an explicit target *with* failover, so the
+/// primary resolves to that target's roomiest pool and its sibling pools rank
+/// ahead of the other targets — a pinned call now survives one upstream quota
+/// running out. A target the router cannot rank (a custom binary, say) falls
+/// back to the previous shape: the caller's own primary, then the open ranking
+/// behind it, dropping the primary if it reappears.
 fn ranked_targets_for_call(
     target: &str,
     mode: InvokeMode,
     model: Option<String>,
 ) -> Vec<RankedTarget> {
-    let primary = RankedTarget {
-        target: target.to_string(),
-        mode,
-        model: model.clone(),
-        cost_class: CostClass::Unknown,
-    };
     let cfg = effective_config_for_cwd();
     let tools = rtrt_core::detect_tools_with_config(cfg);
     let usage = UsageSnapshot::load_for_routing();
     let req = RouteRequest {
         capability: None,
         prefer: Prefer::Cheapest,
+        target: Some(target.to_string()),
+        model: model.clone(),
+        mode: (mode != InvokeMode::Auto).then_some(mode),
+        failover: true,
+    };
+    if let Ok(decision) = select_route(&req, &tools, &usage) {
+        return decision.ranked_targets();
+    }
+    let primary = RankedTarget {
+        target: target.to_string(),
+        mode,
+        model,
+        cost_class: CostClass::Unknown,
+    };
+    let open = RouteRequest {
         target: None,
         model: None,
-        mode: (mode != InvokeMode::Auto).then_some(mode),
         failover: false,
+        ..req
     };
     let mut ranked = vec![primary];
-    if let Ok(decision) = select_route(&req, &tools, &usage) {
+    if let Ok(decision) = select_route(&open, &tools, &usage) {
         let normalized = target.to_ascii_lowercase();
         for candidate in decision.ranked_targets() {
             if candidate.target.to_ascii_lowercase() != normalized {
@@ -4439,6 +4469,7 @@ fn print_route_decision(
     usage: &UsageSnapshot,
     windows: &BTreeMap<String, TargetWindows>,
     headroom: &BTreeMap<String, TargetHeadroom>,
+    pools: &[Option<CandidatePool>],
 ) {
     println!("target: {}", decision.target);
     println!("mode: {}", invoke_mode_label(decision.mode));
@@ -4449,11 +4480,26 @@ fn print_route_decision(
         return;
     }
     // Per-candidate recent usage + remaining headroom from the ledger. The
-    // chosen target is listed first, then each ranked alternative.
+    // chosen target is listed first, then each ranked alternative. A candidate
+    // whose model names an upstream pool is reported per pool, because that —
+    // not the target — is the quota bucket the call actually draws down.
     println!("candidates:");
-    print_candidate_headroom("* ", &decision.target, windows, headroom);
+    let mut pools = pools.iter();
+    print_candidate_headroom(
+        "* ",
+        &decision.target,
+        windows,
+        headroom,
+        pools.next().and_then(Option::as_ref),
+    );
     for alt in &decision.alternatives {
-        print_candidate_headroom("  ", &alt.target, windows, headroom);
+        print_candidate_headroom(
+            "  ",
+            &alt.target,
+            windows,
+            headroom,
+            pools.next().and_then(Option::as_ref),
+        );
     }
     println!("alternatives:");
     if decision.alternatives.is_empty() {
@@ -4502,15 +4548,81 @@ fn print_route_decision(
     }
 }
 
+/// The quota bucket behind one pooled candidate, plus what an ordering over the
+/// pooled candidates was actually derived from.
+///
+/// Only built for a candidate whose model names a pool: an unpooled candidate
+/// has no identity finer than its target, so it keeps printing the target line
+/// it always printed.
+struct CandidatePool {
+    key: PoolKey,
+    room: PoolHeadroom,
+    basis: RoomBasis,
+}
+
+/// Resolve the pool identity and room of every ranked candidate — the pick
+/// first, then each alternative — in the order `print_route_decision` lists
+/// them. `None` marks an unpooled candidate.
+///
+/// The basis is shared by the whole set, because that is what the ordering was
+/// decided on: [`RoomBasis::Quota`] only when every pooled candidate has a
+/// configured cap, otherwise the order fell back to observed usage.
+fn candidate_pools(
+    decision: &RouteDecision,
+    cfg: &rtrt_core::Config,
+) -> Vec<Option<CandidatePool>> {
+    let keys: Vec<PoolKey> = std::iter::once((decision.target.as_str(), decision.model.as_deref()))
+        .chain(
+            decision
+                .alternatives
+                .iter()
+                .map(|alt| (alt.target.as_str(), alt.model.as_deref())),
+        )
+        .map(|(target, model)| PoolKey::from_target_model(target, model))
+        .collect();
+    if !keys.iter().any(PoolKey::is_pooled) {
+        // No pools in play at all: nothing to disclose, and every line stays
+        // exactly what it was before pools existed.
+        return keys.iter().map(|_| None).collect();
+    }
+    let rooms: Vec<Option<PoolHeadroom>> = keys
+        .iter()
+        .map(|key| key.is_pooled().then(|| headroom_for_pool(key, cfg)))
+        .collect();
+    let basis = rank_pools_by_room(&rooms.iter().flatten().cloned().collect::<Vec<_>>()).basis;
+    keys.into_iter()
+        .zip(rooms)
+        .map(|(key, room)| room.map(|room| CandidatePool { key, room, basis }))
+        .collect()
+}
+
 /// One candidate's recent (24h) usage and remaining headroom, formatted for
 /// `route --explain`. The `~` prefix on a token count marks an estimate (CLI
 /// shell-outs); a `?` for headroom means no `[limits]` cap is configured.
+///
+/// A pooled candidate is labelled `target#pool` and reports that pool's own
+/// numbers, so the line can never be read as the target's whole allowance. When
+/// the pooled ordering is [`RoomBasis::ObservedUsage`] the line says so: without
+/// a configured cap the remaining quota is unknowable, and a least-used-first
+/// order must never be presented as a quota measurement.
 fn print_candidate_headroom(
     marker: &str,
     target: &str,
     windows: &BTreeMap<String, TargetWindows>,
     headroom: &BTreeMap<String, TargetHeadroom>,
+    pool: Option<&CandidatePool>,
 ) {
+    if let Some(pool) = pool {
+        let used = format_token_count(pool.room.used_tokens, pool.room.tokens_estimated);
+        println!(
+            "{marker}{}: 24h used={used} requests={} remaining={}{}",
+            pool.key.canonical(),
+            pool.room.used_requests,
+            format_pool_room(&pool.room),
+            pool_basis_suffix(pool.basis),
+        );
+        return;
+    }
     let normalized = target.to_ascii_lowercase();
     let window = windows.get(&normalized).copied().unwrap_or_default();
     let recent = window.last_24h;
@@ -4523,6 +4635,51 @@ fn print_candidate_headroom(
         "{marker}{target}: 24h used={used} requests={} remaining={head}",
         recent.requests
     );
+}
+
+/// Remaining room for one pool. `?` when no cap is configured at either level —
+/// a ceiling is never invented — and a cap inherited from the target is marked
+/// as shared with the sibling pools instead of being reported as this pool's
+/// own allowance.
+fn format_pool_room(room: &PoolHeadroom) -> String {
+    if room.limits_unknown() {
+        return "? (no [limits] cap)".to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(tokens) = format_pool_cap(room.tokens, "tok") {
+        parts.push(tokens);
+    }
+    if let Some(requests) = format_pool_cap(room.requests, "req") {
+        parts.push(requests);
+    }
+    if parts.is_empty() {
+        return "?".to_string();
+    }
+    let mut label = parts.join(", ");
+    if room.shares_a_cap() {
+        label.push_str(" (cap shared with sibling pools)");
+    }
+    label
+}
+
+/// One capped axis, or `None` when that axis has no configured ceiling.
+fn format_pool_cap(cap: PoolCap, unit: &str) -> Option<String> {
+    let limit = cap.limit?;
+    Some(format!(
+        "{}/{limit} {unit} left (used {})",
+        cap.remaining.unwrap_or_default(),
+        cap.used
+    ))
+}
+
+/// States what a pooled ordering was derived from, and only when that is
+/// observed usage — the same disclosure the router puts on its `reason`, so the
+/// two never disagree. A quota-derived order needs no caveat.
+fn pool_basis_suffix(basis: RoomBasis) -> String {
+    match basis {
+        RoomBasis::ObservedUsage => format!(" [pool order: {}]", RoomBasis::ObservedUsage.label()),
+        RoomBasis::Quota => String::new(),
+    }
 }
 
 /// Per-target windowed usage + headroom table (`rtrt usage`).
@@ -7698,6 +7855,175 @@ fn detect_provider(model: &str) -> ProviderArg {
         ProviderArg::Openai
     } else {
         ProviderArg::OpenaiCompat
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use rtrt_providers::CapScope;
+
+    use super::*;
+
+    fn route_opts(target: Option<&str>, failover: bool) -> RouteCliOptions {
+        RouteCliOptions {
+            capability: Some(RouteCapabilityArg::Code),
+            prefer: RoutePreferArg::Cheapest,
+            target: target.map(str::to_string),
+            model: None,
+            mode: CallModeArg::Auto,
+            explain: false,
+            dry_run: false,
+            failover,
+            prompt: vec!["ship it".to_string()],
+        }
+    }
+
+    /// `opencode` reaching two upstream pools, plus a second target behind it.
+    fn pooled_tools() -> Vec<DetectedTool> {
+        let opencode = DetectedTool {
+            name: "opencode".to_string(),
+            kind: ToolKind::CodingAgent,
+            installed: true,
+            path: None,
+            version: None,
+            invocation_modes: vec![InvocationMode::Cli],
+            cli_invocation: Some("opencode run {prompt}".to_string()),
+            cost_class: CostClass::SubscriptionFlat,
+            capabilities: vec![Capability::Code],
+            config_path: None,
+            models: vec![
+                "opencode-go/glm-5.2".to_string(),
+                "ollama/glm-5.2:cloud".to_string(),
+            ],
+            server_running: None,
+            enabled: true,
+        };
+        let claude = DetectedTool {
+            name: "claude".to_string(),
+            cli_invocation: Some("claude -p {prompt}".to_string()),
+            models: vec!["sonnet".to_string()],
+            ..opencode.clone()
+        };
+        vec![opencode, claude]
+    }
+
+    /// The regression: `[providers] active` pinned every route, an explicit
+    /// target collapsed the candidate list to one entry, and `--failover` had
+    /// nothing to fall over to. Merely configuring `active` disarmed the flag.
+    #[test]
+    fn configured_active_target_no_longer_neuters_failover() {
+        let tools = pooled_tools();
+        let usage = UsageSnapshot::default();
+
+        let with_failover = route_request_for(&route_opts(None, true), Some("opencode"));
+        assert_eq!(with_failover.target.as_deref(), Some("opencode"));
+        assert!(with_failover.failover);
+        let decision = select_route(&with_failover, &tools, &usage).expect("failover route");
+        assert_eq!(decision.target, "opencode");
+        assert!(
+            decision.ranked_targets().len() >= 2,
+            "pinned + --failover must keep a tail: {decision:?}"
+        );
+
+        // Default behaviour is untouched: one pinned candidate, no tail.
+        let pinned = route_request_for(&route_opts(None, false), Some("opencode"));
+        assert!(!pinned.failover);
+        let decision = select_route(&pinned, &tools, &usage).expect("pinned route");
+        assert_eq!(decision.target, "opencode");
+        assert!(decision.alternatives.is_empty(), "{decision:?}");
+        assert_eq!(decision.ranked_targets().len(), 1);
+    }
+
+    #[test]
+    fn explicit_target_still_wins_over_the_configured_active_target() {
+        let req = route_request_for(&route_opts(Some("claude"), true), Some("opencode"));
+        assert_eq!(req.target.as_deref(), Some("claude"));
+        // No `--target` and no `[providers] active`: the route stays open.
+        assert_eq!(
+            route_request_for(&route_opts(None, false), None).target,
+            None
+        );
+    }
+
+    /// A usage-derived order must never read as a quota measurement.
+    #[test]
+    fn pool_basis_suffix_only_discloses_usage_derived_order() {
+        assert_eq!(
+            pool_basis_suffix(RoomBasis::ObservedUsage),
+            " [pool order: usage-derived (observed 24h usage, not a quota measurement)]"
+        );
+        assert!(pool_basis_suffix(RoomBasis::Quota).is_empty());
+    }
+
+    #[test]
+    fn pool_room_never_invents_a_ceiling_and_marks_shared_caps() {
+        let uncapped = pool_room(
+            PoolCap {
+                scope: CapScope::Unknown,
+                limit: None,
+                used: 900,
+                remaining: None,
+            },
+            PoolCap {
+                scope: CapScope::Unknown,
+                limit: None,
+                used: 3,
+                remaining: None,
+            },
+        );
+        assert_eq!(format_pool_room(&uncapped), "? (no [limits] cap)");
+
+        let shared = pool_room(
+            PoolCap {
+                scope: CapScope::Shared,
+                limit: Some(1000),
+                used: 900,
+                remaining: Some(100),
+            },
+            PoolCap {
+                scope: CapScope::Unknown,
+                limit: None,
+                used: 3,
+                remaining: None,
+            },
+        );
+        assert_eq!(
+            format_pool_room(&shared),
+            "100/1000 tok left (used 900) (cap shared with sibling pools)"
+        );
+
+        let own = pool_room(
+            PoolCap {
+                scope: CapScope::Pool,
+                limit: Some(1000),
+                used: 250,
+                remaining: Some(750),
+            },
+            PoolCap {
+                scope: CapScope::Pool,
+                limit: Some(50),
+                used: 5,
+                remaining: Some(45),
+            },
+        );
+        assert_eq!(
+            format_pool_room(&own),
+            "750/1000 tok left (used 250), 45/50 req left (used 5)"
+        );
+    }
+
+    fn pool_room(tokens: PoolCap, requests: PoolCap) -> PoolHeadroom {
+        PoolHeadroom {
+            key: "opencode#opencode-go".to_string(),
+            target: "opencode".to_string(),
+            pool: Some("opencode-go".to_string()),
+            used_tokens: tokens.used,
+            used_requests: requests.used,
+            tokens_estimated: false,
+            tokens,
+            requests,
+            sibling_pools: 2,
+        }
     }
 }
 

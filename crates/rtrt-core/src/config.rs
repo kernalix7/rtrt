@@ -968,11 +968,53 @@ pub struct ProjectConfig {
     /// core does not need to know it. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline: Option<toml::Value>,
+    /// Per-project orchestration roster (`[team]`).
+    ///
+    /// **Granularity: whole-section replacement, never a field-level merge.**
+    /// When this is `Some`, it *replaces* the global `[team]` outright; keys the
+    /// project omits fall back to the schema default, not to the global value.
+    ///
+    /// The reason is [`TeamConfig::validate`]. A roster is a web of
+    /// cross-references — `leader_order` and `tiers.*` name lanes, lanes name a
+    /// `sibling` and a `fallback` chain, `policy` names tiers — so merging two
+    /// rosters field by field can synthesise a config neither side wrote: a
+    /// global tier naming a lane the project removed, a global leader that no
+    /// longer exists, a sibling pair split across layers. Replacement keeps the
+    /// validator meaningful, because the effective roster is then *exactly* the
+    /// section that was validated (see [`ProjectConfig::validate`]) — there is
+    /// no third, unvalidated combination to reason about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamConfig>,
+    /// Per-project invocation failure policy (`[failover]`). Whole-section
+    /// replacement, for the same reason as `team`: the three marker classes are
+    /// consulted in priority order, so appending a project list to a global one
+    /// would silently reclassify markers the project never mentioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<FailoverConfig>,
 }
 
 impl ProjectConfig {
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(|e| Error::Config(format!("project config TOML: {e}")))
+        let over: Self =
+            toml::from_str(s).map_err(|e| Error::Config(format!("project config TOML: {e}")))?;
+        over.validate()?;
+        Ok(over)
+    }
+
+    /// Reject an override that could not be a valid effective config.
+    ///
+    /// Mirrors [`Config::from_toml_str`], which validates the global `[team]`
+    /// at parse time. Because a project `[team]` *replaces* the global section
+    /// rather than merging into it, the effective roster is byte-for-byte this
+    /// override — so validating it here validates the effective config, and no
+    /// caller of [`Config::load_effective`] can be handed a roster that
+    /// [`TeamConfig::validate`] would reject. Errors carry the validator's own
+    /// message.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(team) = &self.team {
+            team.validate()?;
+        }
+        Ok(())
     }
 
     /// The per-project statusline override serialized as a `[statusline]` TOML
@@ -996,6 +1038,13 @@ impl ProjectConfig {
                 p.enabled.is_empty() && p.active.is_none() && p.api_max_tokens.is_none()
             })
             && self.statusline.is_none()
+            // `team` / `failover` are REPLACEMENT overrides, so — unlike the
+            // `agents` / `providers` overlays above — an "all default" section
+            // is not a no-op: it pins the shipped roster against a divergent
+            // global. Only an absent section counts as no override, exactly as
+            // for `compression` and `statusline`.
+            && self.team.is_none()
+            && self.failover.is_none()
     }
 }
 
@@ -1508,7 +1557,12 @@ impl Config {
 
     /// Load the global config and overlay a project's customization overrides.
     /// The base kernel is never overlaid — only the customization layer
-    /// (output level, compression, enabled agents/providers).
+    /// (output level, compression, enabled agents/providers, orchestration).
+    ///
+    /// The result always satisfies [`TeamConfig::validate`]: the global roster
+    /// is validated by [`Config::from_toml_str`], a project roster by
+    /// [`ProjectConfig::from_toml_str`], and the overlay picks one of the two
+    /// whole rather than blending them.
     pub fn load_effective(repo: Option<&Path>) -> Result<Self> {
         let mut base = Self::load()?;
         if let Some(repo) = repo {
@@ -1551,11 +1605,24 @@ impl Config {
                 self.providers.api_max_tokens = providers.api_max_tokens;
             }
         }
+        // Whole-section replacement — see `ProjectConfig::team`. The overlay
+        // takes one validated roster or the other, never a blend of both.
+        if let Some(team) = &over.team {
+            self.team = team.clone();
+        }
+        if let Some(failover) = &over.failover {
+            self.failover = failover.clone();
+        }
     }
 
     /// Write a project override file, creating `.rtrt/` as needed. When the
     /// override is empty the file is removed so the repo stays clean.
+    ///
+    /// An override that would make the effective config invalid is rejected
+    /// here — before anything is written — with the validator's own message, so
+    /// no writer (dashboard, CLI, future callers) can persist a broken roster.
     pub fn save_project(repo: &Path, over: &ProjectConfig) -> Result<()> {
+        over.validate()?;
         let path = Self::project_config_path(repo);
         if over.is_empty() {
             let _ = std::fs::remove_file(&path);
@@ -2718,6 +2785,240 @@ mod tests {
         .unwrap();
         base.apply_project_overrides(&over);
         assert_eq!(base.providers.api_max_tokens, Some(2048));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-project orchestration overrides (`[team]` / `[failover]` in
+    // `<repo>/.rtrt/config.toml`). These assert the LAYERING CONTRACT — whole
+    // section replacement, validated before it can become effective — without
+    // pinning any shipped lane, tier or model name.
+    // -----------------------------------------------------------------------
+
+    /// A global config whose roster shares no lane name with the project one
+    /// below, so "replaced" and "merged" cannot be confused.
+    fn global_with_roster() -> Config {
+        Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            manager_provider = "global-manager"
+            manager_model = "global-model"
+            leader_order = ["global-lane"]
+
+            [[team.members]]
+            name = "global-lane"
+            target = "global-target"
+            mode = "cli"
+            roles = ["lead"]
+
+            [team.tiers]
+            global-rung = ["global-lane"]
+
+            [failover]
+            quota = ["global marker"]
+            transient_retries = 3
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_absent_orchestration_override_leaves_the_global_untouched() {
+        let base = global_with_roster();
+        let mut effective = base.clone();
+        effective.apply_project_overrides(&ProjectConfig::default());
+        assert_eq!(effective.team, base.team);
+        assert_eq!(effective.failover, base.failover);
+        // …and the empty override is never worth a file.
+        assert!(ProjectConfig::default().is_empty());
+    }
+
+    #[test]
+    fn a_project_roster_replaces_the_global_section_wholesale() {
+        let mut base = global_with_roster();
+        let over = ProjectConfig::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            manager_provider = "project-manager"
+            manager_model = "project-model"
+            leader_order = ["project-lane"]
+
+            [[team.members]]
+            name = "project-lane"
+            target = "project-target"
+            mode = "cli"
+            roles = ["lead"]
+
+            [failover]
+            fatal = ["project marker"]
+            "#,
+        )
+        .unwrap();
+        assert!(!over.is_empty());
+        base.apply_project_overrides(&over);
+
+        // Replacement, not merge: nothing of the global roster survives — not
+        // its lanes, not its leaders, not its ladder, not its manager.
+        assert_eq!(base.team.manager_provider, "project-manager");
+        assert_eq!(base.team.leader_order, ["project-lane"]);
+        assert_eq!(
+            base.team
+                .members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["project-lane"]
+        );
+        assert!(base.team.tiers.is_empty(), "the global ladder is dropped");
+        // Same for the failure policy: the global `quota` marker and retry
+        // count are gone rather than blended with the project's `fatal` list.
+        assert_eq!(base.failover.fatal, ["project marker"]);
+        assert!(base.failover.quota.is_empty());
+        assert_eq!(base.failover.transient_retries, None);
+
+        // The effective roster is exactly the validated override.
+        base.team.validate().unwrap();
+    }
+
+    #[test]
+    fn a_project_roster_that_cannot_be_valid_is_rejected_by_the_validator() {
+        // A ladder rung naming a lane this roster does not define — the exact
+        // shape a field-level merge could have synthesised silently.
+        let err = ProjectConfig::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            leader_order = ["kept"]
+
+            [[team.members]]
+            name = "kept"
+            target = "one"
+            mode = "cli"
+            roles = ["lead"]
+
+            [team.tiers]
+            rung = ["dropped"]
+            "#,
+        )
+        .expect_err("a tier naming an unknown lane must not parse");
+        let message = err.to_string();
+        // The validator's own message, forwarded verbatim.
+        assert!(
+            message.contains("dropped") && message.contains("unknown member"),
+            "expected the validator's message, got: {message}"
+        );
+    }
+
+    /// A minimal usable lane: identity plus the one role the validator insists
+    /// every lane declares.
+    fn lane(name: &str) -> TeamMember {
+        TeamMember {
+            roles: vec!["work".to_string()],
+            ..TeamMember::new(name, "some-target", TeamMode::Cli)
+        }
+    }
+
+    #[test]
+    fn save_project_rejects_an_invalid_roster_before_writing() {
+        let repo = scratch_dir("rtrt-core-project-team");
+        let over = ProjectConfig {
+            team: Some(TeamConfig {
+                enabled: true,
+                leader_order: vec!["absent".to_string()],
+                members: vec![lane("present")],
+                ..TeamConfig::default()
+            }),
+            ..ProjectConfig::default()
+        };
+        let err = Config::save_project(&repo, &over).expect_err("invalid roster must not persist");
+        assert!(
+            err.to_string().contains("absent"),
+            "expected the validator's message, got: {err}"
+        );
+        assert!(
+            !Config::project_config_path(&repo).exists(),
+            "a rejected override must not create the project config file"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn an_orchestration_override_round_trips_and_clears_without_touching_its_neighbours() {
+        let repo = scratch_dir("rtrt-core-project-orch");
+
+        // A project that already customises something else. Written first so
+        // the later orchestration edits have a neighbour to preserve.
+        let mut over = ProjectConfig {
+            output_level: Some("lite".to_string()),
+            ..ProjectConfig::default()
+        };
+        Config::save_project(&repo, &over).unwrap();
+        let raw = std::fs::read_to_string(Config::project_config_path(&repo)).unwrap();
+        assert!(
+            !raw.contains("team") && !raw.contains("failover"),
+            "an unset orchestration override must add no keys, got:\n{raw}"
+        );
+        // Round-trip: reading and rewriting an existing file is a no-op.
+        let reread = Config::load_project(&repo).unwrap();
+        assert!(reread.team.is_none() && reread.failover.is_none());
+        Config::save_project(&repo, &reread).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(Config::project_config_path(&repo)).unwrap(),
+            raw
+        );
+
+        // Pin both orchestration sections for this project.
+        over.team = Some(TeamConfig {
+            enabled: true,
+            leader_order: vec!["only".to_string()],
+            members: vec![lane("only")],
+            ..TeamConfig::default()
+        });
+        over.failover = Some(FailoverConfig {
+            fatal: vec!["project marker".to_string()],
+            ..FailoverConfig::default()
+        });
+        Config::save_project(&repo, &over).unwrap();
+        let stored = Config::load_project(&repo).unwrap();
+        assert_eq!(stored.team.as_ref().unwrap().leader_order, ["only"]);
+        assert_eq!(
+            stored.failover.as_ref().unwrap().fatal,
+            ["project marker".to_string()]
+        );
+        assert_eq!(stored.output_level.as_deref(), Some("lite"));
+
+        // Clearing `[team]` leaves `[failover]` and the unrelated override in
+        // place — the file is rewritten from the whole ProjectConfig.
+        let mut cleared = stored;
+        cleared.team = None;
+        Config::save_project(&repo, &cleared).unwrap();
+        let after = Config::load_project(&repo).unwrap();
+        assert!(after.team.is_none());
+        assert!(after.failover.is_some());
+        assert_eq!(after.output_level.as_deref(), Some("lite"));
+
+        // Clearing the last override removes the file so the repo stays clean.
+        let empty = ProjectConfig::default();
+        assert!(empty.is_empty());
+        Config::save_project(&repo, &empty).unwrap();
+        assert!(!Config::project_config_path(&repo).exists());
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A unique scratch directory for the file-touching tests above.
+    fn scratch_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]

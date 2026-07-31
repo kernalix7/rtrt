@@ -1160,10 +1160,8 @@ async fn team_config_scope_toggle_matches_the_other_settings() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // A selected project reports the same scope triple the other settings use.
-    // Orchestration has no per-project layer, so it always INHERITS the global
-    // roster — `project_overridable` says so rather than leaving the UI to
-    // infer it from a `custom` that can never become true.
+    // A project that pins nothing INHERITS the global roster, and says so with
+    // the same scope triple as the other seven per-project settings.
     let app = router(state.clone(), None);
     let resp = call(app, get("/api/team/config?project=demo")).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1171,7 +1169,8 @@ async fn team_config_scope_toggle_matches_the_other_settings() {
     assert_eq!(v["scope"], "global");
     assert_eq!(v["custom"], false);
     assert_eq!(v["inherited"], true);
-    assert_eq!(v["project_overridable"], false);
+    // Reading a project's roster must not conjure an override file for it.
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
 
     // The global scope reports nothing to inherit, same as every other endpoint.
     let app = router(state.clone(), None);
@@ -1180,16 +1179,12 @@ async fn team_config_scope_toggle_matches_the_other_settings() {
     assert_eq!(v["scope"], "global");
     assert_eq!(v["inherited"], false);
 
-    // "Follow global" carries no body and is a safe no-op that re-reads the
-    // effective roster, exactly like the other clear paths.
+    // "Follow global" on a project that has no override is a safe no-op that
+    // re-reads the effective roster, exactly like the other clear paths.
     let app = router(state.clone(), None);
     let resp = call(
         app,
-        Request::builder()
-            .method(Method::POST)
-            .uri("/api/team/config?project=demo&scope=global")
-            .body(Body::empty())
-            .unwrap(),
+        post_empty("/api/team/config?project=demo&scope=global"),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1197,6 +1192,255 @@ async fn team_config_scope_toggle_matches_the_other_settings() {
     assert_eq!(v["scope"], "global");
     assert_eq!(v["inherited"], true);
     assert!(!v["members"].as_array().expect("members").is_empty());
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+}
+
+/// A POST with no body — the "Follow global" clear path every scoped endpoint
+/// exposes.
+fn post_empty(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A roster with no lane in common with the shipped one, so "the project's own"
+/// and "the global" can never be confused for each other.
+const PROJECT_ROSTER: &str = r#"{
+    "enabled": true,
+    "manager_provider": "project-manager",
+    "manager_model": "project-model",
+    "manager_base_url": "",
+    "leader_order": ["project-lane"],
+    "members": [
+        {"name":"project-lane","target":"project-target","model":null,"mode":"cli",
+         "roles":["lead"],"logical":null,"sibling":null,"tier":null,
+         "fallback":[],"allow_impl":true,"flags":{}}
+    ],
+    "tiers": [],
+    "policy": null
+}"#;
+
+/// Register `demo` as an on-disk project rooted at `<tmp>/repo` and return it.
+async fn register_demo_project(
+    state: crate::state::AppState,
+    tmp: &std::path::Path,
+) -> std::path::PathBuf {
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let resp = call(
+        router(state, None),
+        json(
+            Method::PUT,
+            "/api/projects",
+            &format!(
+                r#"{{"name":"demo","path":"{}"}}"#,
+                repo.to_string_lossy().replace('\\', "\\\\")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    repo
+}
+
+#[tokio::test]
+async fn team_config_writes_and_clears_a_project_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let repo = register_demo_project(state.clone(), tmp.path()).await;
+    let project_file = repo.join(".rtrt").join("config.toml");
+
+    // A coexisting override written first, so the clear below has a neighbour
+    // it must not disturb.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/compression/config?project=demo",
+            r#"{"level":"ultra"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Writing with a project selected pins THIS project's roster.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/team/config?project=demo",
+            PROJECT_ROSTER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["custom"], true);
+    assert_eq!(v["inherited"], false);
+    // The reported path is the file the write actually landed in.
+    assert_eq!(v["path"], project_file.to_string_lossy().into_owned());
+
+    // GET through the project scope now reads the override back…
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config?project=demo")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["manager_provider"], "project-manager");
+    assert_eq!(v["members"][0]["name"], "project-lane");
+
+    // …while the GLOBAL scope still serves the shipped roster untouched.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    let shipped = rtrt_core::TeamConfig::default();
+    assert_eq!(v["manager_provider"], shipped.manager_provider);
+    assert_eq!(v["members"][0]["name"], shipped.members[0].name);
+
+    // `?scope=global` clears ONLY the team override; the compression override
+    // in the same file survives.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        post_empty("/api/team/config?project=demo&scope=global"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["manager_provider"], shipped.manager_provider);
+
+    let stored = rtrt_core::Config::load_project(&repo).unwrap();
+    assert!(stored.team.is_none(), "the team override was cleared");
+    assert!(
+        stored.compression.is_some(),
+        "clearing the roster must not touch a coexisting override"
+    );
+}
+
+#[tokio::test]
+async fn a_project_roster_that_would_be_invalid_is_rejected_and_not_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let repo = register_demo_project(state.clone(), tmp.path()).await;
+
+    // A ladder rung naming a lane this roster does not define — the effective
+    // roster would be invalid, so the write must not happen at all.
+    let body = r#"{
+        "enabled": true,
+        "leader_order": ["kept"],
+        "members": [
+            {"name":"kept","target":"one","model":null,"mode":"cli",
+             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
+             "fallback":[],"allow_impl":true,"flags":{}}
+        ],
+        "tiers": [{"tier":"rung","members":["dropped"]}],
+        "policy": null
+    }"#;
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(Method::POST, "/api/team/config?project=demo", body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    let message = v["error"].as_str().expect("error message");
+    // The validator's own message, not a paraphrase.
+    assert!(
+        message.contains("dropped") && message.contains("unknown member"),
+        "expected the validator's message, got: {message}"
+    );
+
+    // Nothing reached disk: no project override file, and the project still
+    // inherits the global roster.
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config?project=demo")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+}
+
+#[tokio::test]
+async fn failover_config_scope_matches_the_team_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let repo = register_demo_project(state.clone(), tmp.path()).await;
+
+    // A global policy the project will shadow.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/failover/config",
+            r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Before any project write, the project inherits it.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/failover/config?project=demo")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+
+    // The project pins its own policy: whole-section replacement, so the
+    // global marker and retry count are gone rather than merged in.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/failover/config?project=demo",
+            r#"{"fatal":["project marker"],"quota":[],"transient":[],"transient_retries":null}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/failover/config?project=demo")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
+    assert_eq!(v["fatal"][0], "project marker");
+    assert!(v["transient_retries"].is_null());
+
+    // The global policy is untouched by the project write.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/failover/config")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+
+    // Clearing returns the project to the global policy and removes the now
+    // empty override file, keeping the repo clean.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        post_empty("/api/failover/config?project=demo&scope=global"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["fatal"][0], "global marker");
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
 }
 
 #[tokio::test]

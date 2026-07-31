@@ -149,22 +149,34 @@ async function loadOrchestration() {
   renderOrchestration();
 }
 
-// Reuse the shared "Follow global / Custom (this project)" toggle. Orchestration
-// has no per-project layer (`project_overridable: false` from the API), so the
-// Custom option stays disabled and the hint says why — but the fields stay
-// editable, because editing them here IS editing the global roster.
+// Reuse the shared "Follow global / Custom (this project)" toggle — the same
+// helper the other per-project settings use, with no extra machinery here.
+//
+// Fields stay editable in BOTH scopes, unlike the read-only-when-inherited
+// settings cards: Save writes whichever layer the toggle names, so editing
+// while following global edits the global roster (which is what it did before a
+// project layer existed), and editing while Custom writes this project's
+// override. `onLock` is therefore deliberately not passed.
+//
+// One radiogroup governs both sections on the page, so the card reads Custom
+// when the project pins EITHER `[team]` or `[failover]` — each Save writes only
+// its own section's override, and "Follow global" clears both.
 function applyOrchScope(team) {
-  const overridable = !!(team && team.project_overridable);
-  const customRadio = document.getElementById('team-scope-custom');
-  if (customRadio) customRadio.disabled = !overridable;
-  applyScopeToggle('team', team && team.custom ? 'custom' : 'global', {
+  const custom = !!(team && team.custom) || !!(ORCH_FAILOVER && ORCH_FAILOVER.custom);
+  applyScopeToggle('team', custom ? 'custom' : 'global', {
     hints: {
-      custom: 'Custom: this project carries its own roster.',
-      global: 'Orchestration is global — one roster serves every project. Edits below apply everywhere.',
+      custom: 'Custom: this project carries its own roster. Save writes <repo>/.rtrt/config.toml; the global roster is untouched.',
+      global: 'Follow global: this project inherits the global roster. Save here edits that global roster, for every project.',
     },
   });
+  // The file hints name the layer the API says it read. They are only applied
+  // when a path came back with the payload: the pre-save "Custom" flip has no
+  // response yet, and showing the global path next to a Custom card would name
+  // a file that save is not going to touch. In that case the generic hint
+  // `applyScopeToggle` already wrote is the accurate one.
+  if (!team || !team.path) return;
   const hint = document.getElementById('team-config-hint');
-  if (hint && team && team.path) hint.textContent = `${team.path} [team]`;
+  if (hint) hint.textContent = `${team.path} [team]`;
   const failHint = document.getElementById('failover-config-hint');
   if (failHint && ORCH_FAILOVER && ORCH_FAILOVER.path) failHint.textContent = `${ORCH_FAILOVER.path} [failover]`;
 }
@@ -616,6 +628,9 @@ async function saveOrchFailover() {
     if (!r.ok) throw new Error(d.error || `${r.status}`);
     ORCH_FAILOVER = d;
     renderOrchFailover();
+    // A project-scoped save has just created this project's `[failover]`
+    // override, so the shared scope toggle has to catch up.
+    applyOrchScope(ORCH_TEAM);
     if (result) result.innerHTML = '<span class="badge ok">✓ Saved</span>';
     pushActivity('Orchestration: failure policy saved');
     showToast('Failure policy saved', 'ok');
@@ -739,7 +754,40 @@ async function saveOrchestration() {
       : (((ORCH_TEAM.effective || {}).design_only_tiers) || []).slice();
     renderOrchPolicy();
   }, 'change');
-  // Radios are rendered by the shared scope helper; "Follow global" is the only
-  // selectable option here, and re-selecting it just re-reads the roster.
-  on('team-scope-global', () => loadOrchestration(), 'change');
+  // Scope radios. Rendered by the shared `applyScopeToggle`; wired exactly like
+  // the other form-and-Save settings cards (providers, agents): "Follow global"
+  // clears this project's override immediately, "Custom" flips the card and
+  // waits for Save to write it. The one page-specific part is that the single
+  // "Orchestration scope" radiogroup governs BOTH sections on the page, so the
+  // clear covers `[team]` and `[failover]` together.
+  on('team-scope-global', async (ev) => {
+    if (!ev.target.checked || !scopeHasProject()) return;
+    try {
+      const responses = await Promise.all(
+        ['/api/team/config', '/api/failover/config'].map(base =>
+          fetch(scopeClearUrl(base), { method: 'POST' })
+        )
+      );
+      for (const r of responses) {
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error(d.error || `${r.status}`);
+        }
+      }
+      pushActivity('Orchestration now follows global');
+      showToast('Following global orchestration', 'ok');
+      await loadOrchestration();
+    } catch (e) {
+      showToast(`Scope error: ${e.message || e}`, 'err');
+      applyOrchScope({ custom: true });
+    }
+  }, 'change');
+  on('team-scope-custom', (ev) => {
+    if (!ev.target.checked || !scopeHasProject()) return;
+    applyOrchScope({ custom: true });
+    const result = document.getElementById('orch-save-result');
+    if (result) result.textContent = 'Editing project override — click Save to apply.';
+    const failResult = document.getElementById('orch-fail-save-result');
+    if (failResult) failResult.textContent = 'Editing project override — click Save to apply.';
+  }, 'change');
 })();

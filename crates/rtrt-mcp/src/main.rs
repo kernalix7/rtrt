@@ -26,11 +26,12 @@ use rmcp::{
     },
 };
 use rtrt_compress::Compressor;
-use rtrt_core::{Capability, CompressionLevel};
+use rtrt_core::{Capability, CompressionLevel, DetectedTool, pool_from_model};
 use rtrt_memory::{Embedder, MemoryStore};
 use rtrt_providers::{
     ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvokeOptions, Mode as InvokeMode,
-    Prefer, Role, RouteRequest, UsageSnapshot, dispatch_team, invoke_agent, select_route,
+    Prefer, Role, RouteRequest, UsageSnapshot, dispatch_team, invoke_agent, invoke_with_failover,
+    select_route,
 };
 use rtrt_templates::PromptRegistry;
 use serde::Deserialize;
@@ -423,9 +424,11 @@ struct AgentCallArgs {
     project: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 struct AgentRouteArgs {
     prompt: String,
+    /// Ranking *strategy*: `cheapest` (default), `local`, or `quality`. This is
+    /// not a provider name — pin a provider with `target`.
     #[serde(default)]
     prefer: Option<String>,
     #[serde(default)]
@@ -434,9 +437,40 @@ struct AgentRouteArgs {
     dry_run: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Pin a detected target (provider) by name, e.g. `opencode`. The target
+    /// resolves to its roomiest pool unless `model` names one; without
+    /// `failover` it is the only candidate.
+    #[serde(default)]
+    target: Option<String>,
+    /// Invocation mode for the selected target: `cli`, `api`, or `auto`
+    /// (default — pick whichever the target supports).
+    #[serde(default)]
+    mode: Option<String>,
+    /// Keep the ranked fallbacks behind the pick — sibling pools of the same
+    /// target first — and fall over to them on a recoverable failure. Defaults
+    /// to `false`, which routes to exactly one candidate as before.
+    #[serde(default)]
+    failover: Option<bool>,
     /// Project used for auto-capture. Required for shared HTTP servers.
     #[serde(default)]
     project: Option<String>,
+}
+
+/// The routing request behind one `agent_route` call.
+///
+/// Split out of the handler so the argument → [`RouteRequest`] mapping is
+/// testable without detection or a live provider. Every field absent from the
+/// arguments keeps the pre-existing default, so a legacy-shaped call builds the
+/// exact request it always did.
+fn agent_route_request(args: &AgentRouteArgs) -> Result<RouteRequest, McpError> {
+    Ok(RouteRequest {
+        capability: parse_agent_route_capability(args.capability.as_deref())?,
+        prefer: parse_agent_route_prefer(args.prefer.as_deref())?,
+        target: args.target.clone(),
+        model: args.model.clone(),
+        mode: parse_agent_route_mode(args.mode.as_deref())?,
+        failover: args.failover.unwrap_or(false),
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -453,7 +487,93 @@ fn team_dispatch_timeout(timeout_secs: Option<u64>) -> std::time::Duration {
     std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
 }
 
+/// The accepted `prefer` strategies, listed in the error the way the capability
+/// parser lists its own — a rejected value must always say what *is* accepted.
+const AGENT_ROUTE_PREFER_VALUES: &str = "cheapest, local, or quality";
+
+/// A detected routing identity a caller might mistake for a `prefer` strategy.
+///
+/// `prefer` decides *how* candidates are ranked; naming a provider or one of its
+/// upstream pools is what `target` (plus `model`, for a pool) is for. Telling
+/// the caller which of the two they actually named turns a dead-end
+/// "unknown prefer" into a fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DetectedRoute {
+    /// A detected target name, e.g. `opencode`.
+    Target { target: String },
+    /// A pool reachable through a detected target, named by a model prefix:
+    /// `opencode-go` from `opencode-go/glm-5.2`.
+    Pool {
+        target: String,
+        pool: String,
+        model: String,
+    },
+}
+
+impl DetectedRoute {
+    /// How to pass this identity correctly.
+    fn hint(&self) -> String {
+        match self {
+            Self::Target { target } => format!(
+                "'{target}' is a detected target, not a strategy: pass target=\"{target}\" instead"
+            ),
+            Self::Pool {
+                target,
+                pool,
+                model,
+            } => format!(
+                "'{pool}' is a pool of the detected target '{target}', not a strategy: pass \
+                 target=\"{target}\" (with model=\"{model}\" to pin that pool) instead"
+            ),
+        }
+    }
+}
+
+/// Resolve a rejected `prefer` value against the detected tools: an exact target
+/// name first, then any pool named by one of their model prefixes.
+fn detected_route_in(tools: &[DetectedTool], value: &str) -> Option<DetectedRoute> {
+    let needle = value.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    if let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.name.to_ascii_lowercase() == needle)
+    {
+        return Some(DetectedRoute::Target {
+            target: tool.name.clone(),
+        });
+    }
+    tools.iter().find_map(|tool| {
+        tool.models.iter().find_map(|model| {
+            let pool = pool_from_model(model)?;
+            (pool == needle).then(|| DetectedRoute::Pool {
+                target: tool.name.clone(),
+                pool: pool.clone(),
+                model: model.clone(),
+            })
+        })
+    })
+}
+
+/// Detection is only run on the error path — a valid `prefer` never probes the
+/// host.
+fn detected_route_named(value: &str) -> Option<DetectedRoute> {
+    let cfg = rtrt_core::Config::load_effective_for_cwd();
+    let tools = rtrt_core::detect_tools_with_config(cfg);
+    detected_route_in(&tools, value)
+}
+
 fn parse_agent_route_prefer(value: Option<&str>) -> Result<Prefer, McpError> {
+    parse_agent_route_prefer_with(value, detected_route_named)
+}
+
+/// The parse itself, with the "did you mean a target?" lookup injected so tests
+/// can exercise the message without detecting anything on the host.
+fn parse_agent_route_prefer_with(
+    value: Option<&str>,
+    detected: impl FnOnce(&str) -> Option<DetectedRoute>,
+) -> Result<Prefer, McpError> {
     let Some(value) = value else {
         return Ok(Prefer::Cheapest);
     };
@@ -462,10 +582,31 @@ fn parse_agent_route_prefer(value: Option<&str>) -> Result<Prefer, McpError> {
         "local" => Ok(Prefer::Local),
         "quality" => Ok(Prefer::Quality),
         other => Err(McpError::invalid_params(
-            format!("agent_route prefer: unknown prefer '{other}'"),
+            unknown_prefer_message(other, detected(other)),
             None,
         )),
     }
+}
+
+fn unknown_prefer_message(value: &str, detected: Option<DetectedRoute>) -> String {
+    let base = format!(
+        "agent_route prefer: unknown prefer '{value}' \
+         (expected {AGENT_ROUTE_PREFER_VALUES})"
+    );
+    match detected {
+        Some(route) => format!("{base}. {}", route.hint()),
+        None => base,
+    }
+}
+
+/// `cli` / `api` / `auto`, or `None` when the caller named no mode — which
+/// leaves the router's own mode resolution in charge, exactly as before this
+/// argument existed.
+fn parse_agent_route_mode(value: Option<&str>) -> Result<Option<InvokeMode>, McpError> {
+    value
+        .map(|value| InvokeMode::parse_label(&value.trim().to_ascii_lowercase()))
+        .transpose()
+        .map_err(|e| McpError::invalid_params(format!("agent_route mode: {e}"), None))
 }
 
 fn parse_agent_route_capability(value: Option<&str>) -> Result<Option<Capability>, McpError> {
@@ -1115,21 +1256,14 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Select the best detected agent route by preference and capability, optionally invoking the selected target."
+        description = "Select the best detected agent route by preference and capability, optionally invoking the selected target. `prefer` is a ranking strategy (cheapest / local / quality), not a provider name: pin a provider with `target`, pin its upstream pool with `model`, and set `failover` to keep the ranked fallbacks behind the pick."
     )]
     async fn agent_route(
         &self,
         Parameters(args): Parameters<AgentRouteArgs>,
     ) -> Result<CallToolResult, McpError> {
         let project = args.project.clone();
-        let req = RouteRequest {
-            capability: parse_agent_route_capability(args.capability.as_deref())?,
-            prefer: parse_agent_route_prefer(args.prefer.as_deref())?,
-            target: None,
-            model: args.model,
-            mode: None,
-            failover: false,
-        };
+        let req = agent_route_request(&args)?;
         // Same routing inputs as the CLI: the effective (global ⊕ project
         // `.rtrt/config.toml`) config drives the per-project enable map, and
         // the usage snapshot carries the ledger's rolling 24h window so
@@ -1151,17 +1285,34 @@ impl RtrtMcp {
                 body.to_string(),
             )]));
         }
-        let outcome = invoke_agent(
-            &decision.target,
-            &args.prompt,
-            InvokeOptions {
-                mode: Some(decision.mode),
-                model: decision.model,
-                timeout: std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            },
-        )
-        .await
-        .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
+        let timeout = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+        // `failover` walks the ranked candidates (the pick first, then its
+        // sibling pools, then the rest); without it the single-shot invocation
+        // is byte-for-byte the one this tool always made.
+        let outcome = if req.failover {
+            let ranked = decision.ranked_targets();
+            let walked = invoke_with_failover(&ranked, &args.prompt, timeout)
+                .await
+                .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?;
+            body["served_by"] = serde_json::json!(walked.outcome.target);
+            body["failover"] = serde_json::json!(walked.summary());
+            body["failed_over"] = serde_json::to_value(&walked.failed_over).map_err(|e| {
+                McpError::internal_error(format!("agent_route serialize: {e}"), None)
+            })?;
+            walked.outcome
+        } else {
+            invoke_agent(
+                &decision.target,
+                &args.prompt,
+                InvokeOptions {
+                    mode: Some(decision.mode),
+                    model: decision.model,
+                    timeout,
+                },
+            )
+            .await
+            .map_err(|e| McpError::internal_error(format!("agent_route: {e}"), None))?
+        };
         body["output"] = serde_json::Value::String(rtrt_compress::redact_secrets(&outcome.output));
         body["exit_code"] = serde_json::json!(outcome.exit_code);
         body["ms"] = serde_json::json!(outcome.ms);
@@ -1779,6 +1930,177 @@ mod tests {
         );
         assert_eq!(parse_agent_route_capability(None).unwrap(), None);
         assert!(parse_agent_route_capability(Some("telepathy")).is_err());
+    }
+
+    #[test]
+    fn agent_route_capability_error_lists_the_accepted_values() {
+        let err = parse_agent_route_capability(Some("implementation")).unwrap_err();
+        let message = err.message.to_string();
+        assert!(
+            message.contains("expected code, reasoning, vision, embed, agentic, or cheap"),
+            "{message}"
+        );
+    }
+
+    /// The plain rejection: no detected identity matches, so the message is the
+    /// accepted-value list and nothing invented.
+    #[test]
+    fn agent_route_prefer_error_lists_the_accepted_values() {
+        let err = parse_agent_route_prefer_with(Some("telepathy"), |_| None).unwrap_err();
+        assert_eq!(
+            err.message.to_string(),
+            "agent_route prefer: unknown prefer 'telepathy' (expected cheapest, local, or quality)"
+        );
+    }
+
+    /// The mistake that started this: a provider name passed to `prefer`.
+    #[test]
+    fn agent_route_prefer_error_points_a_target_name_at_target() {
+        let err = parse_agent_route_prefer_with(Some("opencode"), |value| {
+            detected_route_in(&[pooled_tool()], value)
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.message.to_string(),
+            "agent_route prefer: unknown prefer 'opencode' (expected cheapest, local, or quality). \
+             'opencode' is a detected target, not a strategy: pass target=\"opencode\" instead"
+        );
+    }
+
+    /// A pool name is not a target either — the fix needs `model` as well.
+    #[test]
+    fn agent_route_prefer_error_points_a_pool_name_at_target_and_model() {
+        let err = parse_agent_route_prefer_with(Some("opencode-go"), |value| {
+            detected_route_in(&[pooled_tool()], value)
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.message.to_string(),
+            "agent_route prefer: unknown prefer 'opencode-go' (expected cheapest, local, or \
+             quality). 'opencode-go' is a pool of the detected target 'opencode', not a strategy: \
+             pass target=\"opencode\" (with model=\"opencode-go/glm-5.2\" to pin that pool) instead"
+        );
+    }
+
+    #[test]
+    fn detected_route_resolves_targets_pools_and_nothing_else() {
+        let tools = [pooled_tool()];
+        assert_eq!(
+            detected_route_in(&tools, " OpenCode "),
+            Some(DetectedRoute::Target {
+                target: "opencode".to_string()
+            })
+        );
+        assert_eq!(
+            detected_route_in(&tools, "ollama"),
+            Some(DetectedRoute::Pool {
+                target: "opencode".to_string(),
+                pool: "ollama".to_string(),
+                model: "ollama/glm-5.2:cloud".to_string(),
+            })
+        );
+        assert_eq!(detected_route_in(&tools, "telepathy"), None);
+        assert_eq!(detected_route_in(&tools, "  "), None);
+    }
+
+    /// Backward compatibility: the pre-existing argument shape still builds the
+    /// request it always built — no target, no mode, no failover.
+    #[test]
+    fn agent_route_legacy_arguments_build_the_legacy_request() {
+        let args: AgentRouteArgs =
+            serde_json::from_str(r#"{"prompt":"ship it","capability":"code"}"#)
+                .expect("valid arguments");
+        assert_eq!(args.dry_run, None);
+        let req = agent_route_request(&args).expect("legacy arguments route");
+        assert_eq!(
+            req,
+            RouteRequest {
+                capability: Some(Capability::Code),
+                prefer: Prefer::Cheapest,
+                target: None,
+                model: None,
+                mode: None,
+                failover: false,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_route_arguments_carry_target_mode_and_failover() {
+        let args: AgentRouteArgs = serde_json::from_str(
+            r#"{"prompt":"ship it","target":"opencode","mode":"CLI","failover":true}"#,
+        )
+        .expect("valid arguments");
+        let req = agent_route_request(&args).expect("pinned arguments route");
+        assert_eq!(req.target.as_deref(), Some("opencode"));
+        assert_eq!(req.mode, Some(InvokeMode::Cli));
+        assert!(req.failover);
+        assert!(
+            agent_route_request(&AgentRouteArgs {
+                mode: Some("telekinesis".to_string()),
+                ..AgentRouteArgs::default()
+            })
+            .is_err()
+        );
+    }
+
+    /// An explicit `target` pins that target; `failover` keeps the ranked
+    /// fallbacks behind it instead of collapsing the route to one candidate.
+    #[test]
+    fn agent_route_target_pins_and_failover_keeps_alternatives() {
+        let tools = routing_tools();
+        let usage = UsageSnapshot::default();
+
+        let pinned = agent_route_request(&AgentRouteArgs {
+            target: Some("opencode".to_string()),
+            ..AgentRouteArgs::default()
+        })
+        .expect("pinned request");
+        let decision = select_route(&pinned, &tools, &usage).expect("pinned route");
+        assert_eq!(decision.target, "opencode");
+        assert!(decision.alternatives.is_empty(), "{decision:?}");
+
+        let with_failover = agent_route_request(&AgentRouteArgs {
+            target: Some("opencode".to_string()),
+            failover: Some(true),
+            ..AgentRouteArgs::default()
+        })
+        .expect("failover request");
+        let decision = select_route(&with_failover, &tools, &usage).expect("failover route");
+        assert_eq!(decision.target, "opencode");
+        assert!(!decision.alternatives.is_empty(), "{decision:?}");
+        assert!(decision.ranked_targets().len() >= 2, "{decision:?}");
+    }
+
+    /// `opencode` reaching two upstream pools, plus a second target to fall over
+    /// to — the shape the owner actually runs.
+    fn pooled_tool() -> DetectedTool {
+        DetectedTool {
+            name: "opencode".to_string(),
+            kind: rtrt_core::ToolKind::CodingAgent,
+            installed: true,
+            path: None,
+            version: None,
+            invocation_modes: vec![rtrt_core::InvocationMode::Cli],
+            cli_invocation: Some("opencode run {prompt}".to_string()),
+            cost_class: rtrt_core::CostClass::SubscriptionFlat,
+            capabilities: vec![Capability::Code],
+            config_path: None,
+            models: vec![
+                "opencode-go/glm-5.2".to_string(),
+                "ollama/glm-5.2:cloud".to_string(),
+            ],
+            server_running: None,
+            enabled: true,
+        }
+    }
+
+    fn routing_tools() -> Vec<DetectedTool> {
+        let mut claude = pooled_tool();
+        claude.name = "claude".to_string();
+        claude.cli_invocation = Some("claude -p {prompt}".to_string());
+        claude.models = vec!["sonnet".to_string()];
+        vec![pooled_tool(), claude]
     }
 
     #[test]

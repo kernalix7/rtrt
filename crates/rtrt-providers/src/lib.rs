@@ -34,8 +34,9 @@ pub use gateway_server::{
     infer_capability, serve as serve_gateway,
 };
 pub use invoke::{
-    DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, InvokeOptions, InvokeOutcome, Mode,
-    invoke_agent, invoke_with_failover, is_retryable_error,
+    DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, FailureClass, FailurePolicy,
+    InvokeOptions, InvokeOutcome, Mode, PolicyAttempt, PolicyOutcome, classify_error, invoke_agent,
+    invoke_with_failover, invoke_with_policy, is_retryable_error,
 };
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;

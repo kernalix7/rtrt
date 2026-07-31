@@ -1,10 +1,12 @@
 use std::{
+    future::Future,
     io::Read,
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
-use rtrt_core::{CostClass, DetectedTool, Error, InvocationMode, Result};
+use rtrt_core::{CostClass, DetectedTool, Error, InvocationMode, Result, config::FailoverConfig};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -236,69 +238,363 @@ impl FailoverOutcome {
     }
 }
 
-/// Classify an invocation [`Error`] as retryable (fall over to the next ranked
-/// candidate) versus terminal (return immediately).
-///
-/// We are deliberately conservative: only failures that another provider could
-/// plausibly satisfy are retryable. Rate-limit / quota / 429 / 5xx / timeouts /
-/// process-spawn and unavailable-target failures fall over. Auth, other 4xx,
-/// empty-prompt, disabled-target, and unsupported-mode errors are terminal.
-pub fn is_retryable_error(err: &Error) -> bool {
-    // Errors surface as `Error::Provider(String)`; we classify on the message.
-    let Error::Provider(message) = err else {
-        // I/O and serde errors are transient/local plumbing, not provider state
-        // a peer would share — treat as retryable so failover can try a peer.
-        return true;
-    };
-    let lower = message.to_ascii_lowercase();
+/// One failed candidate in a policy walk — the richer record that
+/// [`FailoverAttempt`] flattens from. It carries the [`FailureClass`] and
+/// whether the target's transient retry was consumed, so an operator can see
+/// *why* the walk moved on instead of only *that* it did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyAttempt {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How the failure was classified.
+    pub class: FailureClass,
+    /// True when the target was retried in place before the walk gave up on it.
+    #[serde(default)]
+    pub retried: bool,
+    pub error: String,
+}
 
-    // Terminal first: these must NOT fall over even if a status-code substring
-    // would otherwise look retryable.
-    const TERMINAL_MARKERS: &[&str] = &[
-        "401",
-        "403",
-        "unauthorized",
-        "forbidden",
-        "invalid api key",
-        "authentication",
-        "api key",
-        "not detected",
-        "model not found",
-        "model-not-found",
-        "disabled",
-        "does not support",
-        "requires --model",
-        "needs --model",
-        "no cli invocation",
-        "is empty",
-    ];
-    if TERMINAL_MARKERS.iter().any(|m| lower.contains(m)) {
-        return false;
+impl PolicyAttempt {
+    fn label(&self) -> String {
+        target_label(&self.target, self.model.as_deref())
     }
 
-    // Retryable: rate limits, quota, server-side and transient failures, and
-    // local spawn/timeout errors a different target could route around.
-    const RETRYABLE_MARKERS: &[&str] = &[
-        "429",
-        "rate limit",
-        "rate-limit",
-        "ratelimit",
-        "quota",
-        "weekly",
-        "usage",
-        "hit your",
-        "limit reached",
-        "credits exhausted",
-        "overloaded",
-        "capacity",
-        "too many requests",
-        "timed out",
-        "timeout",
-        "spawn",
-        "not installed",
-        "budget exceeded",
-    ];
-    RETRYABLE_MARKERS.iter().any(|m| lower.contains(m)) || contains_server_status(&lower)
+    fn trail_entry(&self) -> String {
+        let retried = if self.retried { ", retried" } else { "" };
+        format!("{}: {}{retried}", self.label(), self.class.label())
+    }
+}
+
+impl From<&PolicyAttempt> for FailoverAttempt {
+    fn from(attempt: &PolicyAttempt) -> Self {
+        Self {
+            target: attempt.target.clone(),
+            model: attempt.model.clone(),
+            retryable: attempt.class.is_recoverable(),
+            error: attempt.error.clone(),
+        }
+    }
+}
+
+/// The full record of an [`invoke_with_policy`] walk: what served the request
+/// (if anything), every candidate that failed, and the lane that halted the
+/// walk on a [`FailureClass::Fatal`].
+///
+/// This is a separate type rather than a `halted` field bolted onto
+/// [`FailoverOutcome`], because `FailoverOutcome` models a *successful* walk —
+/// it owns an `InvokeOutcome` — while a fatal halt has no success to report.
+/// [`Self::into_failover`] flattens back to that legacy shape, which is how
+/// [`invoke_with_failover`] keeps its exact contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyOutcome {
+    /// The invocation that served the request, if any candidate succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<InvokeOutcome>,
+    /// Every candidate that failed, in walk order (the halted one included).
+    #[serde(default)]
+    pub attempts: Vec<PolicyAttempt>,
+    /// The lane whose fatal failure halted the walk; no candidate after it was
+    /// tried. `None` means the walk either succeeded or exhausted the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted: Option<PolicyAttempt>,
+}
+
+impl PolicyOutcome {
+    /// How many candidates fell over — i.e. failed and handed the request to
+    /// the next lane. The halted candidate did not fall over, so it is excluded.
+    pub fn fell_over(&self) -> usize {
+        self.attempts.len() - usize::from(self.halted.is_some())
+    }
+
+    /// A one-line audit string covering all three endings: served, halted at a
+    /// fatal lane, or every candidate exhausted.
+    pub fn summary(&self) -> String {
+        let trail = self
+            .attempts
+            .iter()
+            .map(PolicyAttempt::trail_entry)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(halted) = &self.halted {
+            return format!(
+                "halted at {} after {} fell over: fatal, no failover ({})",
+                halted.label(),
+                self.fell_over(),
+                halted.error
+            );
+        }
+        match &self.served {
+            Some(outcome) => {
+                let served_by = target_label(&outcome.target, outcome.model.as_deref());
+                if self.attempts.is_empty() {
+                    format!("served by {served_by} (no failover)")
+                } else {
+                    format!(
+                        "served by {served_by} after {} fell over ({trail})",
+                        self.attempts.len()
+                    )
+                }
+            }
+            None => format!("all {} candidate(s) failed ({trail})", self.attempts.len()),
+        }
+    }
+
+    /// Flatten to the legacy shape: `Ok` with the failover trail when a
+    /// candidate served the request, otherwise the aggregated error listing
+    /// every attempt — byte-for-byte what `invoke_with_failover` returned
+    /// before the three-class split.
+    pub fn into_failover(self) -> Result<FailoverOutcome> {
+        let failed_over: Vec<FailoverAttempt> =
+            self.attempts.iter().map(FailoverAttempt::from).collect();
+        match self.served {
+            Some(outcome) => Ok(FailoverOutcome {
+                outcome,
+                failed_over,
+            }),
+            None => Err(aggregated_error(&failed_over)),
+        }
+    }
+}
+
+/// How the failover walk must react to a failed invocation.
+///
+/// This replaces the old retryable/terminal bool: the walk needs to know *why*
+/// a lane failed, not merely whether some other lane could serve the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureClass {
+    /// Timeout, 5xx, connection or spawn hiccup: the same target may well work
+    /// a moment later, so it earns a short backoff and one more try before the
+    /// walk spends another lane's budget.
+    Transient,
+    /// 429 / rate limit / quota / credits / usage cap: the target is out of
+    /// allowance, so retrying it is pure latency — fall over immediately.
+    Quota,
+    /// Auth, unknown model, disabled or undetected target, malformed request:
+    /// neither a retry nor a different provider can fix it. Halt and surface it
+    /// to the operator.
+    Fatal,
+}
+
+impl FailureClass {
+    /// Lower-case label used in audit trails and aggregated errors.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Quota => "quota",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    /// Whether the walk may continue past this failure (by retrying the same
+    /// target or falling over). This is exactly the bool the pre-split
+    /// `is_retryable_error` returned.
+    pub fn is_recoverable(self) -> bool {
+        !matches!(self, Self::Fatal)
+    }
+}
+
+/// Fatal markers, checked before any other built-in table: an auth or config
+/// mistake must not fall over even when the same message carries a
+/// retryable-looking status code.
+const FATAL_MARKERS: &[&str] = &[
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "authentication",
+    "api key",
+    "not detected",
+    "model not found",
+    "model-not-found",
+    "disabled",
+    "does not support",
+    "requires --model",
+    "needs --model",
+    "no cli invocation",
+    "is empty",
+];
+
+/// Quota markers: the target is out of budget or allowance. A sibling lane can
+/// serve the request, but the same target cannot — so no same-target retry.
+const QUOTA_MARKERS: &[&str] = &[
+    "429",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "quota",
+    "weekly",
+    "usage",
+    "hit your",
+    "limit reached",
+    "credits exhausted",
+    "budget exceeded",
+    "too many requests",
+];
+
+/// Transient markers: a hiccup the same target may recover from on its own.
+/// The 5xx heuristic ([`contains_server_status`]) joins this class.
+const TRANSIENT_MARKERS: &[&str] = &[
+    "overloaded",
+    "capacity",
+    "timed out",
+    "timeout",
+    "spawn",
+    "not installed",
+];
+
+/// Same-target retries a transient failure earns before the walk falls over.
+const DEFAULT_TRANSIENT_RETRIES: u32 = 1;
+
+/// The transient backoff is the caller's own timeout budget divided by this,
+/// so the wait always scales with how long the caller was willing to wait
+/// (120s budget → 2s backoff, 2s budget → the 25ms floor) instead of being a
+/// fixed constant that is either rude to fast calls or useless to slow ones.
+const DEFAULT_BACKOFF_DIVISOR: u32 = 60;
+
+/// The effective failure policy: the built-in marker tables plus any
+/// `[failover]` overrides from the user's config.
+///
+/// Classification precedence, highest first:
+///   1. user `fatal`, then user `quota`, then user `transient` — a user entry
+///      therefore *reclassifies* a built-in marker;
+///   2. built-in fatal, then built-in quota, then built-in transient
+///      (including the 5xx heuristic);
+///   3. anything still unmatched stays fatal, so an unknown provider message is
+///      never silently retried around.
+#[derive(Debug, Clone, Default)]
+pub struct FailurePolicy {
+    fatal: Vec<String>,
+    quota: Vec<String>,
+    transient: Vec<String>,
+    transient_retries: Option<u32>,
+    backoff_divisor: Option<u32>,
+    backoff: Option<Duration>,
+}
+
+impl FailurePolicy {
+    /// The shipped policy: built-in tables only, no user overrides.
+    pub fn builtin() -> Self {
+        Self::default()
+    }
+
+    /// Layer a user's `[failover]` section on top of the built-in tables. An
+    /// all-default section yields exactly [`FailurePolicy::builtin`].
+    pub fn from_config(config: &FailoverConfig) -> Self {
+        Self {
+            fatal: lowercased_markers(&config.fatal),
+            quota: lowercased_markers(&config.quota),
+            transient: lowercased_markers(&config.transient),
+            transient_retries: config.transient_retries,
+            backoff_divisor: config.backoff_divisor,
+            backoff: config.backoff_ms.map(Duration::from_millis),
+        }
+    }
+
+    /// Classify an invocation [`Error`] (see the type docs for precedence).
+    pub fn classify(&self, err: &Error) -> FailureClass {
+        // Errors surface as `Error::Provider(String)`; we classify on the
+        // message. I/O and serde errors are local plumbing, not provider state
+        // a peer would share, so they stay transient.
+        let Error::Provider(message) = err else {
+            return FailureClass::Transient;
+        };
+        let lower = message.to_ascii_lowercase();
+
+        // 1. User overrides win outright, so an operator can move a marker
+        //    between classes without a rebuild.
+        for (markers, class) in [
+            (&self.fatal, FailureClass::Fatal),
+            (&self.quota, FailureClass::Quota),
+            (&self.transient, FailureClass::Transient),
+        ] {
+            if markers.iter().any(|marker| lower.contains(marker.as_str())) {
+                return class;
+            }
+        }
+
+        // 2. Built-ins, fatal first.
+        if FATAL_MARKERS.iter().any(|m| lower.contains(m)) {
+            return FailureClass::Fatal;
+        }
+        if QUOTA_MARKERS.iter().any(|m| lower.contains(m)) {
+            return FailureClass::Quota;
+        }
+        if TRANSIENT_MARKERS.iter().any(|m| lower.contains(m)) || contains_server_status(&lower) {
+            return FailureClass::Transient;
+        }
+
+        // 3. Unmatched: conservative by design.
+        FailureClass::Fatal
+    }
+
+    /// Same-target retries granted to a transient failure (`0` disables them).
+    pub fn transient_retries(&self) -> u32 {
+        self.transient_retries.unwrap_or(DEFAULT_TRANSIENT_RETRIES)
+    }
+
+    /// The pause before a same-target retry. Derived from the call's own
+    /// timeout budget divided by [`DEFAULT_BACKOFF_DIVISOR`] (or the
+    /// configured divisor), floored at one child-wait poll tick so it is never
+    /// a no-op and ceilinged at the default budget's share so an unusually long
+    /// timeout cannot park the walk. A configured `backoff_ms` pins it outright.
+    pub fn backoff(&self, timeout: Duration) -> Duration {
+        if let Some(fixed) = self.backoff {
+            return fixed;
+        }
+        let divisor = self
+            .backoff_divisor
+            .unwrap_or(DEFAULT_BACKOFF_DIVISOR)
+            .max(1);
+        let ceiling =
+            (Duration::from_secs(DEFAULT_TIMEOUT_SECS) / divisor).max(CHILD_WAIT_POLL_INTERVAL);
+        (timeout / divisor).clamp(CHILD_WAIT_POLL_INTERVAL, ceiling)
+    }
+}
+
+fn lowercased_markers(markers: &[String]) -> Vec<String> {
+    markers
+        .iter()
+        .map(|marker| marker.trim().to_ascii_lowercase())
+        .filter(|marker| !marker.is_empty())
+        .collect()
+}
+
+/// The policy this process runs with: built-ins plus the user's `[failover]`
+/// overrides, resolved once. Classification happens on every failed attempt, so
+/// it must not touch the disk each time.
+fn effective_policy() -> &'static FailurePolicy {
+    static POLICY: OnceLock<FailurePolicy> = OnceLock::new();
+    POLICY.get_or_init(|| {
+        // Unit tests must not inherit the developer's ~/.rtrt/config.toml —
+        // the in-crate test binary always classifies with the shipped
+        // defaults, and the override layer is covered by explicit
+        // `FailurePolicy::from_config` tests.
+        if cfg!(test) {
+            FailurePolicy::builtin()
+        } else {
+            FailurePolicy::from_config(&rtrt_core::Config::load_effective_for_cwd().failover)
+        }
+    })
+}
+
+/// Classify an invocation [`Error`] with the effective policy.
+pub fn classify_error(err: &Error) -> FailureClass {
+    effective_policy().classify(err)
+}
+
+/// Whether a failure leaves the walk anything to try (retry the same target or
+/// fall over to the next one).
+///
+/// Kept as a thin shim over [`classify_error`] so existing callers — the
+/// gateway's HTTP status mapping in particular — keep their exact behaviour:
+/// the bool is `true` for everything that was retryable before the three-class
+/// split (transient *and* quota) and `false` for everything that was terminal
+/// ([`FailureClass::Fatal`]).
+pub fn is_retryable_error(err: &Error) -> bool {
+    classify_error(err).is_recoverable()
 }
 
 fn contains_server_status(message: &str) -> bool {
@@ -338,63 +634,131 @@ fn target_label(target: &str, model: Option<&str>) -> String {
     }
 }
 
-/// Invoke targets in ranked order with automatic cross-provider failover.
+/// Invoke targets in ranked order under the three-class failure policy.
 ///
-/// Tries each [`RankedTarget`] at most once. On a **retryable** failure
-/// (rate-limit / quota / 429 / 5xx / timeout / spawn / known but unavailable
-/// target) it records the attempt and falls through to the next candidate. On a
-/// **terminal** failure (auth, other 4xx, empty prompt, disabled target) it stops and returns
-/// that error — falling over would only repeat a user/config mistake. Returns
-/// the first success (with its failover trail), or an aggregated error listing
-/// every attempt if all candidates fail.
+/// Per candidate, the response depends on how its failure classifies:
+/// * [`FailureClass::Transient`] — back off briefly (see
+///   [`FailurePolicy::backoff`]) and try the **same** target again; only if
+///   that also fails does the walk move on.
+/// * [`FailureClass::Quota`] — the target is out of allowance, so retrying it
+///   would just burn time: fall over to the next lane immediately.
+/// * [`FailureClass::Fatal`] — halt. No retry, no failover: a bad credential or
+///   a wrong model id cannot be fixed by asking another provider.
 ///
-/// `invoke_agent`'s single-target behavior is untouched; this is an additional
-/// layer on top. Each underlying call still records to the ledger (failures as
-/// `ok = 0`), so balance accounting is identical to a direct invocation.
-pub async fn invoke_with_failover(
+/// Returns the walk record rather than a bare error, so a caller can report the
+/// halted lane. `invoke_agent`'s single-target behaviour is untouched; each
+/// underlying call still records to the ledger (failures as `ok = 0`), so
+/// balance accounting is identical to a direct invocation.
+pub async fn invoke_with_policy(
     targets: &[RankedTarget],
     prompt: &str,
     timeout: Duration,
-) -> Result<FailoverOutcome> {
+) -> Result<PolicyOutcome> {
+    walk_with_policy(
+        effective_policy(),
+        targets,
+        prompt,
+        timeout,
+        |candidate, prompt, timeout| async move {
+            let opts = InvokeOptions {
+                mode: Some(candidate.mode),
+                model: candidate.model.clone(),
+                timeout,
+            };
+            invoke_agent(&candidate.target, &prompt, opts).await
+        },
+    )
+    .await
+}
+
+/// The policy walk, parameterised over the invoker so tests can drive every
+/// class transition without spawning real providers.
+async fn walk_with_policy<F, Fut>(
+    policy: &FailurePolicy,
+    targets: &[RankedTarget],
+    prompt: &str,
+    timeout: Duration,
+    mut invoke: F,
+) -> Result<PolicyOutcome>
+where
+    F: FnMut(RankedTarget, String, Duration) -> Fut,
+    Fut: Future<Output = Result<InvokeOutcome>>,
+{
     if targets.is_empty() {
         return Err(Error::Provider(
             "invoke: failover received no ranked targets".to_string(),
         ));
     }
 
-    let mut failed_over = Vec::new();
+    let max_tries = policy.transient_retries().saturating_add(1);
+    let mut attempts: Vec<PolicyAttempt> = Vec::new();
     for candidate in targets {
-        let opts = InvokeOptions {
-            mode: Some(candidate.mode),
-            model: candidate.model.clone(),
-            timeout,
-        };
-        match invoke_agent(&candidate.target, prompt, opts).await {
-            Ok(outcome) => {
-                return Ok(FailoverOutcome {
-                    outcome,
-                    failed_over,
-                });
-            }
-            Err(err) => {
-                let retryable = is_retryable_error(&err);
-                failed_over.push(FailoverAttempt {
-                    target: candidate.target.clone(),
-                    model: candidate.model.clone(),
-                    retryable,
-                    error: err.to_string(),
-                });
-                // Terminal failure: do not fall over — repeating a user/config
-                // mistake against the next target would not help.
-                if !retryable {
-                    return Err(aggregated_error(&failed_over));
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            match invoke(candidate.clone(), prompt.to_string(), timeout).await {
+                Ok(outcome) => {
+                    return Ok(PolicyOutcome {
+                        served: Some(outcome),
+                        attempts,
+                        halted: None,
+                    });
                 }
-                // Retryable: the ledger already recorded ok=0 inside
-                // invoke_agent; walk on to the next ranked candidate.
+                Err(err) => {
+                    let class = policy.classify(&err);
+                    // Transient: give the same target its retry before
+                    // spending another lane's budget on the same request.
+                    if class == FailureClass::Transient && tries < max_tries {
+                        tokio::time::sleep(policy.backoff(timeout)).await;
+                        continue;
+                    }
+                    let attempt = PolicyAttempt {
+                        target: candidate.target.clone(),
+                        model: candidate.model.clone(),
+                        class,
+                        retried: tries > 1,
+                        error: err.to_string(),
+                    };
+                    // Fatal: halt. Falling over would replay a credential or
+                    // config mistake against every remaining lane.
+                    if class == FailureClass::Fatal {
+                        attempts.push(attempt.clone());
+                        return Ok(PolicyOutcome {
+                            served: None,
+                            attempts,
+                            halted: Some(attempt),
+                        });
+                    }
+                    // Quota, or a transient that used up its retry: the ledger
+                    // already recorded ok=0 inside the invoker; fall over.
+                    attempts.push(attempt);
+                    break;
+                }
             }
         }
     }
-    Err(aggregated_error(&failed_over))
+    Ok(PolicyOutcome {
+        served: None,
+        attempts,
+        halted: None,
+    })
+}
+
+/// Invoke targets in ranked order with automatic cross-provider failover.
+///
+/// A thin flattening of [`invoke_with_policy`] onto the legacy shape: the first
+/// success with its failover trail, or an aggregated error listing every
+/// attempt (which is also what a fatal halt returns, as it did before the
+/// three-class split). Callers that want to report the halted lane should use
+/// [`invoke_with_policy`] directly.
+pub async fn invoke_with_failover(
+    targets: &[RankedTarget],
+    prompt: &str,
+    timeout: Duration,
+) -> Result<FailoverOutcome> {
+    invoke_with_policy(targets, prompt, timeout)
+        .await?
+        .into_failover()
 }
 
 /// Build a single error summarizing every failover attempt, in order.
@@ -1003,6 +1367,546 @@ mod tests {
         let raw = "\x1b[?25l\r\x1b[?2026h⠙\r\x1b[K⠹\r\x1b[32mClean answer\x1b[0m\n";
 
         assert_eq!(sanitize_cli_output(raw), "Clean answer");
+    }
+
+    // --- three-class failure policy ------------------------------------
+
+    /// The terminal table exactly as it shipped before the split.
+    const LEGACY_TERMINAL_MARKERS: &[&str] = &[
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "authentication",
+        "api key",
+        "not detected",
+        "model not found",
+        "model-not-found",
+        "disabled",
+        "does not support",
+        "requires --model",
+        "needs --model",
+        "no cli invocation",
+        "is empty",
+    ];
+
+    /// The retryable table exactly as it shipped before the split.
+    const LEGACY_RETRYABLE_MARKERS: &[&str] = &[
+        "429",
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "quota",
+        "weekly",
+        "usage",
+        "hit your",
+        "limit reached",
+        "credits exhausted",
+        "overloaded",
+        "capacity",
+        "too many requests",
+        "timed out",
+        "timeout",
+        "spawn",
+        "not installed",
+        "budget exceeded",
+    ];
+
+    /// The classifier verbatim as it was before the three-class split, so the
+    /// `is_retryable_error` shim can be *proven* identical rather than assumed.
+    fn legacy_is_retryable_error(err: &Error) -> bool {
+        let Error::Provider(message) = err else {
+            return true;
+        };
+        let lower = message.to_ascii_lowercase();
+        if LEGACY_TERMINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+            return false;
+        }
+        LEGACY_RETRYABLE_MARKERS.iter().any(|m| lower.contains(m)) || contains_server_status(&lower)
+    }
+
+    /// Every marker from both pre-split tables plus the messages the rest of
+    /// this module asserts on.
+    fn classification_corpus() -> Vec<String> {
+        let mut corpus: Vec<String> = LEGACY_TERMINAL_MARKERS
+            .iter()
+            .chain(LEGACY_RETRYABLE_MARKERS)
+            .map(|m| (*m).to_string())
+            .collect();
+        corpus.extend(
+            [
+                "anthropic 429: rate limit exceeded",
+                "openai 503 Service Unavailable",
+                "openai 529 overloaded",
+                "invalid upstream response: 503",
+                "gateway: budget exceeded for openai",
+                "invoke: command 'ollama' timed out after 120s",
+                "invoke: spawn 'codex': No such file or directory",
+                "provider overloaded, retry later",
+                "daily quota reached",
+                "you have hit your weekly usage limit",
+                "weekly limit reached",
+                "credits exhausted",
+                "invoke: target 'claude' is not installed; available targets: opencode",
+                "anthropic 401: invalid api key",
+                "openai 403: forbidden",
+                "invoke: target 'typo' is not detected; available targets: claude",
+                "invoke: target 'claude' does not support API mode",
+                "invoke: target 'openai' API mode requires --model",
+                "rtrt call: prompt is empty",
+                "configuration requires 512 tokens",
+                "anthropic 401: rate limit note",
+                "model-not-found: 429 rate limit",
+                "invalid api key: 503",
+                "weekly usage limit reached",
+                "some entirely unrecognised provider message",
+            ]
+            .iter()
+            .map(|m| (*m).to_string()),
+        );
+        corpus
+    }
+
+    #[test]
+    fn marker_tables_classify_into_the_intended_failure_classes() {
+        let policy = FailurePolicy::builtin();
+        for marker in FATAL_MARKERS {
+            assert_eq!(
+                policy.classify(&Error::Provider((*marker).to_string())),
+                FailureClass::Fatal,
+                "expected fatal for marker: {marker}"
+            );
+        }
+        for marker in QUOTA_MARKERS {
+            assert_eq!(
+                policy.classify(&Error::Provider((*marker).to_string())),
+                FailureClass::Quota,
+                "expected quota for marker: {marker}"
+            );
+        }
+        for marker in TRANSIENT_MARKERS {
+            assert_eq!(
+                policy.classify(&Error::Provider((*marker).to_string())),
+                FailureClass::Transient,
+                "expected transient for marker: {marker}"
+            );
+        }
+
+        // The split is a partition of the pre-split tables: nothing was
+        // dropped, invented, or moved between the fatal and recoverable sides.
+        assert_eq!(FATAL_MARKERS, LEGACY_TERMINAL_MARKERS);
+        assert_eq!(
+            QUOTA_MARKERS.len() + TRANSIENT_MARKERS.len(),
+            LEGACY_RETRYABLE_MARKERS.len()
+        );
+        for marker in QUOTA_MARKERS.iter().chain(TRANSIENT_MARKERS) {
+            assert!(
+                LEGACY_RETRYABLE_MARKERS.contains(marker),
+                "{marker} is not a pre-split retryable marker"
+            );
+        }
+    }
+
+    #[test]
+    fn shim_verdict_is_identical_to_the_pre_split_classifier() {
+        for message in classification_corpus() {
+            let err = Error::Provider(message.clone());
+            assert_eq!(
+                is_retryable_error(&err),
+                legacy_is_retryable_error(&err),
+                "shim drifted for: {message}"
+            );
+        }
+        // Non-provider errors were retryable before the split; they stay
+        // transient (and therefore recoverable) after it.
+        let io = Error::Io(std::io::Error::other("socket closed"));
+        assert_eq!(classify_error(&io), FailureClass::Transient);
+        assert!(is_retryable_error(&io));
+        assert!(legacy_is_retryable_error(&io));
+    }
+
+    #[test]
+    fn absent_failover_config_classifies_exactly_like_the_builtins() {
+        let configured = FailurePolicy::from_config(&FailoverConfig::default());
+        let builtin = FailurePolicy::builtin();
+        for message in classification_corpus() {
+            let err = Error::Provider(message.clone());
+            assert_eq!(
+                configured.classify(&err),
+                builtin.classify(&err),
+                "default config drifted for: {message}"
+            );
+        }
+        assert_eq!(configured.transient_retries(), builtin.transient_retries());
+        assert_eq!(
+            configured.backoff(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+            builtin.backoff(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        );
+    }
+
+    #[test]
+    fn user_markers_win_over_the_builtin_tables() {
+        let policy = FailurePolicy::from_config(&FailoverConfig {
+            quota: vec!["  TIMED OUT  ".to_string()],
+            fatal: vec!["seat revoked".to_string()],
+            transient: vec![String::new()],
+            ..FailoverConfig::default()
+        });
+
+        // Reclassified built-in marker (and the entry is trimmed/lowercased).
+        assert_eq!(
+            policy.classify(&Error::Provider(
+                "invoke: command 'ollama' timed out after 120s".to_string()
+            )),
+            FailureClass::Quota
+        );
+        // A message the built-ins do not know at all.
+        assert_eq!(
+            policy.classify(&Error::Provider("seat revoked for this org".to_string())),
+            FailureClass::Fatal
+        );
+        // Blank entries are dropped rather than matching every message.
+        assert_eq!(
+            policy.classify(&Error::Provider("unrecognised message".to_string())),
+            FailureClass::Fatal
+        );
+    }
+
+    #[test]
+    fn failover_section_parses_from_config_toml() {
+        let config = rtrt_core::Config::from_toml_str(
+            "[failover]\nquota = [\"Seat Limit\"]\ntransient_retries = 0\nbackoff_ms = 7\n",
+        )
+        .expect("failover section should parse");
+
+        assert_eq!(config.failover.quota, vec!["Seat Limit".to_string()]);
+        assert_eq!(config.failover.transient_retries, Some(0));
+
+        let policy = FailurePolicy::from_config(&config.failover);
+        assert_eq!(policy.transient_retries(), 0);
+        assert_eq!(
+            policy.backoff(Duration::from_secs(600)),
+            Duration::from_millis(7)
+        );
+        assert_eq!(
+            policy.classify(&Error::Provider("provider: SEAT LIMIT hit".to_string())),
+            FailureClass::Quota
+        );
+    }
+
+    #[test]
+    fn transient_backoff_is_derived_from_the_call_timeout() {
+        let policy = FailurePolicy::builtin();
+        let default_timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+
+        assert_eq!(
+            policy.backoff(default_timeout),
+            default_timeout / DEFAULT_BACKOFF_DIVISOR
+        );
+        // Floor: a tiny budget still pauses for one child-wait poll tick.
+        assert_eq!(
+            policy.backoff(Duration::from_millis(10)),
+            CHILD_WAIT_POLL_INTERVAL
+        );
+        // Ceiling: an unusually generous budget cannot park the walk.
+        assert_eq!(
+            policy.backoff(Duration::from_secs(3600)),
+            default_timeout / DEFAULT_BACKOFF_DIVISOR
+        );
+        // A configured divisor still scales with the caller's budget.
+        let steeper = FailurePolicy::from_config(&FailoverConfig {
+            backoff_divisor: Some(4),
+            ..FailoverConfig::default()
+        });
+        assert_eq!(
+            steeper.backoff(Duration::from_secs(8)),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// A scripted invoker: each target gets a list of steps (`None` = success,
+    /// `Some(message)` = provider error), the last step repeating forever. It
+    /// records the exact call order so a test can assert retries and failover.
+    struct Script {
+        calls: std::cell::RefCell<Vec<String>>,
+        plan: std::collections::BTreeMap<String, Vec<Option<String>>>,
+    }
+
+    impl Script {
+        fn new(plan: Vec<(&str, Vec<Option<&str>>)>) -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+                plan: plan
+                    .into_iter()
+                    .map(|(target, steps)| {
+                        (
+                            target.to_string(),
+                            steps.into_iter().map(|s| s.map(str::to_string)).collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        fn next(&self, target: &str) -> Result<InvokeOutcome> {
+            self.calls.borrow_mut().push(target.to_string());
+            let tries = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.as_str() == target)
+                .count();
+            let steps = self.plan.get(target).expect("scripted target");
+            match steps[(tries - 1).min(steps.len() - 1)].clone() {
+                None => Ok(InvokeOutcome {
+                    target: target.to_string(),
+                    mode_used: Mode::Cli,
+                    model: None,
+                    output: "ok".to_string(),
+                    exit_code: Some(0),
+                    ms: 1,
+                }),
+                Some(message) => Err(Error::Provider(message)),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    async fn run_walk(
+        policy: &FailurePolicy,
+        targets: &[RankedTarget],
+        script: &Script,
+    ) -> Result<PolicyOutcome> {
+        walk_with_policy(
+            policy,
+            targets,
+            "hi",
+            Duration::from_secs(1),
+            |candidate, _prompt, _timeout| {
+                let result = script.next(&candidate.target);
+                async move { result }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn quota_falls_over_immediately_without_retrying_the_same_target() {
+        let script = Script::new(vec![
+            ("a", vec![Some("anthropic 429: rate limit exceeded")]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a", "b"]);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].class, FailureClass::Quota);
+        assert!(!outcome.attempts[0].retried);
+        assert!(outcome.halted.is_none());
+        assert_eq!(outcome.served.expect("b should serve").target, "b");
+    }
+
+    #[tokio::test]
+    async fn transient_retries_the_same_target_once_then_falls_over() {
+        let script = Script::new(vec![
+            ("a", vec![Some("invoke: command 'a' timed out after 1s")]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a", "a", "b"]);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].class, FailureClass::Transient);
+        assert!(outcome.attempts[0].retried);
+        assert_eq!(outcome.served.expect("b should serve").target, "b");
+    }
+
+    #[tokio::test]
+    async fn transient_retry_can_succeed_without_falling_over() {
+        let script = Script::new(vec![
+            ("a", vec![Some("provider overloaded, retry later"), None]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a", "a"]);
+        assert!(outcome.attempts.is_empty());
+        assert_eq!(outcome.served.as_ref().expect("a should serve").target, "a");
+        assert_eq!(outcome.summary(), "served by a (no failover)");
+    }
+
+    #[tokio::test]
+    async fn fatal_halts_the_walk_and_never_tries_the_next_target() {
+        let script = Script::new(vec![
+            ("a", vec![Some("anthropic 401: invalid api key")]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a"]);
+        assert!(outcome.served.is_none());
+        assert_eq!(outcome.fell_over(), 0);
+        let halted = outcome.halted.clone().expect("halt should be recorded");
+        assert_eq!(halted.target, "a");
+        assert_eq!(halted.class, FailureClass::Fatal);
+        assert!(
+            outcome
+                .summary()
+                .starts_with("halted at a after 0 fell over"),
+            "got: {}",
+            outcome.summary()
+        );
+
+        // Flattened to the legacy shape it is the same aggregated error a
+        // terminal failure produced before the split.
+        let err = outcome.into_failover().expect_err("a halt is an error");
+        let message = err.to_string();
+        assert!(
+            message.contains("all 1 candidate(s) failed"),
+            "got: {message}"
+        );
+        assert!(message.contains("a (terminal)"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn quota_then_transient_records_both_classes_in_the_trail() {
+        let script = Script::new(vec![
+            ("a", vec![Some("weekly limit reached")]),
+            ("b", vec![Some("invoke: command 'b' timed out after 1s")]),
+            ("c", vec![None]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b"), ranked("c")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a", "b", "b", "c"]);
+        assert_eq!(
+            outcome.summary(),
+            "served by c after 2 fell over (a: quota, b: transient, retried)"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_override_reclassifies_a_transient_marker_as_quota() {
+        let policy = FailurePolicy::from_config(&FailoverConfig {
+            quota: vec!["timed out".to_string()],
+            ..FailoverConfig::default()
+        });
+        let script = Script::new(vec![
+            ("a", vec![Some("invoke: command 'a' timed out after 1s")]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(&policy, &[ranked("a"), ranked("b")], &script)
+            .await
+            .expect("walk should complete");
+
+        // No same-target retry: the override moved this marker to quota.
+        assert_eq!(script.calls(), vec!["a", "b"]);
+        assert_eq!(outcome.attempts[0].class, FailureClass::Quota);
+        assert!(!outcome.attempts[0].retried);
+    }
+
+    #[tokio::test]
+    async fn configured_zero_retries_disables_the_same_target_retry() {
+        let policy = FailurePolicy::from_config(&FailoverConfig {
+            transient_retries: Some(0),
+            ..FailoverConfig::default()
+        });
+        let script = Script::new(vec![
+            ("a", vec![Some("invoke: command 'a' timed out after 1s")]),
+            ("b", vec![None]),
+        ]);
+
+        let outcome = run_walk(&policy, &[ranked("a"), ranked("b")], &script)
+            .await
+            .expect("walk should complete");
+
+        assert_eq!(script.calls(), vec!["a", "b"]);
+        assert_eq!(outcome.attempts[0].class, FailureClass::Transient);
+        assert!(!outcome.attempts[0].retried);
+    }
+
+    #[tokio::test]
+    async fn exhausted_walk_reports_every_candidate() {
+        let script = Script::new(vec![
+            ("a", vec![Some("anthropic 429: rate limit exceeded")]),
+            ("b", vec![Some("weekly limit reached")]),
+        ]);
+
+        let outcome = run_walk(
+            &FailurePolicy::builtin(),
+            &[ranked("a"), ranked("b")],
+            &script,
+        )
+        .await
+        .expect("walk should complete");
+
+        assert!(outcome.served.is_none());
+        assert!(outcome.halted.is_none());
+        assert_eq!(outcome.fell_over(), 2);
+        assert_eq!(
+            outcome.summary(),
+            "all 2 candidate(s) failed (a: quota, b: quota)"
+        );
+        let err = outcome.into_failover().expect_err("no candidate served");
+        assert!(err.to_string().contains("all 2 candidate(s) failed"));
+    }
+
+    #[test]
+    fn policy_attempt_flattens_to_the_legacy_attempt_shape() {
+        let quota = PolicyAttempt {
+            target: "opencode".to_string(),
+            model: Some("provider/model".to_string()),
+            class: FailureClass::Quota,
+            retried: false,
+            error: "weekly limit reached".to_string(),
+        };
+        let fatal = PolicyAttempt {
+            class: FailureClass::Fatal,
+            ..quota.clone()
+        };
+
+        assert!(FailoverAttempt::from(&quota).retryable);
+        assert!(!FailoverAttempt::from(&fatal).retryable);
+        assert_eq!(FailoverAttempt::from(&quota).model, quota.model);
     }
 
     fn tool_for_mode(

@@ -31,6 +31,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default, skip_serializing_if = "TeamConfig::is_default")]
     pub team: TeamConfig,
+    #[serde(default, skip_serializing_if = "FailoverConfig::is_default")]
+    pub failover: FailoverConfig,
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
 }
@@ -862,6 +864,67 @@ fn repo_root_in<'a>(ancestors: impl Iterator<Item = &'a Path>) -> Option<PathBuf
         }
     }
     None
+}
+
+/// User overrides for the invocation failure policy (`rtrt-providers`
+/// `invoke_with_policy`): which error messages count as fatal / quota /
+/// transient, and how a transient failure is retried.
+///
+/// The marker tables shipped in `rtrt-providers` remain the source of truth;
+/// this section is purely additive. An absent `[failover]` section classifies
+/// exactly like the built-ins, so the default behaviour is unchanged.
+///
+/// Precedence, highest first:
+///   1. user `fatal`, then user `quota`, then user `transient`;
+///   2. built-in fatal, then built-in quota, then built-in transient
+///      (including the 5xx heuristic);
+///   3. anything still unmatched is fatal.
+///
+/// Because the user layer is consulted first, listing a built-in marker under a
+/// different class *reclassifies* it — e.g. putting `"timed out"` under `quota`
+/// stops timeouts from earning a same-target retry.
+///
+/// Example `~/.rtrt/config.toml`:
+///
+/// ```toml
+/// [failover]
+/// quota = ["seat limit reached"]
+/// fatal = ["contract expired"]
+/// transient_retries = 1
+/// backoff_divisor = 60
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailoverConfig {
+    /// Extra markers that halt the walk: no retry, no failover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fatal: Vec<String>,
+    /// Extra markers that fall over immediately, without retrying the target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota: Vec<String>,
+    /// Extra markers that earn a backed-off retry on the same target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transient: Vec<String>,
+    /// Same-target retries granted to a transient failure; `None` keeps the
+    /// built-in single retry, `0` disables retrying entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_retries: Option<u32>,
+    /// Divisor applied to the per-call timeout to derive the retry backoff;
+    /// `None` keeps the built-in divisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_divisor: Option<u32>,
+    /// Fixed retry backoff in milliseconds. Set only to pin the backoff; it
+    /// overrides the timeout-derived value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+}
+
+impl FailoverConfig {
+    /// True when nothing is customised, i.e. the policy is exactly the
+    /// built-in one. Used to keep an untouched `[failover]` section out of the
+    /// serialized config.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[cfg(test)]

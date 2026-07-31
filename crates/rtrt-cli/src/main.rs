@@ -4319,6 +4319,7 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
         target,
         model: opts.model,
         mode: (mode != InvokeMode::Auto).then_some(mode),
+        failover: false,
     };
     let tools = rtrt_core::detect_tools_with_config(cfg);
     // Routing snapshot with the ledger's rolling 24h window so ranking is
@@ -4418,6 +4419,7 @@ fn ranked_targets_for_call(
         target: None,
         model: None,
         mode: (mode != InvokeMode::Auto).then_some(mode),
+        failover: false,
     };
     let mut ranked = vec![primary];
     if let Ok(decision) = select_route(&req, &tools, &usage) {

@@ -115,6 +115,7 @@ pub(crate) async fn route_api(
         target: None,
         model: None,
         mode: None,
+        failover: false,
     };
     let tools = detected_tools_with_config_overrides();
     // Overlay the provider-usage ledger's rolling 24h window (same snapshot

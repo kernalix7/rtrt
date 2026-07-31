@@ -1,10 +1,22 @@
 use std::time::Duration;
 
-use rtrt_core::{CostClass, Error, Result, TeamConfig, TeamMember, TeamMode};
+use rtrt_core::{Config, CostClass, Error, Result, TeamConfig, TeamMember};
 
-use crate::{FailoverOutcome, Mode, RankedTarget, invoke_with_failover};
+use crate::{
+    FailoverOutcome, FailurePolicy, RankedTarget,
+    lane::{AGENT_INVOKER, LaneRunner, LaneTask, LedgerRoom, mode_from_team, resolve_leader_lane},
+};
 
 /// Dispatch a task to the first available configured team leader.
+///
+/// The leader candidates are walked by the lane runner rather than by a bare
+/// failover list, so the leader gets the same treatment every delegated task
+/// gets: a quota wall crosses to the leader's sibling pool before it downgrades
+/// the model, a transient hiccup earns one same-lane retry inside the task's
+/// `max_retries` budget, and a fatal failure halts instead of replaying a broken
+/// credential against every remaining leader. A roster that declares no
+/// `sibling` and no `fallback` collapses to `leader_order` itself, which is
+/// exactly what this walked before lanes existed.
 pub async fn dispatch_team(
     config: &TeamConfig,
     prompt: &str,
@@ -15,9 +27,38 @@ pub async fn dispatch_team(
             "team dispatch prompt must not be empty".to_string(),
         ));
     }
-    let leaders = ranked_leaders(config)?;
+    // Validates the roster and keeps the pre-existing error messages for a
+    // disabled config or an unknown leader.
+    ranked_leaders(config)?;
     let leader_prompt = build_team_leader_prompt(config, prompt);
-    invoke_with_failover(&leaders, &leader_prompt, timeout).await
+    let effective = Config::load_effective_for_cwd();
+    let failure = FailurePolicy::from_config(&effective.failover);
+    let room = LedgerRoom::new(effective);
+    let steps = resolve_leader_lane(config, &room)?;
+
+    let run = LaneRunner::new(config, &AGENT_INVOKER)
+        .with_room(&room)
+        .with_failure_policy(failure)
+        .with_timeout(timeout)
+        .run_steps(&leader_task(&leader_prompt), &steps)
+        .await;
+    if let Some(reason) = run.unresolved {
+        return Err(Error::Config(reason));
+    }
+    run.into_policy_outcome().into_failover()
+}
+
+/// The leader's task.
+///
+/// `implements` is false because a leader plans, delegates and integrates — the
+/// shipped roster's first leader is design-only, and filtering it out would
+/// change who leads. Redo directives are off because
+/// [`build_team_leader_prompt`] already restates the whole original task and
+/// carries no partial output, so re-sending it to the next leader IS a
+/// from-scratch redo; adding a directive would only perturb bytes an existing
+/// deployment depends on.
+fn leader_task(leader_prompt: &str) -> LaneTask {
+    LaneTask::design("team-leader", leader_prompt).without_redo()
 }
 
 /// Build the shared instructions passed unchanged to every fallback leader.
@@ -155,14 +196,6 @@ fn ranked_leaders(config: &TeamConfig) -> Result<Vec<RankedTarget>> {
         .collect()
 }
 
-fn mode_from_team(mode: TeamMode) -> Mode {
-    match mode {
-        TeamMode::Cli => Mode::Cli,
-        TeamMode::Api => Mode::Api,
-        TeamMode::Auto => Mode::Auto,
-    }
-}
-
 fn format_member(member: &TeamMember) -> String {
     let mut line = format!(
         "- name: {}; target: {}; model: {}; roles: {}",
@@ -206,9 +239,13 @@ fn format_member(member: &TeamMember) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rtrt_core::TierMap;
+    use rtrt_core::{TeamMode, TierMap};
 
     use super::*;
+    use crate::{
+        Mode,
+        lane::{LaneRole, UNKNOWN_ROOM},
+    };
 
     fn member(
         name: &str,
@@ -450,6 +487,77 @@ mod tests {
         ));
         // A member's own tier declaration reaches the routing block too.
         assert!(prompt.contains("- tier review"));
+    }
+
+    #[test]
+    fn a_legacy_roster_walks_exactly_the_configured_leader_order() {
+        // No `sibling`, no `fallback` anywhere: the lane expansion must collapse
+        // to `leader_order` itself, which is what dispatch walked before lanes
+        // existed. Same order, same targets, same models, no extra candidates.
+        let config = config();
+        let steps = resolve_leader_lane(&config, &UNKNOWN_ROOM).unwrap();
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (
+                    step.lane.as_str(),
+                    step.target.as_str(),
+                    step.model.as_deref(),
+                    step.mode
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("second", "opencode", Some("openai/gpt-5.6-sol"), Mode::Api),
+                ("first", "claude", Some("sonnet"), Mode::Cli),
+            ]
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.ranked_target())
+                .collect::<Vec<_>>(),
+            ranked_leaders(&config).unwrap()
+        );
+        assert_eq!(steps[0].role, LaneRole::Primary);
+        assert_eq!(steps[1].role, LaneRole::Alternate);
+    }
+
+    #[test]
+    fn a_leader_with_lane_wiring_gains_its_sibling_and_fallback() {
+        let mut config = config();
+        config.members[1].logical = Some("gpt-5.6-sol".to_string());
+        config.members[1].sibling = Some("worker".to_string());
+        config.members[1].fallback = vec!["first".to_string()];
+        config.members[2].logical = Some("gpt-5.6-sol".to_string());
+        config.validate().unwrap();
+
+        let steps = resolve_leader_lane(&config, &UNKNOWN_ROOM).unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.lane.as_str(), step.role, step.assigned.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("second", LaneRole::Primary, "second"),
+                ("worker", LaneRole::Sibling, "second"),
+                ("first", LaneRole::Fallback, "second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_design_only_leader_is_never_filtered_out_of_the_leader_walk() {
+        // The shipped roster's first leader plans rather than implements; a walk
+        // that dropped it would silently change who leads.
+        let mut config = config();
+        config.members[1].allow_impl = false;
+        config.tiers = TierMap::from_pairs([("design", vec!["second"])]);
+        config.policy.design_only_tiers = Some(vec!["design".to_string()]);
+        config.validate().unwrap();
+
+        let steps = resolve_leader_lane(&config, &UNKNOWN_ROOM).unwrap();
+        assert_eq!(steps[0].lane, "second");
     }
 
     #[test]

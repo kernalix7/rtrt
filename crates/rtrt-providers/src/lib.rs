@@ -15,6 +15,7 @@ pub mod context7;
 pub mod gateway;
 pub mod gateway_server;
 pub mod invoke;
+pub mod lane;
 pub mod openai;
 pub mod openai_compatible;
 pub mod router;
@@ -37,6 +38,11 @@ pub use invoke::{
     DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, FailureClass, FailurePolicy,
     InvokeOptions, InvokeOutcome, Mode, PolicyAttempt, PolicyOutcome, classify_error, invoke_agent,
     invoke_with_failover, invoke_with_policy, is_retryable_error,
+};
+pub use lane::{
+    AGENT_INVOKER, AgentInvoker, LaneAttempt, LaneHalt, LaneInvoker, LaneReport, LaneRole,
+    LaneRoom, LaneRun, LaneRunner, LaneStep, LaneTask, LedgerRoom, RedoDirective, StaticRoom,
+    UNKNOWN_ROOM, UnknownRoom, resolve_lane, resolve_leader_lane,
 };
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;

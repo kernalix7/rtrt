@@ -22,8 +22,24 @@ const VERSION_TIMEOUT: Duration = Duration::from_millis(800);
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OLLAMA_HOST: &str = "127.0.0.1";
 const OLLAMA_PORT: u16 = 11434;
-const OLLAMA_HTTP_TIMEOUT: Duration = Duration::from_millis(700);
+/// Budget for one runtime round-trip (connect, write, read) against a service
+/// that is already listening locally.
+const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(700);
+/// Budget for asking a CLI agent to list its models. Unlike ollama's loopback
+/// `/api/tags` read this pays a process start (`VERSION_TIMEOUT`, already the
+/// measured cost of spawning these CLIs) plus the tool's own round-trips to its
+/// provider registry — so the ceiling is derived from those two constants
+/// rather than guessed. It is a ceiling, not an expected cost: the probe
+/// returns as soon as the child exits.
+const MODEL_LIST_ROUND_TRIPS: u32 = 2;
+const MODEL_LIST_TIMEOUT: Duration =
+    VERSION_TIMEOUT.saturating_add(RUNTIME_PROBE_TIMEOUT.saturating_mul(MODEL_LIST_ROUND_TRIPS));
 const HTTP_OK_PREFIX: &str = "HTTP/1.1 200";
+/// Characters that may appear inside a `provider/model` identifier. Anything
+/// else on a line means it is prose (a header, a warning, a spinner) and not a
+/// model id.
+const MODEL_ID_PUNCTUATION: &[char] = &['/', '-', '_', '.', ':', '@', '+'];
+const ANSI_ESCAPE: char = '\u{1b}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolKind {
@@ -90,10 +106,16 @@ struct ToolDescriptor {
     runtime_probe: RuntimeProbe,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeProbe {
     None,
     Ollama,
+    /// Enumerate models by running the tool's own list subcommand with these
+    /// arguments and reading one model id per stdout line. Adding another
+    /// CLI-hosted multi-provider agent is a matter of supplying its list
+    /// arguments here — the parser is shared and knows nothing about any
+    /// particular tool.
+    CliModelList(&'static [&'static str]),
 }
 
 #[derive(Default)]
@@ -148,6 +170,7 @@ const API_MODE: &[InvocationMode] = &[InvocationMode::Api];
 
 const EMPTY_BINS: &[&str] = &[];
 const VERSION_FLAG: &[&str] = &["--version"];
+const OPENCODE_MODELS_ARGS: &[&str] = &["models"];
 
 const REGISTRY: &[ToolDescriptor] = &[
     ToolDescriptor {
@@ -192,7 +215,10 @@ const REGISTRY: &[ToolDescriptor] = &[
         capabilities: CODING_CAPS,
         config_path: Some("~/.config/opencode"),
         env_vars: &[],
-        runtime_probe: RuntimeProbe::None,
+        // One `opencode` target fronts several upstream pools (`opencode-go/…`,
+        // `openai/…`, `ollama/…`). Enumerating them is what lets routing bind a
+        // lane to a concrete `(target, model)` without hand-written config.
+        runtime_probe: RuntimeProbe::CliModelList(OPENCODE_MODELS_ARGS),
     },
     ToolDescriptor {
         name: "aider",
@@ -478,7 +504,10 @@ fn detect_descriptor(descriptor: &ToolDescriptor, context: &DetectionContext) ->
         .and_then(|(_, path)| command_version(path, descriptor.version_args));
     let (server_running, models) = match descriptor.runtime_probe {
         RuntimeProbe::Ollama => probe_ollama(),
-        RuntimeProbe::None => (None, Vec::new()),
+        probe => (
+            None,
+            enumerate_cli_models(probe, located.as_ref().map(|(_, path)| path.as_path())),
+        ),
     };
     let enabled = enabled_for_descriptor(descriptor, installed, &context.config);
 
@@ -592,8 +621,23 @@ fn command_version(path: &Path, version_args: &[&str]) -> Option<String> {
     if version_args.is_empty() {
         return None;
     }
-    let mut child = Command::new(path)
-        .args(version_args)
+    let mut command = Command::new(path);
+    command.args(version_args);
+    let output = run_bounded(command, VERSION_TIMEOUT)?;
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    if text.trim().is_empty() {
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    normalize_version(&text)
+}
+
+/// Run a child process to completion under a wall-clock ceiling, killing it if
+/// it overruns. Every failure mode — spawn error, timeout, wait error — folds
+/// into `None`, because detection is advisory: no probe may abort or stall a
+/// `rtrt detect` sweep.
+fn run_bounded(mut command: Command, timeout: Duration) -> Option<std::process::Output> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -602,16 +646,8 @@ fn command_version(path: &Path, version_args: &[&str]) -> Option<String> {
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().ok()?;
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if text.trim().is_empty() {
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                return normalize_version(&text);
-            }
-            Ok(None) if started.elapsed() >= VERSION_TIMEOUT => {
+            Ok(Some(_status)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -629,6 +665,114 @@ fn normalize_version(raw: &str) -> Option<String> {
         .map(|line| line.chars().take(120).collect())
 }
 
+/// Ask an installed CLI agent to list its own models.
+///
+/// Returns an empty list unless the probe both enumerates models this way and
+/// found the tool's binary: a tool that is not installed is never spawned, so a
+/// machine without it sees exactly the detection it saw before.
+fn enumerate_cli_models(probe: RuntimeProbe, located: Option<&Path>) -> Vec<String> {
+    model_list_command(probe, located)
+        .map(|(path, args)| probe_cli_models(path, args))
+        .unwrap_or_default()
+}
+
+/// The command a runtime probe would run to enumerate models, or `None` when it
+/// must not run one. Split out from the spawn so that "never probe a tool that
+/// is not installed" is a pure decision — [`probe_cli_models`] is unreachable
+/// without a `Some` from here.
+fn model_list_command(
+    probe: RuntimeProbe,
+    located: Option<&Path>,
+) -> Option<(&Path, &'static [&'static str])> {
+    match probe {
+        RuntimeProbe::CliModelList(args) if !args.is_empty() => located.map(|path| (path, args)),
+        _ => None,
+    }
+}
+
+/// Run the list command and parse its stdout. Bounded by [`MODEL_LIST_TIMEOUT`]
+/// and non-fatal by construction: a timeout, a non-zero exit, or output that
+/// holds no model ids all yield an empty list rather than an error, so a tool
+/// whose list command misbehaves degrades to "models unknown" instead of
+/// breaking detection.
+fn probe_cli_models(path: &Path, args: &[&str]) -> Vec<String> {
+    let mut command = Command::new(path);
+    command.args(args);
+    // Ask for plain output. The parser strips escapes anyway, but a CLI told to
+    // stay dumb is less likely to emit spinners or paginate.
+    command.env("NO_COLOR", "1").env("TERM", "dumb");
+    let Some(output) = run_bounded(command, MODEL_LIST_TIMEOUT) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_cli_model_list(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse a `provider/model`-per-line listing.
+///
+/// Deliberately tool-agnostic and defensive: escape sequences are stripped,
+/// blank lines and anything that does not look like a model id are dropped, and
+/// duplicates are removed while first-seen order is preserved. Order matters —
+/// the router picks the first model a target offers.
+fn parse_cli_model_list(raw: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut models = Vec::new();
+    for line in raw.lines() {
+        let line = strip_ansi(line);
+        let candidate = line.trim();
+        if !looks_like_model_id(candidate) {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            models.push(candidate.to_string());
+        }
+    }
+    models
+}
+
+/// A model id is `provider/model` (occasionally with more segments, as when a
+/// gateway re-exports another provider's namespace). Every segment must be
+/// non-empty and start alphanumerically, and the whole id must be free of
+/// whitespace and prose punctuation.
+fn looks_like_model_id(candidate: &str) -> bool {
+    if !candidate.contains('/') {
+        return false;
+    }
+    if !candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || MODEL_ID_PUNCTUATION.contains(&c))
+    {
+        return false;
+    }
+    candidate.split('/').all(|segment| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// Drop ANSI escape sequences (`ESC` followed by parameter bytes and an
+/// alphabetic final byte) so a colourised listing still parses.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != ANSI_ESCAPE {
+            out.push(c);
+            continue;
+        }
+        for next in chars.by_ref() {
+            if next.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn probe_ollama() -> (Option<bool>, Vec<String>) {
     let Ok(mut addrs) = (OLLAMA_HOST, OLLAMA_PORT).to_socket_addrs() else {
         return (Some(false), Vec::new());
@@ -636,11 +780,11 @@ fn probe_ollama() -> (Option<bool>, Vec<String>) {
     let Some(addr) = addrs.next() else {
         return (Some(false), Vec::new());
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, OLLAMA_HTTP_TIMEOUT) else {
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, RUNTIME_PROBE_TIMEOUT) else {
         return (Some(false), Vec::new());
     };
-    let _ = stream.set_read_timeout(Some(OLLAMA_HTTP_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(OLLAMA_HTTP_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(RUNTIME_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RUNTIME_PROBE_TIMEOUT));
     let request = format!(
         "GET /api/tags HTTP/1.1\r\nHost: {OLLAMA_HOST}:{OLLAMA_PORT}\r\nConnection: close\r\n\r\n"
     );
@@ -953,6 +1097,128 @@ mod tests {
                 name: "rtrt".to_string(),
                 command: "rtrt-mcp".to_string(),
             }]
+        );
+    }
+
+    /// Captured from a real `opencode models` run, with a blank line, a
+    /// duplicate, a colourised line and two junk lines spliced in.
+    const OPENCODE_MODELS_SAMPLE: &str = concat!(
+        "opencode-go/glm-5.2\n",
+        "\n",
+        "opencode-go/kimi-k2.7-code\n",
+        "opencode-go/kimi-k3\n",
+        "Available models:\n",
+        "openai/gpt-5.6-sol\n",
+        "\u{1b}[32mopenai/gpt-5.6-terra\u{1b}[0m\n",
+        "openai/gpt-5.6-luna\n",
+        "   \n",
+        "ollama/glm-5.2:cloud\n",
+        "ollama/kimi-k2.7-code:cloud\n",
+        "ollama/kimi-k3:cloud\n",
+        "opencode-go/glm-5.2\n",
+        "  * pick one with --model\n",
+    );
+
+    #[test]
+    fn parses_cli_model_list_from_captured_output() {
+        assert_eq!(
+            parse_cli_model_list(OPENCODE_MODELS_SAMPLE),
+            vec![
+                "opencode-go/glm-5.2",
+                "opencode-go/kimi-k2.7-code",
+                "opencode-go/kimi-k3",
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-terra",
+                "openai/gpt-5.6-luna",
+                "ollama/glm-5.2:cloud",
+                "ollama/kimi-k2.7-code:cloud",
+                "ollama/kimi-k3:cloud",
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_model_list_rejects_empty_and_junk_output() {
+        for raw in [
+            "",
+            "\n\n   \n",
+            "no models configured\n",
+            "error: not logged in\n",
+            "/leading-slash\n",
+            "trailing-slash/\n",
+            "provider//model\n",
+            "opencode-go/glm 5.2\n",
+            "==============\n",
+        ] {
+            assert!(
+                parse_cli_model_list(raw).is_empty(),
+                "expected no models from {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_model_list_keeps_pool_distinct_ids_that_share_a_model_name() {
+        // `PoolKey` is the segment before the first `/`, so the same model
+        // reached through two pools must survive as two entries.
+        assert_eq!(
+            parse_cli_model_list("opencode-go/gpt-5.6-luna\nopenai/gpt-5.6-luna\n"),
+            vec!["opencode-go/gpt-5.6-luna", "openai/gpt-5.6-luna"]
+        );
+    }
+
+    #[test]
+    fn model_list_probe_never_runs_for_a_missing_binary() {
+        let probe = RuntimeProbe::CliModelList(OPENCODE_MODELS_ARGS);
+        let path = Path::new("/nonexistent/bin/opencode");
+
+        // No located binary means no command at all — the spawn is unreachable.
+        assert!(model_list_command(probe, None).is_none());
+        assert!(enumerate_cli_models(probe, None).is_empty());
+
+        // Probes that do not enumerate this way never produce a command either.
+        assert!(model_list_command(RuntimeProbe::None, Some(path)).is_none());
+        assert!(model_list_command(RuntimeProbe::Ollama, Some(path)).is_none());
+        assert!(model_list_command(RuntimeProbe::CliModelList(&[]), Some(path)).is_none());
+
+        assert_eq!(
+            model_list_command(probe, Some(path)),
+            Some((path, OPENCODE_MODELS_ARGS))
+        );
+    }
+
+    #[test]
+    fn uninstalled_cli_agent_reports_no_models() {
+        let descriptor = REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.name == "opencode")
+            .unwrap();
+        let tool = detect_descriptor(descriptor, &DetectionContext::default());
+        assert!(!tool.installed);
+        assert_eq!(tool.path, None);
+        assert!(tool.models.is_empty());
+        assert_eq!(tool.server_running, None);
+    }
+
+    #[test]
+    fn opencode_enumerates_models_through_its_own_list_command() {
+        let descriptor = REGISTRY
+            .iter()
+            .find(|descriptor| descriptor.name == "opencode")
+            .unwrap();
+        assert_eq!(
+            descriptor.runtime_probe,
+            RuntimeProbe::CliModelList(&["models"])
+        );
+    }
+
+    #[test]
+    fn model_list_budget_covers_a_process_start_plus_its_round_trips() {
+        assert!(MODEL_LIST_TIMEOUT > VERSION_TIMEOUT);
+        assert!(MODEL_LIST_TIMEOUT > RUNTIME_PROBE_TIMEOUT);
+        assert_eq!(
+            MODEL_LIST_TIMEOUT,
+            VERSION_TIMEOUT + RUNTIME_PROBE_TIMEOUT * MODEL_LIST_ROUND_TRIPS
         );
     }
 

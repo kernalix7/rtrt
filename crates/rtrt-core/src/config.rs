@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -45,6 +45,11 @@ pub enum TeamMode {
     Auto,
 }
 
+/// One lane of the team: a concrete `(target, model, mode)` the leader can
+/// delegate to, plus the routing policy that decides *when* it is used.
+///
+/// Everything after `roles` is optional and defaults to "unset", so a `[team]`
+/// section written before lanes existed parses and re-serializes byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamMember {
@@ -54,6 +59,66 @@ pub struct TeamMember {
     pub model: Option<String>,
     pub mode: TeamMode,
     pub roles: Vec<String>,
+    /// The logical model behind this lane (e.g. `glm-5.2`). Two members sharing
+    /// a `logical` are the *same* model reached through different pools — that
+    /// is what makes quota crossover between them safe, and it is the only
+    /// thing [`TeamMember::sibling`] is allowed to pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical: Option<String>,
+    /// Name of the sibling lane: the same [`TeamMember::logical`] model served
+    /// by another pool. Consulted before the fallback chain when this lane's
+    /// pool runs out of quota, so a quota wall costs a pool switch instead of a
+    /// model downgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sibling: Option<String>,
+    /// The difficulty tier this lane serves. Purely a self-declaration: it adds
+    /// the lane to that tier's roster in [`TeamConfig::effective_tiers`], which
+    /// lets a roster be expressed member-by-member without a `[team.tiers]`
+    /// table at all. `[team.tiers]` still decides ordering within a tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Ordered replacement lanes, tried left to right when this one fails past
+    /// its retries. Names must resolve to other members and must not form a
+    /// cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+    /// Whether this lane may implement (write code). A design-only lane —
+    /// typically an expensive or tightly rationed one — sets `false` and may
+    /// then only appear in tiers listed under
+    /// [`TeamPolicy::design_only_tiers`].
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub allow_impl: bool,
+    /// Free-form per-lane invocation flags, passed through verbatim by whoever
+    /// invokes the lane (e.g. `permission-mode` / `allowed-tools` for a
+    /// `claude -p` lane). rtrt stores and renders them; it does not interpret
+    /// them, so a new upstream flag needs no rtrt release.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub flags: BTreeMap<String, String>,
+}
+
+impl TeamMember {
+    /// A lane with only its identity set; every routing field takes its default
+    /// so callers opt into exactly the policy they mean.
+    pub fn new(name: impl Into<String>, target: impl Into<String>, mode: TeamMode) -> Self {
+        Self {
+            name: name.into(),
+            target: target.into(),
+            model: None,
+            mode,
+            roles: Vec::new(),
+            logical: None,
+            sibling: None,
+            tier: None,
+            fallback: Vec::new(),
+            allow_impl: true,
+            flags: BTreeMap::new(),
+        }
+    }
+
+    /// One invocation flag by key.
+    pub fn flag(&self, key: &str) -> Option<&str> {
+        self.flags.get(key).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +136,17 @@ pub struct TeamConfig {
     pub leader_order: Vec<String>,
     #[serde(default = "default_team_members")]
     pub members: Vec<TeamMember>,
+    /// Difficulty ladder: tier name -> the lanes that serve it, most preferred
+    /// first. Empty means "use the shipped default ladder" (see
+    /// [`TeamConfig::effective_tiers`]); a non-empty table *replaces* the
+    /// default outright rather than merging with it, so a user roster is never
+    /// polluted by lanes they did not ask for.
+    #[serde(default, skip_serializing_if = "TierMap::is_empty")]
+    pub tiers: TierMap,
+    /// How the leader walks the ladder: retries, sibling crossover, fallback
+    /// depth, provenance.
+    #[serde(default, skip_serializing_if = "TeamPolicy::is_default")]
+    pub policy: TeamPolicy,
 }
 
 impl Default for TeamConfig {
@@ -82,6 +158,11 @@ impl Default for TeamConfig {
             manager_base_url: None,
             leader_order: default_team_leader_order(),
             members: default_team_members(),
+            // Empty, not the default ladder: an unset `[team.tiers]` must not
+            // be written back into anyone's config file. `effective_tiers`
+            // supplies the default at read time instead.
+            tiers: TierMap::default(),
+            policy: TeamPolicy::default(),
         }
     }
 }
@@ -158,7 +239,511 @@ impl TeamConfig {
                 )));
             }
         }
+
+        self.validate_lane_links(&member_names)?;
+        self.validate_tiers(&member_names)?;
         Ok(())
+    }
+
+    /// Cross-references between lanes: siblings must be the same logical model,
+    /// fallbacks must resolve and must not loop.
+    fn validate_lane_links(&self, member_names: &BTreeSet<&str>) -> Result<()> {
+        for (index, member) in self.members.iter().enumerate() {
+            if let Some(logical) = &member.logical {
+                validate_team_value(&format!("members[{index}].logical"), logical)?;
+            }
+            if let Some(tier) = &member.tier {
+                validate_team_value(&format!("members[{index}].tier"), tier)?;
+            }
+            for (key, value) in &member.flags {
+                validate_team_value(&format!("members[{index}].flags key"), key)?;
+                validate_team_text(&format!("members[{index}].flags.{key}"), value)?;
+            }
+
+            if let Some(sibling) = &member.sibling {
+                validate_team_value(&format!("members[{index}].sibling"), sibling)?;
+                if sibling == &member.name {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].sibling must not reference itself: {sibling}"
+                    )));
+                }
+                let Some(other) = self.member(sibling) else {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].sibling references unknown member: {sibling}"
+                    )));
+                };
+                match (member.logical.as_deref(), other.logical.as_deref()) {
+                    (Some(mine), Some(theirs)) if mine == theirs => {}
+                    (Some(mine), Some(theirs)) => {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].sibling {sibling} serves logical model \
+                             {theirs}, not {mine}: siblings must be the same model on \
+                             different pools"
+                        )));
+                    }
+                    _ => {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].sibling {sibling} requires both members to \
+                             declare `logical`: a sibling pair is one model on two pools"
+                        )));
+                    }
+                }
+            }
+
+            let mut seen_fallback = BTreeSet::new();
+            for (position, name) in member.fallback.iter().enumerate() {
+                validate_team_value(&format!("members[{index}].fallback[{position}]"), name)?;
+                if name == &member.name {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].fallback[{position}] must not reference itself: \
+                         {name}"
+                    )));
+                }
+                if !member_names.contains(name.as_str()) {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].fallback[{position}] references unknown member: \
+                         {name}"
+                    )));
+                }
+                if !seen_fallback.insert(name.as_str()) {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].fallback lists {name} twice"
+                    )));
+                }
+            }
+        }
+
+        if let Some(cycle) = fallback_cycle(&self.members) {
+            return Err(Error::Config(format!(
+                "team fallback chain forms a cycle: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// The difficulty ladder: every explicitly configured tier must be usable,
+    /// and no design-only lane may sit in a tier that implements.
+    fn validate_tiers(&self, member_names: &BTreeSet<&str>) -> Result<()> {
+        for (tier, lanes) in self.tiers.iter() {
+            validate_team_value(&format!("tiers.{tier}"), tier)?;
+            if lanes.is_empty() {
+                return Err(Error::Config(format!(
+                    "team.tiers.{tier} must list at least one member"
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            for name in lanes {
+                validate_team_value(&format!("tiers.{tier}"), name)?;
+                if !member_names.contains(name.as_str()) {
+                    return Err(Error::Config(format!(
+                        "team.tiers.{tier} references unknown member: {name}"
+                    )));
+                }
+                if !seen.insert(name.as_str()) {
+                    return Err(Error::Config(format!(
+                        "team.tiers.{tier} lists {name} twice"
+                    )));
+                }
+            }
+        }
+
+        let effective = self.effective_tiers();
+        if let Some(configured) = &self.policy.design_only_tiers {
+            for tier in configured {
+                validate_team_value("policy.design_only_tiers", tier)?;
+                if !effective.contains(tier) {
+                    return Err(Error::Config(format!(
+                        "team.policy.design_only_tiers references unknown tier: {tier}"
+                    )));
+                }
+            }
+        }
+        if let Some(tier) = &self.policy.default_tier {
+            validate_team_value("policy.default_tier", tier)?;
+            if !effective.contains(tier) {
+                return Err(Error::Config(format!(
+                    "team.policy.default_tier references unknown tier: {tier}"
+                )));
+            }
+        }
+
+        let design_only = self.design_only_tier_names(&effective);
+        for (tier, lanes) in effective.iter() {
+            if design_only.contains(tier) {
+                continue;
+            }
+            for name in lanes {
+                let implements = self.member(name).is_none_or(|member| member.allow_impl);
+                if !implements {
+                    return Err(Error::Config(format!(
+                        "team.tiers.{tier} places design-only member {name} in an implementation \
+                         tier: set allow_impl = true or list {tier} under \
+                         team.policy.design_only_tiers"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One lane by name.
+    pub fn member(&self, name: &str) -> Option<&TeamMember> {
+        self.members.iter().find(|member| member.name == name)
+    }
+
+    /// The sibling lane of `name`, when it declares one that resolves.
+    pub fn sibling_of(&self, name: &str) -> Option<&TeamMember> {
+        let sibling = self.member(name)?.sibling.as_deref()?;
+        self.member(sibling)
+    }
+
+    /// The difficulty ladder actually in force.
+    ///
+    /// A configured `[team.tiers]` replaces the shipped ladder outright. With
+    /// none configured, the shipped ladder is used but filtered to lanes that
+    /// exist in *this* roster, so a fully custom roster never inherits lane
+    /// names it does not have. Either way, lanes that declare a
+    /// [`TeamMember::tier`] are appended to that tier, creating it when the
+    /// table does not.
+    pub fn effective_tiers(&self) -> TierMap {
+        let names: BTreeSet<&str> = self
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect();
+        let mut tiers = if self.tiers.is_empty() {
+            let mut shipped = default_team_tiers();
+            shipped.retain_members(|name| names.contains(name));
+            shipped
+        } else {
+            self.tiers.clone()
+        };
+        for member in &self.members {
+            if let Some(tier) = &member.tier {
+                tiers.push_member(tier, &member.name);
+            }
+        }
+        tiers
+    }
+
+    /// Tiers whose output is a plan, not an edit. Configured names win; with
+    /// none configured the shipped name is used, but only if such a tier
+    /// actually exists — a default must never invalidate a config.
+    fn design_only_tier_names(&self, effective: &TierMap) -> BTreeSet<String> {
+        match &self.policy.design_only_tiers {
+            Some(configured) => configured.iter().cloned().collect(),
+            None => default_design_only_tiers()
+                .into_iter()
+                .filter(|tier| effective.contains(tier))
+                .collect(),
+        }
+    }
+
+    /// Whether a tier is design-only (its lanes plan, they do not implement).
+    pub fn is_design_only_tier(&self, tier: &str) -> bool {
+        self.design_only_tier_names(&self.effective_tiers())
+            .contains(tier)
+    }
+
+    /// The tier to start from when a task's difficulty is unclear: the
+    /// configured one, else the first rung of the ladder.
+    pub fn effective_default_tier(&self) -> Option<String> {
+        if let Some(tier) = &self.policy.default_tier {
+            return Some(tier.clone());
+        }
+        self.effective_tiers().first_name().map(str::to_string)
+    }
+
+    /// How many lanes deep a fallback walk may go. Derived from the roster —
+    /// a walk can visit each lane at most once — unless pinned by the config.
+    pub fn effective_max_fallback_depth(&self) -> usize {
+        self.policy.max_fallback_depth.unwrap_or(self.members.len())
+    }
+
+    /// The fallback chain starting at `name`: every replacement it declares, in
+    /// order, then their replacements, deduplicated and cut at
+    /// [`TeamConfig::effective_max_fallback_depth`]. `name` itself is never in
+    /// the result.
+    ///
+    /// Breadth-first on purpose — a lane's own preferences outrank the
+    /// preferences of its replacement.
+    pub fn fallback_chain(&self, name: &str) -> Vec<String> {
+        let depth = self.effective_max_fallback_depth();
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::from([name.to_string()]);
+        let mut current = name.to_string();
+        let mut cursor = 0usize;
+        loop {
+            if let Some(member) = self.member(&current) {
+                for next in &member.fallback {
+                    if chain.len() >= depth {
+                        return chain;
+                    }
+                    if seen.insert(next.clone()) {
+                        chain.push(next.clone());
+                    }
+                }
+            }
+            let Some(next) = chain.get(cursor) else {
+                return chain;
+            };
+            current = next.clone();
+            cursor += 1;
+        }
+    }
+}
+
+/// The first fallback cycle in the roster, as the looping path, or `None` when
+/// the graph is acyclic. Iterative three-colour DFS: the roster is small, but a
+/// cycle must never blow the stack of whoever loads a config.
+fn fallback_cycle(members: &[TeamMember]) -> Option<Vec<String>> {
+    const WHITE: u8 = 0;
+    const GREY: u8 = 1;
+    const BLACK: u8 = 2;
+
+    let index: BTreeMap<&str, usize> = members
+        .iter()
+        .enumerate()
+        .map(|(position, member)| (member.name.as_str(), position))
+        .collect();
+    let mut colour = vec![WHITE; members.len()];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..members.len() {
+        if colour[start] != WHITE {
+            continue;
+        }
+        colour[start] = GREY;
+        stack.push((start, 0));
+        while let Some(&(node, cursor)) = stack.last() {
+            let Some(next_name) = members[node].fallback.get(cursor) else {
+                colour[node] = BLACK;
+                stack.pop();
+                continue;
+            };
+            if let Some(top) = stack.last_mut() {
+                top.1 += 1;
+            }
+            // Unresolvable names are reported separately; skip them here so the
+            // cycle report never blames a typo.
+            let Some(&next) = index.get(next_name.as_str()) else {
+                continue;
+            };
+            match colour[next] {
+                GREY => {
+                    let entry = stack
+                        .iter()
+                        .position(|(node, _)| *node == next)
+                        .unwrap_or_default();
+                    let mut cycle: Vec<String> = stack[entry..]
+                        .iter()
+                        .map(|(node, _)| members[*node].name.clone())
+                        .collect();
+                    cycle.push(members[next].name.clone());
+                    return Some(cycle);
+                }
+                WHITE => {
+                    colour[next] = GREY;
+                    stack.push((next, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// An insertion-ordered map of tier name -> the lanes serving it.
+///
+/// Order is meaningful — it is the difficulty ladder the leader climbs — so
+/// this preserves the order the config declares instead of sorting names the
+/// way a `BTreeMap` would. Serializes as a plain TOML table, so
+/// `[team.tiers]\nmechanical = ["glm-go"]` is all a user writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierMap(Vec<(String, Vec<String>)>);
+
+impl TierMap {
+    /// Build a ladder from ordered `(tier, lanes)` pairs. A repeated tier name
+    /// extends the first occurrence rather than shadowing it.
+    pub fn from_pairs<N, M>(pairs: impl IntoIterator<Item = (N, M)>) -> Self
+    where
+        N: Into<String>,
+        M: IntoIterator,
+        M::Item: Into<String>,
+    {
+        let mut map = Self::default();
+        for (tier, lanes) in pairs {
+            let tier = tier.into();
+            for lane in lanes {
+                map.push_member(&tier, &lane.into());
+            }
+        }
+        map
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Tiers in ladder order, each with its lanes in preference order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.0
+            .iter()
+            .map(|(tier, lanes)| (tier.as_str(), lanes.as_slice()))
+    }
+
+    /// Tier names in ladder order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(tier, _)| tier.as_str())
+    }
+
+    /// The lanes serving one tier, most preferred first.
+    pub fn get(&self, tier: &str) -> Option<&[String]> {
+        self.0
+            .iter()
+            .find(|(name, _)| name == tier)
+            .map(|(_, lanes)| lanes.as_slice())
+    }
+
+    pub fn contains(&self, tier: &str) -> bool {
+        self.0.iter().any(|(name, _)| name == tier)
+    }
+
+    /// The first rung of the ladder.
+    pub fn first_name(&self) -> Option<&str> {
+        self.0.first().map(|(tier, _)| tier.as_str())
+    }
+
+    /// Append a lane to a tier, creating the tier at the end of the ladder when
+    /// it is new. Re-adding a lane it already holds is a no-op, so ordering
+    /// stays with the first declaration.
+    pub fn push_member(&mut self, tier: &str, member: &str) {
+        match self.0.iter_mut().find(|(name, _)| name == tier) {
+            Some((_, lanes)) => {
+                if !lanes.iter().any(|lane| lane == member) {
+                    lanes.push(member.to_string());
+                }
+            }
+            None => self.0.push((tier.to_string(), vec![member.to_string()])),
+        }
+    }
+
+    /// Drop lanes that fail `keep`, then drop tiers left with none. Used to fit
+    /// the shipped ladder to a roster that renamed or removed lanes.
+    pub fn retain_members(&mut self, keep: impl Fn(&str) -> bool) {
+        for (_, lanes) in &mut self.0 {
+            lanes.retain(|lane| keep(lane));
+        }
+        self.0.retain(|(_, lanes)| !lanes.is_empty());
+    }
+}
+
+impl Serialize for TierMap {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(tier, lanes)| (tier, lanes)))
+    }
+}
+
+impl<'de> Deserialize<'de> for TierMap {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct TierMapVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TierMapVisitor {
+            type Value = TierMap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a table of tier name to member names")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut access: M,
+            ) -> std::result::Result<TierMap, M::Error> {
+                let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
+                while let Some((tier, lanes)) = access.next_entry::<String, Vec<String>>()? {
+                    if pairs.iter().any(|(existing, _)| *existing == tier) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate team tier: {tier}"
+                        )));
+                    }
+                    pairs.push((tier, lanes));
+                }
+                Ok(TierMap(pairs))
+            }
+        }
+
+        deserializer.deserialize_map(TierMapVisitor)
+    }
+}
+
+/// How the leader climbs the ladder and recovers from failures.
+///
+/// The whole table is omitted from the serialized config while it equals the
+/// defaults, so adding it never rewrites an existing `~/.rtrt/config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamPolicy {
+    /// Same-lane attempts a *transient* failure earns before the lane is
+    /// abandoned for its sibling or fallback chain. `0` falls over on the first
+    /// failure.
+    #[serde(default = "default_team_max_retries")]
+    pub max_retries: u32,
+    /// Redo the delegated work from scratch on the replacement lane instead of
+    /// resuming from whatever the failed lane produced. On by default because a
+    /// lane that failed mid-task usually left partial edits.
+    #[serde(default = "default_true")]
+    pub redo_on_fallback: bool,
+    /// On a *quota* failure, cross over to the lane's sibling pool before
+    /// walking the fallback chain — a pool switch keeps the same model, a
+    /// fallback usually does not.
+    #[serde(default = "default_true")]
+    pub prefer_sibling_on_quota: bool,
+    /// Report which lane produced each delegated result.
+    #[serde(default = "default_true")]
+    pub record_provenance: bool,
+    /// Hard cap on how many lanes deep a fallback walk may go. `None` derives
+    /// it from the roster (a walk visits each lane at most once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fallback_depth: Option<usize>,
+    /// Rung to start from when a task's difficulty is unclear. `None` uses the
+    /// first tier of the effective ladder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tier: Option<String>,
+    /// Tiers whose lanes plan rather than implement; the only tiers a member
+    /// with `allow_impl = false` may appear in. `None` uses the shipped name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_only_tiers: Option<Vec<String>>,
+}
+
+impl Default for TeamPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: default_team_max_retries(),
+            redo_on_fallback: true,
+            prefer_sibling_on_quota: true,
+            record_provenance: true,
+            max_fallback_depth: None,
+            default_tier: None,
+            design_only_tiers: None,
+        }
+    }
+}
+
+impl TeamPolicy {
+    /// True while nothing is customised, i.e. the policy is exactly the shipped
+    /// one. Keeps an untouched `[team.policy]` out of the serialized config.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -166,10 +751,20 @@ fn validate_team_value(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::Config(format!("team.{name} must not be empty")));
     }
+    validate_team_text(name, value)
+}
+
+/// NUL check only — for values that may legitimately be empty, such as a
+/// valueless invocation flag.
+fn validate_team_text(name: &str, value: &str) -> Result<()> {
     if value.contains('\0') {
         return Err(Error::Config(format!("team.{name} must not contain NUL")));
     }
     Ok(())
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn default_team_manager_provider() -> String {
@@ -189,53 +784,123 @@ fn default_team_leader_order() -> Vec<String> {
 
 fn default_team_members() -> Vec<TeamMember> {
     vec![
-        team_member(
-            "opus",
-            "claude",
-            "opus",
-            &["lead", "architecture", "integration"],
-        ),
-        team_member(
-            "gpt-sol",
-            "opencode",
-            "openai/gpt-5.6-sol",
-            &["deputy", "hard-implementation", "debugging"],
-        ),
-        team_member(
-            "glm-go",
-            "opencode",
-            "opencode-go/glm-5.2",
-            &["routine", "boilerplate", "bulk-edit"],
-        ),
-        team_member(
-            "glm-cloud",
-            "opencode",
-            "ollama/glm-5.2:cloud",
-            &["routine", "overflow", "bulk-edit"],
-        ),
-        team_member(
-            "sonnet",
-            "claude",
-            "sonnet",
-            &["general-implementation", "tests", "review"],
-        ),
+        TeamMember {
+            // Plans and integrates; the ladder keeps it out of every tier that
+            // writes code.
+            allow_impl: false,
+            fallback: team_names(&["gpt-sol"]),
+            ..team_member(
+                "opus",
+                "claude",
+                "opus",
+                "opus",
+                &["lead", "architecture", "integration"],
+            )
+        },
+        TeamMember {
+            fallback: team_names(&["sonnet"]),
+            ..team_member(
+                "gpt-sol",
+                "opencode",
+                "openai/gpt-5.6-sol",
+                "gpt-5.6-sol",
+                &["deputy", "hard-implementation", "debugging"],
+            )
+        },
+        TeamMember {
+            // Same model as glm-cloud on a different pool: when this pool is
+            // spent the work crosses over instead of dropping a model tier.
+            sibling: Some("glm-cloud".to_string()),
+            fallback: team_names(&["kimi-cloud"]),
+            ..team_member(
+                "glm-go",
+                "opencode",
+                "opencode-go/glm-5.2",
+                "glm-5.2",
+                &["routine", "boilerplate", "bulk-edit"],
+            )
+        },
+        TeamMember {
+            sibling: Some("glm-go".to_string()),
+            fallback: team_names(&["kimi-cloud"]),
+            ..team_member(
+                "glm-cloud",
+                "opencode",
+                "ollama/glm-5.2:cloud",
+                "glm-5.2",
+                &["routine", "overflow", "bulk-edit"],
+            )
+        },
+        TeamMember {
+            fallback: team_names(&["kimi-cloud"]),
+            ..team_member(
+                "sonnet",
+                "claude",
+                "sonnet",
+                "sonnet",
+                &["general-implementation", "tests", "review"],
+            )
+        },
+        // Last rung: the widest-quota lane, so its chain terminates here.
         team_member(
             "kimi-cloud",
             "opencode",
             "ollama/kimi-k2.7-code:cloud",
+            "kimi-k2.7-code",
             &["parallel-implementation", "research", "tests"],
         ),
     ]
 }
 
-fn team_member(name: &str, target: &str, model: &str, roles: &[&str]) -> TeamMember {
+/// The shipped difficulty ladder, expressed over [`default_team_members`].
+///
+/// Only a default: a `[team.tiers]` table replaces it wholesale, and a roster
+/// that renames these lanes drops the ones it no longer has (see
+/// [`TeamConfig::effective_tiers`]).
+fn default_team_tiers() -> TierMap {
+    TierMap::from_pairs([
+        (TIER_MECHANICAL, vec!["glm-go", "glm-cloud"]),
+        (TIER_ROUTINE, vec!["kimi-cloud", "glm-cloud"]),
+        (TIER_MULTIFILE, vec!["gpt-sol", "kimi-cloud"]),
+        (TIER_DESIGN, vec!["opus", "gpt-sol"]),
+        (TIER_REVIEW, vec!["sonnet", "gpt-sol"]),
+    ])
+}
+
+/// Mechanical edits: renames, moves, formatting — cheapest lanes first.
+const TIER_MECHANICAL: &str = "mechanical";
+/// Routine single-file work with a clear spec.
+const TIER_ROUTINE: &str = "routine";
+/// Changes spanning several files that have to stay consistent.
+const TIER_MULTIFILE: &str = "multifile";
+/// Architecture and API shape: a plan, not an edit.
+const TIER_DESIGN: &str = "design";
+/// Reading someone else's diff for defects.
+const TIER_REVIEW: &str = "review";
+
+fn default_design_only_tiers() -> Vec<String> {
+    vec![TIER_DESIGN.to_string()]
+}
+
+/// Same-lane attempts a transient failure earns before the leader gives up on
+/// the lane. Overridable via `[team.policy] max_retries`.
+pub const DEFAULT_TEAM_MAX_RETRIES: u32 = 2;
+
+fn default_team_max_retries() -> u32 {
+    DEFAULT_TEAM_MAX_RETRIES
+}
+
+fn team_member(name: &str, target: &str, model: &str, logical: &str, roles: &[&str]) -> TeamMember {
     TeamMember {
-        name: name.to_string(),
-        target: target.to_string(),
         model: Some(model.to_string()),
-        mode: TeamMode::Cli,
-        roles: roles.iter().map(|role| (*role).to_string()).collect(),
+        logical: Some(logical.to_string()),
+        roles: team_names(roles),
+        ..TeamMember::new(name, target, TeamMode::Cli)
     }
+}
+
+fn team_names(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 /// Global security defaults applied before any per-project binding. A project
@@ -1236,6 +1901,473 @@ mod tests {
         let mut nul = enabled_team();
         nul.members[0].target.push('\0');
         assert!(nul.validate().is_err());
+    }
+
+    /// A `[team]` section exactly as it was written before lanes existed —
+    /// the shape sitting in `~/.rtrt/config.toml` today.
+    const LEGACY_TEAM_TOML: &str = r#"
+        [team]
+        enabled = true
+        manager_provider = "ollama"
+        manager_model = "granite4.1:3b"
+        manager_base_url = "http://127.0.0.1:11434/v1"
+        leader_order = ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
+
+        [[team.members]]
+        name = "opus"
+        target = "claude"
+        model = "opus"
+        mode = "cli"
+        roles = ["lead", "architecture", "integration"]
+
+        [[team.members]]
+        name = "gpt-sol"
+        target = "opencode"
+        model = "openai/gpt-5.6-sol"
+        mode = "cli"
+        roles = ["deputy", "hard-implementation", "debugging"]
+
+        [[team.members]]
+        name = "glm-go"
+        target = "opencode"
+        model = "opencode-go/glm-5.2"
+        mode = "cli"
+        roles = ["routine", "boilerplate", "bulk-edit"]
+
+        [[team.members]]
+        name = "glm-cloud"
+        target = "opencode"
+        model = "ollama/glm-5.2:cloud"
+        mode = "cli"
+        roles = ["routine", "overflow", "bulk-edit"]
+
+        [[team.members]]
+        name = "sonnet"
+        target = "claude"
+        model = "sonnet"
+        mode = "cli"
+        roles = ["general-implementation", "tests", "review"]
+
+        [[team.members]]
+        name = "kimi-cloud"
+        target = "opencode"
+        model = "ollama/kimi-k2.7-code:cloud"
+        mode = "cli"
+        roles = ["parallel-implementation", "research", "tests"]
+    "#;
+
+    #[test]
+    fn legacy_team_toml_round_trips_without_emitting_lane_keys() {
+        let team = Config::from_toml_str(LEGACY_TEAM_TOML).unwrap().team;
+        let serialized = toml::to_string(&team).unwrap();
+
+        // Nothing a lane-less config never wrote may appear on the way out,
+        // otherwise loading and saving would rewrite everyone's config file.
+        for key in [
+            "tiers",
+            "policy",
+            "logical",
+            "sibling",
+            "fallback",
+            "allow_impl",
+            "flags",
+        ] {
+            assert!(
+                !serialized.contains(key),
+                "{key} leaked into a legacy [team] section:\n{serialized}"
+            );
+        }
+
+        let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, team);
+        assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
+        // The lane fields are present in memory, at their defaults.
+        assert!(team.members.iter().all(|member| member.allow_impl));
+        assert!(team.members.iter().all(|member| member.fallback.is_empty()));
+        assert!(team.tiers.is_empty());
+        assert!(team.policy.is_default());
+        team.validate().unwrap();
+    }
+
+    #[test]
+    fn shipped_tier_ladder_is_ordered_and_validates() {
+        let team = TeamConfig {
+            enabled: true,
+            ..TeamConfig::default()
+        };
+        team.validate().unwrap();
+
+        let tiers = team.effective_tiers();
+        assert_eq!(
+            tiers.names().collect::<Vec<_>>(),
+            ["mechanical", "routine", "multifile", "design", "review"]
+        );
+        assert_eq!(tiers.get("mechanical").unwrap(), ["glm-go", "glm-cloud"]);
+        assert_eq!(tiers.get("design").unwrap(), ["opus", "gpt-sol"]);
+        assert!(team.is_design_only_tier("design"));
+        assert!(!team.is_design_only_tier("review"));
+        assert_eq!(team.effective_default_tier().as_deref(), Some("mechanical"));
+    }
+
+    #[test]
+    fn configured_tiers_replace_the_shipped_ladder_instead_of_merging() {
+        let team = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            leader_order = ["opus"]
+
+            [team.tiers]
+            quick = ["glm-go"]
+            deep = ["opus", "gpt-sol"]
+
+            [team.policy]
+            design_only_tiers = ["deep"]
+            "#,
+        )
+        .unwrap()
+        .team;
+
+        let tiers = team.effective_tiers();
+        // Declaration order, not alphabetical, and none of the shipped rungs.
+        assert_eq!(tiers.names().collect::<Vec<_>>(), ["quick", "deep"]);
+        for shipped in ["mechanical", "routine", "multifile", "review"] {
+            assert!(!tiers.contains(shipped), "{shipped} survived the override");
+        }
+        assert_eq!(team.effective_default_tier().as_deref(), Some("quick"));
+        assert!(team.is_design_only_tier("deep"));
+        assert!(!team.is_design_only_tier("quick"));
+    }
+
+    #[test]
+    fn member_tier_declarations_build_a_ladder_without_a_tiers_table() {
+        let team = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            leader_order = ["lead"]
+
+            [[team.members]]
+            name = "lead"
+            target = "claude"
+            mode = "cli"
+            roles = ["lead"]
+            tier = "solo"
+
+            [[team.members]]
+            name = "helper"
+            target = "opencode"
+            mode = "cli"
+            roles = ["helper"]
+            tier = "solo"
+            "#,
+        )
+        .unwrap()
+        .team;
+
+        // The shipped ladder names lanes this roster does not have, so it is
+        // dropped rather than inherited; the members' own declarations stand.
+        let tiers = team.effective_tiers();
+        assert_eq!(tiers.names().collect::<Vec<_>>(), ["solo"]);
+        assert_eq!(tiers.get("solo").unwrap(), ["lead", "helper"]);
+        team.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_and_looping_fallbacks_are_rejected() {
+        let enabled_team = || TeamConfig {
+            enabled: true,
+            ..TeamConfig::default()
+        };
+
+        let mut unknown = enabled_team();
+        unknown.members[0].fallback = vec!["missing".to_string()];
+        assert_eq!(
+            unknown.validate().unwrap_err().to_string(),
+            "config error: team.members[0].fallback[0] references unknown member: missing"
+        );
+
+        let mut itself = enabled_team();
+        itself.members[0].fallback = vec!["opus".to_string()];
+        assert!(
+            itself
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fallback[0] must not reference itself: opus")
+        );
+
+        let mut repeated = enabled_team();
+        repeated.members[0].fallback = vec!["sonnet".to_string(), "sonnet".to_string()];
+        assert!(
+            repeated
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("team.members[0].fallback lists sonnet twice")
+        );
+
+        // Shipped chain is opus -> gpt-sol -> sonnet -> kimi-cloud; close it.
+        let mut cycle = enabled_team();
+        let last = cycle.members.len() - 1;
+        assert_eq!(cycle.members[last].name, "kimi-cloud");
+        cycle.members[last].fallback = vec!["opus".to_string()];
+        assert_eq!(
+            cycle.validate().unwrap_err().to_string(),
+            "config error: team fallback chain forms a cycle: \
+             opus -> gpt-sol -> sonnet -> kimi-cloud -> opus"
+        );
+    }
+
+    #[test]
+    fn siblings_must_be_one_logical_model_on_two_pools() {
+        let enabled_team = || TeamConfig {
+            enabled: true,
+            ..TeamConfig::default()
+        };
+        let glm_go = 2;
+        assert_eq!(enabled_team().members[glm_go].name, "glm-go");
+
+        let mut crossed = enabled_team();
+        crossed.members[glm_go].logical = Some("kimi-k2.7-code".to_string());
+        assert!(
+            crossed
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sibling glm-cloud serves logical model glm-5.2, not kimi-k2.7-code"),
+        );
+
+        let mut undeclared = enabled_team();
+        undeclared.members[glm_go].logical = None;
+        assert!(
+            undeclared
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires both members to declare `logical`")
+        );
+
+        let mut unknown = enabled_team();
+        unknown.members[glm_go].sibling = Some("missing".to_string());
+        assert!(
+            unknown
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sibling references unknown member: missing")
+        );
+
+        let mut itself = enabled_team();
+        itself.members[glm_go].sibling = Some("glm-go".to_string());
+        assert!(
+            itself
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sibling must not reference itself")
+        );
+
+        // The shipped pair resolves both ways.
+        let team = enabled_team();
+        assert_eq!(team.sibling_of("glm-go").unwrap().name, "glm-cloud");
+        assert_eq!(team.sibling_of("glm-cloud").unwrap().name, "glm-go");
+        assert!(team.sibling_of("sonnet").is_none());
+    }
+
+    #[test]
+    fn tier_rosters_must_name_real_members_and_real_tiers() {
+        let team = |body: &str| {
+            Config::from_toml_str(&format!(
+                "[team]\nenabled = true\nleader_order = [\"opus\"]\n{body}"
+            ))
+        };
+
+        assert!(
+            team("[team.tiers]\nquick = [\"nope\"]\n")
+                .unwrap_err()
+                .to_string()
+                .contains("team.tiers.quick references unknown member: nope")
+        );
+        assert!(
+            team("[team.tiers]\nquick = []\n")
+                .unwrap_err()
+                .to_string()
+                .contains("team.tiers.quick must list at least one member")
+        );
+        assert!(
+            team("[team.tiers]\nquick = [\"sonnet\", \"sonnet\"]\n")
+                .unwrap_err()
+                .to_string()
+                .contains("team.tiers.quick lists sonnet twice")
+        );
+        assert!(
+            team("[team.policy]\ndesign_only_tiers = [\"nope\"]\n")
+                .unwrap_err()
+                .to_string()
+                .contains("team.policy.design_only_tiers references unknown tier: nope")
+        );
+        assert!(
+            team("[team.policy]\ndefault_tier = \"nope\"\n")
+                .unwrap_err()
+                .to_string()
+                .contains("team.policy.default_tier references unknown tier: nope")
+        );
+    }
+
+    #[test]
+    fn design_only_member_cannot_sit_in_an_implementation_tier() {
+        let error = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+            leader_order = ["opus"]
+
+            [team.tiers]
+            deep = ["opus", "gpt-sol"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        // `opus` ships with allow_impl = false, and the override renamed the
+        // design rung without saying the new one is design-only.
+        assert!(
+            error.contains(
+                "team.tiers.deep places design-only member opus in an implementation tier"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("team.policy.design_only_tiers"), "{error}");
+    }
+
+    #[test]
+    fn policy_knobs_default_and_derive_from_the_roster() {
+        let team = TeamConfig::default();
+        assert_eq!(team.policy.max_retries, DEFAULT_TEAM_MAX_RETRIES);
+        assert!(team.policy.redo_on_fallback);
+        assert!(team.policy.prefer_sibling_on_quota);
+        assert!(team.policy.record_provenance);
+        assert!(team.policy.max_fallback_depth.is_none());
+        // Derived from the roster, never a flat literal: a walk visits each
+        // lane at most once.
+        assert_eq!(team.effective_max_fallback_depth(), team.members.len());
+
+        let pinned = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = true
+
+            [team.policy]
+            max_retries = 0
+            redo_on_fallback = false
+            prefer_sibling_on_quota = false
+            max_fallback_depth = 1
+            "#,
+        )
+        .unwrap()
+        .team;
+        assert_eq!(pinned.policy.max_retries, 0);
+        assert!(!pinned.policy.redo_on_fallback);
+        assert!(!pinned.policy.prefer_sibling_on_quota);
+        assert!(pinned.policy.record_provenance);
+        assert_eq!(pinned.effective_max_fallback_depth(), 1);
+        assert!(!pinned.policy.is_default());
+    }
+
+    #[test]
+    fn fallback_chain_is_breadth_first_and_bounded() {
+        let team = TeamConfig::default();
+        assert_eq!(
+            team.fallback_chain("opus"),
+            ["gpt-sol", "sonnet", "kimi-cloud"]
+        );
+        assert!(team.fallback_chain("kimi-cloud").is_empty());
+        assert!(team.fallback_chain("missing").is_empty());
+
+        let mut capped = TeamConfig::default();
+        capped.policy.max_fallback_depth = Some(2);
+        assert_eq!(capped.fallback_chain("opus"), ["gpt-sol", "sonnet"]);
+
+        // Every direct replacement is offered before a replacement's own.
+        let mut branching = TeamConfig::default();
+        branching.members[0].fallback = vec!["glm-go".to_string(), "sonnet".to_string()];
+        assert_eq!(
+            branching.fallback_chain("opus"),
+            ["glm-go", "sonnet", "kimi-cloud"]
+        );
+    }
+
+    #[test]
+    fn lane_fields_round_trip_through_toml() {
+        let source = r#"
+            [team]
+            enabled = true
+            leader_order = ["primary"]
+
+            [team.tiers]
+            mechanical = ["secondary"]
+            deep = ["primary"]
+
+            [team.policy]
+            max_retries = 3
+            design_only_tiers = ["deep"]
+
+            [[team.members]]
+            name = "primary"
+            target = "claude"
+            model = "opus"
+            mode = "cli"
+            roles = ["lead"]
+            logical = "opus"
+            allow_impl = false
+            fallback = ["secondary"]
+
+            [[team.members]]
+            name = "secondary"
+            target = "opencode"
+            model = "opencode-go/glm-5.2"
+            mode = "cli"
+            roles = ["routine"]
+            logical = "glm-5.2"
+
+            [team.members.flags]
+            permission-mode = "acceptEdits"
+            allowed-tools = "Read,Edit"
+        "#;
+
+        let team = Config::from_toml_str(source).unwrap().team;
+        assert!(!team.members[0].allow_impl);
+        assert!(team.members[1].allow_impl);
+        assert_eq!(team.members[1].flag("permission-mode"), Some("acceptEdits"));
+        assert_eq!(team.members[1].flag("allowed-tools"), Some("Read,Edit"));
+        assert_eq!(team.members[1].flag("nope"), None);
+        assert_eq!(team.members[0].fallback, ["secondary"]);
+        assert_eq!(
+            team.effective_tiers().names().collect::<Vec<_>>(),
+            ["mechanical", "deep"]
+        );
+
+        let serialized = toml::to_string(&team).unwrap();
+        assert!(serialized.contains("allow_impl = false"));
+        // The implementing lane keeps the default out of the file.
+        assert_eq!(serialized.matches("allow_impl").count(), 1);
+        let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, team);
+        assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
+        reparsed.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_lane_keys_are_still_rejected() {
+        assert!(
+            Config::from_toml_str(
+                "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"cli\", \
+                 roles = [\"lead\"], laneish = \"typo\" }]"
+            )
+            .is_err()
+        );
+        assert!(Config::from_toml_str("[team]\n[team.policy]\nmax_retry = 1\n").is_err());
     }
 
     #[test]

@@ -14,12 +14,17 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::Config;
+use crate::{
+    Config,
+    model_cache::{ProbeIdentity, Store},
+};
 
 const PATH_ENV_VAR: &str = "PATH";
 const PATH_EXTENSION_ENV_VAR: &str = "PATHEXT";
 const VERSION_TIMEOUT: Duration = Duration::from_millis(800);
-const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often [`run_bounded`] samples a child process — detection's own timing
+/// floor. [`crate::model_cache`] amortises probe costs against it.
+pub(crate) const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OLLAMA_HOST: &str = "127.0.0.1";
 const OLLAMA_PORT: u16 = 11434;
 /// Budget for one runtime round-trip (connect, write, read) against a service
@@ -32,7 +37,7 @@ const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(700);
 /// rather than guessed. It is a ceiling, not an expected cost: the probe
 /// returns as soon as the child exits.
 const MODEL_LIST_ROUND_TRIPS: u32 = 2;
-const MODEL_LIST_TIMEOUT: Duration =
+pub(crate) const MODEL_LIST_TIMEOUT: Duration =
     VERSION_TIMEOUT.saturating_add(RUNTIME_PROBE_TIMEOUT.saturating_mul(MODEL_LIST_ROUND_TRIPS));
 const HTTP_OK_PREFIX: &str = "HTTP/1.1 200";
 /// Characters that may appear inside a `provider/model` identifier. Anything
@@ -506,7 +511,13 @@ fn detect_descriptor(descriptor: &ToolDescriptor, context: &DetectionContext) ->
         RuntimeProbe::Ollama => probe_ollama(),
         probe => (
             None,
-            enumerate_cli_models(probe, located.as_ref().map(|(_, path)| path.as_path())),
+            cached_cli_models(
+                &Store::from_env(),
+                descriptor.name,
+                probe,
+                located.as_ref().map(|(_, path)| path.as_path()),
+                version.as_deref(),
+            ),
         ),
     };
     let enabled = enabled_for_descriptor(descriptor, installed, &context.config);
@@ -663,6 +674,68 @@ fn normalize_version(raw: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(120).collect())
+}
+
+/// Enumerate a CLI agent's models, reusing the last answer when nothing that
+/// would change it has changed.
+///
+/// Asking a CLI to list its models costs a process start plus the tool's own
+/// round-trips to its provider registry — over a second in practice — and
+/// detection runs on every routing decision, so the answer is cached in the
+/// rtrt state directory and re-probed only on a miss. The cache is consulted
+/// strictly *after* [`model_list_command`] has confirmed the tool both
+/// enumerates models this way and is installed: a machine without the tool
+/// neither spawns anything nor creates a cache file, exactly as before.
+fn cached_cli_models(
+    store: &Store,
+    tool: &str,
+    probe: RuntimeProbe,
+    located: Option<&Path>,
+    version: Option<&str>,
+) -> Vec<String> {
+    let Some((path, args)) = model_list_command(probe, located) else {
+        return Vec::new();
+    };
+    store.models_or_probe(tool, &ProbeIdentity::new(path, version, args), || {
+        enumerate_cli_models(probe, Some(path))
+    })
+}
+
+/// Re-probe every CLI-hosted model list, ignoring any cached entry, and rewrite
+/// the cache with what the tools report now.
+///
+/// The escape hatch for a list that went stale inside its reuse window — a
+/// newly authorised provider, a model added upstream. `RTRT_MODEL_CACHE=off`
+/// is the standing form of the same override; this is the one-shot form.
+/// Returns each installed tool that enumerates models this way, paired with the
+/// list it just reported (empty when the tool failed to answer).
+pub fn refresh_cli_model_cache() -> Vec<(String, Vec<String>)> {
+    let store = Store::from_env().refreshing();
+    let path_env = env::var_os(PATH_ENV_VAR);
+    let path_ext_env = env::var_os(PATH_EXTENSION_ENV_VAR);
+    REGISTRY
+        .iter()
+        .filter_map(|descriptor| {
+            let located = find_first_binary(
+                descriptor.binaries,
+                path_env.as_deref(),
+                path_ext_env.as_deref(),
+            );
+            let binary = located.as_ref().map(|(_, path)| path.as_path())?;
+            // Same gate as detection: a tool that does not enumerate this way,
+            // or is not installed, is never spawned.
+            model_list_command(descriptor.runtime_probe, Some(binary))?;
+            let version = command_version(binary, descriptor.version_args);
+            let models = cached_cli_models(
+                &store,
+                descriptor.name,
+                descriptor.runtime_probe,
+                Some(binary),
+                version.as_deref(),
+            );
+            Some((descriptor.name.to_string(), models))
+        })
+        .collect()
 }
 
 /// Ask an installed CLI agent to list its own models.
@@ -1220,6 +1293,55 @@ mod tests {
             MODEL_LIST_TIMEOUT,
             VERSION_TIMEOUT + RUNTIME_PROBE_TIMEOUT * MODEL_LIST_ROUND_TRIPS
         );
+    }
+
+    fn temp_store_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rtrt-detect-cache-{tag}-{}-{}/cli-models.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn an_uninstalled_cli_agent_never_touches_the_cache() {
+        let path = temp_store_path("uninstalled");
+        let store = Store::at(path.clone(), crate::model_cache::CacheMode::Use);
+
+        let models = cached_cli_models(
+            &store,
+            "opencode",
+            RuntimeProbe::CliModelList(OPENCODE_MODELS_ARGS),
+            None,
+            None,
+        );
+
+        assert!(models.is_empty());
+        assert!(
+            !path.exists(),
+            "a machine without the tool must not create a cache file"
+        );
+    }
+
+    #[test]
+    fn probes_that_do_not_enumerate_models_are_never_cached() {
+        // Ollama is handled by its own loopback probe and `None` tools have no
+        // list command; neither may reach the cache even with a real binary.
+        let path = temp_store_path("non-cli");
+        let store = Store::at(path.clone(), crate::model_cache::CacheMode::Use);
+        let binary = Path::new("/nonexistent/bin/tool");
+
+        for probe in [
+            RuntimeProbe::None,
+            RuntimeProbe::Ollama,
+            RuntimeProbe::CliModelList(&[]),
+        ] {
+            assert!(cached_cli_models(&store, "tool", probe, Some(binary), Some("1.0")).is_empty());
+        }
+        assert!(!path.exists());
     }
 
     #[test]

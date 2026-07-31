@@ -23,6 +23,27 @@
 //! buckets by that finer identity; [`provider_usage_windows`] is the same data
 //! folded back to target level, so every pre-existing caller — and every row
 //! already on disk — behaves exactly as before.
+//!
+//! # Provider-reported rate limits
+//!
+//! A configured `[limits]` cap is the owner's *belief* about a quota. The
+//! provider ships the actual numbers in the rate-limit headers of every HTTP
+//! response, and rtrt used to discard them. [`record_response_rate_limit`]
+//! keeps them in a sibling append-only file, `provider-ratelimit.tsv`, in the
+//! same directory and under the same advisory-lock / row-cap / trim discipline
+//! as the ledger itself.
+//!
+//! A sibling file rather than extra ledger columns, because a signal is
+//! per-RESPONSE, not per-invocation: it arrives on rejections too (a 429 is
+//! exactly when the numbers matter), it can arrive when no tokens were spent,
+//! and widening the seven-field row would have invalidated every row already on
+//! disk.
+//!
+//! What is recorded outranks what is configured — [`CapScope::Reported`] beats
+//! [`CapScope::Pool`]/[`CapScope::Shared`], which beat the usage-derived
+//! ordering of [`RoomBasis::ObservedUsage`] — but only while it is still
+//! current. Past the reset instant the provider itself named, the number has
+//! already refilled: that is history, not headroom.
 
 use std::{
     cmp::Ordering,
@@ -33,6 +54,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use reqwest::header::HeaderMap;
 use rtrt_core::{Config, PoolKey};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +76,20 @@ const LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10
 const WINDOW_5H_SECS: u64 = 5 * 60 * 60;
 const WINDOW_24H_SECS: u64 = 24 * 60 * 60;
 const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Sibling of the usage ledger holding provider-reported rate-limit signals.
+/// Shares the ledger's directory, lock discipline and [`MAX_LEDGER_ROWS`] cap.
+const RATELIMIT_FILE_NAME: &str = "provider-ratelimit.tsv";
+/// Written where the provider reported no number. Deliberately not `0`: an
+/// absent header is "unknown", never "exhausted".
+const ABSENT_FIELD: &str = "-";
+
+/// Unit conversions for the duration formats rate-limit headers use.
+const MILLIS_PER_SEC: u64 = 1_000;
+const SECS_PER_MINUTE: f64 = 60.0;
+const SECS_PER_HOUR: f64 = 3_600.0;
+/// Seconds per day, for resolving an RFC 3339 reset instant to an epoch second.
+const SECS_PER_DAY: i64 = 86_400;
 
 /// One parsed ledger row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,9 +224,28 @@ impl TargetHeadroom {
 /// it is genuinely *shared*: the remaining room is one pot the siblings draw
 /// from together. rtrt reports it as such instead of splitting the cap into
 /// invented per-pool slices.
+///
+/// It matters again because the numbers have different provenance, and a human
+/// reading `rtrt route --explain` has to be able to tell them apart. In
+/// descending order of trust:
+///
+/// 1. [`CapScope::Reported`] — the provider's own rate-limit headers, i.e. a
+///    reading of the quota.
+/// 2. [`CapScope::Pool`] / [`CapScope::Shared`] — a configured `[limits]`
+///    ceiling, i.e. a human's belief about the quota.
+/// 3. [`CapScope::Unknown`] — nothing is known, and nothing is invented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapScope {
+    /// The provider itself reported this pool's remaining quota, in the
+    /// rate-limit headers of a response rtrt actually received, and that report
+    /// has not yet passed the reset instant it named.
+    ///
+    /// `limit` / `remaining` are the provider's numbers verbatim. `used` is
+    /// `limit - remaining` when a ceiling came with them — arithmetic on two
+    /// reported numbers — and otherwise rtrt's own observed usage, which is
+    /// measured rather than inferred.
+    Reported,
     /// `[limits.<target>.pools.<pool>]` — this pool's own ceiling. `used` is
     /// this pool's usage alone.
     Pool,
@@ -212,6 +267,29 @@ impl CapScope {
     /// True when the ceiling is shared with sibling pools.
     pub fn is_shared(self) -> bool {
         matches!(self, Self::Shared)
+    }
+
+    /// True when the number came from the provider rather than from config.
+    pub fn is_reported(self) -> bool {
+        matches!(self, Self::Reported)
+    }
+
+    /// How a human should read this axis. Spelled out per scope so a real
+    /// provider number, a configured guess and "nothing is known" can never be
+    /// mistaken for one another on a `--explain` line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reported => {
+                "provider-reported (remaining quota from the provider's own rate-limit headers)"
+            }
+            Self::Pool => {
+                "configured (this pool's own [limits] cap — a set belief, not a measurement)"
+            }
+            Self::Shared => {
+                "configured (the target's [limits] cap, shared with every sibling pool)"
+            }
+            Self::Unknown => "unknown (nothing reported by the provider, nothing configured)",
+        }
     }
 }
 
@@ -248,6 +326,23 @@ impl PoolCap {
                 remaining: Some(limit.saturating_sub(used)),
             },
             None => Self::unknown(used),
+        }
+    }
+
+    /// A ceiling the provider reported for itself.
+    ///
+    /// `remaining` is the provider's number verbatim. `used` is
+    /// `limit - remaining` when a ceiling came with it, and otherwise the usage
+    /// rtrt observed — never a derived stand-in for the ceiling. A reported
+    /// remaining with no reported ceiling therefore has no fraction, and
+    /// [`PoolCap::remaining_fraction`] stays `None` rather than inventing a
+    /// denominator.
+    fn reported(limit: Option<u64>, remaining: u64, observed_used: u64) -> Self {
+        Self {
+            scope: CapScope::Reported,
+            limit,
+            used: limit.map_or(observed_used, |limit| limit.saturating_sub(remaining)),
+            remaining: Some(remaining),
         }
     }
 
@@ -315,6 +410,31 @@ impl PoolHeadroom {
         }
     }
 
+    /// The provenance of the axis [`PoolHeadroom::room_fraction`] is actually
+    /// decided by — the binding (smallest-fraction) capped axis. `None` when no
+    /// axis is capped.
+    pub fn room_scope(&self) -> Option<CapScope> {
+        match (
+            self.tokens.remaining_fraction(),
+            self.requests.remaining_fraction(),
+        ) {
+            (Some(tokens), Some(requests)) => Some(if tokens <= requests {
+                self.tokens.scope
+            } else {
+                self.requests.scope
+            }),
+            (Some(_), None) => Some(self.tokens.scope),
+            (None, Some(_)) => Some(self.requests.scope),
+            (None, None) => None,
+        }
+    }
+
+    /// True when either axis rests on a number the provider reported rather
+    /// than on a configured cap.
+    pub fn has_reported_quota(&self) -> bool {
+        self.tokens.scope.is_reported() || self.requests.scope.is_reported()
+    }
+
     /// The structured identity behind [`PoolHeadroom::key`].
     pub fn pool_key(&self) -> PoolKey {
         PoolKey::new(&self.target, self.pool.as_deref())
@@ -330,6 +450,11 @@ impl PoolHeadroom {
 #[serde(rename_all = "snake_case")]
 pub enum RoomBasis {
     /// Every compared pool had a real cap: ranked by remaining fraction.
+    ///
+    /// `RoomBasis` names the *kind* of ordering only. The cap behind it may be
+    /// provider-reported or configured; which one it was lives on each axis's
+    /// [`CapScope`], and is summarised by [`PoolRanking::cap_scope`] /
+    /// [`PoolRanking::basis_label`].
     Quota,
     /// At least one pool had no cap: ranked by observed 24h usage, ascending.
     ObservedUsage,
@@ -364,6 +489,552 @@ impl PoolRanking {
     pub fn best(&self) -> Option<&PoolHeadroom> {
         self.ranked.first()
     }
+
+    /// The cap provenance every ranked pool shares, or `None` when the set is
+    /// empty, uncapped, or mixed. `Some(CapScope::Reported)` is the strongest
+    /// reading available: every number in this order came from the providers
+    /// themselves.
+    pub fn cap_scope(&self) -> Option<CapScope> {
+        let mut scopes = self.ranked.iter().map(PoolHeadroom::room_scope);
+        let first = scopes.next()??;
+        scopes.all(|scope| scope == Some(first)).then_some(first)
+    }
+
+    /// What this order means *and* where its numbers came from, in one line.
+    ///
+    /// [`RoomBasis::label`] states only the former, so on its own a
+    /// provider-reported remaining would read exactly like a configured guess.
+    pub fn basis_label(&self) -> String {
+        match self.cap_scope() {
+            Some(scope) if scope.is_capped() => {
+                format!("{} — {}", self.basis.label(), scope.label())
+            }
+            _ => self.basis.label().to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider-reported rate-limit signals
+// ---------------------------------------------------------------------------
+
+/// The header names carrying one fact about one axis, in every dialect rtrt
+/// speaks. Anthropic and OpenAI (and OpenAI-compatible servers that bother)
+/// name the same three facts differently; both spellings are checked for every
+/// axis, which is what makes the two dialects parse into one record.
+const REQUEST_LIMIT_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-requests-limit",
+    "x-ratelimit-limit-requests",
+];
+const REQUEST_REMAINING_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-requests-remaining",
+    "x-ratelimit-remaining-requests",
+];
+const REQUEST_RESET_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-requests-reset",
+    "x-ratelimit-reset-requests",
+];
+const TOKEN_LIMIT_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-tokens-limit",
+    "x-ratelimit-limit-tokens",
+];
+const TOKEN_REMAINING_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-tokens-remaining",
+    "x-ratelimit-remaining-tokens",
+];
+const TOKEN_RESET_HEADERS: [&str; 2] = [
+    "anthropic-ratelimit-tokens-reset",
+    "x-ratelimit-reset-tokens",
+];
+/// Sent by both dialects on a 429 (and, per RFC 9110, by neither otherwise).
+const RETRY_AFTER_HEADERS: [&str; 1] = ["retry-after"];
+
+/// One axis — requests or tokens — of what a provider reported about its own
+/// rate limit.
+///
+/// Every field is independently optional: a provider may send a remaining with
+/// no ceiling, a ceiling with no reset, or a reset alone. A header that is
+/// absent, empty or unparseable leaves its field `None`, never `0` — a zero
+/// would read as "fully exhausted", which is a fabrication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitAxis {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u64>,
+    /// The epoch second the provider says this axis refills at. Durations
+    /// (`6m0s`, `250ms`, `30`) are resolved against the observation time;
+    /// Anthropic's RFC 3339 instants are absolute already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<u64>,
+}
+
+impl RateLimitAxis {
+    /// True when the provider reported nothing at all on this axis.
+    pub fn is_empty(&self) -> bool {
+        self.limit.is_none() && self.remaining.is_none() && self.reset_at.is_none()
+    }
+
+    /// Whether this axis still describes the present.
+    ///
+    /// Past the reset instant the provider itself named, whatever it reported
+    /// has already refilled — presenting it as current would be presenting
+    /// history as headroom. When no reset instant was reported the window is
+    /// unknowable, so the axis is honoured only inside the same
+    /// [`WINDOW_24H_SECS`] window the headroom itself is measured over, and
+    /// never longer. No separate staleness constant is invented for it.
+    pub fn is_current(&self, observed_at: u64, now: u64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        match self.reset_at {
+            Some(reset_at) => now < reset_at,
+            None => now.saturating_sub(observed_at) < WINDOW_24H_SECS,
+        }
+    }
+}
+
+/// Everything one provider HTTP response disclosed about the quota it drew
+/// from — the normalized record both dialects parse into.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitSignal {
+    /// [`PoolKey::canonical`] of the bucket the response drew from.
+    pub key: String,
+    /// Epoch second the response carrying these headers was observed. Also the
+    /// origin any duration-style reset was resolved against.
+    pub observed_at: u64,
+    /// HTTP status of that response. Kept because a signal read off a 429 is
+    /// worth at least as much as one read off a success, and a reader should be
+    /// able to see which it was.
+    pub status: u16,
+    #[serde(default)]
+    pub requests: RateLimitAxis,
+    #[serde(default)]
+    pub tokens: RateLimitAxis,
+    /// `retry-after`, resolved to the epoch second it points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_at: Option<u64>,
+}
+
+impl RateLimitSignal {
+    /// True when the response disclosed nothing usable. Such a signal is never
+    /// written: once on disk, an all-absent row is indistinguishable from a
+    /// fabricated one.
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.tokens.is_empty() && self.retry_after_at.is_none()
+    }
+
+    /// The structured identity behind [`RateLimitSignal::key`].
+    pub fn pool_key(&self) -> PoolKey {
+        PoolKey::parse(&self.key)
+    }
+
+    /// This signal with everything past its own reset instant dropped, or
+    /// `None` when nothing about it is still current.
+    pub fn current_at(&self, now: u64) -> Option<Self> {
+        let mut fresh = self.clone();
+        if !fresh.requests.is_current(self.observed_at, now) {
+            fresh.requests = RateLimitAxis::default();
+        }
+        if !fresh.tokens.is_current(self.observed_at, now) {
+            fresh.tokens = RateLimitAxis::default();
+        }
+        fresh.retry_after_at = fresh.retry_after_at.filter(|at| now < *at);
+        (!fresh.is_empty()).then_some(fresh)
+    }
+
+    /// The epoch second before which the provider asked rtrt not to come back,
+    /// when it said so at all.
+    pub fn backoff_until(&self) -> Option<u64> {
+        self.retry_after_at
+    }
+
+    fn to_tsv_line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.observed_at,
+            self.key,
+            self.status,
+            optional_field(self.requests.limit),
+            optional_field(self.requests.remaining),
+            optional_field(self.requests.reset_at),
+            optional_field(self.tokens.limit),
+            optional_field(self.tokens.remaining),
+            optional_field(self.tokens.reset_at),
+            optional_field(self.retry_after_at),
+        )
+    }
+
+    fn parse(line: &str) -> Option<Self> {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 10 {
+            return None;
+        }
+        Some(Self {
+            observed_at: fields[0].trim().parse().ok()?,
+            key: PoolKey::parse(fields[1]).canonical(),
+            status: fields[2].trim().parse().ok()?,
+            requests: RateLimitAxis {
+                limit: parse_optional_field(fields[3]),
+                remaining: parse_optional_field(fields[4]),
+                reset_at: parse_optional_field(fields[5]),
+            },
+            tokens: RateLimitAxis {
+                limit: parse_optional_field(fields[6]),
+                remaining: parse_optional_field(fields[7]),
+                reset_at: parse_optional_field(fields[8]),
+            },
+            retry_after_at: parse_optional_field(fields[9]),
+        })
+    }
+}
+
+fn optional_field(value: Option<u64>) -> String {
+    value.map_or_else(|| ABSENT_FIELD.to_string(), |value| value.to_string())
+}
+
+fn parse_optional_field(field: &str) -> Option<u64> {
+    let field = field.trim();
+    if field == ABSENT_FIELD {
+        return None;
+    }
+    field.parse().ok()
+}
+
+/// Read a provider response's rate-limit headers into the normalized record.
+///
+/// `None` when the response carried nothing usable: an absent, empty or garbage
+/// header contributes nothing — never a zero and never a guess. `observed_at`
+/// is a parameter rather than "now" so the caller (and the tests) control the
+/// origin that duration-style resets resolve against.
+pub fn rate_limit_signal(
+    key: &PoolKey,
+    status: u16,
+    observed_at: u64,
+    headers: &HeaderMap,
+) -> Option<RateLimitSignal> {
+    let signal = RateLimitSignal {
+        key: key.canonical(),
+        observed_at,
+        status,
+        requests: axis_from_headers(
+            headers,
+            observed_at,
+            &REQUEST_LIMIT_HEADERS,
+            &REQUEST_REMAINING_HEADERS,
+            &REQUEST_RESET_HEADERS,
+        ),
+        tokens: axis_from_headers(
+            headers,
+            observed_at,
+            &TOKEN_LIMIT_HEADERS,
+            &TOKEN_REMAINING_HEADERS,
+            &TOKEN_RESET_HEADERS,
+        ),
+        retry_after_at: first_header(headers, &RETRY_AFTER_HEADERS)
+            .and_then(|raw| parse_reset_instant(raw, observed_at)),
+    };
+    (!signal.is_empty()).then_some(signal)
+}
+
+fn axis_from_headers(
+    headers: &HeaderMap,
+    observed_at: u64,
+    limit: &[&str],
+    remaining: &[&str],
+    reset: &[&str],
+) -> RateLimitAxis {
+    RateLimitAxis {
+        limit: first_header(headers, limit).and_then(parse_count),
+        remaining: first_header(headers, remaining).and_then(parse_count),
+        reset_at: first_header(headers, reset)
+            .and_then(|raw| parse_reset_instant(raw, observed_at)),
+    }
+}
+
+/// The first of `names` present with a non-empty, valid-UTF-8 value.
+/// [`HeaderMap`] lookups are already case-insensitive.
+fn first_header<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// A whole-number header value. Anything that is not a plain non-negative
+/// integer is `None`: a header rtrt cannot read is not a quota of zero.
+fn parse_count(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// Resolve a reset / retry-after header to the epoch second it points at.
+///
+/// Anthropic reports an absolute RFC 3339 instant; OpenAI reports a duration
+/// (`6m0s`, `250ms`) or a bare count of seconds. Both normalize to one absolute
+/// instant, which is also what makes staleness decidable without a separate
+/// staleness constant. Sub-second durations round *up* so that a real, if tiny,
+/// window never collapses into "already reset".
+fn parse_reset_instant(raw: &str, observed_at: u64) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(epoch) = parse_rfc3339_epoch(raw) {
+        return Some(epoch);
+    }
+    let millis = parse_duration_millis(raw)?;
+    Some(observed_at.saturating_add(millis.div_ceil(MILLIS_PER_SEC)))
+}
+
+/// Parse a rate-limit duration into milliseconds.
+///
+/// Accepts a bare number (seconds, e.g. `30`) or a Go-style unit string
+/// (`6m0s`, `1s`, `250ms`, `1h30m`). Empty, negative, non-finite, unit-less or
+/// unknown-unit input is `None` — garbage must never become a number.
+pub(crate) fn parse_duration_millis(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // A bare number is a count of seconds, which is what OpenAI-compatible
+    // servers most often send.
+    if let Ok(secs) = raw.parse::<f64>() {
+        return millis_from_secs(secs);
+    }
+    let mut total = 0.0_f64;
+    let mut rest = raw;
+    let mut segments = 0usize;
+    while !rest.is_empty() {
+        // A trailing number with no unit (`6m0`) is malformed, not "0 of
+        // something", so a missing unit boundary rejects the whole value.
+        let value_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+        if value_len == 0 {
+            return None;
+        }
+        let value = rest[..value_len].parse::<f64>().ok()?;
+        rest = &rest[value_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        total += value * unit_secs(&rest[..unit_len])?;
+        rest = &rest[unit_len..];
+        segments += 1;
+    }
+    (segments > 0).then_some(())?;
+    millis_from_secs(total)
+}
+
+fn unit_secs(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "ns" => 1e-9,
+        "us" | "\u{b5}s" | "\u{3bc}s" => 1e-6,
+        "ms" => 1e-3,
+        "s" => 1.0,
+        "m" => SECS_PER_MINUTE,
+        "h" => SECS_PER_HOUR,
+        _ => return None,
+    })
+}
+
+fn millis_from_secs(secs: f64) -> Option<u64> {
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    let millis = (secs * MILLIS_PER_SEC as f64).round();
+    (millis <= u64::MAX as f64).then_some(millis as u64)
+}
+
+/// Parse an RFC 3339 timestamp — `2026-07-31T12:34:56Z`, optional fractional
+/// seconds, `Z` or `\u{b1}HH:MM` offset — into an epoch second.
+///
+/// Hand-rolled rather than pulling a date crate into a provider adapter for one
+/// header. `None` on anything malformed, which is what routes a value like
+/// `6m0s` on to the duration parser.
+pub(crate) fn parse_rfc3339_epoch(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let bytes = raw.as_bytes();
+    if bytes.len() < 19 || !raw.is_ascii() {
+        return None;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let year = ascii_number(&raw[0..4])?;
+    let month = ascii_number(&raw[5..7])?;
+    let day = ascii_number(&raw[8..10])?;
+    let hour = ascii_number(&raw[11..13])?;
+    let minute = ascii_number(&raw[14..16])?;
+    // A leap second (`:60`) is clamped rather than rejected — the instant it
+    // names is real even though the arithmetic below has no room for it.
+    let second = ascii_number(&raw[17..19])?.min(59);
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+
+    let mut rest = &raw[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(fraction.len());
+        if digits == 0 {
+            return None;
+        }
+        rest = &fraction[digits..];
+    }
+    let offset_secs = match rest.as_bytes().first() {
+        // No offset at all is not strictly RFC 3339, but reading it as UTC is
+        // the only interpretation that does not silently discard a real number.
+        None => 0,
+        Some(b'Z' | b'z') if rest.len() == 1 => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            if rest.len() != 6 || rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            let offset_hour = ascii_number(&rest[1..3])?;
+            let offset_minute = ascii_number(&rest[4..6])?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let magnitude = offset_hour * SECS_PER_HOUR as i64 + offset_minute * 60;
+            if *sign == b'+' { magnitude } else { -magnitude }
+        }
+        _ => return None,
+    };
+
+    let epoch = days_from_civil(year, month, day) * SECS_PER_DAY
+        + hour * SECS_PER_HOUR as i64
+        + minute * 60
+        + second
+        - offset_secs;
+    u64::try_from(epoch).ok()
+}
+
+fn ascii_number(raw: &str) -> Option<i64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days between 1970-01-01 and the given proleptic-Gregorian date (Hinnant's
+/// `days_from_civil`), exact for every date this parser accepts.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Record what one provider response said about its own rate limit.
+///
+/// Best-effort by exactly the same contract as [`record_invocation`]: the same
+/// bounded advisory lock, one appended line, the same [`MAX_LEDGER_ROWS`] trim,
+/// and failure reported as `false` rather than as an error the request path
+/// could ever surface. A signal with nothing in it is not written at all.
+pub fn record_rate_limit(signal: &RateLimitSignal) -> bool {
+    record_rate_limit_at(&ratelimit_path(), signal)
+}
+
+fn record_rate_limit_at(path: &Path, signal: &RateLimitSignal) -> bool {
+    if signal.is_empty() {
+        return false;
+    }
+    // Same rationale as the ledger: trim_to_cap is a read-rewrite, so a
+    // concurrent append during a trim could be lost. When the lock cannot be
+    // taken within the bounded retries we still append and skip only the trim.
+    let lock = LedgerLock::try_acquire(lock_path(path), LOCK_STALE_SECS);
+    if append_line(path, &signal.to_tsv_line()).is_err() {
+        return false;
+    }
+    if lock.is_some() {
+        let _ = trim_to_cap(path, MAX_LEDGER_ROWS);
+    }
+    true
+}
+
+/// Parse a provider response's rate-limit headers and record them.
+///
+/// The entry point every adapter calls, on the success *and* the error path.
+/// Returns the signal that was written, or `None` when the response disclosed
+/// nothing or the write was skipped — never an error.
+pub fn record_response_rate_limit(
+    key: &PoolKey,
+    status: u16,
+    headers: &HeaderMap,
+) -> Option<RateLimitSignal> {
+    let signal = rate_limit_signal(key, status, now_epoch_secs(), headers)?;
+    record_rate_limit(&signal).then_some(signal)
+}
+
+/// The newest signal recorded for each pool, whether or not it is still
+/// current — [`RateLimitSignal::current_at`] is what decides that.
+pub fn rate_limit_signals() -> BTreeMap<String, RateLimitSignal> {
+    latest_signals(&read_signals(&ratelimit_path()))
+}
+
+/// The newest signal recorded for one pool.
+pub fn rate_limit_signal_for(key: &PoolKey) -> Option<RateLimitSignal> {
+    rate_limit_signals().remove(&key.canonical())
+}
+
+/// Collapse the append-only log to one row per pool: newest observation wins,
+/// and within one second the later row wins, because file order is the only
+/// further ordering there is.
+fn latest_signals(rows: &[RateLimitSignal]) -> BTreeMap<String, RateLimitSignal> {
+    let mut out: BTreeMap<String, RateLimitSignal> = BTreeMap::new();
+    for row in rows {
+        match out.get(&row.key) {
+            Some(seen) if seen.observed_at > row.observed_at => {}
+            _ => {
+                out.insert(row.key.clone(), row.clone());
+            }
+        }
+    }
+    out
+}
+
+fn read_signals(path: &Path) -> Vec<RateLimitSignal> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(RateLimitSignal::parse)
+        .collect()
+}
+
+/// Sibling of the usage ledger, so a redirected ledger (tests, sandboxes) takes
+/// its rate-limit signals with it.
+fn ratelimit_path() -> PathBuf {
+    if let Some(custom) = std::env::var_os("RTRT_PROVIDER_RATELIMIT_PATH") {
+        return PathBuf::from(custom);
+    }
+    ledger_path().with_file_name(RATELIMIT_FILE_NAME)
 }
 
 /// Append one invocation to the ledger. Best-effort: returns the row that was
@@ -538,7 +1209,12 @@ fn headroom_for(
 /// always visible even before its first invocation). Target-level visibility is
 /// unchanged and still comes from [`target_headroom`].
 pub fn pool_headroom(config: &Config) -> BTreeMap<String, PoolHeadroom> {
-    pool_headroom_from_windows(&pool_usage_windows(), config)
+    pool_headroom_from_parts(
+        &pool_usage_windows(),
+        config,
+        &rate_limit_signals(),
+        now_epoch_secs(),
+    )
 }
 
 /// Headroom for a single pool. Public so a caller can query one candidate
@@ -546,7 +1222,14 @@ pub fn pool_headroom(config: &Config) -> BTreeMap<String, PoolHeadroom> {
 pub fn headroom_for_pool(key: &PoolKey, config: &Config) -> PoolHeadroom {
     let pooled = pool_usage_windows();
     let targets = fold_pools_to_targets(&pooled);
-    headroom_for_pool_in(key, &pooled, &targets, config)
+    headroom_for_pool_in(
+        key,
+        &pooled,
+        &targets,
+        config,
+        &rate_limit_signals(),
+        now_epoch_secs(),
+    )
 }
 
 /// The pools of one target, ranked most-room-first — the "which sibling should
@@ -562,9 +1245,14 @@ pub fn rank_target_pools(target: &str, config: &Config) -> PoolRanking {
     rank_pools_by_room(&pools)
 }
 
-fn pool_headroom_from_windows(
+/// Same inputs the ledger has always used, plus whatever the providers
+/// themselves reported. With no signals on disk the extra argument is empty and
+/// every number is what it was before.
+fn pool_headroom_from_parts(
     pooled: &BTreeMap<String, TargetWindows>,
     config: &Config,
+    signals: &BTreeMap<String, RateLimitSignal>,
+    now: u64,
 ) -> BTreeMap<String, PoolHeadroom> {
     let targets = fold_pools_to_targets(pooled);
     let mut keys = pooled
@@ -578,16 +1266,29 @@ fn pool_headroom_from_windows(
             }
         }
     }
+    // A pool the provider has reported on is visible even with no ledger rows
+    // yet — the report is the strongest thing rtrt knows about it.
+    keys.extend(signals.keys().map(|key| PoolKey::parse(key)));
     keys.sort();
     keys.dedup();
     keys.into_iter()
         .map(|key| {
             (
                 key.canonical(),
-                headroom_for_pool_in(&key, pooled, &targets, config),
+                headroom_for_pool_in(&key, pooled, &targets, config, signals, now),
             )
         })
         .collect()
+}
+
+/// The pre-signal call shape, kept so the tests that pin the configured-cap
+/// behaviour exercise exactly the path they always did.
+#[cfg(test)]
+fn pool_headroom_from_windows(
+    pooled: &BTreeMap<String, TargetWindows>,
+    config: &Config,
+) -> BTreeMap<String, PoolHeadroom> {
+    pool_headroom_from_parts(pooled, config, &BTreeMap::new(), now_epoch_secs())
 }
 
 fn headroom_for_pool_in(
@@ -595,6 +1296,8 @@ fn headroom_for_pool_in(
     pooled: &BTreeMap<String, TargetWindows>,
     targets: &BTreeMap<String, TargetWindows>,
     config: &Config,
+    signals: &BTreeMap<String, RateLimitSignal>,
+    now: u64,
 ) -> PoolHeadroom {
     let window = pooled
         .get(&key.canonical())
@@ -614,16 +1317,27 @@ fn headroom_for_pool_in(
         .and_then(|pool| target_limit.and_then(|limit| limit.pool(pool)))
         .filter(|limit| limit.is_set());
 
+    // The provider's own reading of this exact pool, with anything past its
+    // reset instant already dropped. Never inherited from the target: a
+    // rate-limit header describes the bucket the response drew from, and
+    // spreading it over siblings would be a guess.
+    let reported = signals
+        .get(&key.canonical())
+        .and_then(|signal| signal.current_at(now))
+        .unwrap_or_default();
+
     // Resolved per axis: a pool may pin tokens while inheriting a shared
     // request cap, and collapsing that into one scope would misreport one of
     // them.
-    let tokens = axis_cap(
+    let tokens = axis_cap_with_reported(
+        reported.tokens,
         pool_limit.and_then(|limit| limit.daily_tokens),
         target_limit.and_then(|limit| limit.daily_tokens),
         window.tokens,
         target_window.tokens,
     );
-    let requests = axis_cap(
+    let requests = axis_cap_with_reported(
+        reported.requests,
         pool_limit.and_then(|limit| limit.daily_requests),
         target_limit.and_then(|limit| limit.daily_requests),
         window.requests,
@@ -640,6 +1354,26 @@ fn headroom_for_pool_in(
         tokens,
         requests,
         sibling_pools: sibling_pool_count(key.target_key(), pooled),
+    }
+}
+
+/// [`axis_cap`] with the provider's own reading of this axis taking precedence.
+///
+/// Trust order, highest first: a still-current provider-reported `remaining`,
+/// then a configured `[limits]` cap (this pool's, else the target's shared
+/// one), then nothing. A reported axis with no `remaining` is not a ceiling — a
+/// bare limit or reset says nothing about what is left — so it falls through to
+/// config rather than being dressed up as one.
+pub(crate) fn axis_cap_with_reported(
+    reported: RateLimitAxis,
+    pool_limit: Option<u64>,
+    target_limit: Option<u64>,
+    pool_used: u64,
+    target_used: u64,
+) -> PoolCap {
+    match reported.remaining {
+        Some(remaining) => PoolCap::reported(reported.limit, remaining, pool_used),
+        None => axis_cap(pool_limit, target_limit, pool_used, target_used),
     }
 }
 
@@ -762,11 +1496,15 @@ fn windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWin
 }
 
 fn append_row(path: &Path, row: &LedgerRow) -> std::io::Result<()> {
+    append_line(path, &row.to_tsv_line())
+}
+
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{}", row.to_tsv_line())
+    writeln!(file, "{line}")
 }
 
 fn trim_to_cap(path: &Path, cap: usize) -> std::io::Result<()> {
@@ -1308,6 +2046,487 @@ mod tests {
         assert_eq!(headroom.used_requests, 2);
         assert_eq!(headroom.remaining_requests, Some(8));
         assert!(!headroom.limits_unknown());
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider-reported rate-limit signals
+    // -----------------------------------------------------------------------
+
+    /// A fixed observation instant so duration-resolved and RFC 3339 resets can
+    /// be compared against each other exactly. `1_700_000_000` is
+    /// `2023-11-14T22:13:20Z`, which the RFC 3339 test pins independently.
+    const OBSERVED: u64 = 1_700_000_000;
+    /// `OBSERVED` + 6 minutes, i.e. the same instant `6m0s` and `360` resolve to.
+    const RESET_INSTANT: &str = "2023-11-14T22:19:20Z";
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        use reqwest::header::{HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// A reading that pins only the tokens axis — the axis the two-pool fixture
+    /// binds on, so the assertions stay about provenance rather than arithmetic.
+    fn reported_signal(
+        key: &str,
+        observed_at: u64,
+        limit: Option<u64>,
+        remaining: u64,
+        reset_at: u64,
+    ) -> RateLimitSignal {
+        RateLimitSignal {
+            key: key.to_string(),
+            observed_at,
+            status: 200,
+            requests: RateLimitAxis::default(),
+            tokens: RateLimitAxis {
+                limit,
+                remaining: Some(remaining),
+                reset_at: Some(reset_at),
+            },
+            retry_after_at: None,
+        }
+    }
+
+    fn signal_map<const N: usize>(
+        signals: [RateLimitSignal; N],
+    ) -> BTreeMap<String, RateLimitSignal> {
+        signals
+            .into_iter()
+            .map(|signal| (signal.key.clone(), signal))
+            .collect()
+    }
+
+    #[test]
+    fn anthropic_and_openai_header_sets_parse_into_the_same_record() {
+        let key = PoolKey::unpooled("anthropic");
+        let anthropic = rate_limit_signal(
+            &key,
+            200,
+            OBSERVED,
+            &headers(&[
+                ("anthropic-ratelimit-requests-limit", "1000"),
+                ("anthropic-ratelimit-requests-remaining", "999"),
+                ("anthropic-ratelimit-requests-reset", RESET_INSTANT),
+                ("anthropic-ratelimit-tokens-limit", "80000"),
+                ("anthropic-ratelimit-tokens-remaining", "12345"),
+                ("anthropic-ratelimit-tokens-reset", RESET_INSTANT),
+            ]),
+        )
+        .expect("anthropic headers are a signal");
+        let openai = rate_limit_signal(
+            &key,
+            200,
+            OBSERVED,
+            &headers(&[
+                ("x-ratelimit-limit-requests", "1000"),
+                ("x-ratelimit-remaining-requests", "999"),
+                // The same instant, expressed the way OpenAI expresses it.
+                ("x-ratelimit-reset-requests", "6m0s"),
+                ("x-ratelimit-limit-tokens", "80000"),
+                ("x-ratelimit-remaining-tokens", "12345"),
+                ("x-ratelimit-reset-tokens", "360"),
+            ]),
+        )
+        .expect("openai headers are a signal");
+
+        assert_eq!(anthropic, openai, "one normalized record, two dialects");
+        assert_eq!(
+            anthropic.requests,
+            RateLimitAxis {
+                limit: Some(1_000),
+                remaining: Some(999),
+                reset_at: Some(OBSERVED + 360),
+            }
+        );
+        assert_eq!(anthropic.tokens.remaining, Some(12_345));
+        assert_eq!(anthropic.retry_after_at, None);
+    }
+
+    #[test]
+    fn every_documented_duration_shape_parses_and_garbage_never_does() {
+        assert_eq!(parse_duration_millis("6m0s"), Some(360_000));
+        assert_eq!(parse_duration_millis("1s"), Some(1_000));
+        assert_eq!(parse_duration_millis("250ms"), Some(250));
+        assert_eq!(parse_duration_millis("30"), Some(30_000));
+        assert_eq!(parse_duration_millis("1h30m"), Some(5_400_000));
+        assert_eq!(parse_duration_millis("1.5s"), Some(1_500));
+        for garbage in ["", "   ", "soon", "-5", "s", "6m0", "1x", "nan", "inf"] {
+            assert_eq!(
+                parse_duration_millis(garbage),
+                None,
+                "{garbage:?} must never become a number"
+            );
+        }
+        // A sub-second window is real; rounding it down would make a live
+        // reading read as already reset.
+        assert_eq!(parse_reset_instant("250ms", OBSERVED), Some(OBSERVED + 1));
+        assert_eq!(parse_reset_instant("6m0s", OBSERVED), Some(OBSERVED + 360));
+    }
+
+    #[test]
+    fn rfc3339_reset_instants_resolve_and_garbage_never_does() {
+        assert_eq!(parse_rfc3339_epoch("2023-11-14T22:13:20Z"), Some(OBSERVED));
+        assert_eq!(
+            parse_rfc3339_epoch("2023-11-14T22:13:20.123456Z"),
+            Some(OBSERVED)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2023-11-14T23:13:20+01:00"),
+            Some(OBSERVED)
+        );
+        assert_eq!(
+            parse_rfc3339_epoch("2023-11-14T21:13:20-01:00"),
+            Some(OBSERVED)
+        );
+        for garbage in [
+            "",
+            "2023-11-14",
+            "2023-13-01T00:00:00Z",
+            "2023-02-30T00:00:00Z",
+            "2023-11-14T25:00:00Z",
+            "2023-11-14T22:13:20QQ",
+            "not-a-real-timestamp",
+            "6m0s",
+        ] {
+            assert_eq!(parse_rfc3339_epoch(garbage), None, "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn absent_empty_and_garbage_headers_record_nothing_rather_than_zero() {
+        let key = PoolKey::unpooled("openai");
+        assert!(
+            rate_limit_signal(&key, 200, OBSERVED, &HeaderMap::new()).is_none(),
+            "no headers at all is not a signal"
+        );
+        assert!(
+            rate_limit_signal(
+                &key,
+                200,
+                OBSERVED,
+                &headers(&[
+                    ("x-ratelimit-limit-requests", ""),
+                    ("x-ratelimit-remaining-requests", "   "),
+                    ("x-ratelimit-reset-requests", "whenever"),
+                    ("retry-after", "soon"),
+                ])
+            )
+            .is_none(),
+            "empty and unreadable headers carry no number"
+        );
+
+        // One readable header is still a reading, and the unreadable one beside
+        // it stays absent instead of collapsing to zero.
+        let partial = rate_limit_signal(
+            &key,
+            200,
+            OBSERVED,
+            &headers(&[
+                ("x-ratelimit-limit-requests", "-1"),
+                ("x-ratelimit-remaining-requests", "17"),
+            ]),
+        )
+        .expect("one readable header is a signal");
+        assert_eq!(partial.requests.limit, None);
+        assert_eq!(partial.requests.remaining, Some(17));
+        assert_eq!(partial.requests.reset_at, None);
+
+        // An empty signal is never written to disk.
+        assert!(!record_rate_limit_at(
+            &temp_ledger_path("ratelimit-empty"),
+            &RateLimitSignal::default()
+        ));
+    }
+
+    #[test]
+    fn a_429_still_records_the_remaining_and_reset_it_carries() {
+        let key = PoolKey::new("openai", Some("gpt-5"));
+        let signal = rate_limit_signal(
+            &key,
+            429,
+            OBSERVED,
+            &headers(&[
+                ("x-ratelimit-limit-requests", "1000"),
+                ("x-ratelimit-remaining-requests", "0"),
+                ("x-ratelimit-reset-requests", "6m0s"),
+                ("retry-after", "60"),
+            ]),
+        )
+        .expect("a rejection is still a reading");
+        assert_eq!(signal.status, 429);
+        assert_eq!(signal.requests.remaining, Some(0));
+        assert_eq!(signal.requests.reset_at, Some(OBSERVED + 360));
+        assert_eq!(signal.backoff_until(), Some(OBSERVED + 60));
+
+        let path = temp_ledger_path("ratelimit-429");
+        assert!(record_rate_limit_at(&path, &signal));
+        let stored = latest_signals(&read_signals(&path));
+        assert_eq!(stored[&key.canonical()], signal);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn signal_rows_round_trip_and_absent_numbers_stay_absent() {
+        let signal = RateLimitSignal {
+            key: "opencode#ollama".to_string(),
+            observed_at: OBSERVED,
+            status: 429,
+            requests: RateLimitAxis {
+                limit: Some(1_000),
+                remaining: Some(0),
+                reset_at: Some(OBSERVED + 60),
+            },
+            tokens: RateLimitAxis::default(),
+            retry_after_at: Some(OBSERVED + 30),
+        };
+        let line = signal.to_tsv_line();
+        assert_eq!(
+            line.split('\t').filter(|f| *f == ABSENT_FIELD).count(),
+            3,
+            "the unreported tokens axis is absent, not zero: {line}"
+        );
+        assert_eq!(RateLimitSignal::parse(&line).expect("round trip"), signal);
+        assert!(RateLimitSignal::parse("garbage").is_none());
+        assert!(RateLimitSignal::parse("").is_none());
+    }
+
+    #[test]
+    fn the_newest_row_per_pool_wins() {
+        let path = temp_ledger_path("ratelimit-newest");
+        let older = reported_signal("openai", OBSERVED, Some(1_000), 900, OBSERVED + 60);
+        let newer = reported_signal("openai", OBSERVED + 5, Some(1_000), 100, OBSERVED + 60);
+        assert!(record_rate_limit_at(&path, &older));
+        assert!(record_rate_limit_at(&path, &newer));
+        let stored = latest_signals(&read_signals(&path));
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored["openai"].tokens.remaining, Some(100));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reading_past_its_own_reset_is_history_not_headroom() {
+        let now = 1_000_000;
+        let config = config_with_pool_cap(
+            "opencode",
+            (Some(1_000), None),
+            "opencode-go",
+            (Some(400), None),
+        );
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let baseline = pool_headroom_from_windows(&pooled, &config);
+
+        // Observed an hour ago, self-declared to refill a minute after that:
+        // whatever it reported refilled long before now.
+        let expired = reported_signal(
+            "opencode#opencode-go",
+            now - 3_600,
+            Some(4_000),
+            12,
+            now - 3_540,
+        );
+        assert_eq!(expired.current_at(now), None);
+        let with_expired = pool_headroom_from_parts(&pooled, &config, &signal_map([expired]), now);
+        assert_eq!(
+            format!("{baseline:#?}"),
+            format!("{with_expired:#?}"),
+            "a stale reading must leave every number exactly as it was"
+        );
+        assert_eq!(
+            serde_json::to_string(&baseline).unwrap(),
+            serde_json::to_string(&with_expired).unwrap()
+        );
+
+        // The same reading inside its own window does govern.
+        let live = reported_signal("opencode#opencode-go", now, Some(4_000), 12, now + 60);
+        let with_live = pool_headroom_from_parts(&pooled, &config, &signal_map([live]), now);
+        assert_eq!(
+            with_live["opencode#opencode-go"].tokens.scope,
+            CapScope::Reported
+        );
+        assert_eq!(with_live["opencode#opencode-go"].tokens.remaining, Some(12));
+
+        // A reading with no reset instant has no window of its own, so it is
+        // honoured only inside the 24h window the headroom is measured over.
+        let undated = |observed_at: u64| RateLimitSignal {
+            key: "opencode#opencode-go".to_string(),
+            observed_at,
+            status: 200,
+            requests: RateLimitAxis::default(),
+            tokens: RateLimitAxis {
+                limit: Some(4_000),
+                remaining: Some(12),
+                reset_at: None,
+            },
+            retry_after_at: None,
+        };
+        assert!(undated(now).current_at(now).is_some());
+        assert!(undated(now - WINDOW_24H_SECS).current_at(now).is_none());
+    }
+
+    #[test]
+    fn provider_reported_outranks_configured_which_outranks_observed_usage() {
+        let now = 1_000_000;
+        let mut config = Config::default();
+        config
+            .limits
+            .targets
+            .insert("opencode".to_string(), target_limit(Some(1_000), None));
+        let mut rows = two_pool_rows();
+        // A third pool with neither a reading nor a cap.
+        rows.push(model_row("ollama", "granite4:350m", 60, 5, 5, false));
+        let pooled = pool_windows_from_rows(&rows, now);
+        let signals = signal_map([reported_signal(
+            "opencode#opencode-go",
+            now,
+            Some(4_000),
+            3_000,
+            now + 300,
+        )]);
+        let headroom = pool_headroom_from_parts(&pooled, &config, &signals, now);
+
+        // 1. A live provider reading beats the configured cap for the SAME pool.
+        let go = &headroom["opencode#opencode-go"];
+        assert_eq!(go.tokens.scope, CapScope::Reported);
+        assert_eq!(go.tokens.limit, Some(4_000));
+        assert_eq!(go.tokens.remaining, Some(3_000));
+        assert_eq!(
+            go.tokens.used, 1_000,
+            "used is limit - remaining, both of them reported"
+        );
+        assert!(go.has_reported_quota());
+        assert_eq!(go.room_scope(), Some(CapScope::Reported));
+        assert!(go.tokens.scope.label().starts_with("provider-reported"));
+
+        // 2. The configured cap still governs the sibling with no reading, and
+        //    still says it is shared rather than this pool's own.
+        let cloud = &headroom["opencode#ollama"];
+        assert_eq!(cloud.tokens.scope, CapScope::Shared);
+        assert_eq!(cloud.tokens.limit, Some(1_000));
+        assert!(cloud.tokens.scope.label().starts_with("configured"));
+        assert!(cloud.tokens.scope.label().contains("shared"));
+
+        // 3. Neither: nothing is invented.
+        let uncapped = &headroom["ollama"];
+        assert_eq!(uncapped.tokens.scope, CapScope::Unknown);
+        assert_eq!(uncapped.tokens.limit, None);
+        assert_eq!(uncapped.tokens.remaining, None);
+        assert!(uncapped.tokens.scope.label().starts_with("unknown"));
+
+        // Both capped pools rank on a real fraction (75% reported vs 25%
+        // configured); the uncapped one drags a set down to the usage-derived
+        // fallback exactly as it always did.
+        let ranking = rank_pools_by_room(&[go.clone(), cloud.clone()]);
+        assert_eq!(ranking.basis, RoomBasis::Quota);
+        assert_eq!(ranking.best().unwrap().key, "opencode#opencode-go");
+        assert_eq!(
+            ranking.cap_scope(),
+            None,
+            "a mixed set must not claim one provenance"
+        );
+        let mixed = rank_pools_by_room(&[go.clone(), uncapped.clone()]);
+        assert_eq!(mixed.basis, RoomBasis::ObservedUsage);
+        assert!(mixed.basis.label().contains("not a quota measurement"));
+    }
+
+    #[test]
+    fn a_ranking_built_only_on_provider_numbers_says_so() {
+        let now = 1_000_000;
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let signals = signal_map([
+            reported_signal("opencode#opencode-go", now, Some(4_000), 1_000, now + 300),
+            reported_signal("opencode#ollama", now, Some(4_000), 3_000, now + 300),
+        ]);
+        let pools = pool_headroom_from_parts(&pooled, &Config::default(), &signals, now)
+            .into_values()
+            .collect::<Vec<_>>();
+
+        let ranking = rank_pools_by_room(&pools);
+        assert_eq!(ranking.basis, RoomBasis::Quota);
+        assert_eq!(ranking.cap_scope(), Some(CapScope::Reported));
+        assert_eq!(ranking.best().unwrap().key, "opencode#ollama");
+        let label = ranking.basis_label();
+        assert!(label.contains("quota-derived"), "{label}");
+        assert!(label.contains("provider-reported"), "{label}");
+
+        // The pre-existing wording of a basis is untouched — provenance is
+        // added alongside it, never spliced into it.
+        assert_eq!(
+            RoomBasis::Quota.label(),
+            "quota-derived (remaining fraction of a configured cap)"
+        );
+    }
+
+    #[test]
+    fn a_reported_remaining_without_a_ceiling_is_not_given_a_denominator() {
+        let now = 1_000_000;
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let signals = signal_map([reported_signal(
+            "opencode#opencode-go",
+            now,
+            None,
+            900,
+            now + 300,
+        )]);
+        let headroom = pool_headroom_from_parts(&pooled, &Config::default(), &signals, now);
+
+        let go = &headroom["opencode#opencode-go"];
+        assert_eq!(go.tokens.scope, CapScope::Reported);
+        assert_eq!(go.tokens.remaining, Some(900));
+        assert_eq!(go.tokens.limit, None);
+        assert_eq!(
+            go.tokens.used, 150,
+            "no reported ceiling => rtrt's own observed usage, not a guess"
+        );
+        assert_eq!(go.tokens.remaining_fraction(), None);
+        assert_eq!(go.room_fraction(), None);
+    }
+
+    #[test]
+    fn a_pool_rtrt_only_has_a_reading_for_is_still_visible() {
+        let now = 1_000_000;
+        let signals = signal_map([reported_signal(
+            "anthropic",
+            now,
+            Some(80_000),
+            79_000,
+            now + 300,
+        )]);
+        let headroom =
+            pool_headroom_from_parts(&BTreeMap::new(), &Config::default(), &signals, now);
+        let anthropic = &headroom["anthropic"];
+        assert_eq!(anthropic.tokens.scope, CapScope::Reported);
+        assert_eq!(anthropic.tokens.remaining, Some(79_000));
+        assert_eq!(anthropic.used_tokens, 0);
+        assert_eq!(anthropic.sibling_pools, 0);
+    }
+
+    #[test]
+    fn a_reading_is_never_inherited_by_a_sibling_pool() {
+        let now = 1_000_000;
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let signals = signal_map([reported_signal(
+            "opencode#opencode-go",
+            now,
+            Some(4_000),
+            3_000,
+            now + 300,
+        )]);
+        let headroom = pool_headroom_from_parts(&pooled, &Config::default(), &signals, now);
+        // A rate-limit header describes the bucket the response drew from.
+        // Spreading it across siblings, or up to the target, would be a guess.
+        assert_eq!(
+            headroom["opencode#ollama"].tokens.scope,
+            CapScope::Unknown,
+            "the sibling has no reading of its own"
+        );
+        assert_eq!(headroom["opencode#ollama"].tokens.remaining, None);
     }
 
     #[test]

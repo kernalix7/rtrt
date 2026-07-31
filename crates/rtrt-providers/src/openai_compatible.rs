@@ -3,6 +3,9 @@
 //! Re-uses [`OpenAIProvider`]'s wire format. The differences vs `OpenAIProvider`:
 //! - `name` is user-provided so dashboards can distinguish (e.g. `"ollama"`, `"vllm"`).
 //! - `api_key` is optional — many local servers don't require auth.
+//! - rate-limit signals are recorded under that same user-provided name, so a
+//!   local server that emits `x-ratelimit-*` headers gets its own quota bucket
+//!   instead of drawing down OpenAI's.
 
 use async_trait::async_trait;
 use rtrt_core::Result;
@@ -16,9 +19,12 @@ pub struct OpenAICompatibleProvider {
 
 impl OpenAICompatibleProvider {
     pub fn new(name: impl Into<String>, base_url: impl Into<String>) -> Self {
+        let name = name.into();
         Self {
-            name: name.into(),
-            inner: OpenAIProvider::new(String::new()).with_base_url(base_url),
+            inner: OpenAIProvider::new(String::new())
+                .with_base_url(base_url)
+                .with_usage_target(&name),
+            name,
         }
     }
 

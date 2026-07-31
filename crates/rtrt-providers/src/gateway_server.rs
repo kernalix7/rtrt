@@ -384,6 +384,7 @@ async fn dispatch(
                     target: None,
                     model: None,
                     mode: None,
+                    failover: false,
                 },
                 &tools,
                 &usage,
@@ -953,6 +954,7 @@ mod tests {
             target: None,
             model: None,
             mode: None,
+            failover: false,
         };
         let decision = select_route(&req, &tools, &usage).expect("route");
         assert_eq!(decision.target, "anthropic");

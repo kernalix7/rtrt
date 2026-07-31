@@ -44,10 +44,12 @@ pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
 };
 pub use team::{build_team_leader_prompt, dispatch_team};
-pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
+pub use usage::{PoolQuota, ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
-    LedgerRow, TargetHeadroom, TargetWindows, WindowUsage, estimate_tokens, headroom_for_target,
-    provider_usage_windows, record_invocation, target_headroom,
+    CapScope, LedgerRow, PoolCap, PoolHeadroom, PoolRanking, RoomBasis, RoomComparison,
+    TargetHeadroom, TargetWindows, WindowUsage, compare_room, estimate_tokens, headroom_for_pool,
+    headroom_for_target, pool_headroom, pool_usage_windows, provider_usage_windows,
+    rank_pools_by_room, rank_target_pools, record_invocation, target_headroom,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

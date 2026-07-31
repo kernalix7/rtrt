@@ -1128,6 +1128,7 @@ impl RtrtMcp {
             target: None,
             model: args.model,
             mode: None,
+            failover: false,
         };
         // Same routing inputs as the CLI: the effective (global ⊕ project
         // `.rtrt/config.toml`) config drives the per-project enable map, and

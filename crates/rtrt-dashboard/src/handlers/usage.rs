@@ -168,6 +168,7 @@ pub(crate) async fn route_preview_api(
         target: None,
         model: None,
         mode: None,
+        failover: false,
     };
     let tools = detected_tools_with_config_overrides();
     // Ledger-aware snapshot, same as `/api/route` and the CLI — the preview

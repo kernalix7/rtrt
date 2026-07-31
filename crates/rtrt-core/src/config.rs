@@ -674,6 +674,24 @@ impl ProvidersConfig {
 /// [limits.ollama]
 /// daily_tokens = 250_000
 /// ```
+///
+/// One target often fronts several upstream quotas (see [`crate::pool`]). Those
+/// pools can be capped individually, nested under the target they belong to:
+///
+/// ```toml
+/// [limits.opencode]
+/// daily_tokens = 2_000_000        # still the target-wide cap
+///
+/// [limits.opencode.pools.opencode-go]
+/// daily_tokens = 1_200_000
+///
+/// [limits.opencode.pools.ollama]
+/// daily_requests = 500
+/// ```
+///
+/// Pool caps are strictly optional: a target with none behaves exactly as it
+/// always has, and its pools share the target-wide cap rather than each being
+/// given a synthesised slice of it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LimitsConfig {
     #[serde(flatten)]
@@ -686,11 +704,58 @@ pub struct TargetLimit {
     pub daily_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_requests: Option<u64>,
+    /// Per-pool ceilings inside this target (`[limits.<target>.pools.<pool>]`).
+    /// Absent for every config written before pool identity existed, and
+    /// skipped on serialize when empty, so those configs round-trip byte for
+    /// byte.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pools: BTreeMap<String, PoolLimit>,
+}
+
+/// Daily ceilings for one upstream pool inside a target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolLimit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_requests: Option<u64>,
+}
+
+impl TargetLimit {
+    /// The cap configured for one pool inside this target, if any. Matched
+    /// exactly first, then case-insensitively, because pool names derived from
+    /// model strings are lowercased.
+    pub fn pool(&self, name: &str) -> Option<&PoolLimit> {
+        if let Some(limit) = self.pools.get(name) {
+            return Some(limit);
+        }
+        self.pools
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, limit)| limit)
+    }
+
+    /// True when at least one pool inside this target carries its own cap.
+    pub fn has_pool_limits(&self) -> bool {
+        self.pools.values().any(PoolLimit::is_set)
+    }
+}
+
+impl PoolLimit {
+    /// True when this pool pins at least one axis.
+    pub fn is_set(&self) -> bool {
+        self.daily_tokens.is_some() || self.daily_requests.is_some()
+    }
 }
 
 impl LimitsConfig {
     pub fn target(&self, name: &str) -> Option<&TargetLimit> {
         self.targets.get(name)
+    }
+
+    /// The cap for one pool inside a target, if the config pins one.
+    pub fn pool(&self, target: &str, pool: &str) -> Option<&PoolLimit> {
+        self.target(target)?.pool(pool)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1308,6 +1373,119 @@ mod tests {
         let ollama = c.limits.target("ollama").unwrap();
         assert_eq!(ollama.daily_tokens, Some(250_000));
         assert_eq!(ollama.daily_requests, None);
+        // Pool caps are opt-in: a legacy target table declares none.
+        assert!(openai.pools.is_empty());
+        assert!(!openai.has_pool_limits());
+        assert_eq!(c.limits.pool("openai", "anything"), None);
+    }
+
+    #[test]
+    fn legacy_limits_toml_round_trips_without_pool_tables() {
+        let legacy = r#"
+            [limits.openai]
+            daily_tokens = 1000000
+            daily_requests = 2000
+
+            [limits.ollama]
+            daily_tokens = 250000
+        "#;
+        let config = Config::from_toml_str(legacy).unwrap();
+        let serialized = toml::to_string(&config.limits).unwrap();
+        // The new `pools` field must not appear for a config that never set it,
+        // otherwise every existing ~/.rtrt/config.toml would be rewritten.
+        assert!(
+            !serialized.contains("pools"),
+            "empty pools must be skipped on serialize:\n{serialized}"
+        );
+        let reparsed: LimitsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.target("openai").unwrap().daily_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            reparsed.target("openai").unwrap().daily_requests,
+            Some(2_000)
+        );
+        assert_eq!(
+            reparsed.target("ollama").unwrap().daily_tokens,
+            Some(250_000)
+        );
+        assert_eq!(reparsed.target("ollama").unwrap().daily_requests, None);
+        assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
+    }
+
+    #[test]
+    fn pool_limits_nest_under_their_target() {
+        let c = Config::from_toml_str(
+            r#"
+            [limits.opencode]
+            daily_tokens = 2_000_000
+
+            [limits.opencode.pools.opencode-go]
+            daily_tokens = 1_200_000
+
+            [limits.opencode.pools.ollama]
+            daily_requests = 500
+            "#,
+        )
+        .unwrap();
+
+        let opencode = c.limits.target("opencode").unwrap();
+        // The target-wide cap keeps working exactly as before.
+        assert_eq!(opencode.daily_tokens, Some(2_000_000));
+        assert!(opencode.has_pool_limits());
+
+        let go = c.limits.pool("opencode", "opencode-go").unwrap();
+        assert_eq!(go.daily_tokens, Some(1_200_000));
+        assert_eq!(go.daily_requests, None);
+        let ollama = c.limits.pool("opencode", "ollama").unwrap();
+        assert_eq!(ollama.daily_tokens, None);
+        assert_eq!(ollama.daily_requests, Some(500));
+        // An unconfigured pool has no cap — never a slice of the target's.
+        assert!(c.limits.pool("opencode", "unknown-pool").is_none());
+        assert!(c.limits.pool("claude", "opencode-go").is_none());
+    }
+
+    #[test]
+    fn pool_lookup_is_case_insensitive() {
+        let c = Config::from_toml_str(
+            r#"
+            [limits.opencode.pools.OpenCode-Go]
+            daily_tokens = 10
+            "#,
+        )
+        .unwrap();
+        // Pool names derived from model strings are lowercased, so a config key
+        // written with capitals must still match.
+        assert_eq!(
+            c.limits
+                .pool("opencode", "opencode-go")
+                .unwrap()
+                .daily_tokens,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn pool_limits_round_trip_through_toml() {
+        let source = r#"
+            [limits.opencode]
+            daily_requests = 100
+
+            [limits.opencode.pools.ollama]
+            daily_tokens = 42
+        "#;
+        let config = Config::from_toml_str(source).unwrap();
+        let serialized = toml::to_string(&config.limits).unwrap();
+        let reparsed: LimitsConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.pool("opencode", "ollama").unwrap().daily_tokens,
+            Some(42)
+        );
+        assert_eq!(
+            reparsed.target("opencode").unwrap().daily_requests,
+            Some(100)
+        );
     }
 
     #[test]

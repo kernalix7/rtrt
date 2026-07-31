@@ -1,6 +1,6 @@
 //! Daily usage limits — global `[limits]` editor.
 //!
-//! `Config.limits` is a `BTreeMap<target, { daily_tokens, daily_requests }>`.
+//! `Config.limits` is a `BTreeMap<target, { daily_tokens, daily_requests, pools }>`.
 //! These handlers expose the whole map for read and replace it wholesale on
 //! write, persisting to the global `~/.rtrt/config.toml` via `write_config_file`.
 //! Plain global settings — no per-project scope toggle.
@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
-use rtrt_core::config::TargetLimit;
+use rtrt_core::config::{PoolLimit, TargetLimit};
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
@@ -19,6 +19,26 @@ use crate::prelude::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LimitTargetView {
     pub(crate) target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) daily_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) daily_requests: Option<u64>,
+    /// Per-pool ceilings nested under this target
+    /// (`[limits.<target>.pools.<pool>]`). Omitted from the response entirely
+    /// when the target has none, so a config without pool caps reads exactly as
+    /// it always did. On write, an absent field PRESERVES whatever is already
+    /// configured (the UI does not edit pools yet); an explicit list — empty
+    /// included — replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pools: Option<Vec<LimitPoolView>>,
+}
+
+/// One pool row inside a target. Same optional-ceiling semantics as the target
+/// row; the pool name is the model prefix rtrt derives its quota bucket from
+/// (`opencode-go/glm-5.2` → `opencode-go`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LimitPoolView {
+    pub(crate) pool: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) daily_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,8 +60,28 @@ fn limits_to_views(limits: &rtrt_core::config::LimitsConfig) -> Vec<LimitTargetV
             target: name.clone(),
             daily_tokens: lim.daily_tokens,
             daily_requests: lim.daily_requests,
+            pools: pools_to_views(lim),
         })
         .collect()
+}
+
+/// `None` for a target with no pool caps, so the field disappears from the
+/// response instead of showing up as an empty list.
+fn pools_to_views(limit: &TargetLimit) -> Option<Vec<LimitPoolView>> {
+    if limit.pools.is_empty() {
+        return None;
+    }
+    Some(
+        limit
+            .pools
+            .iter()
+            .map(|(pool, cap)| LimitPoolView {
+                pool: pool.clone(),
+                daily_tokens: cap.daily_tokens,
+                daily_requests: cap.daily_requests,
+            })
+            .collect(),
+    )
 }
 
 pub(crate) async fn get_limits_config()
@@ -78,9 +118,21 @@ pub(crate) async fn post_limits_config(
         if name.is_empty() {
             continue;
         }
-        // Skip a row that pins neither axis — it would persist as an empty,
-        // meaningless `[limits.<name>]` table.
-        if view.daily_tokens.is_none() && view.daily_requests.is_none() {
+        // Per-pool caps: an absent `pools` field carries the configured ones
+        // across (a wholesale replace must not silently delete caps the sender
+        // never saw), while an explicit list replaces them.
+        let pools = match view.pools {
+            Some(views) => pool_views_to_limits(views),
+            None => cfg
+                .limits
+                .target(&name)
+                .map(|existing| existing.pools.clone())
+                .unwrap_or_default(),
+        };
+        // Skip a row that pins nothing at all — it would persist as an empty,
+        // meaningless `[limits.<name>]` table. A target whose only ceilings are
+        // per-pool ones is NOT empty.
+        if view.daily_tokens.is_none() && view.daily_requests.is_none() && pools.is_empty() {
             continue;
         }
         targets.insert(
@@ -88,6 +140,7 @@ pub(crate) async fn post_limits_config(
             TargetLimit {
                 daily_tokens: view.daily_tokens,
                 daily_requests: view.daily_requests,
+                pools,
             },
         );
     }
@@ -98,4 +151,112 @@ pub(crate) async fn post_limits_config(
         targets: limits_to_views(&cfg.limits),
         path,
     }))
+}
+
+/// Same tidiness rule as targets: unnamed pools and pools that pin neither axis
+/// are dropped rather than written as empty tables.
+fn pool_views_to_limits(views: Vec<LimitPoolView>) -> BTreeMap<String, PoolLimit> {
+    let mut pools = BTreeMap::new();
+    for view in views {
+        let name = view.pool.trim().to_string();
+        if name.is_empty() || (view.daily_tokens.is_none() && view.daily_requests.is_none()) {
+            continue;
+        }
+        pools.insert(
+            name,
+            PoolLimit {
+                daily_tokens: view.daily_tokens,
+                daily_requests: view.daily_requests,
+            },
+        );
+    }
+    pools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(daily_tokens: Option<u64>, pools: &[(&str, u64)]) -> TargetLimit {
+        TargetLimit {
+            daily_tokens,
+            daily_requests: None,
+            pools: pools
+                .iter()
+                .map(|(pool, tokens)| {
+                    (
+                        (*pool).to_string(),
+                        PoolLimit {
+                            daily_tokens: Some(*tokens),
+                            daily_requests: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_target_without_pool_caps_serializes_exactly_as_before() {
+        let mut limits = rtrt_core::config::LimitsConfig::default();
+        limits
+            .targets
+            .insert("openai".to_string(), target(Some(1_000), &[]));
+        let views = limits_to_views(&limits);
+        let json = serde_json::to_string(&views).unwrap();
+        assert_eq!(json, r#"[{"target":"openai","daily_tokens":1000}]"#);
+    }
+
+    #[test]
+    fn pool_caps_are_exposed_when_configured() {
+        let mut limits = rtrt_core::config::LimitsConfig::default();
+        limits.targets.insert(
+            "opencode".to_string(),
+            target(Some(1_000), &[("opencode-go", 400)]),
+        );
+        let views = limits_to_views(&limits);
+        let pools = views[0].pools.as_ref().expect("pools exposed");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].pool, "opencode-go");
+        assert_eq!(pools[0].daily_tokens, Some(400));
+    }
+
+    #[test]
+    fn a_write_without_pools_preserves_the_configured_ones() {
+        // The UI does not send `pools`, so a save must not delete them.
+        let body: LimitTargetView =
+            serde_json::from_str(r#"{"target":"opencode","daily_tokens":2000}"#).unwrap();
+        assert!(body.pools.is_none());
+        let existing = target(Some(1_000), &[("opencode-go", 400)]);
+        let pools = match body.pools {
+            Some(views) => pool_views_to_limits(views),
+            None => existing.pools.clone(),
+        };
+        assert_eq!(pools["opencode-go"].daily_tokens, Some(400));
+    }
+
+    #[test]
+    fn an_explicit_pool_list_replaces_and_drops_empty_rows() {
+        let views = vec![
+            LimitPoolView {
+                pool: "ollama".to_string(),
+                daily_tokens: Some(10),
+                daily_requests: None,
+            },
+            // No ceiling on either axis: dropped rather than written as an
+            // empty `[limits.<t>.pools.<p>]` table.
+            LimitPoolView {
+                pool: "opencode-go".to_string(),
+                daily_tokens: None,
+                daily_requests: None,
+            },
+            LimitPoolView {
+                pool: "   ".to_string(),
+                daily_tokens: Some(5),
+                daily_requests: None,
+            },
+        ];
+        let pools = pool_views_to_limits(views);
+        assert_eq!(pools.keys().collect::<Vec<_>>(), vec!["ollama"]);
+    }
 }

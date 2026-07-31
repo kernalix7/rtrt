@@ -14,8 +14,18 @@
 //!
 //! Writes are strictly best-effort: a ledger failure never propagates to the
 //! caller, because recording usage must not break an otherwise-fine invocation.
+//!
+//! # Pools
+//!
+//! The row format is unchanged, but the `model` column is no longer inert: one
+//! target routinely fronts several unrelated upstream quotas, and the model
+//! prefix names which one ([`rtrt_core::PoolKey`]). [`pool_usage_windows`]
+//! buckets by that finer identity; [`provider_usage_windows`] is the same data
+//! folded back to target level, so every pre-existing caller — and every row
+//! already on disk — behaves exactly as before.
 
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     fs::OpenOptions,
     io::Write,
@@ -23,7 +33,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rtrt_core::Config;
+use rtrt_core::{Config, PoolKey};
 use serde::{Deserialize, Serialize};
 
 const LEDGER_FILE_NAME: &str = "provider-usage.tsv";
@@ -60,6 +70,12 @@ pub struct LedgerRow {
 impl LedgerRow {
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// The quota bucket this row actually drew from: its target, plus the pool
+    /// named by the model prefix when there is one.
+    pub fn pool_key(&self) -> PoolKey {
+        PoolKey::from_target_model(&self.target, Some(&self.model))
     }
 
     fn to_tsv_line(&self) -> String {
@@ -110,6 +126,16 @@ impl WindowUsage {
         }
     }
 
+    /// Absorb another window's totals — used to fold sibling pools back into
+    /// the target they share.
+    fn merge(&mut self, other: &Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.estimated_requests = self
+            .estimated_requests
+            .saturating_add(other.estimated_requests);
+    }
+
     /// True when any contributing request carried an estimated token count.
     pub fn has_estimates(&self) -> bool {
         self.estimated_requests > 0
@@ -122,6 +148,14 @@ pub struct TargetWindows {
     pub last_5h: WindowUsage,
     pub last_24h: WindowUsage,
     pub last_7d: WindowUsage,
+}
+
+impl TargetWindows {
+    fn merge(&mut self, other: &Self) {
+        self.last_5h.merge(&other.last_5h);
+        self.last_24h.merge(&other.last_24h);
+        self.last_7d.merge(&other.last_7d);
+    }
 }
 
 /// Windowed headroom for one configured `[limits]` target.
@@ -145,6 +179,190 @@ impl TargetHeadroom {
     /// True when neither a token nor a request limit is configured.
     pub fn limits_unknown(&self) -> bool {
         self.limit_tokens.is_none() && self.request_limit.is_none()
+    }
+}
+
+/// Where the cap a pool is measured against comes from.
+///
+/// The distinction matters because a target-level cap with several pools under
+/// it is genuinely *shared*: the remaining room is one pot the siblings draw
+/// from together. rtrt reports it as such instead of splitting the cap into
+/// invented per-pool slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapScope {
+    /// `[limits.<target>.pools.<pool>]` — this pool's own ceiling. `used` is
+    /// this pool's usage alone.
+    Pool,
+    /// No pool cap, but `[limits.<target>]` sets one: every pool under the
+    /// target draws on it. `used` is the target-wide total (all siblings), so
+    /// `remaining` is the shared room, not a per-pool entitlement.
+    Shared,
+    /// No cap at either level. Nothing is known — no ceiling is fabricated.
+    Unknown,
+}
+
+impl CapScope {
+    /// True when a real ceiling backs this axis (either scope that is not
+    /// [`CapScope::Unknown`]).
+    pub fn is_capped(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// True when the ceiling is shared with sibling pools.
+    pub fn is_shared(self) -> bool {
+        matches!(self, Self::Shared)
+    }
+}
+
+/// One capped axis (tokens or requests) of a pool's 24h headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolCap {
+    pub scope: CapScope,
+    /// The configured ceiling; `None` when [`CapScope::Unknown`].
+    pub limit: Option<u64>,
+    /// Usage measured against `limit`: this pool's own for [`CapScope::Pool`],
+    /// the target-wide total for [`CapScope::Shared`] (because that is what the
+    /// shared cap is actually being drawn down by).
+    pub used: u64,
+    /// `limit - used`, saturating; `None` when no cap is configured.
+    pub remaining: Option<u64>,
+}
+
+impl PoolCap {
+    fn unknown(used: u64) -> Self {
+        Self {
+            scope: CapScope::Unknown,
+            limit: None,
+            used,
+            remaining: None,
+        }
+    }
+
+    fn capped(scope: CapScope, limit: Option<u64>, used: u64) -> Self {
+        match limit {
+            Some(limit) => Self {
+                scope,
+                limit: Some(limit),
+                used,
+                remaining: Some(limit.saturating_sub(used)),
+            },
+            None => Self::unknown(used),
+        }
+    }
+
+    /// Fraction of the ceiling still available, in `0.0..=1.0`. `None` when no
+    /// cap is configured — an unknown ceiling has no fraction, and guessing one
+    /// would fabricate a number.
+    ///
+    /// A zero limit is fully consumed by definition, so it reports `0.0` rather
+    /// than dividing by zero.
+    pub fn remaining_fraction(&self) -> Option<f64> {
+        let limit = self.limit?;
+        let remaining = self.remaining.unwrap_or(0);
+        if limit == 0 {
+            return Some(0.0);
+        }
+        Some(remaining as f64 / limit as f64)
+    }
+}
+
+/// 24h headroom for one pool, per axis.
+///
+/// `used_tokens` / `used_requests` are always this pool's own slice. What the
+/// caps mean is spelled out per axis by [`PoolCap::scope`], so a shared target
+/// cap can never be mistaken for a per-pool entitlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolHeadroom {
+    /// [`PoolKey::canonical`] of this bucket.
+    pub key: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    pub used_tokens: u64,
+    pub used_requests: u64,
+    /// Any contributing 24h row carried an estimated token count.
+    pub tokens_estimated: bool,
+    pub tokens: PoolCap,
+    pub requests: PoolCap,
+    /// How many pools (including this one) drew on the same target in the 24h
+    /// window. `> 1` with a [`CapScope::Shared`] axis means the ceiling is
+    /// actively contended.
+    pub sibling_pools: u64,
+}
+
+impl PoolHeadroom {
+    /// True when neither axis has a configured ceiling.
+    pub fn limits_unknown(&self) -> bool {
+        !self.tokens.scope.is_capped() && !self.requests.scope.is_capped()
+    }
+
+    /// True when any configured ceiling is shared with sibling pools.
+    pub fn shares_a_cap(&self) -> bool {
+        self.tokens.scope.is_shared() || self.requests.scope.is_shared()
+    }
+
+    /// The binding constraint: the smallest remaining fraction across the
+    /// capped axes. `None` when no axis is capped.
+    pub fn room_fraction(&self) -> Option<f64> {
+        match (
+            self.tokens.remaining_fraction(),
+            self.requests.remaining_fraction(),
+        ) {
+            (Some(tokens), Some(requests)) => Some(tokens.min(requests)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+
+    /// The structured identity behind [`PoolHeadroom::key`].
+    pub fn pool_key(&self) -> PoolKey {
+        PoolKey::new(&self.target, self.pool.as_deref())
+    }
+}
+
+/// What a room ranking was actually derived from.
+///
+/// Callers must not read an [`RoomBasis::ObservedUsage`] ordering as quota
+/// information — it says "this pool has been used less lately", not "this pool
+/// has more quota left", which is unknowable without a configured cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomBasis {
+    /// Every compared pool had a real cap: ranked by remaining fraction.
+    Quota,
+    /// At least one pool had no cap: ranked by observed 24h usage, ascending.
+    ObservedUsage,
+}
+
+impl RoomBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quota => "quota-derived (remaining fraction of a configured cap)",
+            Self::ObservedUsage => "usage-derived (observed 24h usage, not a quota measurement)",
+        }
+    }
+}
+
+/// A room comparison plus the basis it was decided on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoomComparison {
+    /// `Greater` when the left pool has more room than the right.
+    pub order: Ordering,
+    pub basis: RoomBasis,
+}
+
+/// Pools ordered most-room-first, labelled with what the order means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolRanking {
+    pub basis: RoomBasis,
+    pub ranked: Vec<PoolHeadroom>,
+}
+
+impl PoolRanking {
+    /// The pool with the most room, if any.
+    pub fn best(&self) -> Option<&PoolHeadroom> {
+        self.ranked.first()
     }
 }
 
@@ -249,8 +467,21 @@ pub fn estimate_tokens(text: &str) -> u64 {
 }
 
 /// Read the ledger and bucket every target into the 5h / 24h / 7d windows.
+///
+/// Target-level view: sibling pools inside one target are summed. This is the
+/// fold of [`pool_usage_windows`], so the two views can never disagree.
 pub fn provider_usage_windows() -> BTreeMap<String, TargetWindows> {
-    windows_from_rows(&read_rows(&ledger_path()), now_epoch_secs())
+    fold_pools_to_targets(&pool_usage_windows())
+}
+
+/// Read the ledger and bucket every *pool* into the 5h / 24h / 7d windows.
+///
+/// Keyed by [`PoolKey::canonical`] (`opencode#opencode-go`), so two models that
+/// reach different upstream backends through one target no longer share a
+/// bucket. Rows whose model carries no pool prefix key by the bare target, which
+/// is every row written before pools existed.
+pub fn pool_usage_windows() -> BTreeMap<String, TargetWindows> {
+    pool_windows_from_rows(&read_rows(&ledger_path()), now_epoch_secs())
 }
 
 /// Per-target windowed headroom for the relevant (24h) window, using the
@@ -300,13 +531,202 @@ fn headroom_for(
     }
 }
 
-fn windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWindows> {
+/// Per-pool windowed headroom for the 24h window.
+///
+/// Every pool seen in the ledger is included, plus every pool that carries a
+/// configured `[limits.<target>.pools.<pool>]` cap (so a configured ceiling is
+/// always visible even before its first invocation). Target-level visibility is
+/// unchanged and still comes from [`target_headroom`].
+pub fn pool_headroom(config: &Config) -> BTreeMap<String, PoolHeadroom> {
+    pool_headroom_from_windows(&pool_usage_windows(), config)
+}
+
+/// Headroom for a single pool. Public so a caller can query one candidate
+/// without materializing the whole map.
+pub fn headroom_for_pool(key: &PoolKey, config: &Config) -> PoolHeadroom {
+    let pooled = pool_usage_windows();
+    let targets = fold_pools_to_targets(&pooled);
+    headroom_for_pool_in(key, &pooled, &targets, config)
+}
+
+/// The pools of one target, ranked most-room-first — the "which sibling should
+/// take the next task" question, answered without inventing numbers.
+///
+/// See [`rank_pools_by_room`] for what the ranking is derived from.
+pub fn rank_target_pools(target: &str, config: &Config) -> PoolRanking {
+    let target = normalize_target(target);
+    let pools = pool_headroom(config)
+        .into_values()
+        .filter(|headroom| headroom.target == target)
+        .collect::<Vec<_>>();
+    rank_pools_by_room(&pools)
+}
+
+fn pool_headroom_from_windows(
+    pooled: &BTreeMap<String, TargetWindows>,
+    config: &Config,
+) -> BTreeMap<String, PoolHeadroom> {
+    let targets = fold_pools_to_targets(pooled);
+    let mut keys = pooled
+        .keys()
+        .map(|key| PoolKey::parse(key))
+        .collect::<Vec<_>>();
+    for (target, limit) in &config.limits.targets {
+        for (pool, cap) in &limit.pools {
+            if cap.is_set() {
+                keys.push(PoolKey::new(target, Some(pool)));
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .map(|key| {
+            (
+                key.canonical(),
+                headroom_for_pool_in(&key, pooled, &targets, config),
+            )
+        })
+        .collect()
+}
+
+fn headroom_for_pool_in(
+    key: &PoolKey,
+    pooled: &BTreeMap<String, TargetWindows>,
+    targets: &BTreeMap<String, TargetWindows>,
+    config: &Config,
+) -> PoolHeadroom {
+    let window = pooled
+        .get(&key.canonical())
+        .copied()
+        .unwrap_or_default()
+        .last_24h;
+    let target_window = targets
+        .get(key.target_key())
+        .copied()
+        .unwrap_or_default()
+        .last_24h;
+    let target_limit = config.limits.target(key.target_key());
+    // A pool cap only counts when it actually pins an axis; an empty
+    // `[limits.<t>.pools.<p>]` table is not a ceiling.
+    let pool_limit = key
+        .pool()
+        .and_then(|pool| target_limit.and_then(|limit| limit.pool(pool)))
+        .filter(|limit| limit.is_set());
+
+    // Resolved per axis: a pool may pin tokens while inheriting a shared
+    // request cap, and collapsing that into one scope would misreport one of
+    // them.
+    let tokens = axis_cap(
+        pool_limit.and_then(|limit| limit.daily_tokens),
+        target_limit.and_then(|limit| limit.daily_tokens),
+        window.tokens,
+        target_window.tokens,
+    );
+    let requests = axis_cap(
+        pool_limit.and_then(|limit| limit.daily_requests),
+        target_limit.and_then(|limit| limit.daily_requests),
+        window.requests,
+        target_window.requests,
+    );
+
+    PoolHeadroom {
+        key: key.canonical(),
+        target: key.target.clone(),
+        pool: key.pool().map(str::to_string),
+        used_tokens: window.tokens,
+        used_requests: window.requests,
+        tokens_estimated: window.has_estimates(),
+        tokens,
+        requests,
+        sibling_pools: sibling_pool_count(key.target_key(), pooled),
+    }
+}
+
+/// One axis of a pool's cap: its own ceiling if configured, else the target's
+/// (shared with every sibling), else nothing.
+pub(crate) fn axis_cap(
+    pool_limit: Option<u64>,
+    target_limit: Option<u64>,
+    pool_used: u64,
+    target_used: u64,
+) -> PoolCap {
+    match (pool_limit, target_limit) {
+        (Some(limit), _) => PoolCap::capped(CapScope::Pool, Some(limit), pool_used),
+        // Shared: the cap belongs to the target, so the draw-down is the
+        // target-wide total. Splitting it per pool would be a fabricated number.
+        (None, Some(limit)) => PoolCap::capped(CapScope::Shared, Some(limit), target_used),
+        (None, None) => PoolCap::unknown(pool_used),
+    }
+}
+
+/// How many distinct pool buckets exist under a target in the ledger.
+fn sibling_pool_count(target: &str, pooled: &BTreeMap<String, TargetWindows>) -> u64 {
+    pooled
+        .keys()
+        .filter(|key| PoolKey::parse(key).target == target)
+        .count() as u64
+}
+
+/// Compare two pools by available room.
+///
+/// Quota-derived when both sides have a real cap (remaining fraction wins);
+/// otherwise usage-derived — less-used-first, which is a fallback heuristic and
+/// is labelled as such so it cannot be mistaken for a headroom number.
+pub fn compare_room(left: &PoolHeadroom, right: &PoolHeadroom) -> RoomComparison {
+    match (left.room_fraction(), right.room_fraction()) {
+        (Some(left_room), Some(right_room)) => RoomComparison {
+            order: left_room.total_cmp(&right_room),
+            basis: RoomBasis::Quota,
+        },
+        _ => RoomComparison {
+            // Less observed usage == more room, hence the reversed compare.
+            order: right.used_tokens.cmp(&left.used_tokens),
+            basis: RoomBasis::ObservedUsage,
+        },
+    }
+}
+
+/// Rank pools most-room-first with a single, stated basis.
+///
+/// The basis is [`RoomBasis::Quota`] only when *every* pool in the set has a
+/// configured cap; one uncapped pool makes fraction comparison meaningless for
+/// the set, so the whole ranking falls back to observed 24h usage (ascending)
+/// and says so. Ties break on the canonical key for a deterministic order.
+pub fn rank_pools_by_room(pools: &[PoolHeadroom]) -> PoolRanking {
+    let basis = if !pools.is_empty() && pools.iter().all(|pool| pool.room_fraction().is_some()) {
+        RoomBasis::Quota
+    } else {
+        RoomBasis::ObservedUsage
+    };
+    let mut ranked = pools.to_vec();
+    ranked.sort_by(|left, right| match basis {
+        RoomBasis::Quota => right
+            .room_fraction()
+            .unwrap_or(0.0)
+            .total_cmp(&left.room_fraction().unwrap_or(0.0))
+            .then_with(|| left.key.cmp(&right.key)),
+        RoomBasis::ObservedUsage => left
+            .used_tokens
+            .cmp(&right.used_tokens)
+            .then_with(|| left.used_requests.cmp(&right.used_requests))
+            .then_with(|| left.key.cmp(&right.key)),
+    });
+    PoolRanking { basis, ranked }
+}
+
+/// Bucket rows by pool identity. The only aggregation pass over the ledger —
+/// the target-level view is derived from this one by [`fold_pools_to_targets`].
+fn pool_windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWindows> {
     let mut out: BTreeMap<String, TargetWindows> = BTreeMap::new();
     for row in rows {
         // Future-dated rows (clock skew) are treated as "just now" via
         // saturating_sub, so they still count toward the recent windows.
         let age = now.saturating_sub(row.epoch_ts);
-        let entry = out.entry(row.target.clone()).or_default();
+        // Entry created before the window checks so a target/pool seen only
+        // outside every window still appears (with zeroes), exactly as the
+        // target-only aggregation always did.
+        let entry = out.entry(row.pool_key().canonical()).or_default();
         if age <= WINDOW_5H_SECS {
             entry.last_5h.add(row);
         }
@@ -318,6 +738,27 @@ fn windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWin
         }
     }
     out
+}
+
+/// Sum every pool back into the target it belongs to.
+///
+/// Backward compatibility hinges on this being loss-free at target level: an
+/// unpooled key folds to itself, so a ledger written before pools existed
+/// produces the identical map it always did.
+pub(crate) fn fold_pools_to_targets(
+    pooled: &BTreeMap<String, TargetWindows>,
+) -> BTreeMap<String, TargetWindows> {
+    let mut out: BTreeMap<String, TargetWindows> = BTreeMap::new();
+    for (key, windows) in pooled {
+        let target = PoolKey::parse(key).target;
+        out.entry(target).or_default().merge(windows);
+    }
+    out
+}
+
+#[cfg(test)]
+fn windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWindows> {
+    fold_pools_to_targets(&pool_windows_from_rows(rows, now))
 }
 
 fn append_row(path: &Path, row: &LedgerRow) -> std::io::Result<()> {
@@ -385,15 +826,71 @@ mod tests {
     use super::*;
 
     fn row(target: &str, age_secs: u64, tokens_in: u64, tokens_out: u64, est: bool) -> LedgerRow {
+        model_row(target, "m", age_secs, tokens_in, tokens_out, est)
+    }
+
+    fn model_row(
+        target: &str,
+        model: &str,
+        age_secs: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+        est: bool,
+    ) -> LedgerRow {
         LedgerRow {
             epoch_ts: 1_000_000 - age_secs,
             target: normalize_target(target),
-            model: "m".to_string(),
+            model: model.to_string(),
             input_tokens: tokens_in,
             output_tokens: tokens_out,
             estimated: est,
             ok: true,
         }
+    }
+
+    /// The aggregation exactly as it was before pool identity existed: bucket
+    /// straight into targets, model column ignored. The golden test below pins
+    /// the new fold to this reference output.
+    fn legacy_windows_from_rows(rows: &[LedgerRow], now: u64) -> BTreeMap<String, TargetWindows> {
+        let mut out: BTreeMap<String, TargetWindows> = BTreeMap::new();
+        for row in rows {
+            let age = now.saturating_sub(row.epoch_ts);
+            let entry = out.entry(row.target.clone()).or_default();
+            if age <= WINDOW_5H_SECS {
+                entry.last_5h.add(row);
+            }
+            if age <= WINDOW_24H_SECS {
+                entry.last_24h.add(row);
+            }
+            if age <= WINDOW_7D_SECS {
+                entry.last_7d.add(row);
+            }
+        }
+        out
+    }
+
+    /// A fixture of rows as the ledger has always written them: real targets,
+    /// model strings that carry no pool prefix, spread across the windows.
+    fn legacy_fixture() -> Vec<LedgerRow> {
+        vec![
+            model_row("claude", "sonnet", 30, 900, 120, false),
+            model_row("claude", "opus", 60 * 90, 1_500, 300, false),
+            model_row("ollama", "granite4:350m", 120, 40, 10, true),
+            model_row("ollama", "granite4:350m", WINDOW_5H_SECS + 1, 80, 20, true),
+            model_row(
+                "openai",
+                "gpt-5.6-sol",
+                WINDOW_24H_SECS + 60,
+                5_000,
+                900,
+                false,
+            ),
+            // Only in the 7d window: the target must still appear, with zeroed
+            // 5h/24h windows.
+            model_row("codex", "gpt-5.6", WINDOW_24H_SECS * 3, 10, 10, false),
+            // Older than every window: still creates a (zeroed) target entry.
+            model_row("aider", "sonnet", WINDOW_7D_SECS + 1, 77, 77, false),
+        ]
     }
 
     #[test]
@@ -435,13 +932,10 @@ mod tests {
     #[test]
     fn headroom_uses_24h_window_against_daily_limit() {
         let mut config = Config::default();
-        config.limits.targets.insert(
-            "openai".to_string(),
-            rtrt_core::TargetLimit {
-                daily_tokens: Some(1000),
-                daily_requests: Some(10),
-            },
-        );
+        config
+            .limits
+            .targets
+            .insert("openai".to_string(), target_limit(Some(1000), Some(10)));
         let now = 1_000_000;
         let rows = vec![
             row("openai", 60, 100, 50, false),
@@ -507,6 +1001,313 @@ mod tests {
             lock_path(&ledger),
             PathBuf::from("/tmp/x/provider-usage.tsv.lock")
         );
+    }
+
+    fn target_limit(
+        daily_tokens: Option<u64>,
+        daily_requests: Option<u64>,
+    ) -> rtrt_core::TargetLimit {
+        rtrt_core::TargetLimit {
+            daily_tokens,
+            daily_requests,
+            ..Default::default()
+        }
+    }
+
+    fn config_with_pool_cap(
+        target: &str,
+        target_limit_values: (Option<u64>, Option<u64>),
+        pool: &str,
+        pool_limit_values: (Option<u64>, Option<u64>),
+    ) -> Config {
+        let mut config = Config::default();
+        let mut limit = target_limit(target_limit_values.0, target_limit_values.1);
+        limit.pools.insert(
+            pool.to_string(),
+            rtrt_core::PoolLimit {
+                daily_tokens: pool_limit_values.0,
+                daily_requests: pool_limit_values.1,
+            },
+        );
+        config.limits.targets.insert(target.to_string(), limit);
+        config
+    }
+
+    /// The two `opencode` roster entries that share a target but not a quota.
+    fn two_pool_rows() -> Vec<LedgerRow> {
+        vec![
+            model_row("opencode", "opencode-go/glm-5.2", 60, 100, 50, false),
+            model_row("opencode", "ollama/glm-5.2:cloud", 90, 400, 200, false),
+        ]
+    }
+
+    #[test]
+    fn legacy_rows_aggregate_byte_identically_through_the_fold() {
+        let now = 1_000_000;
+        let rows = legacy_fixture();
+        let legacy = legacy_windows_from_rows(&rows, now);
+        let folded = windows_from_rows(&rows, now);
+        // Byte-identical: same keys, same order, same counters.
+        assert_eq!(format!("{legacy:#?}"), format!("{folded:#?}"));
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            serde_json::to_string(&folded).unwrap()
+        );
+        // Pin a couple of concrete numbers so the reference cannot drift with
+        // the implementation it is guarding.
+        assert_eq!(folded.keys().collect::<Vec<_>>().len(), 5);
+        let claude = folded.get("claude").expect("claude present");
+        assert_eq!(claude.last_5h.requests, 2);
+        assert_eq!(claude.last_5h.tokens, 900 + 120 + 1_500 + 300);
+        let aider = folded.get("aider").expect("aider present even when stale");
+        assert_eq!(aider.last_7d, WindowUsage::default());
+    }
+
+    #[test]
+    fn same_target_different_model_prefix_are_separate_pools() {
+        let now = 1_000_000;
+        let rows = two_pool_rows();
+        let pooled = pool_windows_from_rows(&rows, now);
+
+        assert_eq!(
+            pooled.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "opencode#ollama".to_string(),
+                "opencode#opencode-go".to_string()
+            ]
+        );
+        assert_eq!(pooled["opencode#opencode-go"].last_24h.tokens, 150);
+        assert_eq!(pooled["opencode#ollama"].last_24h.tokens, 600);
+
+        // Folded back: one target bucket carrying the summed totals.
+        let folded = fold_pools_to_targets(&pooled);
+        assert_eq!(folded.keys().cloned().collect::<Vec<_>>(), vec!["opencode"]);
+        let opencode = folded["opencode"];
+        assert_eq!(opencode.last_24h.tokens, 750);
+        assert_eq!(opencode.last_24h.requests, 2);
+        // ...and identical to what the target-only aggregation would produce.
+        assert_eq!(
+            format!("{folded:#?}"),
+            format!("{:#?}", legacy_windows_from_rows(&rows, now))
+        );
+    }
+
+    #[test]
+    fn unpooled_and_pooled_rows_coexist_under_one_target() {
+        let now = 1_000_000;
+        let mut rows = two_pool_rows();
+        // A prefix-less model keys by the bare target, alongside its pools.
+        rows.push(model_row("opencode", "glm-5.2", 60, 7, 3, false));
+        let pooled = pool_windows_from_rows(&rows, now);
+        assert_eq!(pooled["opencode"].last_24h.tokens, 10);
+        assert_eq!(pooled.len(), 3);
+        let folded = fold_pools_to_targets(&pooled);
+        assert_eq!(folded["opencode"].last_24h.tokens, 760);
+        assert_eq!(
+            format!("{folded:#?}"),
+            format!("{:#?}", legacy_windows_from_rows(&rows, now))
+        );
+    }
+
+    #[test]
+    fn target_cap_with_pools_underneath_is_shared_not_split() {
+        let now = 1_000_000;
+        let mut config = Config::default();
+        config
+            .limits
+            .targets
+            .insert("opencode".to_string(), target_limit(Some(1_000), Some(10)));
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let headroom = pool_headroom_from_windows(&pooled, &config);
+
+        let go = &headroom["opencode#opencode-go"];
+        let cloud = &headroom["opencode#ollama"];
+        for pool in [go, cloud] {
+            assert_eq!(pool.tokens.scope, CapScope::Shared);
+            assert_eq!(pool.requests.scope, CapScope::Shared);
+            // The whole cap is reported, never a per-pool slice of it.
+            assert_eq!(pool.tokens.limit, Some(1_000));
+            assert_eq!(pool.requests.limit, Some(10));
+            // Drawn down by every sibling together, so both see the same
+            // remaining pot.
+            assert_eq!(pool.tokens.used, 750);
+            assert_eq!(pool.tokens.remaining, Some(250));
+            assert_eq!(pool.requests.remaining, Some(8));
+            assert!(pool.shares_a_cap());
+            assert!(!pool.limits_unknown());
+            assert_eq!(pool.sibling_pools, 2);
+        }
+        // Each pool's OWN usage stays visible and un-merged.
+        assert_eq!(go.used_tokens, 150);
+        assert_eq!(cloud.used_tokens, 600);
+        // Nothing anywhere equals cap/2 — the cap was never divided.
+        assert!(
+            headroom
+                .values()
+                .all(|pool| pool.tokens.limit == Some(1_000))
+        );
+    }
+
+    #[test]
+    fn pool_cap_takes_precedence_and_charges_only_its_own_usage() {
+        let now = 1_000_000;
+        let config = config_with_pool_cap(
+            "opencode",
+            (Some(1_000), Some(10)),
+            "opencode-go",
+            (Some(400), None),
+        );
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let headroom = pool_headroom_from_windows(&pooled, &config);
+
+        let go = &headroom["opencode#opencode-go"];
+        assert_eq!(go.tokens.scope, CapScope::Pool);
+        assert_eq!(go.tokens.limit, Some(400));
+        assert_eq!(go.tokens.used, 150, "pool cap charges this pool only");
+        assert_eq!(go.tokens.remaining, Some(250));
+        // The un-capped axis still falls back to the shared target cap, and is
+        // labelled as shared rather than silently reported as this pool's own.
+        assert_eq!(go.requests.scope, CapScope::Shared);
+        assert_eq!(go.requests.used, 2);
+        assert_eq!(go.requests.remaining, Some(8));
+
+        // The sibling has no cap of its own, so it keeps sharing the target's.
+        let cloud = &headroom["opencode#ollama"];
+        assert_eq!(cloud.tokens.scope, CapScope::Shared);
+        assert_eq!(cloud.tokens.limit, Some(1_000));
+        assert_eq!(cloud.tokens.used, 750);
+    }
+
+    #[test]
+    fn pool_without_any_cap_reports_unknown_not_a_synthesised_one() {
+        let now = 1_000_000;
+        let config = Config::default();
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let headroom = pool_headroom_from_windows(&pooled, &config);
+
+        for pool in headroom.values() {
+            assert_eq!(pool.tokens.scope, CapScope::Unknown);
+            assert_eq!(pool.requests.scope, CapScope::Unknown);
+            assert_eq!(pool.tokens.limit, None);
+            assert_eq!(pool.tokens.remaining, None);
+            assert_eq!(pool.requests.limit, None);
+            assert_eq!(pool.requests.remaining, None);
+            assert!(pool.limits_unknown());
+            assert!(!pool.shares_a_cap());
+            assert_eq!(pool.room_fraction(), None);
+        }
+        // Observed usage is still reported — it is measured, not inferred.
+        assert_eq!(headroom["opencode#opencode-go"].used_tokens, 150);
+    }
+
+    #[test]
+    fn configured_pool_cap_is_visible_before_its_first_invocation() {
+        let config = config_with_pool_cap(
+            "opencode",
+            (None, None),
+            "opencode-go",
+            (Some(400), Some(4)),
+        );
+        let headroom = pool_headroom_from_windows(&BTreeMap::new(), &config);
+        let go = &headroom["opencode#opencode-go"];
+        assert_eq!(go.tokens.scope, CapScope::Pool);
+        assert_eq!(go.tokens.limit, Some(400));
+        assert_eq!(go.used_tokens, 0);
+        assert_eq!(go.tokens.remaining, Some(400));
+        assert_eq!(go.sibling_pools, 0);
+    }
+
+    #[test]
+    fn room_ranking_is_quota_derived_only_when_every_pool_has_a_cap() {
+        let now = 1_000_000;
+        // Both capped: 150/400 used vs 600/2000 used -> the cloud pool has the
+        // larger remaining fraction (70% vs 62.5%).
+        let mut config =
+            config_with_pool_cap("opencode", (None, None), "opencode-go", (Some(400), None));
+        config
+            .limits
+            .targets
+            .get_mut("opencode")
+            .unwrap()
+            .pools
+            .insert(
+                "ollama".to_string(),
+                rtrt_core::PoolLimit {
+                    daily_tokens: Some(2_000),
+                    daily_requests: None,
+                },
+            );
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let pools = pool_headroom_from_windows(&pooled, &config)
+            .into_values()
+            .collect::<Vec<_>>();
+
+        let ranking = rank_pools_by_room(&pools);
+        assert_eq!(ranking.basis, RoomBasis::Quota);
+        assert_eq!(ranking.best().unwrap().key, "opencode#ollama");
+        assert!(ranking.basis.label().contains("quota-derived"));
+
+        let go = pools.iter().find(|p| p.key.ends_with("go")).unwrap();
+        let cloud = pools.iter().find(|p| p.key.ends_with("ollama")).unwrap();
+        let comparison = compare_room(cloud, go);
+        assert_eq!(comparison.basis, RoomBasis::Quota);
+        assert_eq!(comparison.order, Ordering::Greater);
+    }
+
+    #[test]
+    fn uncapped_pools_rank_by_observed_usage_and_say_so() {
+        let now = 1_000_000;
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let pools = pool_headroom_from_windows(&pooled, &Config::default())
+            .into_values()
+            .collect::<Vec<_>>();
+
+        let ranking = rank_pools_by_room(&pools);
+        assert_eq!(ranking.basis, RoomBasis::ObservedUsage);
+        // Less-used first — an ordering, explicitly NOT a headroom number.
+        assert_eq!(ranking.best().unwrap().key, "opencode#opencode-go");
+        assert!(ranking.basis.label().contains("not a quota measurement"));
+        assert!(
+            ranking
+                .ranked
+                .iter()
+                .all(|pool| pool.tokens.limit.is_none())
+        );
+    }
+
+    #[test]
+    fn a_single_uncapped_pool_downgrades_the_whole_ranking_basis() {
+        let now = 1_000_000;
+        // Only one of the two pools is capped: comparing a fraction against
+        // nothing is meaningless, so the set falls back to observed usage.
+        let config =
+            config_with_pool_cap("opencode", (None, None), "opencode-go", (Some(400), None));
+        let pooled = pool_windows_from_rows(&two_pool_rows(), now);
+        let pools = pool_headroom_from_windows(&pooled, &config)
+            .into_values()
+            .collect::<Vec<_>>();
+        let ranking = rank_pools_by_room(&pools);
+        assert_eq!(ranking.basis, RoomBasis::ObservedUsage);
+        assert_eq!(ranking.ranked.len(), 2);
+    }
+
+    #[test]
+    fn target_headroom_is_unchanged_by_pooled_rows() {
+        let now = 1_000_000;
+        let mut config = Config::default();
+        config
+            .limits
+            .targets
+            .insert("opencode".to_string(), target_limit(Some(1_000), Some(10)));
+        // The target view sums the pools, so it matches what it reported before
+        // pools existed.
+        let windows = windows_from_rows(&two_pool_rows(), now);
+        let headroom = headroom_for("opencode", &windows, &config);
+        assert_eq!(headroom.used_tokens, 750);
+        assert_eq!(headroom.remaining_tokens, Some(250));
+        assert_eq!(headroom.used_requests, 2);
+        assert_eq!(headroom.remaining_requests, Some(8));
+        assert!(!headroom.limits_unknown());
     }
 
     #[test]

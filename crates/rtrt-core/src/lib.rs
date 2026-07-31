@@ -8,13 +8,14 @@ pub mod detect;
 pub mod error;
 pub mod output_style;
 pub mod plugin;
+pub mod pool;
 pub mod project;
 pub mod token;
 
 pub use config::{
-    AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, LimitsConfig, ProjectConfig, ProjectEntry,
-    ProvidersConfig, TargetLimit, TeamConfig, TeamMember, TeamMode, default_memory_store_path,
-    repo_root_from,
+    AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, LimitsConfig, PoolLimit, ProjectConfig,
+    ProjectEntry, ProvidersConfig, TargetLimit, TeamConfig, TeamMember, TeamMode,
+    default_memory_store_path, repo_root_from,
 };
 pub use detect::{
     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,
@@ -26,5 +27,6 @@ pub use output_style::{
     write_output_style_level, write_output_style_level_for,
 };
 pub use plugin::{Plugin, PluginKind, PluginMetadata};
+pub use pool::{PoolKey, pool_from_model};
 pub use project::{project_for_cwd, project_for_cwd_str};
 pub use token::{CompressionLevel, TokenCount, TokenStats};

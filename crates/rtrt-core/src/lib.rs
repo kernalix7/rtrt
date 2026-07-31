@@ -6,6 +6,7 @@
 pub mod config;
 pub mod detect;
 pub mod error;
+mod model_cache;
 pub mod output_style;
 pub mod plugin;
 pub mod pool;
@@ -19,7 +20,7 @@ pub use config::{
 };
 pub use detect::{
     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,
-    detect_tools_with_config,
+    detect_tools_with_config, refresh_cli_model_cache,
 };
 pub use error::{Error, Result};
 pub use output_style::{

@@ -423,6 +423,150 @@ struct AgentCallArgs {
     project: Option<String>,
 }
 
+async fn native_opencode_agent_call(args: &AgentCallArgs) -> Result<Option<String>, McpError> {
+    if args.target != "opencode" {
+        return Ok(None);
+    }
+    let (Ok(parent_id), Ok(server_raw)) = (
+        std::env::var("RTRT_OPENCODE_PARENT_SESSION"),
+        std::env::var("RTRT_OPENCODE_SERVER_URL"),
+    ) else {
+        return Ok(None);
+    };
+    if parent_id.is_empty()
+        || parent_id.len() > 128
+        || !parent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(McpError::internal_error(
+            "agent_call: invalid OpenCode parent session context".to_string(),
+            None,
+        ));
+    }
+    let server = reqwest::Url::parse(&server_raw)
+        .ok()
+        .filter(|url| {
+            url.scheme() == "http"
+                && url
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+        })
+        .ok_or_else(|| {
+            McpError::internal_error(
+                "agent_call: invalid OpenCode loopback server context".to_string(),
+                None,
+            )
+        })?;
+    let model = args.model.as_deref().ok_or_else(|| {
+        McpError::invalid_params(
+            "agent_call: native OpenCode child requires model".to_string(),
+            None,
+        )
+    })?;
+    let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
+        McpError::invalid_params(
+            "agent_call: native OpenCode model must be provider/model".to_string(),
+            None,
+        )
+    })?;
+    let agent = native_worker_agent(model);
+    let directory = std::env::current_dir()
+        .map_err(|e| McpError::internal_error(format!("agent_call cwd: {e}"), None))?;
+    let directory_string = directory.to_string_lossy().into_owned();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| McpError::internal_error(format!("agent_call client: {e}"), None))?;
+    let session_url = server
+        .join("session")
+        .map_err(|e| McpError::internal_error(format!("agent_call session URL: {e}"), None))?;
+    let created = client
+        .post(session_url)
+        .query(&[("directory", directory_string.as_str())])
+        .json(&serde_json::json!({
+            "parentID": parent_id,
+            "title": format!("RTRT worker: {agent}"),
+            "agent": agent,
+            "model": { "id": model_id, "providerID": provider_id }
+        }))
+        .send()
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_call create child: {e}"), None))?
+        .error_for_status()
+        .map_err(|e| McpError::internal_error(format!("agent_call create child: {e}"), None))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_call child response: {e}"), None))?;
+    let child_id = created
+        .get("data")
+        .unwrap_or(&created)
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            McpError::internal_error("agent_call child response missing id".to_string(), None)
+        })?;
+    let prompt_url = server
+        .join(&format!("session/{child_id}/message"))
+        .map_err(|e| McpError::internal_error(format!("agent_call prompt URL: {e}"), None))?;
+    let response = client
+        .post(prompt_url)
+        .query(&[("directory", directory_string.as_str())])
+        .json(&serde_json::json!({
+            "agent": agent,
+            "model": { "providerID": provider_id, "modelID": model_id },
+            "parts": [{ "type": "text", "text": args.prompt }]
+        }))
+        .send()
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_call prompt child: {e}"), None))?
+        .error_for_status()
+        .map_err(|e| McpError::internal_error(format!("agent_call prompt child: {e}"), None))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| McpError::internal_error(format!("agent_call child output: {e}"), None))?;
+    let response = response.get("data").unwrap_or(&response);
+    let output = response
+        .get("parts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    if output.is_empty() {
+        return Err(McpError::internal_error(
+            "agent_call native child returned no text".to_string(),
+            None,
+        ));
+    }
+    Ok(Some(
+        serde_json::json!({
+            "target": args.target,
+            "model": model,
+            "agent": agent,
+            "child_session_id": child_id,
+            "output": output
+        })
+        .to_string(),
+    ))
+}
+
+fn native_worker_agent(model: &str) -> &'static str {
+    if model.starts_with("openai/") {
+        "hard-gpt-worker"
+    } else if model.starts_with("opencode-go/") {
+        "glm-go-worker"
+    } else if model.contains("kimi") {
+        "kimi-cloud-worker"
+    } else if model.starts_with("ollama/glm") {
+        "glm-cloud-worker"
+    } else {
+        "build"
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentRouteArgs {
     prompt: String,
@@ -1088,6 +1232,21 @@ impl RtrtMcp {
         Parameters(args): Parameters<AgentCallArgs>,
     ) -> Result<CallToolResult, McpError> {
         let project = args.project.clone();
+        if let Some(body) = native_opencode_agent_call(&args).await? {
+            let output = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            self.state
+                .auto_capture("agent_call", project.as_deref(), &output)
+                .await;
+            return Ok(CallToolResult::success(vec![Content::text(body)]));
+        }
         let mode = match args.mode.as_deref() {
             Some(value) => Some(
                 InvokeMode::parse_label(value)
@@ -1754,6 +1913,21 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn native_worker_agents_follow_configured_provider_roles() {
+        assert_eq!(native_worker_agent("openai/gpt-5.4"), "hard-gpt-worker");
+        assert_eq!(native_worker_agent("opencode-go/glm-5.2"), "glm-go-worker");
+        assert_eq!(
+            native_worker_agent("ollama/glm-5:cloud"),
+            "glm-cloud-worker"
+        );
+        assert_eq!(
+            native_worker_agent("ollama/kimi-k2.7-code:cloud"),
+            "kimi-cloud-worker"
+        );
+        assert_eq!(native_worker_agent("other/model"), "build");
     }
 
     #[test]

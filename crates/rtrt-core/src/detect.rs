@@ -157,7 +157,7 @@ const REGISTRY: &[ToolDescriptor] = &[
         version_args: VERSION_FLAG,
         invocation_modes: CLI_MODE,
         cli_invocation: Some(
-            "claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call",
+            "claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call mcp__rtrt__memory_recall mcp__rtrt__memory_smart_search mcp__rtrt__memory_timeline mcp__rtrt__memory_sessions",
         ),
         cost_class: CostClass::SubscriptionFlat,
         capabilities: CODING_CAPS,
@@ -853,7 +853,9 @@ mod tests {
 
         assert_eq!(
             template("claude"),
-            Some("claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call")
+            Some(
+                "claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call mcp__rtrt__memory_recall mcp__rtrt__memory_smart_search mcp__rtrt__memory_timeline mcp__rtrt__memory_sessions"
+            )
         );
         assert_eq!(
             template("opencode"),

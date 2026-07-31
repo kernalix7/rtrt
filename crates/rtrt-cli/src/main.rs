@@ -616,7 +616,7 @@ enum GatewayCmd {
 enum TeamCmd {
     /// Dispatch the prompt through the configured leader order with failover.
     Dispatch {
-        /// Timeout in seconds for each manager or leader invocation.
+        /// Timeout in seconds for the complete leader failover walk.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
         timeout: u64,
         /// Emit the complete dispatch result as JSON.
@@ -4143,13 +4143,20 @@ async fn run_team(cmd: TeamCmd) -> Result<()> {
             prompt,
         } => {
             let prompt = read_team_prompt(prompt, std::io::stdin())?;
-            let outcome = dispatch_team(
-                &config.team,
-                &prompt,
-                std::time::Duration::from_secs(timeout),
-            )
-            .await
-            .context("rtrt team dispatch")?;
+            let timeout = std::time::Duration::from_secs(timeout);
+            #[cfg(unix)]
+            let outcome = {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .context("install team dispatch termination handler")?;
+                tokio::select! {
+                    result = dispatch_team(&config.team, &prompt, timeout) => result,
+                    _ = terminate.recv() => bail!("rtrt team dispatch: terminated"),
+                }
+            };
+            #[cfg(not(unix))]
+            let outcome = dispatch_team(&config.team, &prompt, timeout).await;
+            let outcome = outcome.context("rtrt team dispatch")?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {

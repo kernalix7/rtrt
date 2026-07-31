@@ -1,11 +1,18 @@
 use std::{
     io::Read,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use rtrt_core::{CostClass, DetectedTool, Error, InvocationMode, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use tokio::task::JoinHandle;
 
 use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage_ledger};
@@ -73,7 +80,9 @@ pub async fn invoke_agent(
     prompt: &str,
     opts: InvokeOptions,
 ) -> Result<InvokeOutcome> {
-    let tools = rtrt_core::detect_tools();
+    let tools = tokio::task::spawn_blocking(rtrt_core::detect_tools)
+        .await
+        .map_err(|e| Error::Provider(format!("invoke: tool detection failed: {e}")))?;
     let tool = resolve_target(target, &tools)?;
     let requested = opts.mode.unwrap_or(Mode::Auto);
     let mode_used = select_mode(tool, requested)?;
@@ -351,6 +360,7 @@ fn target_label(target: &str, model: Option<&str>) -> String {
 /// `invoke_agent`'s single-target behavior is untouched; this is an additional
 /// layer on top. Each underlying call still records to the ledger (failures as
 /// `ok = 0`), so balance accounting is identical to a direct invocation.
+/// `timeout` is the budget for the complete failover walk, not each candidate.
 pub async fn invoke_with_failover(
     targets: &[RankedTarget],
     prompt: &str,
@@ -362,21 +372,41 @@ pub async fn invoke_with_failover(
         ));
     }
 
+    let started = Instant::now();
     let mut failed_over = Vec::new();
     for candidate in targets {
+        let remaining = timeout.saturating_sub(started.elapsed());
         let opts = InvokeOptions {
             mode: Some(candidate.mode),
             model: candidate.model.clone(),
-            timeout,
+            timeout: remaining,
         };
-        match invoke_agent(&candidate.target, prompt, opts).await {
-            Ok(outcome) => {
+        let invocation =
+            tokio::time::timeout(remaining, invoke_agent(&candidate.target, prompt, opts)).await;
+        match invocation {
+            Err(_) => {
+                record_cli(
+                    &candidate.target,
+                    candidate.model.as_deref().unwrap_or_default(),
+                    prompt,
+                    "",
+                    false,
+                );
+                failed_over.push(FailoverAttempt {
+                    target: candidate.target.clone(),
+                    model: candidate.model.clone(),
+                    retryable: true,
+                    error: format!("invoke: failover timed out after {}s", timeout.as_secs()),
+                });
+                break;
+            }
+            Ok(Ok(outcome)) => {
                 return Ok(FailoverOutcome {
                     outcome,
                     failed_over,
                 });
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let retryable = is_retryable_error(&err);
                 failed_over.push(FailoverAttempt {
                     target: candidate.target.clone(),
@@ -395,6 +425,60 @@ pub async fn invoke_with_failover(
         }
     }
     Err(aggregated_error(&failed_over))
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+    #[cfg(unix)]
+    process_group: Option<Pid>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        #[cfg(unix)]
+        let process_group = i32::try_from(child.id()).ok().map(Pid::from_raw);
+        Self {
+            child: Some(child),
+            #[cfg(unix)]
+            process_group,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child guard must be armed")
+    }
+
+    fn disarm(&mut self) {
+        self.child.take();
+    }
+
+    fn terminate(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(process_group) = self.process_group {
+            let _ = kill(Pid::from_raw(-process_group.as_raw()), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let pid = child.id().to_string();
+            let _ = Command::new("taskkill")
+                .args(["/PID", pid.as_str(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 /// Build a single error summarizing every failover attempt, in order.
@@ -554,22 +638,26 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
     let (program, args) = argv.split_first().ok_or_else(|| {
         Error::Provider("invoke: cannot spawn an empty CLI invocation".to_string())
     })?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
         .spawn()
         .map_err(|e| Error::Provider(format!("invoke: spawn '{program}': {e}")))?;
+    let mut child = ChildGuard::new(child);
 
-    let stdout_reader = child.stdout.take().map(read_pipe);
-    let stderr_reader = child.stderr.take().map(read_pipe);
+    let stdout_reader = child.child_mut().stdout.take().map(read_pipe);
+    let stderr_reader = child.child_mut().stderr.take().map(read_pipe);
 
-    let status = match tokio::time::timeout(timeout, wait_for_child(&mut child)).await {
+    let status = match tokio::time::timeout(timeout, wait_for_child(child.child_mut())).await {
         Ok(result) => result?,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.terminate();
             drain_reader_bounded(stdout_reader).await;
             drain_reader_bounded(stderr_reader).await;
             return Err(Error::Provider(format!(
@@ -579,6 +667,7 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
             )));
         }
     };
+    child.disarm();
 
     let stdout = join_reader(stdout_reader).await?;
     let stderr = join_reader(stderr_reader).await?;
@@ -898,6 +987,67 @@ mod tests {
         drain_reader_bounded(Some(reader)).await;
 
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_cli_invocation_kills_its_process_group() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("rtrt-invoke-cancel-{}-{nonce}", std::process::id()));
+        let parent_pid_file = base.with_extension("parent");
+        let child_pid_file = base.with_extension("child");
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo $$ > \"$1\"; sleep 30 & echo $! > \"$2\"; wait".to_string(),
+            "sh".to_string(),
+            parent_pid_file.to_string_lossy().into_owned(),
+            child_pid_file.to_string_lossy().into_owned(),
+        ];
+
+        let invocation =
+            tokio::spawn(async move { run_cli_argv(&argv, Duration::from_secs(30)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !parent_pid_file.exists() || !child_pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test command should publish its pids");
+        let parent_pid = read_test_pid(&parent_pid_file);
+        let child_pid = read_test_pid(&child_pid_file);
+
+        invocation.abort();
+        let _ = invocation.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while process_exists(parent_pid) || process_exists(child_pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled invocation left a process behind");
+        let _ = std::fs::remove_file(parent_pid_file);
+        let _ = std::fs::remove_file(child_pid_file);
+    }
+
+    #[cfg(unix)]
+    fn read_test_pid(path: &std::path::Path) -> Pid {
+        let raw = std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        Pid::from_raw(raw)
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: Pid) -> bool {
+        kill(pid, None).is_ok()
     }
 
     #[tokio::test]

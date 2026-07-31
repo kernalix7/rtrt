@@ -117,11 +117,11 @@ rtrt team show
 rtrt team check-manager
 ```
 
-setup은 `~/.rtrt/config.toml`의 `[team]`을 활성화하고, `~/.config/opencode/opencode.jsonc`에 Ollama provider와 rtrt MCP 항목을 병합하며, Claude leader용 동일 MCP server를 `~/.claude.json`에도 등록하고, 기본 agent를 `rtrt-orchestrator`로 지정합니다. worker agents와 원문 보존 relay plugin도 함께 생성합니다. 반복 실행해도 안전하며 OpenCode를 완전히 재설치한 뒤에도 같은 명령으로 전체 통합을 재생성합니다. 첫 기록은 `.bak`으로 백업합니다.
+setup은 `~/.rtrt/config.toml`의 `[team]`을 활성화하고, `~/.config/opencode/opencode.jsonc`에 `rtrt/team` loopback provider, Ollama provider, rtrt MCP 항목을 병합하며 Claude Leader용 동일 MCP server를 `~/.claude.json`에도 등록합니다. 도구가 없는 `rtrt-orchestrator` transport shell을 기본 agent로 지정하고 Leader/worker agent와 gateway bootstrap plugin을 생성합니다. 반복 실행해도 안전하며 첫 기록은 `.bak`으로 백업합니다.
 
-텍스트 prompt는 byte 단위로 그대로 전달합니다. OpenCode 파일 attachment는 worker가 로컬 파일을 열 수 있도록 `mime` / `filename` / `url` metadata로 전달하며, inline image data를 provider-native multimodal message로 변환하지는 않습니다.
+최신 사용자 텍스트만 byte 단위로 그대로 전달하며 이전 chat history는 Leader prompt에 복사하지 않습니다. 이전 project/session 맥락이 필요하면 Leader가 rtrt memory recall/timeline tool로 복구합니다. client tool 정의, 파일 attachment, vision content는 이 텍스트 전용 bridge가 전달하지 않습니다.
 
-기본 로컬 manager는 `ollama/granite4:350m`입니다. setup 시 `--team-manager-provider`, `--team-manager-model`로 변경할 수 있습니다. RTRT는 설정된 leader 순서를 따르며 가용성·quota·rate-limit·server·timeout처럼 재시도 가능한 실패에서만 다음 leader로 넘어갑니다. Claude member는 Anthropic API가 아니라 Claude CLI 구독 경로인 `claude -p --model opus|sonnet`으로 실행합니다.
+local manager 설정은 진단과 직접 team dispatch용으로 남지만 OpenCode LLM orchestrator로 사용되지 않습니다. deterministic router는 사용량/headroom만 확인하고 설정된 Leader 순서를 유지하며 가용성·quota·rate-limit·server·timeout처럼 재시도 가능한 실패에서만 다음 Leader로 넘어갑니다. Claude member는 Anthropic API가 아니라 Claude CLI 구독 경로인 `claude -p --model opus|sonnet`으로 실행합니다.
 
 로컬 stdio MCP 자동 캡처는 linked worktree를 main Git 저장소 project로 귀속합니다. 공유 HTTP MCP server의 자동 캡처 tool은 명시적 `project`를 받을 수 있으며, 없으면 잘못된 project를 만들거나 오염시키지 않고 캡처를 건너뜁니다.
 
@@ -275,6 +275,7 @@ export OPENAI_API_KEY=unused      # 또는 설정한 RTRT_GATEWAY_TOKEN
 
 | `model` | 동작 |
 |---------|------|
+| `rtrt/team` | Deterministic 팀 라우팅: provider 사용량/headroom만 계산하고 설정된 Leader 우선순위, 최신 사용자 원문 전달, 재시도 가능 오류 failover, 필터링된 assistant-text streaming을 적용. |
 | `auto` / `""` / `rtrt/auto` | 전체 라우팅: 요청에서 능력(capability)을 추론한 뒤 헤드룸 인지 `select_route` + 랭크된 타깃에 대한 자동 페일오버. |
 | `rtrt/cheapest` | 같은 랭크 목록, 가장 저렴한 비용 티어 우선. |
 | `rtrt/best` | 같은 랭크 목록, 능력이 가장 높은 티어 우선. |
@@ -291,11 +292,10 @@ export OPENAI_API_KEY=unused      # 또는 설정한 RTRT_GATEWAY_TOKEN
 - 기본 바인딩은 `127.0.0.1`. 토큰 없이 비루프백으로 바인딩하면 경고를 로깅합니다.
 - `--token <T>` / `RTRT_GATEWAY_TOKEN`을 설정하면 `/v1/*`에 `Authorization: Bearer <T>`가 필요합니다(누락 시 401 + `WWW-Authenticate`; 상수 시간 비교). `/healthz`는 계속 열려 있습니다.
 
-한계(정직하게): 텍스트 전용 브리지입니다. 라우팅 경로에서는 요청이 단일 프롬프트로
-평탄화되므로, 툴 콜링 / 함수 콜링 / 비전 콘텐츠는 아직 전달되지 않습니다.
-스트리밍은 버퍼링 방식입니다 — 라우팅된 답변을 전부 계산한 뒤 SSE 청크로
-내보냅니다(CLI 모드 타깃은 전체 텍스트만 반환). 즉 `stream:true`는 와이어
-호환이지만 토큰 단위 스트리밍은 아닙니다.
+한계(정직하게): 텍스트 전용 브리지라 client tool 정의, 함수 호출, 비전 콘텐츠는
+전달하지 않습니다. `rtrt/team`은 Claude CLI assistant text delta를 실시간 전달하면서
+UUID/tool/usage JSON을 숨깁니다. 기존 auto/explicit 경로는 여전히 전체 결과를 받은 뒤
+SSE로 내보냅니다.
 
 ```bash
 # 자동 라우팅, 비스트리밍

@@ -75,9 +75,12 @@ const OPENCODE_AGENTS_REL: &str = "~/.config/opencode/agents";
 const OPENCODE_LEGACY_AGENTS_REL: &str = "~/.config/opencode/agent";
 const OPENCODE_PLUGINS_REL: &str = "~/.config/opencode/plugins";
 const OPENCODE_ORCHESTRATOR: &str = "rtrt-orchestrator";
+const OPENCODE_ORCHESTRATOR_MODEL: &str = "rtrt/team";
 const OPENCODE_TEAM_RELAY_PLUGIN: &str = "rtrt-team-relay.js";
+const OPENCODE_GATEWAY_PLUGIN: &str = "rtrt-gateway-bootstrap.js";
 const OLLAMA_OPENCODE_NPM: &str = "@ai-sdk/openai-compatible";
 const OLLAMA_OPENCODE_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+const RTRT_GATEWAY_BASE_URL: &str = "http://127.0.0.1:7412/v1";
 const AIDER_RULES_REL: &str = "~/.aider/conventions.md";
 const TERSE_BLOCK_BEGIN: &str = "# BEGIN rtrt-output-optimizer";
 const TERSE_BLOCK_END: &str = "# END rtrt-output-optimizer";
@@ -703,7 +706,7 @@ fn apply_opencode_team_at(
     let patch = opencode_team_config_patch(binary, memory_path, &config.team, &root);
     deep_merge_json(&mut root, patch);
     let agents = render_opencode_team_agents(&config.team)?;
-    let relay_plugin = paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN);
+    let cleanup_paths = opencode_team_cleanup_paths(paths, &agents);
 
     if !apply {
         println!(
@@ -719,16 +722,14 @@ fn apply_opencode_team_at(
         if team_uses_ollama(&config.team) {
             println!("[dry-run] would ensure provider.ollama at {OLLAMA_OPENCODE_BASE_URL}");
         }
-        for (name, _) in &agents {
-            println!(
-                "[dry-run] would write OpenCode agent {}",
-                opencode_team_agent_path(paths, name).display()
-            );
-        }
+        println!("[dry-run] would write OpenCode agents (orchestrator + workers)");
         println!(
-            "[dry-run] would write OpenCode exact-relay plugin {}",
-            relay_plugin.display()
+            "[dry-run] would write OpenCode gateway bootstrap {}",
+            paths.plugins.join(OPENCODE_GATEWAY_PLUGIN).display()
         );
+        for path in cleanup_paths {
+            println!("[dry-run] would remove {}", path.display());
+        }
         println!("Re-run with --apply to write team configuration.");
         return Ok(());
     }
@@ -739,7 +740,19 @@ fn apply_opencode_team_at(
         let path = opencode_team_agent_path(paths, &name);
         write_managed_file(&path, &body)?;
     }
-    write_managed_file(&relay_plugin, &render_opencode_team_relay_plugin(binary)?)?;
+    for path in cleanup_paths {
+        remove_stale_managed_file(&path, "description: RTRT")?;
+    }
+    write_managed_file(
+        &paths.plugins.join(OPENCODE_GATEWAY_PLUGIN),
+        &render_opencode_gateway_bootstrap(binary)?,
+    )?;
+    // Remove any stale relay plugin from a previous relay-based setup.
+    let relay_plugin = paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN);
+    if relay_plugin.exists() {
+        let _ = std::fs::remove_file(&relay_plugin);
+        println!("removed stale relay plugin {}", relay_plugin.display());
+    }
     println!(
         "enabled OpenCode team manager {}/{}",
         config.team.manager_provider, config.team.manager_model
@@ -802,6 +815,19 @@ fn opencode_team_config_patch(
             "ollama": serde_json::Value::Object(ollama)
         });
     }
+    let providers = patch
+        .as_object_mut()
+        .expect("OpenCode patch is an object")
+        .entry("provider")
+        .or_insert_with(|| serde_json::json!({}));
+    providers["rtrt"] = serde_json::json!({
+        "name": "RTRT deterministic team router",
+        "npm": OLLAMA_OPENCODE_NPM,
+        "models": {
+            "team": { "name": "RTRT Team Router" }
+        },
+        "options": { "baseURL": RTRT_GATEWAY_BASE_URL }
+    });
     patch
 }
 
@@ -835,14 +861,19 @@ fn deep_merge_json(target: &mut serde_json::Value, patch: serde_json::Value) {
 }
 
 fn render_opencode_team_agents(team: &TeamConfig) -> Result<Vec<(String, String)>> {
-    let manager_model = format!("{}/{}", team.manager_provider, team.manager_model);
-    let mut agents = vec![(
-        OPENCODE_ORCHESTRATOR.to_string(),
-        format!(
-            "---\ndescription: RTRT primary team orchestrator\nmode: primary\nmodel: {}\ntemperature: 0\nsteps: 1\ntools:\n  \"*\": false\n---\n\nThe RTRT relay plugin has already dispatched the complete user message. Reply with `RTRT_RELAY_PENDING` only. Do not analyze the request or call tools. The plugin replaces this placeholder with the selected leader's exact output.\n",
-            serde_json::to_string(&manager_model)?
+    let mut agents = vec![
+        (
+            OPENCODE_ORCHESTRATOR.to_string(),
+            format!(
+                "---\ndescription: RTRT deterministic team transport — no LLM planning, tools, or repository access\nmode: primary\nmodel: {}\ntemperature: 0\nsteps: 1\ntools:\n  \"*\": false\n---\n\nTransport shell only. The local RTRT provider selects an available Leader from usage state, forwards the latest user message byte-for-byte, and streams the Leader response. Do not interpret, plan, edit, or call tools.\n",
+                serde_json::to_string(OPENCODE_ORCHESTRATOR_MODEL)?
+            ),
         ),
-    )];
+        (
+            "rtrt-leader".to_string(),
+            "---\ndescription: RTRT selected Leader — analyzes requests and delegates implementation to subagents\nmode: primary\nsteps: 60\ntools:\n  \"*\": false\n  task: true\n  rtrt_agent_call: true\n  rtrt_memory_recall: true\n  rtrt_memory_smart_search: true\n  rtrt_memory_timeline: true\n  rtrt_memory_sessions: true\n---\n\nAct as selected Leader. Analyze the exact current user task supplied by RTRT. When it depends on earlier work, recover context through rtrt memory recall/timeline tools instead of expecting chat history from the router. Delegate implementation and verification to appropriate subagents, integrate their results, and return the final answer. Do not perform repository edits directly.\n".to_string(),
+        ),
+    ];
     let worker_specs = [
         (
             "hard-gpt-worker",
@@ -890,61 +921,38 @@ fn render_opencode_team_agents(team: &TeamConfig) -> Result<Vec<(String, String)
     Ok(agents)
 }
 
-fn render_opencode_team_relay_plugin(mcp_binary: &str) -> Result<String> {
-    let cli_binary = companion_rtrt_binary(mcp_binary);
-    let cli_binary = serde_json::to_string(&cli_binary.to_string_lossy())?;
+fn render_opencode_gateway_bootstrap(mcp_binary: &str) -> Result<String> {
+    let cli = companion_rtrt_binary(mcp_binary);
+    let cli = serde_json::to_string(&cli.to_string_lossy())?;
     Ok(format!(
-        r#"const RTRT_BINARY = {cli_binary}
+        r#"const RTRT_BINARY = {cli}
+const HEALTHZ = "http://127.0.0.1:7412/healthz"
 
-export const RtrtTeamRelay = async ({{ directory }}) => {{
-  const pending = new Map()
+const healthy = async () => {{
+  try {{
+    const response = await fetch(HEALTHZ)
+    return response.ok
+  }} catch {{
+    return false
+  }}
+}}
 
+export const RtrtGatewayBootstrap = async ({{ serverUrl }}) => {{
+  if (!(await healthy())) {{
+    Bun.spawn([RTRT_BINARY, "gateway", "serve"], {{
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    }})
+    for (let attempt = 0; attempt < 40 && !(await healthy()); attempt++) {{
+      await Bun.sleep(50)
+    }}
+  }}
   return {{
-    "chat.message": async (input, output) => {{
-      const agent = input.agent ?? output.message?.agent
-      if (agent !== "rtrt-orchestrator") {{
-        pending.delete(input.sessionID)
-        return
-      }}
-      const text = output.parts
-        .filter((part) => part.type === "text" && !part.synthetic && !part.ignored)
-        .map((part) => part.text)
-        .join("")
-      const attachments = output.parts
-        .filter((part) => part.type === "file")
-        .map((part) => ({{ mime: part.mime, filename: part.filename, url: part.url }}))
-      const prompt = attachments.length === 0
-        ? text
-        : `${{text}}\n\n<opencode_attachments>\n${{JSON.stringify(attachments)}}\n</opencode_attachments>`
-      const state = {{ output: undefined }}
-      pending.set(input.sessionID, state)
-
-      const child = Bun.spawn(
-        [RTRT_BINARY, "team", "dispatch", "--json"],
-        {{ cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "pipe" }},
-      )
-      child.stdin.write(prompt)
-      child.stdin.end()
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ])
-      if (exitCode !== 0) {{
-        throw new Error(`rtrt team dispatch failed (${{exitCode}}): ${{stderr.trim()}}`)
-      }}
-      const result = JSON.parse(stdout)
-      if (typeof result?.outcome?.output !== "string") {{
-        throw new Error("rtrt team dispatch returned no leader output")
-      }}
-      state.output = result.outcome.output
-    }},
-    "experimental.text.complete": async (input, output) => {{
-      const state = pending.get(input.sessionID)
-      if (state?.output !== undefined) {{
-        output.text = state.output
-        pending.delete(input.sessionID)
-      }}
+    "chat.headers": async (input, output) => {{
+      if (input.provider?.info?.id !== "rtrt") return
+      output.headers["x-rtrt-opencode-session"] = input.sessionID
+      output.headers["x-rtrt-opencode-server"] = serverUrl.toString()
     }},
   }}
 }}
@@ -973,6 +981,48 @@ fn opencode_team_agent_path(paths: &OpencodeTeamPaths, name: &str) -> PathBuf {
     } else {
         paths.agents.join(format!("{name}.md"))
     }
+}
+
+fn opencode_team_cleanup_paths(
+    paths: &OpencodeTeamPaths,
+    agents: &[(String, String)],
+) -> Vec<PathBuf> {
+    // Only stale/retired paths belong here — never the location a fresh agent
+    // is written to in the same run. `opencode_team_agent_path` writes each
+    // agent to the legacy (`agent/`) dir when a legacy file already exists,
+    // otherwise to the canonical `agents/` dir. So the only stale duplicate
+    // per rendered agent is the *opposite* location, and only when a legacy
+    // file present means the fresh agent went to legacy (leaving a stale
+    // `agents/<name>.md` behind from a prior setup). Adding the legacy path
+    // unconditionally would delete the freshly written legacy file, which is
+    // the regression this guards against. The retired `team-lead.md` in both
+    // agent dirs and the relay plugin always qualify for removal.
+    let mut cleanup_paths = Vec::with_capacity(agents.len() + 3);
+    for (name, _) in agents {
+        if paths.legacy_agents.join(format!("{name}.md")).exists() {
+            cleanup_paths.push(paths.agents.join(format!("{name}.md")));
+        }
+    }
+    cleanup_paths.push(paths.agents.join("team-lead.md"));
+    cleanup_paths.push(paths.legacy_agents.join("team-lead.md"));
+    cleanup_paths.push(paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN));
+    cleanup_paths.sort();
+    cleanup_paths.dedup();
+    cleanup_paths
+}
+
+fn remove_stale_managed_file(path: &Path, marker: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if !raw.contains(marker) {
+        println!("{}: preserving non-rtrt file", path.display());
+        return Ok(());
+    }
+    std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    println!("removed stale {}", path.display());
+    Ok(())
 }
 
 fn write_serialized_config(path: &Path, config: &Config) -> Result<()> {
@@ -1240,7 +1290,10 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
         return Ok(());
     }
     if !apply {
-        println!("[dry-run] would unset mcp.rtrt in {}", path.display());
+        println!(
+            "[dry-run] would unset mcp.rtrt, provider.rtrt, and managed default_agent in {}",
+            path.display()
+        );
         return Ok(());
     }
     backup_if_needed(path)?;
@@ -1260,6 +1313,11 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
                 && let Some(object) = root.as_object_mut()
             {
                 object.remove("default_agent");
+                removed = true;
+            }
+            if let Some(providers) = root.get_mut("provider").and_then(|v| v.as_object_mut())
+                && providers.remove("rtrt").is_some()
+            {
                 removed = true;
             }
             if removed {
@@ -1985,18 +2043,30 @@ fn remove_opencode_team_artifacts(apply: bool) -> Result<()> {
 fn remove_opencode_team_artifacts_at(paths: &OpencodeTeamPaths, apply: bool) -> Result<()> {
     for name in [
         OPENCODE_ORCHESTRATOR,
+        "rtrt-leader",
+        "team-lead",
         "hard-gpt-worker",
         "glm-go-worker",
         "glm-cloud-worker",
         "kimi-cloud-worker",
         "review-gpt",
     ] {
-        let path = opencode_team_agent_path(paths, name);
-        remove_or_restore_managed_file(&path, "description: RTRT", apply)?;
+        for path in [
+            paths.agents.join(format!("{name}.md")),
+            paths.legacy_agents.join(format!("{name}.md")),
+        ] {
+            remove_or_restore_managed_file(&path, "description: RTRT", apply)?;
+        }
     }
+    // Also remove a stale relay plugin if one exists from a previous setup.
     remove_or_restore_managed_file(
         &paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN),
         "RtrtTeamRelay",
+        apply,
+    )?;
+    remove_or_restore_managed_file(
+        &paths.plugins.join(OPENCODE_GATEWAY_PLUGIN),
+        "RtrtGatewayBootstrap",
         apply,
     )?;
 
@@ -2526,12 +2596,18 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&paths.opencode).unwrap()).unwrap();
         assert_eq!(root["provider"]["ollama"]["npm"], OLLAMA_OPENCODE_NPM);
         assert_eq!(
+            root["provider"]["rtrt"]["options"]["baseURL"],
+            RTRT_GATEWAY_BASE_URL
+        );
+        assert!(root["provider"]["rtrt"]["models"]["team"].is_object());
+        assert_eq!(
             root["provider"]["ollama"]["options"]["baseURL"],
             OLLAMA_OPENCODE_BASE_URL
         );
 
         let expected = [
             OPENCODE_ORCHESTRATOR,
+            "rtrt-leader",
             "hard-gpt-worker",
             "glm-go-worker",
             "glm-cloud-worker",
@@ -2544,34 +2620,30 @@ mod tests {
         let orchestrator =
             std::fs::read_to_string(paths.agents.join("rtrt-orchestrator.md")).unwrap();
         assert!(orchestrator.contains("mode: primary"));
-        assert!(orchestrator.contains("model: \"ollama/granite4:350m\""));
+        assert!(orchestrator.contains("model: \"rtrt/team\""));
         assert!(orchestrator.contains("steps: 1"));
         assert!(orchestrator.contains("temperature: 0"));
-        assert!(orchestrator.contains("RTRT_RELAY_PENDING"));
+        assert!(orchestrator.contains("\"*\": false"));
+        assert!(!orchestrator.contains("bash: true"));
+        assert!(!orchestrator.contains("task: true"));
+        assert!(orchestrator.contains("Do not interpret, plan, edit, or call tools"));
+        assert!(!orchestrator.contains("RTRT_RELAY_PENDING"));
         assert!(!orchestrator.contains("rtrt_team_dispatch: true"));
-        let relay =
-            std::fs::read_to_string(paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN)).unwrap();
-        assert!(relay.contains("chat.message"));
-        assert!(relay.contains("const RTRT_BINARY = \"rtrt\""));
-        assert!(relay.contains("[RTRT_BINARY, \"team\", \"dispatch\", \"--json\"]"));
-        assert!(relay.contains("input.agent ?? output.message?.agent"));
-        assert!(relay.contains("child.stdin.write(prompt)"));
-        assert!(relay.contains("pending.delete(input.sessionID)"));
-        assert!(relay.contains("experimental.text.complete"));
+        assert!(!paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN).exists());
+        let bootstrap =
+            std::fs::read_to_string(paths.plugins.join(OPENCODE_GATEWAY_PLUGIN)).unwrap();
+        assert!(bootstrap.contains("RtrtGatewayBootstrap"));
+        assert!(bootstrap.contains("gateway\", \"serve"));
+        assert!(bootstrap.contains("chat.headers"));
+        assert!(bootstrap.contains("x-rtrt-opencode-session"));
+        assert!(bootstrap.contains("x-rtrt-opencode-server"));
+        assert!(bootstrap.contains("input.provider?.info?.id !== \"rtrt\""));
+        let leader = std::fs::read_to_string(paths.agents.join("rtrt-leader.md")).unwrap();
+        assert!(leader.contains("rtrt_memory_recall: true"));
+        assert!(leader.contains("rtrt_memory_timeline: true"));
+        assert!(!paths.agents.join("team-lead.md").exists());
         assert!(!paths.agents.join("opus.md").exists());
         assert!(!paths.agents.join("sonnet.md").exists());
-    }
-
-    #[test]
-    fn opencode_team_relay_uses_cli_next_to_mcp_binary() {
-        assert_eq!(
-            companion_rtrt_binary("/opt/rtrt/bin/rtrt-mcp"),
-            PathBuf::from("/opt/rtrt/bin/rtrt")
-        );
-        assert_eq!(
-            companion_rtrt_binary("rtrt-mcp.exe"),
-            PathBuf::from("rtrt.exe")
-        );
     }
 
     #[test]
@@ -2593,10 +2665,36 @@ mod tests {
         );
         let orchestrator =
             std::fs::read_to_string(paths.agents.join("rtrt-orchestrator.md")).unwrap();
-        assert!(orchestrator.contains("model: \"ollama/qwen3:8b\""));
+        assert!(orchestrator.contains("model: \"rtrt/team\""));
+        assert!(!paths.agents.join("team-lead.md").exists());
         let persisted = Config::from_toml_str(&std::fs::read_to_string(&paths.config).unwrap())
             .expect("persisted config");
         assert_eq!(persisted.team.manager_model, "qwen3:8b");
+    }
+
+    #[test]
+    fn opencode_team_apply_removes_duplicate_and_retired_agents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_team_paths(dir.path());
+        std::fs::create_dir_all(&paths.agents).unwrap();
+        std::fs::create_dir_all(&paths.legacy_agents).unwrap();
+        for path in [
+            paths.agents.join("rtrt-orchestrator.md"),
+            paths.legacy_agents.join("rtrt-orchestrator.md"),
+            paths.agents.join("team-lead.md"),
+            paths.legacy_agents.join("team-lead.md"),
+        ] {
+            std::fs::write(path, "description: RTRT stale agent\n").unwrap();
+        }
+
+        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
+
+        let orchestrator =
+            std::fs::read_to_string(paths.legacy_agents.join("rtrt-orchestrator.md")).unwrap();
+        assert!(orchestrator.contains(OPENCODE_ORCHESTRATOR_MODEL));
+        assert!(!paths.agents.join("rtrt-orchestrator.md").exists());
+        assert!(!paths.agents.join("team-lead.md").exists());
+        assert!(!paths.legacy_agents.join("team-lead.md").exists());
     }
 
     #[test]
@@ -2648,6 +2746,19 @@ mod tests {
     fn opencode_team_dry_run_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = test_team_paths(&dir.path().join("missing"));
+        let cleanup = opencode_team_cleanup_paths(
+            &paths,
+            &render_opencode_team_agents(&enabled_team_config().team).unwrap(),
+        );
+        // With no pre-existing legacy files the fresh agents are written to
+        // `agents/`, so no per-agent stale-duplicate path qualifies for
+        // removal — adding it would mean deleting the freshly written file.
+        // Only the retired `team-lead.md` in both agent dirs and the relay
+        // plugin are planned deletions here.
+        assert!(!cleanup.contains(&paths.legacy_agents.join("hard-gpt-worker.md")));
+        assert!(cleanup.contains(&paths.agents.join("team-lead.md")));
+        assert!(cleanup.contains(&paths.legacy_agents.join("team-lead.md")));
+        assert!(cleanup.contains(&paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN)));
 
         apply_test_team(&paths, false, &enabled_team_config()).unwrap();
 
@@ -2655,6 +2766,58 @@ mod tests {
         assert!(!paths.opencode.exists());
         assert!(!paths.agents.exists());
         assert!(!paths.legacy_agents.exists());
+    }
+
+    /// When a legacy (`agent/`) file already exists, the fresh agent is written
+    /// there and the duplicate at the canonical `agents/` dir is the stale
+    /// one. The dry-run preview must list only that stale duplicate (never the
+    /// legacy path that will be freshly written), and apply must preserve the
+    /// legacy file while removing the duplicate.
+    #[test]
+    fn opencode_team_cleanup_targets_opposite_dir_when_legacy_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_team_paths(dir.path());
+        std::fs::create_dir_all(&paths.agents).unwrap();
+        std::fs::create_dir_all(&paths.legacy_agents).unwrap();
+        // Pre-existing legacy fresh location + stale duplicate in agents/.
+        std::fs::write(
+            paths.legacy_agents.join("rtrt-orchestrator.md"),
+            "description: RTRT prior legacy\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.agents.join("rtrt-orchestrator.md"),
+            "description: RTRT stale duplicate\n",
+        )
+        .unwrap();
+
+        let cleanup = opencode_team_cleanup_paths(
+            &paths,
+            &render_opencode_team_agents(&enabled_team_config().team).unwrap(),
+        );
+        // Stale duplicate at the canonical dir is a planned deletion.
+        assert!(cleanup.contains(&paths.agents.join("rtrt-orchestrator.md")));
+        // The legacy path is the fresh write target — must NOT be a deletion.
+        assert!(!cleanup.contains(&paths.legacy_agents.join("rtrt-orchestrator.md")));
+
+        apply_test_team(&paths, true, &enabled_team_config()).unwrap();
+
+        // Legacy file preserved with fresh content + backup of the prior copy.
+        let legacy =
+            std::fs::read_to_string(paths.legacy_agents.join("rtrt-orchestrator.md")).unwrap();
+        assert!(legacy.contains(OPENCODE_ORCHESTRATOR_MODEL));
+        assert_eq!(
+            std::fs::read_to_string(
+                paths
+                    .legacy_agents
+                    .join("rtrt-orchestrator.md")
+                    .with_extension("md.bak")
+            )
+            .unwrap(),
+            "description: RTRT prior legacy\n"
+        );
+        // Stale duplicate at the canonical dir removed.
+        assert!(!paths.agents.join("rtrt-orchestrator.md").exists());
     }
 
     #[test]
@@ -2896,7 +3059,9 @@ mod tests {
         remove_opencode_team_artifacts_at(&paths, true).unwrap();
 
         assert!(!paths.agents.join("rtrt-orchestrator.md").exists());
+        assert!(!paths.agents.join("rtrt-leader.md").exists());
         assert!(!paths.plugins.join(OPENCODE_TEAM_RELAY_PLUGIN).exists());
+        assert!(!paths.plugins.join(OPENCODE_GATEWAY_PLUGIN).exists());
         let config = Config::from_toml_str(&std::fs::read_to_string(&paths.config).unwrap())
             .expect("persisted config");
         assert!(!config.team.enabled);

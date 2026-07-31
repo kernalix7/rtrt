@@ -30,11 +30,10 @@
 //!
 //! ## Limitations (honest)
 //!
-//! This is a **text-only** bridge: the request is flattened to a single prompt
-//! for the routed path, so tool-calling / function-calling / vision content is
-//! NOT passed through yet. Streaming is buffered — the routed answer is
-//! computed in full and then emitted as SSE chunks (CLI-mode targets only
-//! return full text), so `stream:true` is wire-compatible but not token-by-token.
+//! This is a **text-only** bridge: tool-calling / function-calling / vision
+//! content from the client is not passed through. `rtrt/team` is genuinely
+//! incremental for Claude CLI text deltas and filters transport/tool metadata;
+//! legacy auto/explicit routes remain buffered before SSE emission.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -50,13 +49,14 @@ use axum::{
     },
     routing::{get, post},
 };
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use rtrt_core::{Capability, Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChatMessage, ChatRequest, Gateway, Prefer, Role, RouteRequest, UsageSnapshot, invoke,
-    invoke_with_failover, is_retryable_error, select_route, usage_ledger,
+    ChatMessage, ChatRequest, Gateway, Prefer, Role, RouteRequest, TeamExecutionContext,
+    UsageSnapshot, dispatch_team, dispatch_team_stream_with_context, invoke, invoke_with_failover,
+    is_retryable_error, select_route, usage_ledger,
 };
 
 /// Requests longer than this many characters are treated as reasoning work
@@ -64,6 +64,8 @@ use crate::{
 /// classification nudge for capability selection, NOT a budget cap — it only
 /// biases which tier `auto` prefers and is documented in USAGE.md.
 const REASONING_CHAR_THRESHOLD: usize = 2000;
+const OPENCODE_SESSION_HEADER: &str = "x-rtrt-opencode-session";
+const OPENCODE_SERVER_HEADER: &str = "x-rtrt-opencode-server";
 
 /// Default bind port for `rtrt gateway serve`.
 pub const DEFAULT_GATEWAY_PORT: u16 = 7412;
@@ -78,6 +80,8 @@ pub const DEFAULT_GATEWAY_HOST: &str = "127.0.0.1";
 /// How the `model` field of an OpenAI request maps onto rtrt routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelRoute {
+    /// Deterministic team router: usage/order only, no intermediate LLM.
+    Team,
     /// Full headroom-aware route, cheapest-first.
     Auto,
     /// Full route, cheapest cost tier.
@@ -99,6 +103,7 @@ impl ModelRoute {
         let trimmed = model.trim();
         let lower = trimmed.to_ascii_lowercase();
         match lower.as_str() {
+            "team" | "rtrt/team" => return Self::Team,
             "" | "auto" | "rtrt/auto" | "rtrt" => return Self::Auto,
             "cheapest" | "rtrt/cheapest" => return Self::Cheapest,
             "best" | "rtrt/best" => return Self::Best,
@@ -121,7 +126,7 @@ impl ModelRoute {
         match self {
             Self::Auto | Self::Cheapest => Some(Prefer::Cheapest),
             Self::Best => Some(Prefer::Quality),
-            Self::Explicit { .. } => None,
+            Self::Team | Self::Explicit { .. } => None,
         }
     }
 }
@@ -166,6 +171,14 @@ fn flatten_messages(messages: &[ChatMessage]) -> String {
         out.push_str(&m.content);
     }
     out
+}
+
+fn team_conversation_prompt(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && !message.content.trim().is_empty())
+        .map(|message| message.content.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +369,20 @@ async fn dispatch(
 ) -> Result<Completion> {
     let messages = req.to_chat_messages();
     match route {
+        ModelRoute::Team => {
+            let prompt = team_conversation_prompt(&messages).ok_or_else(|| {
+                Error::Provider("team route requires a non-empty user message".to_string())
+            })?;
+            let config = rtrt_core::Config::load_effective_for_cwd();
+            let outcome = dispatch_team(&config.team, &prompt, state.timeout).await?;
+            let prompt_tokens = usage_ledger::estimate_tokens(&prompt);
+            let completion_tokens = usage_ledger::estimate_tokens(&outcome.outcome.output);
+            Ok(Completion {
+                content: outcome.outcome.output,
+                usage: UsageWire::new(prompt_tokens, completion_tokens),
+                target: outcome.outcome.target,
+            })
+        }
         ModelRoute::Explicit { model } => {
             let chat = ChatRequest {
                 model: model.clone(),
@@ -499,7 +526,10 @@ async fn healthz() -> &'static str {
 /// axum's own rejections — plain-text 400 for malformed JSON, 422 for a missing
 /// field, 415 for a missing `Content-Type` — none of which a real OpenAI client
 /// expects on this route.
-struct OpenAiRequest(ChatCompletionRequest);
+struct OpenAiRequest {
+    request: ChatCompletionRequest,
+    team_context: TeamExecutionContext,
+}
 
 impl<S> FromRequest<S> for OpenAiRequest
 where
@@ -508,8 +538,12 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> std::result::Result<Self, Self::Rejection> {
+        let team_context = team_context_from_headers(req.headers());
         match Json::<ChatCompletionRequest>::from_request(req, state).await {
-            Ok(Json(body)) => Ok(Self(body)),
+            Ok(Json(request)) => Ok(Self {
+                request,
+                team_context,
+            }),
             Err(rejection) => Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -520,7 +554,10 @@ where
 }
 
 async fn chat_completions(State(state): State<GatewayState>, request: OpenAiRequest) -> Response {
-    let OpenAiRequest(req) = request;
+    let OpenAiRequest {
+        request: req,
+        team_context,
+    } = request;
     if req.messages.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -535,10 +572,130 @@ async fn chat_completions(State(state): State<GatewayState>, request: OpenAiRequ
         req.model.clone()
     };
     let stream = req.stream;
+    if stream && route == ModelRoute::Team {
+        return match team_stream_response(&state, &model_label, &req, team_context) {
+            Ok(response) => response,
+            Err(error) => dispatch_error_response(&error),
+        };
+    }
     match dispatch(&state, route, &req).await {
         Ok(completion) if stream => stream_response(&model_label, completion),
         Ok(completion) => Json(completion_response(&model_label, completion)).into_response(),
         Err(e) => dispatch_error_response(&e),
+    }
+}
+
+fn team_stream_response(
+    state: &GatewayState,
+    model: &str,
+    req: &ChatCompletionRequest,
+    context: TeamExecutionContext,
+) -> Result<Response> {
+    let messages = req.to_chat_messages();
+    let prompt = team_conversation_prompt(&messages).ok_or_else(|| {
+        Error::Provider("team route requires a non-empty user message".to_string())
+    })?;
+    let config = rtrt_core::Config::load_effective_for_cwd();
+    let stream = dispatch_team_stream_with_context(&config.team, &prompt, state.timeout, context)?;
+    let id = completion_id();
+    let created = now_epoch_secs();
+    let model = model.to_string();
+
+    let role = ChatCompletionChunk {
+        id: id.clone(),
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model: model.clone(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: Some("assistant".to_string()),
+                content: None,
+            },
+            finish_reason: None,
+        }],
+    };
+    let role_event = stream::once(async move { Ok::<Event, Infallible>(chunk_event(&role)) });
+    let delta_id = id.clone();
+    let delta_model = model.clone();
+    let deltas = stream.map(move |item| {
+        let event = match item {
+            Ok(text) => chunk_event(&ChatCompletionChunk {
+                id: delta_id.clone(),
+                object: "chat.completion.chunk".to_string(),
+                created,
+                model: delta_model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some(text),
+                    },
+                    finish_reason: None,
+                }],
+            }),
+            Err(error) => Event::default().event("error").data(
+                serde_json::json!({
+                    "error": {
+                        "type": "upstream_error",
+                        "message": error.to_string()
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        Ok::<Event, Infallible>(event)
+    });
+    let final_chunk = ChatCompletionChunk {
+        id,
+        object: "chat.completion.chunk".to_string(),
+        created,
+        model,
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta::default(),
+            finish_reason: Some("stop".to_string()),
+        }],
+    };
+    let end = stream::iter([
+        Ok::<Event, Infallible>(chunk_event(&final_chunk)),
+        Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+    ]);
+    Ok(Sse::new(role_event.chain(deltas).chain(end))
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+fn team_context_from_headers(headers: &axum::http::HeaderMap) -> TeamExecutionContext {
+    let session_id = headers
+        .get(OPENCODE_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+        .map(str::to_string);
+    let server_url = headers
+        .get(OPENCODE_SERVER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .filter(|url| {
+            url.scheme() == "http"
+                && url
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+        })
+        .map(|url| url.to_string().trim_end_matches('/').to_string());
+    if session_id.is_some() && server_url.is_some() {
+        TeamExecutionContext {
+            opencode_session_id: session_id,
+            opencode_server_url: server_url,
+        }
+    } else {
+        TeamExecutionContext::default()
     }
 }
 
@@ -639,6 +796,7 @@ fn chunk_event(chunk: &ChatCompletionChunk) -> Event {
 async fn list_models(State(_state): State<GatewayState>) -> Json<ModelsResponse> {
     let created = now_epoch_secs();
     let mut data = vec![
+        model_object("rtrt/team", "rtrt", created),
         model_object("rtrt/auto", "rtrt", created),
         model_object("rtrt/cheapest", "rtrt", created),
         model_object("rtrt/best", "rtrt", created),
@@ -784,6 +942,8 @@ mod tests {
 
     #[test]
     fn model_route_parses_auto_family_and_aliases() {
+        assert_eq!(ModelRoute::parse("team"), ModelRoute::Team);
+        assert_eq!(ModelRoute::parse("rtrt/team"), ModelRoute::Team);
         assert_eq!(ModelRoute::parse(""), ModelRoute::Auto);
         assert_eq!(ModelRoute::parse("auto"), ModelRoute::Auto);
         assert_eq!(ModelRoute::parse("rtrt/auto"), ModelRoute::Auto);
@@ -829,12 +989,81 @@ mod tests {
         assert_eq!(ModelRoute::Auto.prefer(), Some(Prefer::Cheapest));
         assert_eq!(ModelRoute::Cheapest.prefer(), Some(Prefer::Cheapest));
         assert_eq!(ModelRoute::Best.prefer(), Some(Prefer::Quality));
+        assert_eq!(ModelRoute::Team.prefer(), None);
         assert_eq!(
             ModelRoute::Explicit {
                 model: "x".to_string()
             }
             .prefer(),
             None
+        );
+    }
+
+    #[test]
+    fn team_route_forwards_only_latest_user_message_verbatim() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "ignore router harness".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "first".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "answer".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "  UTF-8 한글\nexact  ".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            team_conversation_prompt(&messages).as_deref(),
+            Some("  UTF-8 한글\nexact  ")
+        );
+    }
+
+    #[test]
+    fn single_user_team_route_is_byte_preserved() {
+        let original = "  UTF-8 한글\r\nexact  ";
+        let messages = vec![ChatMessage {
+            role: Role::User,
+            content: original.to_string(),
+        }];
+
+        assert_eq!(
+            team_conversation_prompt(&messages).as_deref(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn opencode_context_accepts_only_valid_session_and_loopback_server() {
+        let mut headers = HeaderMap::new();
+        headers.insert(OPENCODE_SESSION_HEADER, "ses_native-123".parse().unwrap());
+        headers.insert(
+            OPENCODE_SERVER_HEADER,
+            "http://127.0.0.1:4096/".parse().unwrap(),
+        );
+
+        assert_eq!(
+            team_execution_context(&headers),
+            TeamExecutionContext {
+                opencode_session_id: Some("ses_native-123".to_string()),
+                opencode_server_url: Some("http://127.0.0.1:4096/".to_string()),
+            }
+        );
+
+        headers.insert(
+            OPENCODE_SERVER_HEADER,
+            "https://example.com/".parse().unwrap(),
+        );
+        assert_eq!(
+            team_execution_context(&headers),
+            TeamExecutionContext::default()
         );
     }
 

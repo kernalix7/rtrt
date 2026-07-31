@@ -35,14 +35,17 @@ pub use gateway_server::{
 };
 pub use invoke::{
     DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, InvokeOptions, InvokeOutcome, Mode,
-    invoke_agent, invoke_with_failover, is_retryable_error,
+    invoke_agent, invoke_with_failover, is_retryable_error, template_to_argv,
 };
 pub use openai::OpenAIProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
 };
-pub use team::{build_team_leader_prompt, dispatch_team};
+pub use team::{
+    TeamExecutionContext, TeamTextStream, build_team_leader_prompt, dispatch_team,
+    dispatch_team_stream, dispatch_team_stream_with_context,
+};
 pub use usage::{ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
     LedgerRow, TargetHeadroom, TargetWindows, WindowUsage, estimate_tokens, headroom_for_target,

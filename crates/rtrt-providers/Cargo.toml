@@ -25,3 +25,6 @@ anyhow.workspace = true
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { workspace = true }
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.3", features = ["signal"] }

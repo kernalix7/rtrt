@@ -10,7 +10,11 @@
 
 ### 추가
 
-- **OpenCode 팀 오케스트레이터**: `rtrt setup --agent opencode --team --apply`가 재현 가능하고 반복 실행에 안전한 전체 팀 설정을 설치합니다. 커스터마이즈 가능한 로컬 manager(기본 `ollama/granite4:350m`), 순서 기반 leader failover, 역할 기반 worker, 생성형 OpenCode agents, Claude MCP 등록, 소형 모델의 prompt 복사에 의존하지 않고 사용자 원문을 한 번 전달하는 exact-relay plugin을 포함합니다. 새 `rtrt team show`, `check-manager`, `dispatch` 명령과 MCP `team_dispatch`를 제공합니다. Claude leader는 `claude -p --model opus|sonnet` 구독 CLI 경로를 사용하며, 재시도 가능한 quota·rate-limit·server·timeout 실패에서 다음 leader로 넘어갑니다. MCP 자동 캡처는 linked worktree를 main 저장소로 귀속하며, 공유 HTTP dispatch는 명시적 project가 없으면 stray project 생성 대신 캡처를 건너뜁니다.
+- **OpenCode deterministic 팀 라우터**: `rtrt setup --agent opencode --team --apply`가 중간 LLM·저장소 권한·prompt 해석이 없는 local OpenAI-compatible transport `rtrt/team`을 설치합니다. provider 사용량/headroom만 읽고 설정된 Leader 우선순위(`Claude Opus → GPT → GLM → Claude Sonnet → Kimi`)를 유지하며, 최신 사용자 원문을 그대로 전달하고 quota·rate-limit·server·timeout 오류에서 다음 Leader로 넘어갑니다. Claude CLI `stream-json`과 OpenCode JSON event는 bridge 내부에서 필터링되어 assistant text delta만 OpenCode에 전달되고 UUID·tool 인자·사용량 telemetry·경로는 내부에 남습니다. bootstrap plugin이 loopback gateway를 시작하며, 생성된 Leader/worker agent만 구현 권한을 가집니다. 새 `rtrt team show`, `check-manager`, `dispatch` 명령과 MCP `team_dispatch`를 제공합니다.
+
+### 수정
+
+- **OpenCode 팀 dispatch 무응답과 orphan leader**: CLI subprocess가 timeout, MCP deadline, future 취소 또는 stream 연결 종료 시 Unix process group 또는 Windows process tree 전체를 종료·회수합니다. failover timeout은 Leader마다 반복되지 않고 전체 순회 예산으로 적용됩니다. 기존 relay와 LLM orchestrator 경로를 폐기하고 stale relay 상태, 중복 agent-directory 복사본, 은퇴한 `team-lead` 파일을 정리합니다. `SIGTERM`은 graceful CLI 취소로 처리됩니다.
 
 ### Highlights — 대시보드 URL 라우팅 / 딥링크
 

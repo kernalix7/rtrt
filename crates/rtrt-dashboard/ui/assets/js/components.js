@@ -529,6 +529,7 @@ const PALETTE_ITEMS = [
   { label: 'Providers · Limits', hint: 'daily usage ceilings', run: () => navigate('limits') },
   { label: 'Orchestrate · Environment', hint: 'detected tools', run: () => navigate('environment') },
   { label: 'Orchestrate · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
+  { label: 'Orchestrate · Orchestration', hint: 'lanes / tier ladder / policy / failover', run: () => navigate('orchestration') },
   { label: 'Connect · Setup', hint: 'client snippets', run: () => navigate('connect') },
   // ── Actions ──
   { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
@@ -568,6 +569,9 @@ function refreshProjectScopePage() {
   // Providers (active + enabled) and Agents enable/disable are per-project too.
   if (page === 'llm') loadProvidersConfig();
   if (page === 'environment') loadAgentsConfig();
+  // Orchestration reads through the same ?project= selector, so the scope hint
+  // it shows has to follow the selector too.
+  if (page === 'orchestration') loadOrchestration();
 }
 function setCompressEngine(engine, level) {
   if (!engine) return;
@@ -649,6 +653,10 @@ function navigate(page, opts = {}) {
   if (page === 'limits') {
     // Tools › Limits — daily usage ceilings (moved out of Capture/Config).
     loadLimitsConfig();
+  }
+  if (page === 'orchestration') {
+    // Tools › Orchestration — the editable [team] roster + [failover] policy.
+    loadOrchestration();
   }
   if (page === 'usage') {
     // Tools › Router — provider usage + headroom + load-balancing decision.

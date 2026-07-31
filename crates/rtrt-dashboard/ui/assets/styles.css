@@ -533,6 +533,33 @@
   .chat-msg.pending { color: var(--muted); }
   .chat-msg .chat-msg-meta { display: block; margin-top: 0.35rem; color: var(--muted); font-size: 0.8em; font-variant-numeric: tabular-nums; }
 
+  /* Orchestration (Tools › Orchestration) — lane cards, tier rungs, and the
+     chips that carry ordering. Every list on this page is ORDER-BEARING, so the
+     reorder arrows live inside the chip/row rather than in a separate control. */
+  .orch-lane, .orch-tier { border: 1px solid var(--border); border-radius: 10px; padding: 0.75rem 0.85rem; margin-bottom: 0.7rem; background: var(--bg); }
+  .orch-lane.invalid { border-color: var(--err); box-shadow: 0 0 0 3px rgba(220,38,38,.12); }
+  .orch-lane-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+  .orch-lane-head .orch-lane-name { font-weight: 700; min-width: 11rem; flex: 0 1 auto; }
+  .orch-spacer { flex: 1; }
+  .orch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.6rem; }
+  .orch-grid .orch-wide { grid-column: 1 / -1; }
+  .orch-row { display: flex; gap: 0.55rem; align-items: flex-end; flex-wrap: wrap; margin-top: 0.6rem; }
+  .orch-note { font-size: 0.82em; color: var(--muted); }
+  .orch-chips { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin: 0.4rem 0; }
+  .orch-chip { gap: 0.15rem; padding: 0.1rem 0.3rem; background: var(--surface); }
+  .orch-chip-label { padding: 0 0.25rem; font-variant-numeric: tabular-nums; }
+  .orch-chip-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 0.2rem; font-size: 0.95em; line-height: 1.4; border-radius: 4px; }
+  .orch-chip-btn:hover:not(:disabled) { color: var(--accent); background: var(--bg); }
+  .orch-chip-btn:disabled { opacity: 0.3; cursor: default; }
+  .orch-mini { padding: 0.28rem 0.55rem; font-size: 0.82em; }
+  .orch-danger { color: var(--err); }
+  .orch-chain { margin-top: 0.55rem; font-size: 0.8em; color: var(--muted); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  .orch-flags-section { margin: 0.85rem 0 0; }
+  .orch-flag-row { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.35rem; }
+  .orch-flag-row input { flex: 1 1 9rem; min-width: 0; padding: 0.35rem 0.5rem; font-size: 0.88em; }
+  .orch-error-card { border-color: var(--err); }
+  .orch-error-text { margin: 0; color: var(--err); font-family: ui-monospace, monospace; font-size: 0.88em; overflow-wrap: anywhere; }
+
   /* Memory Sessions — clickable session summary rows. */
   #sessions-tbl .session-row { cursor: pointer; }
   #sessions-tbl .session-row:hover td { background: var(--accent-soft); }

@@ -23,6 +23,7 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
         .route("/assets/js/api.js", get(asset_js_api))
         .route("/assets/js/components.js", get(asset_js_components))
         .route("/assets/js/pages.js", get(asset_js_pages))
+        .route("/assets/js/orchestration.js", get(asset_js_orchestration))
         .route("/assets/js/app.js", get(asset_js_app))
         .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
@@ -62,6 +63,15 @@ pub(crate) fn router(state: AppState, token: Option<String>) -> Router {
         .route(
             "/api/limits/config",
             get(get_limits_config).post(post_limits_config),
+        )
+        // Orchestration: the editable `[team]` roster + `[failover]` markers.
+        .route(
+            "/api/team/config",
+            get(get_team_config).post(post_team_config),
+        )
+        .route(
+            "/api/failover/config",
+            get(get_failover_config).post(post_failover_config),
         )
         .route(
             "/api/memory/settings",

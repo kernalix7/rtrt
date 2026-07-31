@@ -133,6 +133,11 @@ pub(crate) async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str)
     asset_response(ASSET_JS_PAGES, "text/javascript; charset=utf-8")
 }
 
+pub(crate) async fn asset_js_orchestration()
+-> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
+    asset_response(ASSET_JS_ORCHESTRATION, "text/javascript; charset=utf-8")
+}
+
 pub(crate) async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
     asset_response(ASSET_JS_APP, "text/javascript; charset=utf-8")
 }
@@ -150,6 +155,9 @@ pub(crate) const ASSET_JS_API: &str = include_str!("../ui/assets/js/api.js");
 pub(crate) const ASSET_JS_COMPONENTS: &str = include_str!("../ui/assets/js/components.js");
 
 pub(crate) const ASSET_JS_PAGES: &str = include_str!("../ui/assets/js/pages.js");
+
+pub(crate) const ASSET_JS_ORCHESTRATION: &str = include_str!("../ui/assets/js/orchestration.js");
+
 pub(crate) const ASSET_JS_APP: &str = include_str!("../ui/assets/js/app.js");
 
 // Vendored graph libraries (served at /vendor/*) so the map needs no CDN.

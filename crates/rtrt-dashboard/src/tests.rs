@@ -25,9 +25,22 @@ use crate::state::AppState;
 /// test body; the guard restores the originals on drop before releasing.
 static ENV_MUTEX: StdMutex<()> = StdMutex::new(());
 
-/// RAII guard: while live, points `HOME` / `RTRT_MEMORY_PATH` at `tmp_home`
-/// and clears `RTRT_CONFIG` (so config falls back to `<tmp_home>/.rtrt`).
-/// Restores every var on drop.
+/// The sandboxed config file for a test's temp home. [`EnvGuard`] pins
+/// `RTRT_CONFIG` to exactly this path, so it is where the config endpoints
+/// read and write on every platform.
+fn config_file(tmp_home: &std::path::Path) -> std::path::PathBuf {
+    tmp_home.join(".rtrt").join("config.toml")
+}
+
+/// RAII guard: while live, points `HOME` / `RTRT_MEMORY_PATH` / `RTRT_CONFIG`
+/// at `tmp_home`. Restores every var on drop.
+///
+/// `RTRT_CONFIG` is pinned EXPLICITLY rather than cleared: `Config::default_path`
+/// falls back to `dirs::home_dir()`, which reads `HOME` on Unix but `USERPROFILE`
+/// (or the known-folder API) on Windows — so clearing it left the config path
+/// resolving to the REAL profile there, and a test that writes config would
+/// escape the sandbox. Pinning the var makes the sandbox hold on every platform,
+/// matching how `crates/rtrt-cli/tests/cli.rs` already isolates the CLI.
 struct EnvGuard {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -38,10 +51,11 @@ impl EnvGuard {
         let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(tmp_home).ok();
         let mem = tmp_home.join("memory.sqlite");
+        let cfg = config_file(tmp_home);
         let overrides: [(&'static str, Option<std::ffi::OsString>); 3] = [
             ("HOME", Some(tmp_home.as_os_str().to_owned())),
             ("RTRT_MEMORY_PATH", Some(mem.into_os_string())),
-            ("RTRT_CONFIG", None),
+            ("RTRT_CONFIG", Some(cfg.into_os_string())),
         ];
         let mut saved = Vec::with_capacity(overrides.len());
         for (key, new_val) in overrides {
@@ -877,4 +891,421 @@ async fn recall_role_filter_restricts_hits() {
     let hits = v["hits"].as_array().unwrap();
     assert!(!hits.is_empty());
     assert!(hits.iter().all(|h| h["kind"] != "user-prompt-submit"));
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration config — `[team]` roster + `[failover]` markers.
+//
+// The roster the binary ships is only a DEFAULT, so these tests assert the
+// SHAPE of the exchange (shipped default is served, an invalid roster never
+// reaches disk, a custom roster round-trips) without pinning any lane, tier,
+// target or model name — those are config, and a config change must not be a
+// test change.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn team_config_get_returns_the_shipped_default_roster() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+
+    let resp = call(app, get("/api/team/config")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+
+    // With no config file at all, the endpoint serves the shipped roster —
+    // compared against the core's own default rather than a literal list.
+    let shipped = rtrt_core::TeamConfig::default();
+    let names: Vec<&str> = v["members"]
+        .as_array()
+        .expect("members is a list")
+        .iter()
+        .map(|m| m["name"].as_str().expect("lane name"))
+        .collect();
+    let expected: Vec<&str> = shipped.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, expected);
+    assert_eq!(v["enabled"], shipped.enabled);
+    assert_eq!(v["manager_provider"], shipped.manager_provider);
+
+    // `tiers` is the CONFIGURED ladder (empty by default); `effective.tiers`
+    // is the one actually in force, so the UI can tell "unset" from "none".
+    assert!(v["tiers"].as_array().expect("tiers is a list").is_empty());
+    let effective = v["effective"]["tiers"].as_array().expect("effective tiers");
+    assert!(!effective.is_empty());
+    assert!(effective.iter().all(|t| t["tier"].is_string()));
+    // Every lane gets a resolved fallback walk.
+    assert_eq!(
+        v["effective"]["chains"]
+            .as_object()
+            .expect("chains is a map")
+            .len(),
+        shipped.members.len()
+    );
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], false);
+
+    // A GET must never create the config file.
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn team_config_post_with_a_fallback_cycle_is_rejected_and_not_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+
+    // Two lanes that fall back to each other: the walk would never terminate.
+    let body = r#"{
+        "enabled": true,
+        "leader_order": ["first"],
+        "members": [
+            {"name":"first","target":"alpha","model":"alpha/one","mode":"cli",
+             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
+             "fallback":["second"],"allow_impl":true,"flags":{}},
+            {"name":"second","target":"beta","model":"beta/one","mode":"cli",
+             "roles":["support"],"logical":null,"sibling":null,"tier":null,
+             "fallback":["first"],"allow_impl":true,"flags":{}}
+        ],
+        "tiers": [],
+        "policy": null
+    }"#;
+    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    let message = v["error"].as_str().expect("error message");
+    assert!(
+        message.contains("cycle"),
+        "validator message should name the cycle, got: {message}"
+    );
+
+    // Nothing was persisted: the invalid roster never reached the file.
+    assert!(
+        !config_file(tmp.path()).exists(),
+        "a rejected roster must not create or touch the config file"
+    );
+}
+
+#[tokio::test]
+async fn team_config_post_roundtrips_a_valid_roster() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    // A fully custom roster: names, tier names and the ladder shape are all
+    // the caller's, none of them the shipped ones.
+    let body = r#"{
+        "enabled": true,
+        "manager_provider": "local-manager",
+        "manager_model": "tiny",
+        "manager_base_url": "",
+        "leader_order": ["primary", "backup"],
+        "members": [
+            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
+             "roles":["lead","review"],"logical":"one","sibling":"backup","tier":null,
+             "fallback":["backup"],"allow_impl":true,"flags":{"permission-mode":"plan"}},
+            {"name":"backup","target":"beta","model":"beta/one","mode":"api",
+             "roles":["support"],"logical":"one","sibling":"primary","tier":null,
+             "fallback":[],"allow_impl":false,"flags":{}}
+        ],
+        "tiers": [
+            {"tier":"quick","members":["primary"]},
+            {"tier":"deep","members":["primary","backup"]}
+        ],
+        "policy": {
+            "max_retries": 4,
+            "redo_on_fallback": false,
+            "prefer_sibling_on_quota": true,
+            "record_provenance": false,
+            "max_fallback_depth": 2,
+            "default_tier": "quick",
+            "design_only_tiers": ["deep"]
+        }
+    }"#;
+    let app = router(state.clone(), None);
+    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "valid roster should persist");
+
+    // GET reads the persisted roster back, ladder order intact.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["manager_provider"], "local-manager");
+    // An empty manager_base_url is stored as "unset", not as an empty string.
+    assert!(v["manager_base_url"].is_null());
+    assert_eq!(v["members"][0]["name"], "primary");
+    assert_eq!(v["members"][0]["sibling"], "backup");
+    assert_eq!(v["members"][0]["flags"]["permission-mode"], "plan");
+    assert_eq!(v["members"][1]["allow_impl"], false);
+    let tiers = v["tiers"].as_array().expect("tiers is a list");
+    assert_eq!(tiers.len(), 2);
+    assert_eq!(tiers[0]["tier"], "quick");
+    assert_eq!(tiers[1]["tier"], "deep");
+    assert_eq!(v["policy"]["max_retries"], 4);
+    assert_eq!(v["policy"]["default_tier"], "quick");
+    // The design-only rung is reported as such, and the lane that may not
+    // implement is allowed there.
+    let effective = v["effective"]["tiers"].as_array().expect("effective tiers");
+    let deep = effective
+        .iter()
+        .find(|t| t["tier"] == "deep")
+        .expect("deep rung");
+    assert_eq!(deep["design_only"], true);
+    assert_eq!(v["effective"]["chains"]["primary"][0], "backup");
+
+    // The roster really is on disk under `[team]`. Read it back from the path
+    // the ENDPOINT reports rather than a reconstructed one, so the assertion
+    // cannot quietly pass against a file the handler never wrote.
+    let reported = v["path"].as_str().expect("config path reported");
+    assert_eq!(
+        std::path::Path::new(reported),
+        config_file(tmp.path()),
+        "the endpoint must write inside the test sandbox"
+    );
+    let raw = std::fs::read_to_string(reported).expect("config written");
+    assert!(
+        raw.contains("[team]"),
+        "config should carry a [team] section"
+    );
+}
+
+#[tokio::test]
+async fn team_config_post_rejects_a_design_only_lane_in_an_implementing_tier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+
+    // `backup` may not implement, yet sits in a tier that is not design-only.
+    let body = r#"{
+        "enabled": true,
+        "leader_order": ["primary"],
+        "members": [
+            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
+             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
+             "fallback":[],"allow_impl":true,"flags":{}},
+            {"name":"backup","target":"beta","model":"beta/one","mode":"cli",
+             "roles":["support"],"logical":null,"sibling":null,"tier":null,
+             "fallback":[],"allow_impl":false,"flags":{}}
+        ],
+        "tiers": [{"tier":"quick","members":["primary","backup"]}],
+        "policy": null
+    }"#;
+    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    let message = v["error"].as_str().expect("error message");
+    assert!(
+        message.contains("design-only"),
+        "validator message should explain the design-only conflict, got: {message}"
+    );
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn team_config_post_rejects_a_cross_logical_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+
+    // A sibling pair is one model on two pools; these are two different models.
+    let body = r#"{
+        "enabled": true,
+        "leader_order": ["primary"],
+        "members": [
+            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
+             "roles":["lead"],"logical":"one","sibling":"backup","tier":null,
+             "fallback":[],"allow_impl":true,"flags":{}},
+            {"name":"backup","target":"beta","model":"beta/two","mode":"cli",
+             "roles":["support"],"logical":"two","sibling":null,"tier":null,
+             "fallback":[],"allow_impl":true,"flags":{}}
+        ],
+        "tiers": [],
+        "policy": null
+    }"#;
+    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    let message = v["error"].as_str().expect("error message");
+    assert!(
+        message.contains("sibling"),
+        "validator message should name the sibling, got: {message}"
+    );
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn team_config_scope_toggle_matches_the_other_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    // Register a real on-disk project so `resolve_project_repo` resolves it,
+    // exactly as the other per-project settings require.
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::PUT,
+            "/api/projects",
+            &format!(
+                r#"{{"name":"demo","path":"{}"}}"#,
+                repo.to_string_lossy().replace('\\', "\\\\")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A selected project reports the same scope triple the other settings use.
+    // Orchestration has no per-project layer, so it always INHERITS the global
+    // roster — `project_overridable` says so rather than leaving the UI to
+    // infer it from a `custom` that can never become true.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config?project=demo")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["project_overridable"], false);
+
+    // The global scope reports nothing to inherit, same as every other endpoint.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/team/config?project=global")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], false);
+
+    // "Follow global" carries no body and is a safe no-op that re-reads the
+    // effective roster, exactly like the other clear paths.
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/team/config?project=demo&scope=global")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], true);
+    assert!(!v["members"].as_array().expect("members").is_empty());
+}
+
+#[tokio::test]
+async fn failover_config_get_post_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    // Defaults: no marker overrides at all.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/failover/config")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert!(v["fatal"].as_array().expect("fatal").is_empty());
+    assert!(v["transient_retries"].is_null());
+    assert_eq!(v["scope"], "global");
+
+    let app = router(state.clone(), None);
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/failover/config",
+            r#"{"fatal":["contract expired"," "],"quota":["seat limit reached"],
+                "transient":[],"transient_retries":1,"backoff_divisor":60,"backoff_ms":null}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/api/failover/config")).await;
+    let v = json_body(resp).await;
+    // The blank marker a form leaves behind is dropped, not persisted.
+    assert_eq!(
+        v["fatal"].as_array().expect("fatal").len(),
+        1,
+        "blank markers should be dropped"
+    );
+    assert_eq!(v["fatal"][0], "contract expired");
+    assert_eq!(v["quota"][0], "seat limit reached");
+    assert_eq!(v["transient_retries"], 1);
+    assert_eq!(v["backoff_divisor"], 60);
+    assert!(v["backoff_ms"].is_null());
+}
+
+#[tokio::test]
+async fn failover_config_rejects_a_zero_backoff_divisor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+
+    let resp = call(
+        app,
+        json(
+            Method::POST,
+            "/api/failover/config",
+            r#"{"fatal":[],"quota":[],"transient":[],"backoff_divisor":0}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error message")
+            .contains("backoff_divisor")
+    );
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn orchestration_page_assets_are_served_and_deep_linkable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    // The page's script is embedded in the binary and served like the other
+    // app assets: `no-cache`, so a rebuilt UI shows up on the next load.
+    let app = router(state.clone(), None);
+    let resp = call(app, get("/assets/js/orchestration.js")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+    let script = body_text(resp).await;
+    assert!(script.contains("loadOrchestration"));
+
+    // The shell loads it, and the page + nav entry exist in the markup.
+    let app = router(state.clone(), None);
+    let html = body_text(call(app, get("/")).await).await;
+    assert!(html.contains("/assets/js/orchestration.js"));
+    assert!(html.contains("id=\"page-orchestration\""));
+    assert!(html.contains("data-page=\"orchestration\""));
+
+    // Deep link: /orchestration falls through to the SPA shell so a refresh
+    // (or a shared URL) restores the page instead of 404ing.
+    let app = router(state, None);
+    let resp = call(app, get("/orchestration")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/html")
+    );
 }

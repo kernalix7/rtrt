@@ -1,11 +1,31 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CompressionLevel, Error, Result};
+use crate::{CompressionLevel, Error, Result, pool::PoolKey};
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Only permission-prompt bridge accepted for delegated Claude CLI lanes.
+pub const CLAUDE_PERMISSION_PROMPT_TOOL: &str = "mcp__rtrt__permission_prompt";
+pub const DEFAULT_CLAUDE_CONTINUITY_MAX_RESUMED_TURNS: u8 = 4;
+pub const DEFAULT_CLAUDE_CONTINUITY_TTL_SECS: u64 = 900;
+pub const MAX_CLAUDE_CONTINUITY_RESUMED_TURNS: u8 = 16;
+pub const MIN_CLAUDE_CONTINUITY_TTL_SECS: u64 = 30;
+pub const MAX_CLAUDE_CONTINUITY_TTL_SECS: u64 = 86_400;
+pub const MAX_RECURSION_DEPTH: u8 = 8;
+pub const MAX_RECURSION_FAN_OUT: u16 = 32;
+pub const MAX_RECURSION_TOTAL_NODES: u32 = 1024;
+pub const MAX_RECURSION_TOKEN_BUDGET: u64 = 100_000_000;
+pub const MAX_RECURSION_DEADLINE_SECS: u64 = 86_400;
+pub const MAX_RECURSION_PAYLOAD_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -45,6 +65,192 @@ pub enum TeamMode {
     Auto,
 }
 
+/// How the host reaches a team member.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delegation {
+    /// Use the current host's native Task / agent mechanism.
+    #[default]
+    Native,
+    /// Spawn an external CLI via `claude -p`. Restricted to `claude` by
+    /// [`TeamConfig::validate`].
+    #[serde(rename = "cli", alias = "shell")]
+    Shell,
+}
+
+/// Action applied by a native host to one configurable worker capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Insertion-ordered command-pattern permissions for a native worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionMap(Vec<(String, PermissionAction)>);
+
+impl PermissionMap {
+    pub fn from_pairs<K>(pairs: impl IntoIterator<Item = (K, PermissionAction)>) -> Self
+    where
+        K: Into<String>,
+    {
+        let mut permissions = Self::default();
+        for (pattern, action) in pairs {
+            permissions.insert(pattern, action);
+        }
+        permissions
+    }
+
+    pub fn insert(&mut self, pattern: impl Into<String>, action: PermissionAction) {
+        let pattern = pattern.into();
+        if let Some((_, existing)) = self.0.iter_mut().find(|(existing, _)| existing == &pattern) {
+            *existing = action;
+        } else {
+            self.0.push((pattern, action));
+        }
+    }
+
+    pub fn get(&self, pattern: &str) -> Option<PermissionAction> {
+        self.0
+            .iter()
+            .find(|(configured, _)| configured == pattern)
+            .map(|(_, action)| *action)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, PermissionAction)> {
+        self.0
+            .iter()
+            .map(|(pattern, action)| (pattern.as_str(), *action))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for PermissionMap {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(pattern, action)| (pattern, action)))
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionMap {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct PermissionMapVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PermissionMapVisitor {
+            type Value = PermissionMap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an ordered table of command patterns to permission actions")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut access: M,
+            ) -> std::result::Result<PermissionMap, M::Error> {
+                let mut permissions = PermissionMap::default();
+                while let Some((pattern, action)) =
+                    access.next_entry::<String, PermissionAction>()?
+                {
+                    if permissions.get(&pattern).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate bash permission pattern: {pattern}"
+                        )));
+                    }
+                    permissions.0.push((pattern, action));
+                }
+                Ok(permissions)
+            }
+        }
+
+        deserializer.deserialize_map(PermissionMapVisitor)
+    }
+}
+
+/// Capabilities whose policy may be selected by the config owner for a native
+/// worker. Host boundaries such as Task, external directories, and agent/team
+/// bridges deliberately are not represented here and remain host-denied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePermissions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<PermissionAction>,
+    #[serde(default, skip_serializing_if = "PermissionMap::is_empty")]
+    pub bash: PermissionMap,
+}
+
+/// Explicit, bounded opt-in to resuming a Claude CLI lane.
+///
+/// Omission and `enabled = false` both retain one-shot fresh sessions. Runtime
+/// state is intentionally not serializable as part of configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeContinuity {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_claude_continuity_max_resumed_turns")]
+    pub max_resumed_turns: u8,
+    #[serde(default = "default_claude_continuity_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for ClaudeContinuity {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_resumed_turns: default_claude_continuity_max_resumed_turns(),
+            ttl_secs: default_claude_continuity_ttl_secs(),
+        }
+    }
+}
+
+impl Delegation {
+    fn is_native(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+/// How equally suitable lanes in one tier are ordered.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Balance {
+    /// Preserve the configured lane order.
+    #[default]
+    Order,
+    /// Prefer the lane whose backing pool has more room.
+    Room,
+}
+
+impl Balance {
+    fn is_order(&self) -> bool {
+        *self == Self::Order
+    }
+}
+
+/// A shipped roster shape. Selecting one is explicit; [`TeamConfig::default`]
+/// always remains the classic roster.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RosterPreset {
+    #[default]
+    Classic,
+    OpencodeLead,
+}
+
+impl RosterPreset {
+    fn is_classic(&self) -> bool {
+        *self == Self::Classic
+    }
+}
+
 /// One lane of the team: a concrete `(target, model, mode)` the leader can
 /// delegate to, plus the routing policy that decides *when* it is used.
 ///
@@ -59,6 +265,18 @@ pub struct TeamMember {
     pub model: Option<String>,
     pub mode: TeamMode,
     pub roles: Vec<String>,
+    /// Native delegation stays inside the current agent host. CLI delegation
+    /// runs via `claude -p`; invoking another OpenCode instance is rejected
+    /// during validation.
+    #[serde(default, skip_serializing_if = "Delegation::is_native")]
+    pub delegation: Delegation,
+    /// Config-owner policy for host-native edit and bounded command access.
+    /// CLI delegation continues to use its invocation flags instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<NativePermissions>,
+    /// Host-native agent name used for Task / `@mention` delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_agent: Option<String>,
     /// The logical model behind this lane (e.g. `glm-5.2`). Two members sharing
     /// a `logical` are the *same* model reached through different pools — that
     /// is what makes quota crossover between them safe, and it is the only
@@ -89,9 +307,9 @@ pub struct TeamMember {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub allow_impl: bool,
     /// Free-form per-lane invocation flags, passed through verbatim by whoever
-    /// invokes the lane (e.g. `permission-mode` / `allowed-tools` for a
-    /// `claude -p` lane). rtrt stores and renders them; it does not interpret
-    /// them, so a new upstream flag needs no rtrt release.
+    /// invokes the lane (e.g. `permission-mode` / `output-format` for a
+    /// `claude -p` lane). Safe future flags remain pass-through, while
+    /// [`TeamConfig::validate`] rejects permission-bypass flags.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub flags: BTreeMap<String, String>,
 }
@@ -106,6 +324,9 @@ impl TeamMember {
             model: None,
             mode,
             roles: Vec::new(),
+            delegation: Delegation::Native,
+            permissions: None,
+            host_agent: None,
             logical: None,
             sibling: None,
             tier: None,
@@ -119,6 +340,22 @@ impl TeamMember {
     pub fn flag(&self, key: &str) -> Option<&str> {
         self.flags.get(key).map(String::as_str)
     }
+
+    /// Bounded continuity selected by canonical Claude CLI flags. Absence is a
+    /// disabled config, preserving legacy one-shot behavior.
+    pub fn claude_continuity(&self) -> ClaudeContinuity {
+        ClaudeContinuity {
+            enabled: self.flag("continuity-enabled") == Some("true"),
+            max_resumed_turns: self
+                .flag("continuity-max-resumed-turns")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_CLAUDE_CONTINUITY_MAX_RESUMED_TURNS),
+            ttl_secs: self
+                .flag("continuity-ttl-secs")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_CLAUDE_CONTINUITY_TTL_SECS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +363,8 @@ impl TeamMember {
 pub struct TeamConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "RosterPreset::is_classic")]
+    pub roster: RosterPreset,
     #[serde(default = "default_team_manager_provider")]
     pub manager_provider: String,
     #[serde(default = "default_team_manager_model")]
@@ -153,6 +392,7 @@ impl Default for TeamConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            roster: RosterPreset::Classic,
             manager_provider: default_team_manager_provider(),
             manager_model: default_team_manager_model(),
             manager_base_url: None,
@@ -172,14 +412,71 @@ impl TeamConfig {
         self == &Self::default()
     }
 
+    /// Build one shipped roster explicitly. The process-wide default is never
+    /// inferred from environment or host, so existing configurations remain on
+    /// [`RosterPreset::Classic`].
+    pub fn preset(roster: RosterPreset) -> Self {
+        match roster {
+            RosterPreset::Classic => Self::default(),
+            RosterPreset::OpencodeLead => opencode_lead_team(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_team_value("manager_provider", &self.manager_provider)?;
         validate_team_value("manager_model", &self.manager_model)?;
         if let Some(base_url) = &self.manager_base_url {
             validate_team_value("manager_base_url", base_url)?;
         }
+        // This safety boundary applies even to disabled rosters: persisting an
+        // OpenCode CLI lane must never become valid merely by toggling
+        // `enabled` later.
+        for (index, member) in self.members.iter().enumerate() {
+            if member.delegation == Delegation::Shell && member.target != "claude" {
+                return Err(Error::Config(format!(
+                    "team.members[{index}].delegation = cli requires target = \"claude\"; \
+                     refusing to execute CLI delegation for target {}",
+                    member.target
+                )));
+            }
+            if member.delegation == Delegation::Shell && member.permissions.is_some() {
+                return Err(Error::Config(format!(
+                    "team.members[{index}].permissions applies only to native delegation; \
+                     Claude CLI permissions must use flags"
+                )));
+            }
+            if member.delegation == Delegation::Shell {
+                if !matches!(member.model.as_deref(), Some("opus" | "sonnet")) {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}] Claude CLI model must be exactly opus or sonnet"
+                    )));
+                }
+                validate_claude_cli_flags(index, &member.flags)?;
+            }
+            if let Some(permissions) = &member.permissions {
+                for (pattern, _) in permissions.bash.iter() {
+                    validate_bash_permission_pattern(index, pattern)?;
+                }
+            }
+        }
+        self.policy.recursion.validate()?;
         if !self.enabled {
             return Ok(());
+        }
+        if let Some((provider, _)) = self.manager_model.trim().split_once('/') {
+            if !is_valid_opencode_model_id(self.manager_model.trim()) {
+                return Err(Error::Config(format!(
+                    "team.manager_model must be a valid nonempty provider/model ID: {}",
+                    self.manager_model
+                )));
+            }
+            if normalize_provider_id(provider) != normalize_provider_id(&self.manager_provider) {
+                return Err(Error::Config(format!(
+                    "team.manager_model provider prefix {provider} does not match \
+                     team.manager_provider {}",
+                    self.manager_provider
+                )));
+            }
         }
         if self.leader_order.is_empty() {
             return Err(Error::Config(
@@ -194,11 +491,59 @@ impl TeamConfig {
 
         let mut member_names = std::collections::BTreeSet::new();
         let mut member_targets = std::collections::BTreeSet::new();
+        let mut native_host_agents = std::collections::BTreeSet::new();
         for (index, member) in self.members.iter().enumerate() {
             validate_team_value(&format!("members[{index}].name"), &member.name)?;
             validate_team_value(&format!("members[{index}].target"), &member.target)?;
             if let Some(model) = &member.model {
                 validate_team_value(&format!("members[{index}].model"), model)?;
+            }
+            if let Some(host_agent) = &member.host_agent {
+                validate_team_value(&format!("members[{index}].host_agent"), host_agent)?;
+            }
+            if member.delegation == Delegation::Native {
+                if let Some(host_agent) = &member.host_agent {
+                    if !is_valid_native_host_agent(host_agent) {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].host_agent must contain only ASCII letters, \
+                             digits, '-' or '_': {host_agent}"
+                        )));
+                    }
+                    if host_agent == "rtrt-manager" {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].host_agent uses reserved OpenCode agent name: \
+                             {host_agent}"
+                        )));
+                    }
+                    if matches!(host_agent.as_str(), "build" | "plan") {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].host_agent names primary-only OpenCode agent: \
+                             {host_agent}"
+                        )));
+                    }
+                    if matches!(host_agent.as_str(), "explore" | "general" | "scout")
+                        && member.model.is_some()
+                    {
+                        return Err(Error::Config(format!(
+                            "team.members[{index}].host_agent names built-in OpenCode subagent \
+                             {host_agent} and must not set model"
+                        )));
+                    }
+                    if !native_host_agents.insert(host_agent.as_str()) {
+                        return Err(Error::Config(format!(
+                            "duplicate native team host_agent at index {index}: {host_agent}"
+                        )));
+                    }
+                }
+                if member.target == "opencode"
+                    && let Some(model) = &member.model
+                    && !is_valid_opencode_model_id(model)
+                {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].model must be a valid nonempty provider/model ID \
+                         for native target opencode: {model}"
+                    )));
+                }
             }
             if member.roles.is_empty() {
                 return Err(Error::Config(format!(
@@ -272,6 +617,12 @@ impl TeamConfig {
                         "team.members[{index}].sibling references unknown member: {sibling}"
                     )));
                 };
+                if other.sibling.as_deref() != Some(member.name.as_str()) {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].sibling {sibling} must reciprocally reference {}",
+                        member.name
+                    )));
+                }
                 match (member.logical.as_deref(), other.logical.as_deref()) {
                     (Some(mine), Some(theirs)) if mine == theirs => {}
                     (Some(mine), Some(theirs)) => {
@@ -287,6 +638,15 @@ impl TeamConfig {
                              declare `logical`: a sibling pair is one model on two pools"
                         )));
                     }
+                }
+                let pool = PoolKey::from_target_model(&member.target, member.model.as_deref());
+                let sibling_pool =
+                    PoolKey::from_target_model(&other.target, other.model.as_deref());
+                if pool == sibling_pool {
+                    return Err(Error::Config(format!(
+                        "team.members[{index}].sibling {sibling} resolves to the same backing pool \
+                         {pool}: siblings must use distinct pools"
+                    )));
                 }
             }
 
@@ -359,12 +719,28 @@ impl TeamConfig {
                 }
             }
         }
-        if let Some(tier) = &self.policy.default_tier {
-            validate_team_value("policy.default_tier", tier)?;
-            if !effective.contains(tier) {
-                return Err(Error::Config(format!(
-                    "team.policy.default_tier references unknown tier: {tier}"
-                )));
+        for (field, configured) in [
+            ("default_tier", &self.policy.default_tier),
+            ("explore_tier", &self.policy.explore_tier),
+            ("review_tier", &self.policy.review_tier),
+        ] {
+            if let Some(tier) = configured {
+                validate_team_value(&format!("policy.{field}"), tier)?;
+                if !effective.contains(tier) {
+                    return Err(Error::Config(format!(
+                        "team.policy.{field} references unknown tier: {tier}"
+                    )));
+                }
+            }
+        }
+        if self.policy.recursion.enabled {
+            for tier in &self.policy.recursion.subleader_tiers {
+                validate_team_value("policy.recursion.subleader_tiers", tier)?;
+                if !effective.contains(tier) {
+                    return Err(Error::Config(format!(
+                        "team.policy.recursion.subleader_tiers references unknown tier: {tier}"
+                    )));
+                }
             }
         }
 
@@ -719,10 +1095,31 @@ pub struct TeamPolicy {
     /// first tier of the effective ladder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_tier: Option<String>,
+    /// Tier reserved for codebase discovery through a dedicated host agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_tier: Option<String>,
+    /// Tier used to review implementation produced by non-Claude lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_tier: Option<String>,
+    /// Preserve configured order or choose equally suitable lanes by pool room.
+    #[serde(default, skip_serializing_if = "Balance::is_order")]
+    pub balance: Balance,
+    /// Maximum number of summary lines returned by a worker to its lead.
+    #[serde(
+        default = "default_worker_summary_max_lines",
+        skip_serializing_if = "is_default_worker_summary_max_lines"
+    )]
+    pub worker_summary_max_lines: u8,
+    /// Put tasks with conflicting write sets in separate worktrees.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub isolate_conflicting: bool,
     /// Tiers whose lanes plan rather than implement; the only tiers a member
     /// with `allow_impl = false` may appear in. `None` uses the shipped name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_only_tiers: Option<Vec<String>>,
+    /// Explicit opt-in and hard resource limits for recursive team leaders.
+    #[serde(default, skip_serializing_if = "RecursionPolicy::is_default")]
+    pub recursion: RecursionPolicy,
 }
 
 impl Default for TeamPolicy {
@@ -734,9 +1131,169 @@ impl Default for TeamPolicy {
             record_provenance: true,
             max_fallback_depth: None,
             default_tier: None,
+            explore_tier: None,
+            review_tier: None,
+            balance: Balance::Order,
+            worker_summary_max_lines: default_worker_summary_max_lines(),
+            isolate_conflicting: true,
             design_only_tiers: None,
+            recursion: RecursionPolicy::default(),
         }
     }
+}
+
+/// Bounded recursive delegation policy. Defaults preserve flat orchestration:
+/// disabled with an effective depth of exactly zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecursionPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_depth: u8,
+    #[serde(default = "default_recursion_fan_out")]
+    pub max_fan_out: u16,
+    #[serde(default = "default_recursion_total_nodes")]
+    pub max_total_nodes: u32,
+    #[serde(default = "default_recursion_token_budget")]
+    pub max_tokens: u64,
+    #[serde(default = "default_recursion_deadline_secs")]
+    pub deadline_secs: u64,
+    #[serde(default = "default_recursion_payload_bytes")]
+    pub max_payload_bytes: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subleader_tiers: Vec<String>,
+}
+
+impl Default for RecursionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_depth: 0,
+            max_fan_out: default_recursion_fan_out(),
+            max_total_nodes: default_recursion_total_nodes(),
+            max_tokens: default_recursion_token_budget(),
+            deadline_secs: default_recursion_deadline_secs(),
+            max_payload_bytes: default_recursion_payload_bytes(),
+            subleader_tiers: Vec::new(),
+        }
+    }
+}
+
+impl RecursionPolicy {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub const fn effective_max_depth(&self) -> u8 {
+        if self.enabled { self.max_depth } else { 0 }
+    }
+
+    pub const fn effective_max_fan_out(&self) -> u16 {
+        if self.enabled { self.max_fan_out } else { 0 }
+    }
+
+    pub const fn effective_max_total_nodes(&self) -> u32 {
+        if self.enabled {
+            self.max_total_nodes
+        } else {
+            0
+        }
+    }
+
+    pub const fn effective_max_tokens(&self) -> u64 {
+        if self.enabled { self.max_tokens } else { 0 }
+    }
+
+    pub const fn effective_deadline_secs(&self) -> u64 {
+        if self.enabled { self.deadline_secs } else { 0 }
+    }
+
+    pub const fn effective_max_payload_bytes(&self) -> u32 {
+        if self.enabled {
+            self.max_payload_bytes
+        } else {
+            0
+        }
+    }
+
+    pub fn may_sublead(&self, tier: &str) -> bool {
+        self.enabled && self.subleader_tiers.iter().any(|allowed| allowed == tier)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled && self.max_depth != 0 {
+            return Err(Error::Config(
+                "team.policy.recursion.max_depth must be 0 when recursion is disabled".into(),
+            ));
+        }
+        if self.enabled && !(1..=MAX_RECURSION_DEPTH).contains(&self.max_depth) {
+            return Err(Error::Config(format!(
+                "team.policy.recursion.max_depth must be between 1 and {MAX_RECURSION_DEPTH}"
+            )));
+        }
+        bounded_recursion_value(
+            "max_fan_out",
+            self.max_fan_out as u64,
+            MAX_RECURSION_FAN_OUT as u64,
+        )?;
+        bounded_recursion_value(
+            "max_total_nodes",
+            self.max_total_nodes as u64,
+            MAX_RECURSION_TOTAL_NODES as u64,
+        )?;
+        bounded_recursion_value("max_tokens", self.max_tokens, MAX_RECURSION_TOKEN_BUDGET)?;
+        bounded_recursion_value(
+            "deadline_secs",
+            self.deadline_secs,
+            MAX_RECURSION_DEADLINE_SECS,
+        )?;
+        bounded_recursion_value(
+            "max_payload_bytes",
+            self.max_payload_bytes as u64,
+            MAX_RECURSION_PAYLOAD_BYTES as u64,
+        )?;
+        if self.max_total_nodes < u32::from(self.max_fan_out).saturating_add(1) {
+            return Err(Error::Config(
+                "team.policy.recursion.max_total_nodes must accommodate root plus max_fan_out"
+                    .into(),
+            ));
+        }
+        let mut tiers = BTreeSet::new();
+        for tier in &self.subleader_tiers {
+            if !tiers.insert(tier) {
+                return Err(Error::Config(format!(
+                    "team.policy.recursion.subleader_tiers lists {tier} twice"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bounded_recursion_value(name: &str, value: u64, max: u64) -> Result<()> {
+    if value == 0 || value > max {
+        return Err(Error::Config(format!(
+            "team.policy.recursion.{name} must be between 1 and {max}"
+        )));
+    }
+    Ok(())
+}
+
+const fn default_recursion_fan_out() -> u16 {
+    4
+}
+const fn default_recursion_total_nodes() -> u32 {
+    32
+}
+const fn default_recursion_token_budget() -> u64 {
+    1_000_000
+}
+const fn default_recursion_deadline_secs() -> u64 {
+    3_600
+}
+const fn default_recursion_payload_bytes() -> u32 {
+    65_536
 }
 
 impl TeamPolicy {
@@ -754,11 +1311,148 @@ fn validate_team_value(name: &str, value: &str) -> Result<()> {
     validate_team_text(name, value)
 }
 
+fn validate_claude_cli_flags(index: usize, flags: &BTreeMap<String, String>) -> Result<()> {
+    for (key, value) in flags {
+        let normalized = key.to_ascii_lowercase();
+        match normalized.as_str() {
+            "output-format" if value == "json" => {}
+            "permission-mode" if matches!(value.as_str(), "plan" | "acceptEdits") => {}
+            "permission-prompt-tool" if value == CLAUDE_PERMISSION_PROMPT_TOOL => {}
+            "continuity-enabled" if matches!(value.as_str(), "true" | "false") => {}
+            "continuity-max-resumed-turns" => {
+                let parsed = value.parse::<u8>().map_err(|_| {
+                    Error::Config(format!(
+                        "team.members[{index}] --continuity-max-resumed-turns must be an integer"
+                    ))
+                })?;
+                validate_claude_continuity(
+                    index,
+                    &ClaudeContinuity {
+                        max_resumed_turns: parsed,
+                        ..ClaudeContinuity::default()
+                    },
+                )?;
+            }
+            "continuity-ttl-secs" => {
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    Error::Config(format!(
+                        "team.members[{index}] --continuity-ttl-secs must be an integer"
+                    ))
+                })?;
+                validate_claude_continuity(
+                    index,
+                    &ClaudeContinuity {
+                        ttl_secs: parsed,
+                        ..ClaudeContinuity::default()
+                    },
+                )?;
+            }
+            _ => {
+                return Err(Error::Config(format!(
+                    "team.members[{index}] Claude CLI delegation may only set canonical \
+                     output-format=json, permission-mode=plan|acceptEdits, and \
+                     permission-prompt-tool={CLAUDE_PERMISSION_PROMPT_TOOL}, plus bounded \
+                     continuity fields; rejected --{key}"
+                )));
+            }
+        }
+    }
+    for required in ["output-format", "permission-mode", "permission-prompt-tool"] {
+        if !flags.contains_key(required) {
+            return Err(Error::Config(format!(
+                "team.members[{index}] Claude CLI delegation requires canonical --{required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_claude_continuity(index: usize, value: &ClaudeContinuity) -> Result<()> {
+    if !(1..=MAX_CLAUDE_CONTINUITY_RESUMED_TURNS).contains(&value.max_resumed_turns) {
+        return Err(Error::Config(format!(
+            "team.members[{index}].continuity.max_resumed_turns must be between 1 and \
+             {MAX_CLAUDE_CONTINUITY_RESUMED_TURNS}"
+        )));
+    }
+    if !(MIN_CLAUDE_CONTINUITY_TTL_SECS..=MAX_CLAUDE_CONTINUITY_TTL_SECS).contains(&value.ttl_secs)
+    {
+        return Err(Error::Config(format!(
+            "team.members[{index}].continuity.ttl_secs must be between \
+             {MIN_CLAUDE_CONTINUITY_TTL_SECS} and {MAX_CLAUDE_CONTINUITY_TTL_SECS}"
+        )));
+    }
+    Ok(())
+}
+
+const fn default_claude_continuity_max_resumed_turns() -> u8 {
+    DEFAULT_CLAUDE_CONTINUITY_MAX_RESUMED_TURNS
+}
+
+const fn default_claude_continuity_ttl_secs() -> u64 {
+    DEFAULT_CLAUDE_CONTINUITY_TTL_SECS
+}
+
+fn is_valid_native_host_agent(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn is_valid_opencode_model_id(value: &str) -> bool {
+    value.contains('/')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'-' | b'_' | b'.' | b':' | b'@' | b'+')
+        })
+        && value.split('/').all(|segment| {
+            segment
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
 /// NUL check only — for values that may legitimately be empty, such as a
 /// valueless invocation flag.
 fn validate_team_text(name: &str, value: &str) -> Result<()> {
     if value.contains('\0') {
         return Err(Error::Config(format!("team.{name} must not contain NUL")));
+    }
+    Ok(())
+}
+
+fn validate_bash_permission_pattern(member_index: usize, pattern: &str) -> Result<()> {
+    let field = format!("team.members[{member_index}].permissions.bash pattern");
+    if pattern.trim().is_empty() {
+        return Err(Error::Config(format!("{field} must not be empty")));
+    }
+    if pattern.contains('\0') {
+        return Err(Error::Config(format!("{field} must not contain NUL")));
+    }
+    if pattern.trim() == "*" {
+        return Err(Error::Config(format!(
+            "{field} must not be the catch-all `*`"
+        )));
+    }
+    if pattern
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r'))
+    {
+        return Err(Error::Config(format!("{field} must not contain newlines")));
+    }
+    if pattern.contains("$(") || pattern.contains('`') {
+        return Err(Error::Config(format!(
+            "{field} must not contain command substitution"
+        )));
+    }
+    if pattern
+        .chars()
+        .any(|character| matches!(character, '|' | '&' | ';' | '<' | '>' | '(' | ')'))
+    {
+        return Err(Error::Config(format!(
+            "{field} must not contain shell operators or redirections"
+        )));
     }
     Ok(())
 }
@@ -852,6 +1546,194 @@ fn default_team_members() -> Vec<TeamMember> {
     ]
 }
 
+/// Opt-in roster for a live OpenCode lead. OpenCode-backed lanes stay native;
+/// the two Claude lanes are the only members allowed to use CLI delegation.
+fn opencode_lead_team() -> TeamConfig {
+    let members = vec![
+        TeamMember {
+            delegation: Delegation::Shell,
+            host_agent: Some("claude-opus".to_string()),
+            allow_impl: false,
+            flags: team_flags(&[
+                ("permission-mode", "plan"),
+                ("output-format", "json"),
+                ("permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL),
+            ]),
+            ..team_member(
+                "opus",
+                "claude",
+                "opus",
+                "opus",
+                &[
+                    "plan",
+                    "architecture",
+                    "task-breakdown",
+                    "architecture-review",
+                ],
+            )
+        },
+        TeamMember {
+            host_agent: Some("kimi-k3".to_string()),
+            sibling: Some("kimi-k3-cloud".to_string()),
+            fallback: team_names(&["codex-sol"]),
+            ..team_member(
+                "kimi-k3",
+                "opencode",
+                "opencode-go/kimi-k3",
+                "kimi-k3",
+                &[
+                    "hard-implementation",
+                    "multifile",
+                    "refactoring",
+                    "frontend",
+                ],
+            )
+        },
+        TeamMember {
+            delegation: Delegation::Native,
+            host_agent: Some("kimi-k3-cloud".to_string()),
+            sibling: Some("kimi-k3".to_string()),
+            fallback: team_names(&["codex-sol"]),
+            ..team_member(
+                "kimi-k3-cloud",
+                "opencode",
+                "ollama/kimi-k3:cloud",
+                "kimi-k3",
+                &[
+                    "hard-implementation",
+                    "multifile",
+                    "refactoring",
+                    "frontend",
+                ],
+            )
+        },
+        TeamMember {
+            host_agent: Some("codex-sol-worker".to_string()),
+            fallback: team_names(&["sonnet"]),
+            ..team_member(
+                "codex-sol",
+                "opencode",
+                "openai/gpt-5.6-sol",
+                "gpt-5.6-sol",
+                &[
+                    "hard-implementation",
+                    "debugging",
+                    "systems",
+                    "architecture-aware",
+                ],
+            )
+        },
+        TeamMember {
+            host_agent: Some("codex-luna".to_string()),
+            fallback: team_names(&["kimi-k3", "codex-sol"]),
+            ..team_member(
+                "codex-luna",
+                "opencode",
+                "openai/gpt-5.6-luna",
+                "gpt-5.6-luna",
+                &["routine", "tests", "docs"],
+            )
+        },
+        TeamMember {
+            host_agent: Some("glm".to_string()),
+            sibling: Some("glm-cloud".to_string()),
+            fallback: team_names(&["kimi"]),
+            ..team_member(
+                "glm",
+                "opencode",
+                "opencode-go/glm-5.2",
+                "glm-5.2",
+                &["simple", "mechanical", "boilerplate", "bulk-edit"],
+            )
+        },
+        TeamMember {
+            delegation: Delegation::Native,
+            host_agent: Some("glm-cloud".to_string()),
+            sibling: Some("glm".to_string()),
+            fallback: team_names(&["kimi-cloud"]),
+            ..team_member(
+                "glm-cloud",
+                "opencode",
+                "ollama/glm-5.2:cloud",
+                "glm-5.2",
+                &["simple", "mechanical", "boilerplate", "bulk-edit"],
+            )
+        },
+        TeamMember {
+            host_agent: Some("kimi".to_string()),
+            sibling: Some("kimi-cloud".to_string()),
+            fallback: team_names(&["codex-luna"]),
+            ..team_member(
+                "kimi",
+                "opencode",
+                "opencode-go/kimi-k2.7-code",
+                "kimi-k2.7-code",
+                &["simple", "mechanical", "boilerplate", "single-file"],
+            )
+        },
+        TeamMember {
+            delegation: Delegation::Native,
+            host_agent: Some("kimi-cloud".to_string()),
+            sibling: Some("kimi".to_string()),
+            fallback: team_names(&["codex-luna"]),
+            ..team_member(
+                "kimi-cloud",
+                "opencode",
+                "ollama/kimi-k2.7-code:cloud",
+                "kimi-k2.7-code",
+                &["simple", "mechanical", "boilerplate", "single-file"],
+            )
+        },
+        TeamMember {
+            host_agent: Some("explore".to_string()),
+            roles: team_names(&["discovery"]),
+            ..TeamMember::new("explore", "opencode", TeamMode::Cli)
+        },
+        TeamMember {
+            delegation: Delegation::Shell,
+            host_agent: Some("claude-sonnet".to_string()),
+            flags: team_flags(&[
+                ("permission-mode", "acceptEdits"),
+                ("output-format", "json"),
+                ("permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL),
+            ]),
+            ..team_member(
+                "sonnet",
+                "claude",
+                "sonnet",
+                "sonnet",
+                &["review", "consistency"],
+            )
+        },
+    ];
+
+    TeamConfig {
+        enabled: true,
+        roster: RosterPreset::OpencodeLead,
+        manager_provider: "openai".to_string(),
+        manager_model: "gpt-5.6-sol".to_string(),
+        leader_order: team_names(&["codex-sol", "sonnet", "kimi-k3-cloud"]),
+        members,
+        tiers: TierMap::from_pairs([
+            ("simple", vec!["glm", "glm-cloud", "kimi", "kimi-cloud"]),
+            ("routine", vec!["codex-luna"]),
+            ("hard", vec!["codex-sol", "kimi-k3-cloud", "kimi-k3"]),
+            ("plan", vec!["opus"]),
+            ("review", vec!["sonnet"]),
+            ("explore", vec!["explore"]),
+        ]),
+        policy: TeamPolicy {
+            default_tier: Some("hard".to_string()),
+            explore_tier: Some("explore".to_string()),
+            review_tier: Some("review".to_string()),
+            balance: Balance::Room,
+            design_only_tiers: Some(team_names(&["plan"])),
+            ..TeamPolicy::default()
+        },
+        ..TeamConfig::default()
+    }
+}
+
 /// The shipped difficulty ladder, expressed over [`default_team_members`].
 ///
 /// Only a default: a `[team.tiers]` table replaces it wholesale, and a roster
@@ -890,6 +1772,14 @@ fn default_team_max_retries() -> u32 {
     DEFAULT_TEAM_MAX_RETRIES
 }
 
+fn default_worker_summary_max_lines() -> u8 {
+    3
+}
+
+fn is_default_worker_summary_max_lines(value: &u8) -> bool {
+    *value == default_worker_summary_max_lines()
+}
+
 fn team_member(name: &str, target: &str, model: &str, logical: &str, roles: &[&str]) -> TeamMember {
     TeamMember {
         model: Some(model.to_string()),
@@ -901,6 +1791,13 @@ fn team_member(name: &str, target: &str, model: &str, logical: &str, roles: &[&s
 
 fn team_names(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn team_flags(values: &[(&str, &str)]) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
 }
 
 /// Global security defaults applied before any per-project binding. A project
@@ -1190,6 +2087,10 @@ pub struct AutoCompressConfig {
     /// OpenAI-compatible base URL (e.g. a local Ollama endpoint).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Runtime/provider identity behind `base_url`. This is deliberately
+    /// separate from its OpenAI-compatible wire protocol.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default = "default_compress_interval")]
     pub interval_sec: u64,
     #[serde(default = "default_compress_age")]
@@ -1208,6 +2109,7 @@ impl Default for AutoCompressConfig {
             enabled: false,
             model: default_compress_model(),
             base_url: None,
+            provider: None,
             interval_sec: default_compress_interval(),
             age_sec: default_compress_age(),
             min_chars: default_compress_min_chars(),
@@ -1215,6 +2117,59 @@ impl Default for AutoCompressConfig {
             max_tokens: default_compress_max_tokens(),
         }
     }
+}
+
+impl AutoCompressConfig {
+    /// Identity for an OpenAI-compatible endpoint. Explicit env/config values
+    /// win. Only Ollama's shipped loopback URL is recognised implicitly;
+    /// arbitrary compatible endpoints retain the neutral identity.
+    pub fn effective_provider(&self, base_url: &str) -> String {
+        let provider = std::env::var("RTRT_OPENAI_COMPAT_PROVIDER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.provider
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                if is_default_ollama_compatible_url(base_url) {
+                    "ollama".to_string()
+                } else {
+                    "openai-compat".to_string()
+                }
+            });
+        normalize_provider_id(&provider)
+    }
+}
+
+/// Canonical provider/runtime identity used at configuration and routing
+/// boundaries. Provider names are case-insensitive. These aliases are limited
+/// to explicit spellings of the same runtime; transport names never become a
+/// provider and collapse to the neutral compatible-endpoint identity.
+pub fn normalize_provider_id(provider: &str) -> String {
+    let normalized = provider.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "openai-compatible" | "openai_compatible" | "openai-compat" => "openai-compat".to_string(),
+        "lmstudio" | "lm_studio" | "lms" | "lm-studio" => "lm-studio".to_string(),
+        "llama" | "llamacpp" | "llama_cpp" | "llama-cpp" | "llama.cpp" => "llama.cpp".to_string(),
+        _ => normalized,
+    }
+}
+
+/// Whether `url` is the known default Ollama loopback endpoint. Do not extend
+/// this into runtime fingerprinting: compatible servers must identify
+/// themselves explicitly.
+pub fn is_default_ollama_compatible_url(url: &str) -> bool {
+    matches!(
+        url.trim().trim_end_matches('/'),
+        "http://127.0.0.1:11434"
+            | "http://127.0.0.1:11434/v1"
+            | "http://localhost:11434"
+            | "http://localhost:11434/v1"
+            | "http://[::1]:11434"
+            | "http://[::1]:11434/v1"
+    )
 }
 
 fn default_compress_model() -> String {
@@ -1280,13 +2235,17 @@ fn default_memory_path() -> PathBuf {
     default_memory_store_path()
 }
 
-/// Canonical default memory store: `~/.rtrt/memory.sqlite`.
+/// Explicit legacy/admin memory store: `~/.rtrt/memory.sqlite`.
 ///
-/// Every surface (CLI, MCP server, dashboard, hooks, services) must resolve
-/// the store through this function when no explicit `--store` /
-/// `RTRT_MEMORY_PATH` override is given, so a fresh install reads and writes
-/// one SQLite file instead of scattering cwd-relative stores per directory.
+/// Retained for backward-compatible configuration and explicit migration
+/// workflows. New project-scoped callers must not use this default.
 pub fn default_memory_store_path() -> PathBuf {
+    legacy_memory_store_path()
+}
+
+/// Explicit legacy/admin path. Strict project callers must instead use
+/// [`crate::project_memory_db_path`].
+pub fn legacy_memory_store_path() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -1352,11 +2311,15 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     pub fn enabled_override(&self, name: &str) -> Option<bool> {
-        self.enabled.get(name).copied()
+        let normalized = normalize_provider_id(name);
+        self.enabled
+            .iter()
+            .find(|(configured, _)| normalize_provider_id(configured) == normalized)
+            .map(|(_, enabled)| *enabled)
     }
 
     pub fn set_enabled(&mut self, name: &str, enabled: bool) {
-        self.enabled.insert(name.to_string(), enabled);
+        self.enabled.insert(normalize_provider_id(name), enabled);
     }
 
     /// Effective output-token ceiling for API-mode invocations. Resolution
@@ -1464,7 +2427,12 @@ impl PoolLimit {
 
 impl LimitsConfig {
     pub fn target(&self, name: &str) -> Option<&TargetLimit> {
-        self.targets.get(name)
+        self.targets.get(name).or_else(|| {
+            self.targets
+                .iter()
+                .find(|(target, _)| target.eq_ignore_ascii_case(name))
+                .map(|(_, limit)| limit)
+        })
     }
 
     /// The cap for one pool inside a target, if the config pins one.
@@ -1504,8 +2472,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         match Self::default_path() {
             Some(p) if p.exists() => {
-                let raw = std::fs::read_to_string(&p)
-                    .map_err(|e| Error::Config(format!("read {}: {e}", p.display())))?;
+                let raw = read_bounded_config(&p, false)?;
                 Self::from_toml_str(&raw)
             }
             _ => Ok(Self::default()),
@@ -1549,9 +2516,21 @@ impl Config {
 
     /// Load a project's override file if present (empty default otherwise).
     pub fn load_project(repo: &Path) -> Result<ProjectConfig> {
-        match std::fs::read_to_string(Self::project_config_path(repo)) {
-            Ok(raw) => ProjectConfig::from_toml_str(&raw),
-            Err(_) => Ok(ProjectConfig::default()),
+        let root = canonical_repo_root(repo)?;
+        let Some(config_dir) = existing_project_config_dir(&root)? else {
+            return Ok(ProjectConfig::default());
+        };
+        let path = config_dir.join("config.toml");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                validate_project_target(&root, &path, &metadata)?;
+                let raw = read_bounded_config(&path, true)?;
+                ProjectConfig::from_toml_str(&raw)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProjectConfig::default())
+            }
+            Err(error) => Err(config_error("inspect", &path, error)),
         }
     }
 
@@ -1623,21 +2602,291 @@ impl Config {
     /// no writer (dashboard, CLI, future callers) can persist a broken roster.
     pub fn save_project(repo: &Path, over: &ProjectConfig) -> Result<()> {
         over.validate()?;
-        let path = Self::project_config_path(repo);
-        if over.is_empty() {
-            let _ = std::fs::remove_file(&path);
+        let root = canonical_repo_root(repo)?;
+        let config_dir = prepare_project_config_dir(&root, !over.is_empty())?;
+        let Some(config_dir) = config_dir else {
             return Ok(());
+        };
+        let path = config_dir.join("config.toml");
+        let target = match fs::symlink_metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(config_error("inspect", &path, error)),
+        };
+        if let Some(metadata) = &target {
+            validate_project_target(&root, &path, metadata)?;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Config(format!("mkdir {}: {e}", parent.display())))?;
+        if over.is_empty() {
+            if target.is_some() {
+                fs::remove_file(&path).map_err(|error| config_error("remove", &path, error))?;
+            }
+            return Ok(());
         }
         let body = toml::to_string_pretty(over)
             .map_err(|e| Error::Config(format!("serialize project config: {e}")))?;
-        std::fs::write(&path, body)
-            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
-        Ok(())
+        if body.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(Error::Config(format!(
+                "project config exceeds {MAX_CONFIG_BYTES} bytes"
+            )));
+        }
+        atomic_write_project_config(&root, &config_dir, &path, body.as_bytes())
     }
+}
+
+fn config_error(action: &str, path: &Path, error: std::io::Error) -> Error {
+    Error::Config(format!("{action} {}: {error}", path.display()))
+}
+
+fn canonical_repo_root(repo: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(repo).map_err(|error| config_error("canonicalize", repo, error))?;
+    let metadata = fs::metadata(&root).map_err(|error| config_error("inspect", &root, error))?;
+    if !metadata.is_dir() {
+        return Err(Error::Config(format!(
+            "project root is not a directory: {}",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+fn existing_project_config_dir(root: &Path) -> Result<Option<PathBuf>> {
+    let path = root.join(".rtrt");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(config_error("inspect", &path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Config(format!(
+            "project config directory must be a real directory: {}",
+            path.display()
+        )));
+    }
+    validate_same_owner(root, &path, &metadata)?;
+    let canonical =
+        fs::canonicalize(&path).map_err(|error| config_error("canonicalize", &path, error))?;
+    if canonical.parent() != Some(root) {
+        return Err(Error::Config(format!(
+            "project config directory escapes repository: {}",
+            path.display()
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+fn prepare_project_config_dir(root: &Path, create: bool) -> Result<Option<PathBuf>> {
+    if let Some(path) = existing_project_config_dir(root)? {
+        return Ok(Some(path));
+    }
+    if !create {
+        return Ok(None);
+    }
+    let path = root.join(".rtrt");
+    fs::create_dir(&path).map_err(|error| config_error("mkdir", &path, error))?;
+    set_private_directory_mode(&path)?;
+    existing_project_config_dir(root)
+}
+
+fn validate_project_target(root: &Path, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "project config must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    validate_same_owner(root, path, metadata)
+}
+
+#[cfg(unix)]
+fn validate_same_owner(root: &Path, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root_metadata = fs::metadata(root).map_err(|error| config_error("inspect", root, error))?;
+    if metadata.uid() != root_metadata.uid() {
+        return Err(Error::Config(format!(
+            "project config path has foreign ownership: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_owner(_root: &Path, _path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+fn read_bounded_config(path: &Path, reject_symlink: bool) -> Result<String> {
+    let expected = if reject_symlink {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| config_error("inspect", path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Config(format!(
+                "config must be a regular non-symlink file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_CONFIG_BYTES {
+            return Err(Error::Config(format!(
+                "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+                path.display()
+            )));
+        }
+        Some(metadata)
+    } else {
+        None
+    };
+    let file = File::open(path).map_err(|error| config_error("read", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| config_error("inspect", path, error))?;
+    if expected
+        .as_ref()
+        .is_some_and(|expected| !metadata_same_file(expected, &metadata))
+    {
+        return Err(Error::Config(format!(
+            "config changed while opening: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "config is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(Error::Config(format!(
+            "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| config_error("read", path, error))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::Config(format!(
+            "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| Error::Config(format!("read {}: {error}", path.display())))
+}
+
+#[cfg(unix)]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
+}
+
+struct TempConfig {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempConfig {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn atomic_write_project_config(
+    root: &Path,
+    config_dir: &Path,
+    destination: &Path,
+    body: &[u8],
+) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..32 {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = config_dir.join(format!(
+            ".config.toml.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(mut file) => {
+                let mut temp = TempConfig {
+                    path: temp_path,
+                    armed: true,
+                };
+                file.write_all(body)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| config_error("write", &temp.path, error))?;
+                let written_metadata = file
+                    .metadata()
+                    .map_err(|error| config_error("inspect", &temp.path, error))?;
+                drop(file);
+                let checked_dir = existing_project_config_dir(root)?.ok_or_else(|| {
+                    Error::Config("project config directory disappeared during write".to_string())
+                })?;
+                if checked_dir != config_dir {
+                    return Err(Error::Config(
+                        "project config directory changed during write".to_string(),
+                    ));
+                }
+                if let Ok(metadata) = fs::symlink_metadata(destination) {
+                    validate_project_target(root, destination, &metadata)?;
+                }
+                let temp_metadata = fs::symlink_metadata(&temp.path)
+                    .map_err(|error| config_error("inspect", &temp.path, error))?;
+                if temp_metadata.file_type().is_symlink()
+                    || !temp_metadata.is_file()
+                    || !metadata_same_file(&written_metadata, &temp_metadata)
+                {
+                    return Err(Error::Config(
+                        "temporary project config changed during write".to_string(),
+                    ));
+                }
+                fs::rename(&temp.path, destination)
+                    .map_err(|error| config_error("replace", destination, error))?;
+                temp.armed = false;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(config_error("create", &temp_path, error)),
+        }
+    }
+    Err(config_error(
+        "create temporary config",
+        config_dir,
+        last_error.unwrap_or_else(|| std::io::Error::other("name collision")),
+    ))
+}
+
+#[cfg(unix)]
+fn set_private_directory_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| config_error("chmod", path, error))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_mode(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Walk up from `start` to the enclosing repo root — the first ancestor with a
@@ -1742,6 +2991,7 @@ mod tests {
     fn team_defaults_are_backward_compatible_and_ordered() {
         let team = Config::from_toml_str("").unwrap().team;
         assert!(!team.enabled);
+        assert_eq!(team.roster, RosterPreset::Classic);
         assert_eq!(team.manager_provider, "ollama");
         assert_eq!(team.manager_model, "granite4:350m");
         assert_eq!(
@@ -1804,6 +3054,16 @@ mod tests {
                 ),
             ]
         );
+        assert!(
+            team.members
+                .iter()
+                .all(|member| member.delegation == Delegation::Native)
+        );
+        assert!(
+            team.members
+                .iter()
+                .all(|member| member.host_agent.is_none())
+        );
     }
 
     #[test]
@@ -1855,7 +3115,7 @@ mod tests {
             [[team.members]]
             name = "first"
             target = "opencode"
-            model = "first"
+            model = "provider/first"
             mode = "api"
             roles = ["worker"]
 
@@ -1970,6 +3230,715 @@ mod tests {
         assert!(nul.validate().is_err());
     }
 
+    #[test]
+    fn enabled_native_host_and_opencode_model_policy_is_validated_from_toml() {
+        let single_member = |host_agent: &str, model: Option<&str>| {
+            let model = model
+                .map(|model| format!("model = {model:?}\n"))
+                .unwrap_or_default();
+            format!(
+                r#"
+                [team]
+                enabled = true
+                leader_order = ["worker"]
+
+                [[team.members]]
+                name = "worker"
+                target = "opencode"
+                mode = "cli"
+                roles = ["worker"]
+                host_agent = {host_agent:?}
+                {model}
+                "#
+            )
+        };
+
+        for host_agent in ["../worker", "worker.name", "worker name", "작업자"] {
+            let error = Config::from_toml_str(&single_member(host_agent, Some("provider/model")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("only ASCII letters"),
+                "{host_agent}: {error}"
+            );
+        }
+        for host_agent in ["build", "plan"] {
+            let error = Config::from_toml_str(&single_member(host_agent, Some("provider/model")))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("primary-only OpenCode agent"), "{error}");
+        }
+        let error = Config::from_toml_str(&single_member("rtrt-manager", Some("provider/model")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved OpenCode agent name"), "{error}");
+
+        for model in [
+            "",
+            "model",
+            "/model",
+            "provider/",
+            "provider//model",
+            "provider/model name",
+            "provider/$model",
+        ] {
+            assert!(
+                Config::from_toml_str(&single_member("worker", Some(model))).is_err(),
+                "accepted invalid OpenCode model ID {model:?}"
+            );
+        }
+
+        let duplicate = r#"
+            [team]
+            enabled = true
+            leader_order = ["first"]
+
+            [[team.members]]
+            name = "first"
+            target = "opencode"
+            model = "one/model"
+            mode = "cli"
+            roles = ["worker"]
+            host_agent = "shared"
+
+            [[team.members]]
+            name = "second"
+            target = "opencode"
+            model = "two/model"
+            mode = "cli"
+            roles = ["worker"]
+            host_agent = "shared"
+        "#;
+        let error = Config::from_toml_str(duplicate).unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate native team host_agent"),
+            "{error}"
+        );
+
+        for host_agent in ["explore", "general", "scout"] {
+            Config::from_toml_str(&single_member(host_agent, None)).unwrap();
+        }
+    }
+
+    #[test]
+    fn enabled_manager_model_provider_prefix_must_match() {
+        for model in ["legacy-model", "ollama/qualified-model"] {
+            Config::from_toml_str(&format!(
+                "[team]\nenabled = true\nmanager_provider = \"ollama\"\n\
+                 manager_model = {model:?}\n"
+            ))
+            .unwrap();
+        }
+
+        let error = Config::from_toml_str(
+            "[team]\nenabled = true\nmanager_provider = \"ollama\"\n\
+             manager_model = \"openai/model\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("provider prefix openai"), "{error}");
+        assert!(error.contains("manager_provider ollama"), "{error}");
+
+        for model in ["ollama/", "/model", "ollama/model name"] {
+            let error = Config::from_toml_str(&format!(
+                "[team]\nenabled = true\nmanager_provider = \"ollama\"\n\
+                 manager_model = {model:?}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("valid nonempty provider/model"), "{error}");
+        }
+    }
+
+    #[test]
+    fn delegation_and_host_policy_defaults_and_roundtrip() {
+        let member = TeamMember::new("native", "opencode", TeamMode::Cli);
+        assert_eq!(member.delegation, Delegation::Native);
+        assert!(member.host_agent.is_none());
+
+        let policy = TeamPolicy::default();
+        assert!(policy.explore_tier.is_none());
+        assert!(policy.review_tier.is_none());
+        assert_eq!(policy.balance, Balance::Order);
+        assert_eq!(policy.worker_summary_max_lines, 3);
+        assert!(policy.isolate_conflicting);
+
+        let source = r#"
+            [team]
+            enabled = true
+            roster = "opencode-lead"
+            leader_order = ["planner"]
+
+            [[team.members]]
+            name = "planner"
+            target = "claude"
+            model = "opus"
+            mode = "cli"
+            roles = ["plan"]
+            delegation = "cli"
+            host_agent = "claude-opus"
+            allow_impl = false
+
+            [team.members.flags]
+            output-format = "json"
+            permission-mode = "plan"
+            permission-prompt-tool = "mcp__rtrt__permission_prompt"
+
+            [team.tiers]
+            discovery = ["planner"]
+            review = ["planner"]
+            plan = ["planner"]
+
+            [team.policy]
+            explore_tier = "discovery"
+            review_tier = "review"
+            balance = "room"
+            worker_summary_max_lines = 2
+            isolate_conflicting = false
+            design_only_tiers = ["discovery", "review", "plan"]
+        "#;
+        let team = Config::from_toml_str(source).unwrap().team;
+        assert_eq!(team.roster, RosterPreset::OpencodeLead);
+        assert_eq!(team.members[0].delegation, Delegation::Shell);
+        assert_eq!(team.members[0].host_agent.as_deref(), Some("claude-opus"));
+        assert_eq!(team.policy.explore_tier.as_deref(), Some("discovery"));
+        assert_eq!(team.policy.review_tier.as_deref(), Some("review"));
+        assert_eq!(team.policy.balance, Balance::Room);
+        assert_eq!(team.policy.worker_summary_max_lines, 2);
+        assert!(!team.policy.isolate_conflicting);
+
+        let serialized = toml::to_string(&team).unwrap();
+        let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, team);
+        reparsed.validate().unwrap();
+    }
+
+    #[test]
+    fn delegation_wire_names_support_cli_and_legacy_shell() {
+        let member_toml = |delegation: &str| {
+            format!(
+                "name = \"worker\"\ntarget = \"claude\"\nmode = \"cli\"\nroles = [\"worker\"]\ndelegation = {delegation:?}\n"
+            )
+        };
+
+        let cli: TeamMember = toml::from_str(&member_toml("cli")).unwrap();
+        assert_eq!(cli.delegation, Delegation::Shell);
+        assert!(
+            toml::to_string(&cli)
+                .unwrap()
+                .contains("delegation = \"cli\"")
+        );
+
+        let legacy: TeamMember = toml::from_str(&member_toml("shell")).unwrap();
+        assert_eq!(legacy.delegation, Delegation::Shell);
+        assert!(
+            toml::to_string(&legacy)
+                .unwrap()
+                .contains("delegation = \"cli\"")
+        );
+
+        assert_eq!(
+            serde_json::to_string(&Delegation::Native).unwrap(),
+            "\"native\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Delegation>("\"native\"").unwrap(),
+            Delegation::Native
+        );
+    }
+
+    #[test]
+    fn native_permissions_toml_roundtrip_preserves_actions_and_bash_order() {
+        let source = r#"
+            [team]
+            enabled = false
+
+            [[team.members]]
+            name = "worker"
+            target = "opencode"
+            mode = "cli"
+            roles = ["arbitrary-role"]
+
+            [team.members.permissions]
+            edit = "ask"
+
+            [team.members.permissions.bash]
+            "git status" = "allow"
+            "cargo test *" = "ask"
+            "cargo build" = "deny"
+        "#;
+        let config = Config::from_toml_str(source).unwrap();
+        let permissions = config.team.members[0].permissions.as_ref().unwrap();
+        assert_eq!(permissions.edit, Some(PermissionAction::Ask));
+        assert_eq!(
+            permissions.bash.iter().collect::<Vec<_>>(),
+            [
+                ("git status", PermissionAction::Allow),
+                ("cargo test *", PermissionAction::Ask),
+                ("cargo build", PermissionAction::Deny),
+            ]
+        );
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed = Config::from_toml_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.team.members[0].permissions,
+            Some(permissions.clone())
+        );
+        assert!(serialized.find("git status").unwrap() < serialized.find("cargo test *").unwrap());
+        assert!(serialized.find("cargo test *").unwrap() < serialized.find("cargo build").unwrap());
+    }
+
+    #[test]
+    fn omitted_native_permissions_are_backward_compatible_and_not_serialized() {
+        let source = r#"
+            name = "worker"
+            target = "opencode"
+            mode = "cli"
+            roles = ["worker"]
+        "#;
+        let member: TeamMember = toml::from_str(source).unwrap();
+        assert!(member.permissions.is_none());
+        assert!(!toml::to_string(&member).unwrap().contains("permissions"));
+        assert!(
+            default_team_members()
+                .iter()
+                .all(|member| member.permissions.is_none())
+        );
+    }
+
+    #[test]
+    fn unsafe_native_bash_permission_patterns_and_cli_permissions_are_rejected() {
+        for pattern in [
+            "",
+            "   ",
+            "*",
+            "  * ",
+            "git status\0",
+            "git status\ngit diff",
+            "git status\r",
+            "git status | cat",
+            "git status && cargo test",
+            "git status; cargo test",
+            "cargo test > result",
+            "$(whoami)",
+            "`whoami`",
+            "(git status)",
+        ] {
+            let mut member = TeamMember::new("worker", "opencode", TeamMode::Cli);
+            member.roles = team_names(&["worker"]);
+            member.permissions = Some(NativePermissions {
+                edit: None,
+                bash: PermissionMap::from_pairs([(pattern, PermissionAction::Allow)]),
+            });
+            let team = TeamConfig {
+                members: vec![member],
+                ..TeamConfig::default()
+            };
+            assert!(
+                team.validate().is_err(),
+                "accepted unsafe pattern {pattern:?}"
+            );
+        }
+
+        let mut cli = TeamMember::new("worker", "claude", TeamMode::Cli);
+        cli.roles = team_names(&["worker"]);
+        cli.delegation = Delegation::Shell;
+        cli.permissions = Some(NativePermissions {
+            edit: Some(PermissionAction::Allow),
+            bash: PermissionMap::default(),
+        });
+        let team = TeamConfig {
+            members: vec![cli],
+            ..TeamConfig::default()
+        };
+        let error = team.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("applies only to native delegation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn opencode_lead_preset_inherits_native_permissions() {
+        let team = TeamConfig::preset(RosterPreset::OpencodeLead);
+        assert!(
+            team.members
+                .iter()
+                .filter(|member| member.delegation == Delegation::Native)
+                .all(|member| member.permissions.is_none())
+        );
+
+        let opus = team.member("opus").unwrap();
+        assert_eq!(opus.flag("permission-mode"), Some("plan"));
+        assert_eq!(opus.flag("output-format"), Some("json"));
+        assert_eq!(
+            opus.flag("permission-prompt-tool"),
+            Some(CLAUDE_PERMISSION_PROMPT_TOOL)
+        );
+        assert_eq!(opus.flag("allowed-tools"), None);
+
+        let sonnet = team.member("sonnet").unwrap();
+        assert_eq!(sonnet.flag("permission-mode"), Some("acceptEdits"));
+        assert_eq!(sonnet.flag("output-format"), Some("json"));
+        assert_eq!(
+            sonnet.flag("permission-prompt-tool"),
+            Some(CLAUDE_PERMISSION_PROMPT_TOOL)
+        );
+        assert_eq!(sonnet.flag("allowed-tools"), None);
+    }
+
+    #[test]
+    fn claude_cli_delegation_rejects_permission_bypasses_even_when_disabled() {
+        for (key, value, expected) in [
+            ("ALLOWED-TOOLS", "Read", "--ALLOWED-TOOLS"),
+            ("AllowedTools", "Read", "--AllowedTools"),
+            (
+                "DANGEROUSLY-SKIP-PERMISSIONS",
+                "",
+                "--DANGEROUSLY-SKIP-PERMISSIONS",
+            ),
+            (
+                "Permission-Mode",
+                "BYPASSPERMISSIONS",
+                "rejected --Permission-Mode",
+            ),
+            (
+                "Permission-Prompt-Tool",
+                "foreign_tool",
+                "rejected --Permission-Prompt-Tool",
+            ),
+        ] {
+            let mut member = TeamMember::new("worker", "claude", TeamMode::Cli);
+            member.roles = team_names(&["worker"]);
+            member.delegation = Delegation::Shell;
+            member.model = Some("sonnet".into());
+            member.flags = team_flags(&[
+                ("output-format", "json"),
+                ("permission-mode", "acceptEdits"),
+                ("permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL),
+            ]);
+            member.flags.insert(key.to_string(), value.to_string());
+            let team = TeamConfig {
+                enabled: false,
+                members: vec![member],
+                ..TeamConfig::default()
+            };
+            let error = team.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn claude_cli_delegation_rejects_unknown_future_flags() {
+        let mut member = TeamMember::new("worker", "claude", TeamMode::Cli);
+        member.roles = team_names(&["worker"]);
+        member.delegation = Delegation::Shell;
+        member.model = Some("sonnet".into());
+        member.flags = team_flags(&[
+            ("future-safe-flag", "future-value"),
+            ("output-format", "json"),
+            ("permission-mode", "acceptEdits"),
+            ("Permission-Prompt-Tool", CLAUDE_PERMISSION_PROMPT_TOOL),
+        ]);
+        let team = TeamConfig {
+            enabled: false,
+            members: vec![member],
+            ..TeamConfig::default()
+        };
+        assert!(team.validate().is_err());
+    }
+
+    #[test]
+    fn cli_delegation_is_restricted_to_claude() {
+        let cli_member = |target: &str| TeamMember {
+            roles: team_names(&["worker"]),
+            delegation: Delegation::Shell,
+            ..TeamMember::new("worker", target, TeamMode::Cli)
+        };
+
+        for target in ["opencode", "opencode-go", "other"] {
+            let team = TeamConfig {
+                // The boundary applies before enablement so an invalid dormant
+                // roster cannot be activated later.
+                enabled: false,
+                members: vec![cli_member(target)],
+                ..TeamConfig::default()
+            };
+            let error = team.validate().unwrap_err().to_string();
+            assert!(error.contains("requires target = \"claude\""), "{error}");
+            assert!(error.contains("delegation = cli"), "{error}");
+            assert!(error.contains(target), "{error}");
+        }
+
+        let mut claude_member = cli_member("claude");
+        claude_member.model = Some("sonnet".into());
+        claude_member.flags = team_flags(&[
+            ("output-format", "json"),
+            ("permission-mode", "acceptEdits"),
+            ("permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL),
+        ]);
+        let claude = TeamConfig {
+            enabled: true,
+            leader_order: team_names(&["worker"]),
+            members: vec![claude_member],
+            ..TeamConfig::default()
+        };
+        claude.validate().unwrap();
+    }
+
+    #[test]
+    fn opencode_lead_preset_has_native_lanes_and_expected_fallbacks() {
+        let team = TeamConfig::preset(RosterPreset::OpencodeLead);
+        team.validate().unwrap();
+        let serialized = toml::to_string(&Config {
+            team: team.clone(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(!serialized.contains("permissions"));
+        assert!(!serialized.contains("allowed-tools"));
+        assert_eq!(serialized.matches(CLAUDE_PERMISSION_PROMPT_TOOL).count(), 2);
+        assert_eq!(Config::from_toml_str(&serialized).unwrap().team, team);
+
+        assert!(team.enabled);
+        assert_eq!(team.roster, RosterPreset::OpencodeLead);
+        assert_eq!(team.manager_provider, "openai");
+        assert_eq!(team.manager_model, "gpt-5.6-sol");
+        assert_eq!(
+            team.members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "opus",
+                "kimi-k3",
+                "kimi-k3-cloud",
+                "codex-sol",
+                "codex-luna",
+                "glm",
+                "glm-cloud",
+                "kimi",
+                "kimi-cloud",
+                "explore",
+                "sonnet",
+            ]
+        );
+        assert_eq!(team.leader_order, ["codex-sol", "sonnet", "kimi-k3-cloud"]);
+
+        for (name, target, model, logical, sibling, host_agent, roles) in [
+            (
+                "opus",
+                "claude",
+                Some("opus"),
+                Some("opus"),
+                None,
+                "claude-opus",
+                &[
+                    "plan",
+                    "architecture",
+                    "task-breakdown",
+                    "architecture-review",
+                ][..],
+            ),
+            (
+                "kimi-k3",
+                "opencode",
+                Some("opencode-go/kimi-k3"),
+                Some("kimi-k3"),
+                Some("kimi-k3-cloud"),
+                "kimi-k3",
+                &[
+                    "hard-implementation",
+                    "multifile",
+                    "refactoring",
+                    "frontend",
+                ],
+            ),
+            (
+                "kimi-k3-cloud",
+                "opencode",
+                Some("ollama/kimi-k3:cloud"),
+                Some("kimi-k3"),
+                Some("kimi-k3"),
+                "kimi-k3-cloud",
+                &[
+                    "hard-implementation",
+                    "multifile",
+                    "refactoring",
+                    "frontend",
+                ],
+            ),
+            (
+                "codex-sol",
+                "opencode",
+                Some("openai/gpt-5.6-sol"),
+                Some("gpt-5.6-sol"),
+                None,
+                "codex-sol-worker",
+                &[
+                    "hard-implementation",
+                    "debugging",
+                    "systems",
+                    "architecture-aware",
+                ],
+            ),
+            (
+                "codex-luna",
+                "opencode",
+                Some("openai/gpt-5.6-luna"),
+                Some("gpt-5.6-luna"),
+                None,
+                "codex-luna",
+                &["routine", "tests", "docs"],
+            ),
+            (
+                "glm",
+                "opencode",
+                Some("opencode-go/glm-5.2"),
+                Some("glm-5.2"),
+                Some("glm-cloud"),
+                "glm",
+                &["simple", "mechanical", "boilerplate", "bulk-edit"],
+            ),
+            (
+                "glm-cloud",
+                "opencode",
+                Some("ollama/glm-5.2:cloud"),
+                Some("glm-5.2"),
+                Some("glm"),
+                "glm-cloud",
+                &["simple", "mechanical", "boilerplate", "bulk-edit"],
+            ),
+            (
+                "kimi",
+                "opencode",
+                Some("opencode-go/kimi-k2.7-code"),
+                Some("kimi-k2.7-code"),
+                Some("kimi-cloud"),
+                "kimi",
+                &["simple", "mechanical", "boilerplate", "single-file"],
+            ),
+            (
+                "kimi-cloud",
+                "opencode",
+                Some("ollama/kimi-k2.7-code:cloud"),
+                Some("kimi-k2.7-code"),
+                Some("kimi"),
+                "kimi-cloud",
+                &["simple", "mechanical", "boilerplate", "single-file"],
+            ),
+            (
+                "explore",
+                "opencode",
+                None,
+                None,
+                None,
+                "explore",
+                &["discovery"],
+            ),
+            (
+                "sonnet",
+                "claude",
+                Some("sonnet"),
+                Some("sonnet"),
+                None,
+                "claude-sonnet",
+                &["review", "consistency"],
+            ),
+        ] {
+            let member = team.member(name).unwrap();
+            assert_eq!(member.target, target, "{name}");
+            assert_eq!(member.model.as_deref(), model, "{name}");
+            assert_eq!(member.logical.as_deref(), logical, "{name}");
+            assert_eq!(member.sibling.as_deref(), sibling, "{name}");
+            assert_eq!(member.host_agent.as_deref(), Some(host_agent), "{name}");
+            assert_eq!(
+                member.roles.iter().map(String::as_str).collect::<Vec<_>>(),
+                roles,
+                "{name}"
+            );
+        }
+
+        let opus = team.member("opus").unwrap();
+        assert!(!opus.allow_impl);
+        assert_eq!(opus.delegation, Delegation::Shell);
+        assert_eq!(opus.host_agent.as_deref(), Some("claude-opus"));
+        assert!(opus.roles.iter().any(|role| role == "plan"));
+
+        let hard = team.effective_tiers();
+        assert_eq!(
+            hard.get("hard").unwrap(),
+            ["codex-sol", "kimi-k3-cloud", "kimi-k3"]
+        );
+        assert_eq!(hard.get("routine").unwrap(), ["codex-luna"]);
+        assert_eq!(
+            hard.get("simple").unwrap(),
+            ["glm", "glm-cloud", "kimi", "kimi-cloud"]
+        );
+        assert_eq!(hard.get("explore").unwrap(), ["explore"]);
+        assert_eq!(hard.get("review").unwrap(), ["sonnet"]);
+        assert_eq!(team.policy.balance, Balance::Room);
+        assert_eq!(team.policy.explore_tier.as_deref(), Some("explore"));
+        assert_eq!(team.policy.review_tier.as_deref(), Some("review"));
+        assert!(team.is_design_only_tier("plan"));
+
+        assert_eq!(
+            team.members
+                .iter()
+                .map(|member| (
+                    member.name.as_str(),
+                    member
+                        .fallback
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("opus", vec![]),
+                ("kimi-k3", vec!["codex-sol"]),
+                ("kimi-k3-cloud", vec!["codex-sol"]),
+                ("codex-sol", vec!["sonnet"]),
+                ("codex-luna", vec!["kimi-k3", "codex-sol"]),
+                ("glm", vec!["kimi"]),
+                ("glm-cloud", vec!["kimi-cloud"]),
+                ("kimi", vec!["codex-luna"]),
+                ("kimi-cloud", vec!["codex-luna"]),
+                ("explore", vec![]),
+                ("sonnet", vec![]),
+            ]
+        );
+        assert_eq!(
+            team.fallback_chain("glm"),
+            ["kimi", "codex-luna", "kimi-k3", "codex-sol", "sonnet"]
+        );
+        assert_eq!(
+            team.fallback_chain("glm-cloud"),
+            ["kimi-cloud", "codex-luna", "kimi-k3", "codex-sol", "sonnet"]
+        );
+        assert_eq!(
+            team.fallback_chain("kimi-k3-cloud"),
+            ["codex-sol", "sonnet"]
+        );
+
+        let mut host_agents = BTreeSet::new();
+        for member in &team.members {
+            match member.target.as_str() {
+                "opencode" => assert_eq!(member.delegation, Delegation::Native),
+                "claude" => assert_eq!(member.delegation, Delegation::Shell),
+                target => panic!("unexpected preset target: {target}"),
+            }
+            assert!(host_agents.insert(member.host_agent.as_deref().unwrap()));
+        }
+        assert_eq!(host_agents.len(), 11);
+
+        assert_eq!(
+            TeamConfig::preset(RosterPreset::Classic),
+            TeamConfig::default()
+        );
+    }
+
     /// A `[team]` section exactly as it was written before lanes existed —
     /// the shape sitting in `~/.rtrt/config.toml` today.
     const LEGACY_TEAM_TOML: &str = r#"
@@ -2033,6 +4002,9 @@ mod tests {
         for key in [
             "tiers",
             "policy",
+            "roster",
+            "delegation",
+            "host_agent",
             "logical",
             "sibling",
             "fallback",
@@ -2053,6 +4025,7 @@ mod tests {
         assert!(team.members.iter().all(|member| member.fallback.is_empty()));
         assert!(team.tiers.is_empty());
         assert!(team.policy.is_default());
+        assert_eq!(team.roster, RosterPreset::Classic);
         team.validate().unwrap();
     }
 
@@ -2243,6 +4216,97 @@ mod tests {
     }
 
     #[test]
+    fn sibling_toml_requires_reciprocal_distinct_pool_links() {
+        let sibling_team = |first_model: &str,
+                            first_logical: &str,
+                            first_sibling: Option<&str>,
+                            second_model: &str,
+                            second_logical: &str,
+                            second_sibling: Option<&str>| {
+            let first_sibling = first_sibling
+                .map(|name| format!("sibling = {name:?}"))
+                .unwrap_or_default();
+            let second_sibling = second_sibling
+                .map(|name| format!("sibling = {name:?}"))
+                .unwrap_or_default();
+            format!(
+                r#"
+                    [team]
+                    enabled = true
+                    leader_order = ["first"]
+
+                    [[team.members]]
+                    name = "first"
+                    target = "opencode"
+                    model = {first_model:?}
+                    mode = "cli"
+                    roles = ["worker"]
+                    logical = {first_logical:?}
+                    {first_sibling}
+
+                    [[team.members]]
+                    name = "second"
+                    target = "opencode"
+                    model = {second_model:?}
+                    mode = "cli"
+                    roles = ["worker"]
+                    logical = {second_logical:?}
+                    {second_sibling}
+                    "#
+            )
+        };
+
+        let valid = sibling_team(
+            "provider-one/model",
+            "model",
+            Some("second"),
+            "provider-two/model",
+            "model",
+            Some("first"),
+        );
+        Config::from_toml_str(&valid).unwrap();
+
+        let one_way = sibling_team(
+            "provider-one/model",
+            "model",
+            Some("second"),
+            "provider-two/model",
+            "model",
+            None,
+        );
+        let error = Config::from_toml_str(&one_way).unwrap_err().to_string();
+        assert!(
+            error.contains("must reciprocally reference first"),
+            "{error}"
+        );
+
+        let crossed = sibling_team(
+            "provider-one/model",
+            "model-one",
+            Some("second"),
+            "provider-two/model",
+            "model-two",
+            Some("first"),
+        );
+        let error = Config::from_toml_str(&crossed).unwrap_err().to_string();
+        assert!(error.contains("siblings must be the same model"), "{error}");
+
+        let shared_pool = sibling_team(
+            "provider/model-one",
+            "model",
+            Some("second"),
+            "provider/model-two",
+            "model",
+            Some("first"),
+        );
+        let error = Config::from_toml_str(&shared_pool).unwrap_err().to_string();
+        assert!(
+            error.contains("same backing pool opencode#provider"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn tier_rosters_must_name_real_members_and_real_tiers() {
         let team = |body: &str| {
             Config::from_toml_str(&format!(
@@ -2316,6 +4380,19 @@ mod tests {
         assert!(team.policy.prefer_sibling_on_quota);
         assert!(team.policy.record_provenance);
         assert!(team.policy.max_fallback_depth.is_none());
+        assert!(team.policy.explore_tier.is_none());
+        assert!(team.policy.review_tier.is_none());
+        assert_eq!(team.policy.balance, Balance::Order);
+        assert_eq!(team.policy.worker_summary_max_lines, 3);
+        assert!(team.policy.isolate_conflicting);
+        assert_eq!(team.policy.recursion, RecursionPolicy::default());
+        assert!(!team.policy.recursion.enabled);
+        assert_eq!(team.policy.recursion.effective_max_depth(), 0);
+        assert_eq!(team.policy.recursion.effective_max_fan_out(), 0);
+        assert_eq!(team.policy.recursion.effective_max_total_nodes(), 0);
+        assert_eq!(team.policy.recursion.effective_max_tokens(), 0);
+        assert_eq!(team.policy.recursion.effective_deadline_secs(), 0);
+        assert_eq!(team.policy.recursion.effective_max_payload_bytes(), 0);
         // Derived from the roster, never a flat literal: a walk visits each
         // lane at most once.
         assert_eq!(team.effective_max_fallback_depth(), team.members.len());
@@ -2340,6 +4417,50 @@ mod tests {
         assert!(pinned.policy.record_provenance);
         assert_eq!(pinned.effective_max_fallback_depth(), 1);
         assert!(!pinned.policy.is_default());
+    }
+
+    #[test]
+    fn recursion_policy_is_backward_compatible_bounded_and_golden() {
+        let legacy = Config::from_toml_str("[team.policy]\nmax_retries = 1\n").unwrap();
+        assert_eq!(legacy.team.policy.recursion, RecursionPolicy::default());
+        let serialized = toml::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("recursion"), "{serialized}");
+
+        let source = r#"
+            [team]
+            enabled = true
+
+            [team.policy.recursion]
+            enabled = true
+            max_depth = 2
+            max_fan_out = 3
+            max_total_nodes = 12
+            max_tokens = 50000
+            deadline_secs = 120
+            max_payload_bytes = 4096
+            subleader_tiers = ["design"]
+        "#;
+        let recursion = Config::from_toml_str(source).unwrap().team.policy.recursion;
+        assert_eq!(recursion.effective_max_depth(), 2);
+        assert_eq!(recursion.effective_max_fan_out(), 3);
+        assert_eq!(recursion.effective_max_total_nodes(), 12);
+        assert_eq!(recursion.effective_max_tokens(), 50_000);
+        assert_eq!(recursion.effective_deadline_secs(), 120);
+        assert_eq!(recursion.effective_max_payload_bytes(), 4096);
+        assert!(recursion.may_sublead("design"));
+
+        for invalid in [
+            "[team.policy.recursion]\nmax_depth = 1",
+            "[team.policy.recursion]\nenabled = true\nmax_depth = 0",
+            "[team.policy.recursion]\nenabled = true\nmax_depth = 9",
+            "[team.policy.recursion]\nenabled = true\nmax_depth = 1\nmax_fan_out = 0",
+            "[team.policy.recursion]\nenabled = true\nmax_depth = 1\nmax_total_nodes = 2\nmax_fan_out = 4",
+        ] {
+            assert!(
+                Config::from_toml_str(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -2400,14 +4521,17 @@ mod tests {
 
             [team.members.flags]
             permission-mode = "acceptEdits"
-            allowed-tools = "Read,Edit"
+            future-safe-flag = "future-value"
         "#;
 
         let team = Config::from_toml_str(source).unwrap().team;
         assert!(!team.members[0].allow_impl);
         assert!(team.members[1].allow_impl);
         assert_eq!(team.members[1].flag("permission-mode"), Some("acceptEdits"));
-        assert_eq!(team.members[1].flag("allowed-tools"), Some("Read,Edit"));
+        assert_eq!(
+            team.members[1].flag("future-safe-flag"),
+            Some("future-value")
+        );
         assert_eq!(team.members[1].flag("nope"), None);
         assert_eq!(team.members[0].fallback, ["secondary"]);
         assert_eq!(
@@ -2419,6 +4543,21 @@ mod tests {
         assert!(serialized.contains("allow_impl = false"));
         // The implementing lane keeps the default out of the file.
         assert_eq!(serialized.matches("allow_impl").count(), 1);
+        for new_key in [
+            "roster",
+            "delegation",
+            "host_agent",
+            "explore_tier",
+            "review_tier",
+            "balance",
+            "worker_summary_max_lines",
+            "isolate_conflicting",
+        ] {
+            assert!(
+                !serialized.contains(new_key),
+                "defaulted {new_key} leaked into an old roster:\n{serialized}"
+            );
+        }
         let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed, team);
         assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
@@ -2446,6 +4585,26 @@ mod tests {
         assert!(!config.team.enabled);
         assert!(config.team.leader_order.is_empty());
         assert!(config.team.members.is_empty());
+
+        let legacy = Config::from_toml_str(
+            r#"
+            [team]
+            enabled = false
+            manager_provider = "ollama"
+            manager_model = "other/model"
+            leader_order = []
+
+            [[team.members]]
+            name = "legacy"
+            target = "opencode"
+            model = "legacy-unqualified-model"
+            mode = "cli"
+            roles = []
+            host_agent = "../legacy-agent"
+            "#,
+        )
+        .unwrap();
+        assert!(!legacy.team.enabled);
     }
 
     #[test]
@@ -2509,6 +4668,7 @@ mod tests {
             enabled = true
             model = "gemma3:4b"
             base_url = "http://127.0.0.1:11434/v1"
+            provider = "ollama"
             min_chars = 256
             "#,
         )
@@ -2520,10 +4680,70 @@ mod tests {
             Some("http://127.0.0.1:11434/v1")
         );
         assert_eq!(c.auto_compress.min_chars, 256);
+        assert_eq!(c.auto_compress.provider.as_deref(), Some("ollama"));
+        assert_eq!(
+            c.auto_compress
+                .effective_provider("https://example.test/v1"),
+            "ollama"
+        );
         // unset field keeps its default
         assert_eq!(c.auto_compress.age_sec, 3600);
         // unrelated section still defaults
         assert!(c.capture.enabled);
+    }
+
+    #[test]
+    fn compatible_provider_identity_is_only_inferred_for_default_ollama_url() {
+        let config = AutoCompressConfig::default();
+        for (url, expected) in [
+            ("http://127.0.0.1:11434/v1", "ollama"),
+            ("http://localhost:11434", "ollama"),
+            ("http://[::1]:11434/v1/", "ollama"),
+            ("http://192.168.1.2:11434/v1", "openai-compat"),
+            ("http://127.0.0.1:8080/v1", "openai-compat"),
+            ("https://azure.example/openai/v1", "openai-compat"),
+        ] {
+            assert_eq!(config.effective_provider(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn provider_names_normalize_case_and_explicit_aliases() {
+        for (input, expected) in [
+            (" OpenAI ", "openai"),
+            ("OPENAI-COMPATIBLE", "openai-compat"),
+            ("openai_compatible", "openai-compat"),
+            ("LMStudio", "lm-studio"),
+            ("lms", "lm-studio"),
+            ("llama_cpp", "llama.cpp"),
+            ("llama", "llama.cpp"),
+            ("vLLM", "vllm"),
+            ("Azure-West", "azure-west"),
+        ] {
+            assert_eq!(normalize_provider_id(input), expected, "{input}");
+        }
+
+        let mut providers = ProvidersConfig::default();
+        providers.enabled.insert("OpenAI".to_string(), false);
+        assert_eq!(providers.enabled_override("openai"), Some(false));
+    }
+
+    #[test]
+    fn limits_targets_are_case_insensitive_without_becoming_provider_identity() {
+        let mut limits = LimitsConfig::default();
+        limits.targets.insert(
+            "OpenCode".to_string(),
+            TargetLimit {
+                daily_tokens: Some(10),
+                ..TargetLimit::default()
+            },
+        );
+        assert_eq!(
+            limits
+                .target("opencode")
+                .and_then(|limit| limit.daily_tokens),
+            Some(10)
+        );
     }
 
     #[test]
@@ -3005,6 +5225,103 @@ mod tests {
         assert!(!Config::project_config_path(&repo).exists());
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn project_and_global_config_reads_reject_oversize_before_parsing() {
+        let repo = scratch_dir("rtrt-core-project-oversize");
+        let config_dir = repo.join(".rtrt");
+        std::fs::create_dir(&config_dir).unwrap();
+        let project_path = config_dir.join("config.toml");
+        let project_file = std::fs::File::create(&project_path).unwrap();
+        project_file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let error = Config::load_project(&repo).unwrap_err().to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+
+        let global_path = repo.join("global.toml");
+        let global_file = std::fs::File::create(&global_path).unwrap();
+        global_file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let error = read_bounded_config(&global_path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn oversized_save_preserves_existing_project_config_atomically() {
+        let repo = scratch_dir("rtrt-core-project-atomic");
+        let initial = ProjectConfig {
+            output_level: Some("lite".to_string()),
+            ..ProjectConfig::default()
+        };
+        Config::save_project(&repo, &initial).unwrap();
+        let path = Config::project_config_path(&repo);
+        let before = std::fs::read(&path).unwrap();
+
+        let oversized = ProjectConfig {
+            output_level: Some("x".repeat(MAX_CONFIG_BYTES as usize)),
+            ..ProjectConfig::default()
+        };
+        let error = Config::save_project(&repo, &oversized)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(repo.join(".rtrt")).unwrap().count(),
+            1,
+            "failed save left a sibling temporary file"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_config_rejects_symlink_traversal_and_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let repo = scratch_dir("rtrt-core-project-symlink");
+        let outside = scratch_dir("rtrt-core-project-outside");
+        symlink(&outside, repo.join(".rtrt")).unwrap();
+        let over = ProjectConfig {
+            output_level: Some("full".to_string()),
+            ..ProjectConfig::default()
+        };
+        assert!(Config::save_project(&repo, &over).is_err());
+        assert!(Config::load_project(&repo).is_err());
+        assert!(!outside.join("config.toml").exists());
+        std::fs::remove_file(repo.join(".rtrt")).unwrap();
+
+        std::fs::create_dir(repo.join(".rtrt")).unwrap();
+        let foreign = outside.join("foreign.toml");
+        std::fs::write(&foreign, "output_level = \"lite\"\n").unwrap();
+        let path = Config::project_config_path(&repo);
+        symlink(&foreign, &path).unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &over).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            "output_level = \"lite\"\n"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn project_config_rejects_non_directory_components_and_non_regular_targets() {
+        let repo = scratch_dir("rtrt-core-project-components");
+        std::fs::write(repo.join(".rtrt"), b"not a directory").unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
+        std::fs::remove_file(repo.join(".rtrt")).unwrap();
+
+        std::fs::create_dir(repo.join(".rtrt")).unwrap();
+        std::fs::create_dir(Config::project_config_path(&repo)).unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     /// A unique scratch directory for the file-touching tests above.

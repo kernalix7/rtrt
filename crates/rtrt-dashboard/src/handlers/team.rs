@@ -41,7 +41,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
-use rtrt_core::config::{FailoverConfig, TeamConfig, TeamMember, TeamMode, TeamPolicy, TierMap};
+use rtrt_core::config::{
+    Balance, Delegation, FailoverConfig, NativePermissions, RecursionPolicy, RosterPreset,
+    TeamConfig, TeamMember, TeamMode, TeamPolicy, TierMap,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
@@ -64,6 +67,10 @@ pub(crate) struct TeamMemberView {
     pub(crate) mode: TeamMode,
     #[serde(default)]
     pub(crate) roles: Vec<String>,
+    #[serde(default)]
+    pub(crate) delegation: Delegation,
+    #[serde(default)]
+    pub(crate) host_agent: Option<String>,
     pub(crate) logical: Option<String>,
     pub(crate) sibling: Option<String>,
     /// Self-declared tier. Round-tripped even though the ladder editor writes
@@ -76,6 +83,11 @@ pub(crate) struct TeamMemberView {
     pub(crate) allow_impl: bool,
     #[serde(default)]
     pub(crate) flags: BTreeMap<String, String>,
+    /// Typed Native worker permissions. The core roster does not interpret
+    /// these yet; keep the wire field explicit so dashboard clients can edit
+    /// and round-trip the shape without confusing it with invocation flags.
+    #[serde(default)]
+    pub(crate) permissions: Option<NativePermissions>,
 }
 
 fn default_team_mode() -> TeamMode {
@@ -86,6 +98,10 @@ fn default_allow_impl() -> bool {
     true
 }
 
+fn default_worker_summary_max_lines() -> u8 {
+    TeamPolicy::default().worker_summary_max_lines
+}
+
 impl TeamMemberView {
     fn from_member(member: &TeamMember) -> Self {
         Self {
@@ -94,12 +110,15 @@ impl TeamMemberView {
             model: member.model.clone(),
             mode: member.mode,
             roles: member.roles.clone(),
+            delegation: member.delegation,
+            host_agent: member.host_agent.clone(),
             logical: member.logical.clone(),
             sibling: member.sibling.clone(),
             tier: member.tier.clone(),
             fallback: member.fallback.clone(),
             allow_impl: member.allow_impl,
             flags: member.flags.clone(),
+            permissions: member.permissions.clone(),
         }
     }
 
@@ -113,12 +132,15 @@ impl TeamMemberView {
             model: non_empty(self.model),
             mode: self.mode,
             roles: clean_list(self.roles),
+            delegation: self.delegation,
+            host_agent: non_empty(self.host_agent),
             logical: non_empty(self.logical),
             sibling: non_empty(self.sibling),
             tier: non_empty(self.tier),
             fallback: clean_list(self.fallback),
             allow_impl: self.allow_impl,
             flags: clean_flags(self.flags),
+            permissions: self.permissions,
         }
     }
 }
@@ -155,6 +177,16 @@ pub(crate) struct TeamPolicyView {
     pub(crate) max_fallback_depth: Option<usize>,
     /// `null` starts from the first rung of the effective ladder.
     pub(crate) default_tier: Option<String>,
+    #[serde(default)]
+    pub(crate) explore_tier: Option<String>,
+    #[serde(default)]
+    pub(crate) review_tier: Option<String>,
+    #[serde(default)]
+    pub(crate) balance: Balance,
+    #[serde(default = "default_worker_summary_max_lines")]
+    pub(crate) worker_summary_max_lines: u8,
+    #[serde(default = "default_allow_impl")]
+    pub(crate) isolate_conflicting: bool,
     /// `null` follows the shipped design-only tier name(s); an explicit list
     /// (empty included) pins them.
     pub(crate) design_only_tiers: Option<Vec<String>>,
@@ -169,10 +201,16 @@ impl TeamPolicyView {
             record_provenance: policy.record_provenance,
             max_fallback_depth: policy.max_fallback_depth,
             default_tier: policy.default_tier.clone(),
+            explore_tier: policy.explore_tier.clone(),
+            review_tier: policy.review_tier.clone(),
+            balance: policy.balance,
+            worker_summary_max_lines: policy.worker_summary_max_lines,
+            isolate_conflicting: policy.isolate_conflicting,
             design_only_tiers: policy.design_only_tiers.clone(),
         }
     }
 
+    #[cfg(test)]
     fn into_policy(self) -> TeamPolicy {
         TeamPolicy {
             max_retries: self.max_retries,
@@ -181,7 +219,13 @@ impl TeamPolicyView {
             record_provenance: self.record_provenance,
             max_fallback_depth: self.max_fallback_depth,
             default_tier: non_empty(self.default_tier),
+            explore_tier: non_empty(self.explore_tier),
+            review_tier: non_empty(self.review_tier),
+            balance: self.balance,
+            worker_summary_max_lines: self.worker_summary_max_lines,
+            isolate_conflicting: self.isolate_conflicting,
             design_only_tiers: self.design_only_tiers.map(clean_list),
+            recursion: RecursionPolicy::default(),
         }
     }
 }
@@ -336,6 +380,7 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
 fn team_json(team: &TeamConfig, repo: Option<&Path>, custom: bool) -> serde_json::Value {
     serde_json::json!({
         "enabled": team.enabled,
+        "roster": team.roster,
         "manager_provider": team.manager_provider,
         "manager_model": team.manager_model,
         "manager_base_url": team.manager_base_url,
@@ -355,9 +400,10 @@ fn team_json(team: &TeamConfig, repo: Option<&Path>, custom: bool) -> serde_json
 }
 
 pub(crate) async fn get_team_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> axum::response::Response {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let custom = project_overrides(repo.as_deref()).team;
     let cfg = match rtrt_core::Config::load_effective(repo.as_deref()) {
         Ok(cfg) => cfg,
@@ -380,7 +426,9 @@ pub(crate) async fn get_team_config(
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetTeamRequest {
     #[serde(default)]
-    enabled: bool,
+    enabled: Option<bool>,
+    #[serde(default)]
+    roster: Option<RosterPreset>,
     #[serde(default)]
     manager_provider: Option<String>,
     #[serde(default)]
@@ -388,22 +436,121 @@ pub(crate) struct SetTeamRequest {
     #[serde(default)]
     manager_base_url: Option<String>,
     #[serde(default)]
-    leader_order: Vec<String>,
+    leader_order: Option<Vec<String>>,
     #[serde(default)]
-    members: Vec<TeamMemberView>,
+    members: Option<Vec<TeamMemberView>>,
     #[serde(default)]
-    tiers: Vec<TierView>,
+    tiers: Option<Vec<TierView>>,
     #[serde(default)]
-    policy: Option<TeamPolicyView>,
+    policy: Option<TeamPolicyPatch>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct TeamPolicyPatch {
+    max_retries: Option<u32>,
+    redo_on_fallback: Option<bool>,
+    prefer_sibling_on_quota: Option<bool>,
+    record_provenance: Option<bool>,
+    #[serde(default)]
+    max_fallback_depth: crate::util::JsonPatch<usize>,
+    #[serde(default)]
+    default_tier: crate::util::JsonPatch<String>,
+    #[serde(default)]
+    explore_tier: crate::util::JsonPatch<String>,
+    #[serde(default)]
+    review_tier: crate::util::JsonPatch<String>,
+    balance: Option<Balance>,
+    worker_summary_max_lines: Option<u8>,
+    isolate_conflicting: Option<bool>,
+    #[serde(default)]
+    design_only_tiers: crate::util::JsonPatch<Vec<String>>,
+}
+
+fn patch_policy(mut policy: TeamPolicy, patch: TeamPolicyPatch) -> Result<TeamPolicy, String> {
+    if let Some(v) = patch.max_retries {
+        policy.max_retries = v
+    }
+    if let Some(v) = patch.redo_on_fallback {
+        policy.redo_on_fallback = v
+    }
+    if let Some(v) = patch.prefer_sibling_on_quota {
+        policy.prefer_sibling_on_quota = v
+    }
+    if let Some(v) = patch.record_provenance {
+        policy.record_provenance = v
+    }
+    policy.max_fallback_depth = patch_nullable_usize(
+        patch.max_fallback_depth,
+        policy.max_fallback_depth,
+        "max_fallback_depth",
+    )?;
+    policy.default_tier =
+        patch_nullable_string(patch.default_tier, policy.default_tier, "default_tier")?;
+    policy.explore_tier =
+        patch_nullable_string(patch.explore_tier, policy.explore_tier, "explore_tier")?;
+    policy.review_tier =
+        patch_nullable_string(patch.review_tier, policy.review_tier, "review_tier")?;
+    if let Some(v) = patch.balance {
+        policy.balance = v
+    }
+    if let Some(v) = patch.worker_summary_max_lines {
+        policy.worker_summary_max_lines = v
+    }
+    if let Some(v) = patch.isolate_conflicting {
+        policy.isolate_conflicting = v
+    }
+    policy.design_only_tiers = patch_nullable_list(
+        patch.design_only_tiers,
+        policy.design_only_tiers,
+        "design_only_tiers",
+    )?;
+    Ok(policy)
+}
+
+fn patch_nullable_usize(
+    value: crate::util::JsonPatch<usize>,
+    existing: Option<usize>,
+    _field: &str,
+) -> Result<Option<usize>, String> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => Ok(Some(value)),
+    }
+}
+
+fn patch_nullable_string(
+    value: crate::util::JsonPatch<String>,
+    existing: Option<String>,
+    _field: &str,
+) -> Result<Option<String>, String> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => Ok(non_empty(Some(value))),
+    }
+}
+
+fn patch_nullable_list(
+    value: crate::util::JsonPatch<Vec<String>>,
+    existing: Option<Vec<String>>,
+    _field: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => Ok(Some(clean_list(value))),
+    }
 }
 
 pub(crate) async fn post_team_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     // `?scope=global` carries no body (the "Follow global" path), so a missing
     // payload must be tolerated exactly as the other scoped endpoints do.
     body: Option<Json<SetTeamRequest>>,
 ) -> axum::response::Response {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let follow_global = q
         .scope
         .as_deref()
@@ -421,7 +568,7 @@ pub(crate) async fn post_team_config(
             Err(e) => return clear_field_error(e),
         };
         project.team = None;
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         let cfg = match rtrt_core::Config::load_effective(Some(path)) {
@@ -458,27 +605,47 @@ pub(crate) async fn post_team_config(
         return error_response(StatusCode::BAD_REQUEST, "missing body");
     };
 
+    let policy = match req.policy {
+        Some(patch) => match patch_policy(current.policy.clone(), patch) {
+            Ok(policy) => policy,
+            Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+        },
+        None => current.policy.clone(),
+    };
     let team = TeamConfig {
-        enabled: req.enabled,
+        enabled: req.enabled.unwrap_or(current.enabled),
+        roster: req.roster.unwrap_or(current.roster),
         manager_provider: non_empty(req.manager_provider).unwrap_or(current.manager_provider),
         manager_model: non_empty(req.manager_model).unwrap_or(current.manager_model),
-        manager_base_url: non_empty(req.manager_base_url),
-        leader_order: clean_list(req.leader_order),
+        manager_base_url: req
+            .manager_base_url
+            .map(|v| non_empty(Some(v)))
+            .unwrap_or(current.manager_base_url),
+        leader_order: req
+            .leader_order
+            .map(clean_list)
+            .unwrap_or(current.leader_order),
         members: req
             .members
-            .into_iter()
-            .map(TeamMemberView::into_member)
-            .collect(),
-        tiers: TierMap::from_pairs(
-            req.tiers
-                .into_iter()
-                .map(|rung| (rung.tier.trim().to_string(), clean_list(rung.members)))
-                .filter(|(tier, _)| !tier.is_empty()),
-        ),
-        policy: req
-            .policy
-            .map(TeamPolicyView::into_policy)
-            .unwrap_or(current.policy),
+            .map(|members| {
+                members
+                    .into_iter()
+                    .map(TeamMemberView::into_member)
+                    .collect()
+            })
+            .unwrap_or(current.members),
+        tiers: req
+            .tiers
+            .map(|tiers| {
+                TierMap::from_pairs(
+                    tiers
+                        .into_iter()
+                        .map(|rung| (rung.tier.trim().to_string(), clean_list(rung.members)))
+                        .filter(|(tier, _)| !tier.is_empty()),
+                )
+            })
+            .unwrap_or(current.tiers),
+        policy,
     };
 
     // Validate BEFORE writing: an invalid roster must never reach the file.
@@ -496,7 +663,7 @@ pub(crate) async fn post_team_config(
             Err(e) => return clear_field_error(e),
         };
         project.team = Some(team.clone());
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         return Json(with_scope(
@@ -508,14 +675,13 @@ pub(crate) async fn post_team_config(
     }
 
     // Global write.
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    let (cfg, _) = match crate::util::update_config_file(|cfg| {
+        cfg.team = team;
+        Ok(())
+    }) {
+        Ok(result) => result,
+        Err((status, msg)) => return error_response(status, msg),
     };
-    cfg.team = team;
-    if let Err((status, msg)) = write_config_file(&cfg) {
-        return error_response(status, msg);
-    }
     Json(with_scope(team_json(&cfg.team, None, false), None, false)).into_response()
 }
 
@@ -540,9 +706,10 @@ fn failover_json(
 }
 
 pub(crate) async fn get_failover_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> axum::response::Response {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let custom = project_overrides(repo.as_deref()).failover;
     let cfg = match rtrt_core::Config::load_effective(repo.as_deref()) {
         Ok(cfg) => cfg,
@@ -561,24 +728,25 @@ pub(crate) async fn get_failover_config(
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetFailoverRequest {
     #[serde(default)]
-    fatal: Vec<String>,
+    fatal: Option<Vec<String>>,
     #[serde(default)]
-    quota: Vec<String>,
+    quota: Option<Vec<String>>,
     #[serde(default)]
-    transient: Vec<String>,
+    transient: Option<Vec<String>>,
     #[serde(default)]
-    transient_retries: Option<u32>,
+    transient_retries: crate::util::JsonPatch<u64>,
     #[serde(default)]
-    backoff_divisor: Option<u32>,
+    backoff_divisor: crate::util::JsonPatch<u64>,
     #[serde(default)]
-    backoff_ms: Option<u64>,
+    backoff_ms: crate::util::JsonPatch<u64>,
 }
 
 pub(crate) async fn post_failover_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetFailoverRequest>>,
 ) -> axum::response::Response {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let follow_global = q
         .scope
         .as_deref()
@@ -593,7 +761,7 @@ pub(crate) async fn post_failover_config(
             Err(e) => return clear_field_error(e),
         };
         project.failover = None;
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         let cfg = match rtrt_core::Config::load_effective(Some(path)) {
@@ -626,11 +794,32 @@ pub(crate) async fn post_failover_config(
         return error_response(StatusCode::BAD_REQUEST, "missing body");
     };
 
+    let current = rtrt_core::Config::load_effective(repo.as_deref())
+        .or_else(|_| rtrt_core::Config::load())
+        .unwrap_or_default()
+        .failover;
+    let transient_retries = match patch_unsigned(
+        req.transient_retries,
+        current.transient_retries.map(u64::from),
+    ) {
+        Ok(v) => v.map(|v| v as u32),
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let backoff_divisor =
+        match patch_unsigned(req.backoff_divisor, current.backoff_divisor.map(u64::from)) {
+            Ok(v) => v.map(|v| v as u32),
+            Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+        };
+    let backoff_ms = match patch_unsigned(req.backoff_ms, current.backoff_ms) {
+        Ok(v) => v,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+
     // A zero divisor would divide the per-call timeout by zero when deriving
     // the backoff; reject it here rather than shipping a config that panics or
     // silently falls back at invoke time. Checked BEFORE any write, for both
     // scopes.
-    if req.backoff_divisor == Some(0) {
+    if backoff_divisor == Some(0) {
         return error_response(
             StatusCode::BAD_REQUEST,
             "failover.backoff_divisor must be greater than 0",
@@ -638,12 +827,12 @@ pub(crate) async fn post_failover_config(
     }
 
     let failover = FailoverConfig {
-        fatal: clean_list(req.fatal),
-        quota: clean_list(req.quota),
-        transient: clean_list(req.transient),
-        transient_retries: req.transient_retries,
-        backoff_divisor: req.backoff_divisor,
-        backoff_ms: req.backoff_ms,
+        fatal: req.fatal.map(clean_list).unwrap_or(current.fatal),
+        quota: req.quota.map(clean_list).unwrap_or(current.quota),
+        transient: req.transient.map(clean_list).unwrap_or(current.transient),
+        transient_retries,
+        backoff_divisor,
+        backoff_ms,
     };
 
     // Per-project write.
@@ -653,7 +842,7 @@ pub(crate) async fn post_failover_config(
             Err(e) => return clear_field_error(e),
         };
         project.failover = Some(failover.clone());
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         return Json(with_scope(
@@ -665,20 +854,30 @@ pub(crate) async fn post_failover_config(
     }
 
     // Global write.
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    let (cfg, _) = match crate::util::update_config_file(|cfg| {
+        cfg.failover = failover;
+        Ok(())
+    }) {
+        Ok(result) => result,
+        Err((status, msg)) => return error_response(status, msg),
     };
-    cfg.failover = failover;
-    if let Err((status, msg)) = write_config_file(&cfg) {
-        return error_response(status, msg);
-    }
     Json(with_scope(
         failover_json(&cfg.failover, None, false),
         None,
         false,
     ))
     .into_response()
+}
+
+fn patch_unsigned(
+    value: crate::util::JsonPatch<u64>,
+    existing: Option<u64>,
+) -> Result<Option<u64>, String> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => Ok(Some(value)),
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +890,12 @@ mod tests {
         let member = &team.members[0];
         let view = TeamMemberView::from_member(member);
         assert_eq!(&view.into_member(), member);
+        assert!(
+            serde_json::to_value(TeamMemberView::from_member(member))
+                .expect("serialize lane")
+                .get("permissions")
+                .is_some_and(serde_json::Value::is_null)
+        );
     }
 
     #[test]
@@ -701,6 +906,8 @@ mod tests {
             model: Some("   ".to_string()),
             mode: TeamMode::Cli,
             roles: vec!["  review  ".to_string(), "  ".to_string()],
+            delegation: Delegation::Native,
+            host_agent: Some("  ".to_string()),
             logical: Some(String::new()),
             sibling: None,
             tier: Some("  ".to_string()),
@@ -711,16 +918,133 @@ mod tests {
                 // A valueless switch is legal, so an empty VALUE is kept.
                 ("verbose".to_string(), String::new()),
             ]),
+            permissions: None,
         };
         let member = view.into_member();
         assert_eq!(member.name, "lane");
         assert_eq!(member.model, None);
+        assert_eq!(member.host_agent, None);
         assert_eq!(member.logical, None);
         assert_eq!(member.tier, None);
         assert_eq!(member.roles, vec!["review".to_string()]);
         assert!(member.fallback.is_empty());
         assert_eq!(member.flags.len(), 1);
         assert_eq!(member.flags.get("verbose").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn new_team_wire_fields_round_trip() {
+        let mut team = TeamConfig::preset(RosterPreset::OpencodeLead);
+        let member = team.members.first().expect("preset has members").clone();
+        let member_view: TeamMemberView = serde_json::from_value(
+            serde_json::to_value(TeamMemberView::from_member(&member)).expect("serialize member"),
+        )
+        .expect("deserialize member");
+        assert_eq!(member_view.into_member(), member);
+
+        team.policy.explore_tier = Some("explore".to_string());
+        team.policy.review_tier = Some("review".to_string());
+        team.policy.balance = Balance::Room;
+        team.policy.worker_summary_max_lines = 7;
+        team.policy.isolate_conflicting = false;
+        let policy = team.policy.clone();
+        let policy_view: TeamPolicyView = serde_json::from_value(
+            serde_json::to_value(TeamPolicyView::from_policy(&policy)).expect("serialize policy"),
+        )
+        .expect("deserialize policy");
+        assert_eq!(policy_view.into_policy(), policy);
+
+        assert_eq!(team_json(&team, None, false)["roster"], "opencode-lead");
+        let request: SetTeamRequest = serde_json::from_value(serde_json::json!({
+            "roster": "opencode-lead"
+        }))
+        .expect("deserialize request");
+        assert_eq!(request.roster, Some(RosterPreset::OpencodeLead));
+    }
+
+    #[test]
+    fn native_permissions_round_trip_preserves_edit_bash_order_and_none() {
+        use rtrt_core::config::{PermissionAction, PermissionMap};
+
+        let mut member = TeamConfig::default().members[0].clone();
+        member.permissions = Some(NativePermissions {
+            edit: Some(PermissionAction::Ask),
+            bash: PermissionMap::from_pairs([
+                ("git status", PermissionAction::Allow),
+                ("cargo test *", PermissionAction::Ask),
+                ("cargo build", PermissionAction::Deny),
+            ]),
+        });
+
+        let view = TeamMemberView::from_member(&member);
+        assert_eq!(view.permissions, member.permissions);
+        assert_eq!(view.into_member(), member);
+        assert_eq!(
+            member
+                .permissions
+                .as_ref()
+                .expect("native permissions")
+                .bash
+                .iter()
+                .collect::<Vec<_>>(),
+            [
+                ("git status", PermissionAction::Allow),
+                ("cargo test *", PermissionAction::Ask),
+                ("cargo build", PermissionAction::Deny),
+            ]
+        );
+
+        let without_permissions = TeamMemberView::from_member(&TeamConfig::default().members[0]);
+        assert_eq!(without_permissions.permissions, None);
+    }
+
+    #[test]
+    fn old_team_wire_json_uses_new_field_defaults() {
+        let member: TeamMemberView = serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "target": "opencode",
+            "model": null,
+            "logical": null,
+            "sibling": null,
+            "tier": null
+        }))
+        .expect("deserialize old member");
+        assert_eq!(member.delegation, Delegation::Native);
+        assert!(member.host_agent.is_none());
+        assert!(member.permissions.is_none());
+
+        let permissions: NativePermissions = serde_json::from_value(serde_json::json!({
+            "edit": "ask",
+            "bash": {"git status": "allow"}
+        }))
+        .expect("deserialize typed worker permissions");
+        use rtrt_core::config::PermissionAction;
+        assert_eq!(permissions.edit, Some(PermissionAction::Ask));
+        assert_eq!(
+            permissions.bash.get("git status"),
+            Some(PermissionAction::Allow)
+        );
+
+        let policy = serde_json::from_value::<TeamPolicyView>(serde_json::json!({
+            "max_retries": 2,
+            "redo_on_fallback": true,
+            "prefer_sibling_on_quota": true,
+            "record_provenance": true,
+            "max_fallback_depth": null,
+            "default_tier": null,
+            "design_only_tiers": null
+        }))
+        .expect("deserialize old policy")
+        .into_policy();
+        assert_eq!(policy.explore_tier, None);
+        assert_eq!(policy.review_tier, None);
+        assert_eq!(policy.balance, Balance::Order);
+        assert_eq!(policy.worker_summary_max_lines, 3);
+        assert!(policy.isolate_conflicting);
+
+        let request: SetTeamRequest =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize old request");
+        assert_eq!(request.roster, None);
     }
 
     #[test]

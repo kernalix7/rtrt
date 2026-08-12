@@ -48,8 +48,9 @@ pub fn scan_default_dir() -> Result<Vec<Template>> {
 }
 
 pub fn scan_dir(root: &Path) -> Result<Vec<Template>> {
+    let root = canonical_directory(root)?;
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(root).map_err(Error::Io)?;
+    let entries = std::fs::read_dir(&root).map_err(Error::Io)?;
     for entry in entries {
         let entry = entry.map_err(Error::Io)?;
         if !entry.file_type().map_err(Error::Io)?.is_dir() {
@@ -66,7 +67,9 @@ pub fn scan_dir(root: &Path) -> Result<Vec<Template>> {
 }
 
 pub fn load_one(dir: &Path) -> Result<Template> {
+    let dir = canonical_directory(dir)?;
     let manifest_path = dir.join(MANIFEST_FILE);
+    reject_symlink(&manifest_path)?;
     let raw = std::fs::read_to_string(&manifest_path).map_err(Error::Io)?;
     let parsed: ManifestToml = toml::from_str(&raw)
         .map_err(|e| Error::Config(format!("{}: {e}", manifest_path.display())))?;
@@ -78,7 +81,17 @@ pub fn load_one(dir: &Path) -> Result<Template> {
             (Some(c), None) => c,
             (None, Some(rel)) => {
                 validate_file_path(&rel)?;
-                std::fs::read_to_string(dir.join(rel)).map_err(Error::Io)?
+                let source = dir.join(rel);
+                reject_symlink_components(&dir, &source)?;
+                let canonical_source = std::fs::canonicalize(&source).map_err(Error::Io)?;
+                if !canonical_source.starts_with(&dir) || !canonical_source.is_file() {
+                    return Err(Error::Config(format!(
+                        "custom template source must stay under {}: {}",
+                        dir.display(),
+                        source.display()
+                    )));
+                }
+                std::fs::read_to_string(canonical_source).map_err(Error::Io)?
             }
             (Some(_), Some(_)) => {
                 return Err(Error::Config(format!(
@@ -121,11 +134,21 @@ pub fn save_custom(template: &Template) -> Result<PathBuf> {
 
     let root = default_dir()
         .ok_or_else(|| Error::Config("cannot determine custom template directory".to_string()))?;
+    let root = create_canonical_directory(&root)?;
     let dir = root.join(&template.name);
     ensure_strict_child(&root, &dir)?;
-
-    std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+    reject_symlink_components(&root, &dir)?;
+    if !dir.exists() {
+        std::fs::create_dir(&dir).map_err(Error::Io)?;
+    }
+    if canonical_directory(&dir)? != dir {
+        return Err(Error::Config(format!(
+            "custom template directory escaped {}",
+            root.display()
+        )));
+    }
     let manifest_path = dir.join(MANIFEST_FILE);
+    reject_symlink(&manifest_path)?;
     let manifest = ManifestToml {
         name: template.name.clone(),
         description: template.description.clone(),
@@ -152,8 +175,16 @@ pub fn delete_custom(name: &str) -> Result<()> {
     validate_name(name)?;
     let root = default_dir()
         .ok_or_else(|| Error::Config("cannot determine custom template directory".to_string()))?;
+    let root = canonical_directory(&root)?;
     let dir = root.join(name);
     ensure_strict_child(&root, &dir)?;
+    reject_symlink_components(&root, &dir)?;
+    if canonical_directory(&dir)? != dir {
+        return Err(Error::Config(format!(
+            "custom template directory escaped {}",
+            root.display()
+        )));
+    }
     std::fs::remove_dir_all(&dir).map_err(Error::Io)
 }
 
@@ -161,7 +192,11 @@ pub fn is_custom(name: &str) -> bool {
     validate_name(name)
         .ok()
         .and_then(|()| default_dir())
-        .map(|root| root.join(name).join(MANIFEST_FILE).is_file())
+        .and_then(|root| canonical_directory(&root).ok())
+        .map(|root| {
+            let manifest = root.join(name).join(MANIFEST_FILE);
+            reject_symlink_components(&root, &manifest).is_ok() && manifest.is_file()
+        })
         .unwrap_or(false)
 }
 
@@ -206,4 +241,105 @@ fn ensure_strict_child(root: &Path, child: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    reject_symlink_components(path, path)?;
+    let canonical = std::fs::canonicalize(path).map_err(Error::Io)?;
+    if !canonical.is_dir() {
+        return Err(Error::Config(format!(
+            "custom template path is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn create_canonical_directory(path: &Path) -> Result<PathBuf> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(Error::Config(format!(
+            "invalid custom template directory: {}",
+            path.display()
+        )));
+    }
+    reject_symlink_components(path, path)?;
+    std::fs::create_dir_all(path).map_err(Error::Io)?;
+    canonical_directory(path)
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(Error::Config(format!(
+            "symlink is not allowed in custom template path: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    if path != root && !path.starts_with(root) {
+        return Err(Error::Config(format!(
+            "custom template path must stay under {}",
+            root.display()
+        )));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        reject_symlink(&current)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rtrt-custom-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlink_template_roots_sources_and_manifests() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("symlinks");
+        let outside = temp_dir("outside");
+        std::fs::write(outside.join("source.txt"), "secret").unwrap();
+        let template = parent.join("template");
+        std::fs::create_dir(&template).unwrap();
+        std::fs::write(
+            template.join(MANIFEST_FILE),
+            "name='test'\ndescription='test'\n[[files]]\npath='output.txt'\nsource='source.txt'\n",
+        )
+        .unwrap();
+        symlink(outside.join("source.txt"), template.join("source.txt")).unwrap();
+        assert!(load_one(&template).is_err());
+
+        std::fs::remove_file(template.join("source.txt")).unwrap();
+        symlink(&template, parent.join("linked-template")).unwrap();
+        assert!(load_one(&parent.join("linked-template")).is_err());
+
+        let manifest = template.join(MANIFEST_FILE);
+        std::fs::remove_file(&manifest).unwrap();
+        symlink(outside.join("source.txt"), &manifest).unwrap();
+        assert!(load_one(&template).is_err());
+
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
 }

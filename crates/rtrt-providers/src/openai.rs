@@ -130,12 +130,24 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         self.capture_rate_limit(&req.model, &resp);
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = stream::read_body_bounded(
+                resp,
+                OPENAI_TARGET,
+                "error",
+                stream::MAX_ERROR_BODY_BYTES,
+            )
+            .await?;
+            let body = String::from_utf8_lossy(&body);
             return Err(Error::Provider(format!("openai {status}: {body}")));
         }
-        let parsed: ChatCompletion = resp
-            .json()
-            .await
+        let body = stream::read_body_bounded(
+            resp,
+            OPENAI_TARGET,
+            "success",
+            stream::MAX_SUCCESS_BODY_BYTES,
+        )
+        .await?;
+        let parsed: ChatCompletion = serde_json::from_slice(&body)
             .map_err(|e| Error::Provider(format!("openai decode: {e}")))?;
         let content = parsed
             .choices
@@ -165,10 +177,17 @@ impl Provider for OpenAIProvider {
         let status = resp.status();
         self.capture_rate_limit(&req.model, &resp);
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = stream::read_body_bounded(
+                resp,
+                OPENAI_TARGET,
+                "error",
+                stream::MAX_ERROR_BODY_BYTES,
+            )
+            .await?;
+            let body = String::from_utf8_lossy(&body);
             return Err(Error::Provider(format!("openai {status}: {body}")));
         }
-        Ok(stream::decode(resp, decode_event))
+        Ok(stream::decode(resp, OPENAI_TARGET, decode_event))
     }
 }
 

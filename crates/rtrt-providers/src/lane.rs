@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     FailureClass, FailurePolicy, InvokeOptions, InvokeOutcome, Mode, PolicyAttempt, PolicyOutcome,
-    RankedTarget, invoke_agent,
+    RankedTarget,
+    invoke::reject_blank_outcome,
+    invoke_agent,
     usage_ledger::{PoolHeadroom, headroom_for_pool, rank_pools_by_room},
 };
 
@@ -575,8 +577,16 @@ pub trait LaneInvoker: Send + Sync {
 }
 
 /// The production invoker: one `invoke_agent` call per attempt.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AgentInvoker;
+#[derive(Debug, Clone, Default)]
+pub struct AgentInvoker {
+    provenance: Option<crate::InvocationContext>,
+}
+
+impl AgentInvoker {
+    pub fn with_provenance(provenance: Option<crate::InvocationContext>) -> Self {
+        Self { provenance }
+    }
+}
 
 #[async_trait]
 impl LaneInvoker for AgentInvoker {
@@ -590,13 +600,14 @@ impl LaneInvoker for AgentInvoker {
             mode: Some(step.mode),
             model: step.model.clone(),
             timeout,
+            provenance: self.provenance.clone(),
         };
         invoke_agent(&step.target, prompt, opts).await
     }
 }
 
 /// The default invoker, used whenever a runner is not given another.
-pub const AGENT_INVOKER: AgentInvoker = AgentInvoker;
+pub const AGENT_INVOKER: AgentInvoker = AgentInvoker { provenance: None };
 
 /// The order of a lane and its sibling pool, plus what decided it.
 struct RoomOrder {
@@ -964,7 +975,12 @@ impl<'a> LaneRunner<'a> {
 
             let mut retried = false;
             loop {
-                match self.invoker.invoke(step, &prompt, self.timeout).await {
+                match self
+                    .invoker
+                    .invoke(step, &prompt, self.timeout)
+                    .await
+                    .and_then(reject_blank_outcome)
+                {
                     Ok(outcome) => {
                         if record {
                             run.attempts
@@ -1154,6 +1170,7 @@ mod tests {
                     mode_used: step.mode,
                     model: step.model.clone(),
                     output,
+                    cost_usd: None,
                     exit_code: Some(0),
                     ms: 0,
                 }),
@@ -1311,6 +1328,55 @@ mod tests {
         assert!(run.attempts[1].retried);
         assert_eq!(run.served_by.as_deref(), Some("glm-cloud"));
         // The compact trail collapses the retry into one lane entry.
+        assert_eq!(run.trail.len(), 1);
+        assert!(run.trail[0].retried);
+    }
+
+    #[tokio::test]
+    async fn blank_completion_retries_same_lane_and_retains_each_attempt() {
+        let config = config();
+        let invoker = ScriptedInvoker::new([(
+            "glm-go",
+            vec![Ok(" \n\t".to_string()), Ok("complete".to_string())],
+        )]);
+        let run = runner(&config, &invoker).run_task(&task()).await;
+
+        assert_eq!(invoker.lanes_called(), vec!["glm-go", "glm-go"]);
+        assert_eq!(run.retries_used, 1);
+        assert_eq!(run.attempts.len(), 2);
+        assert_eq!(run.attempts[0].class, Some(FailureClass::Transient));
+        assert_eq!(
+            run.attempts[0].error.as_deref(),
+            Some("provider error: provider returned blank successful output")
+        );
+        assert!(!run.attempts[0].retried);
+        assert!(run.attempts[1].retried);
+        assert_eq!(run.served_by.as_deref(), Some("glm-go"));
+        assert_eq!(run.served.as_ref().unwrap().output, "complete");
+    }
+
+    #[tokio::test]
+    async fn blank_completion_falls_back_after_retry_with_exact_provenance() {
+        let mut config = config();
+        config.policy.max_retries = 1;
+        let invoker =
+            ScriptedInvoker::new([("glm-go", vec![Ok(String::new()), Ok("   ".to_string())])]);
+        let run = runner(&config, &invoker).run_task(&task()).await;
+
+        assert_eq!(
+            invoker.lanes_called(),
+            vec!["glm-go", "glm-go", "glm-cloud"]
+        );
+        assert_eq!(run.attempts.len(), 3);
+        assert_eq!(run.attempts[0].actual, "glm-go");
+        assert_eq!(run.attempts[0].class, Some(FailureClass::Transient));
+        assert_eq!(run.attempts[1].actual, "glm-go");
+        assert_eq!(run.attempts[1].class, Some(FailureClass::Transient));
+        assert!(run.attempts[1].retried);
+        assert_eq!(run.attempts[2].actual, "glm-cloud");
+        assert_eq!(run.attempts[2].assigned, "glm-go");
+        assert_eq!(run.attempts[2].class, None);
+        assert_eq!(run.served_by.as_deref(), Some("glm-cloud"));
         assert_eq!(run.trail.len(), 1);
         assert!(run.trail[0].retried);
     }

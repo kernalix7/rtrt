@@ -14,6 +14,10 @@ use crate::{ChatMessage, ChatRequest, Gateway, Role, router::RankedTarget, usage
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
+/// Retain at most 8 MiB from each CLI pipe while always draining the process.
+/// This accommodates large agent JSON/text replies without unbounded memory.
+const MAX_CLI_PIPE_BYTES: usize = 8 * 1024 * 1024;
+const CLI_TRUNCATION_MARKER: &[u8] = b"\n...[rtrt CLI output truncated at 8388608 bytes]";
 const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const PROMPT_PLACEHOLDER: &str = "{prompt}";
@@ -21,12 +25,14 @@ const MODEL_PLACEHOLDER: &str = "{model}";
 const MODEL_ARGS_PLACEHOLDER: &str = "{model_args}";
 const ASCII_SPINNER_CHARS: &[char] = &['|', '/', '-', '\\'];
 const BRAILLE_SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const EMPTY_COMPLETION_ERROR: &str = "provider returned blank successful output";
 
 #[derive(Debug, Clone)]
 pub struct InvokeOptions {
     pub mode: Option<Mode>,
     pub model: Option<String>,
     pub timeout: Duration,
+    pub provenance: Option<InvocationContext>,
 }
 
 impl Default for InvokeOptions {
@@ -35,8 +41,23 @@ impl Default for InvokeOptions {
             mode: Some(Mode::Auto),
             model: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            provenance: None,
         }
     }
+}
+
+/// Parent identity propagated into an externally launched agent process.
+/// Claude's SessionStart hook persists this beside the child session id, so
+/// transcript attribution never has to infer ancestry from a temporary cwd.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvocationContext {
+    pub invocation_id: String,
+    pub parent_project: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub parent_call_id: Option<String>,
+    pub caller_agent: Option<String>,
+    pub parent_cwd: Option<String>,
+    pub parent_worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +87,8 @@ pub struct InvokeOutcome {
     pub mode_used: Mode,
     pub model: Option<String>,
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     pub exit_code: Option<i32>,
     pub ms: u64,
 }
@@ -86,7 +109,7 @@ pub async fn invoke_agent(
     // `ok = 0`) before propagating the error, so the ledger reflects spent
     // request budget even for failed calls.
     let ledger_model = model.clone().unwrap_or_default();
-    let (output, exit_code) = match mode_used {
+    let (output, exit_code, cost_usd) = match mode_used {
         Mode::Cli => {
             let template = match tool.cli_invocation.as_deref() {
                 Some(template) => template,
@@ -98,19 +121,47 @@ pub async fn invoke_agent(
                     )));
                 }
             };
-            let argv = match template_to_argv(template, prompt, model.as_deref()) {
+            let mut argv = match template_to_argv(template, prompt, model.as_deref()) {
                 Ok(argv) => argv,
                 Err(err) => {
                     record_cli(&tool.name, &ledger_model, prompt, "", false);
                     return Err(err);
                 }
             };
-            match run_cli_argv(&argv, opts.timeout).await {
+            if tool.name == "claude" {
+                let model = model.as_deref().ok_or_else(|| {
+                    Error::Provider("invoke: strict Claude CLI requires --model opus|sonnet".into())
+                })?;
+                argv = vec![
+                    "claude".into(),
+                    "-p".into(),
+                    "--model".into(),
+                    model.into(),
+                    "--output-format".into(),
+                    "json".into(),
+                    "--permission-mode".into(),
+                    "acceptEdits".into(),
+                    "--permission-prompt-tool".into(),
+                    rtrt_core::config::CLAUDE_PERMISSION_PROMPT_TOOL.into(),
+                    prompt.into(),
+                ];
+            }
+            let parse_claude_json = prepare_claude_json_output(&tool.name, &mut argv);
+            match run_cli_argv(
+                &argv,
+                opts.timeout,
+                opts.provenance.as_ref(),
+                tool,
+                model.as_deref(),
+            )
+            .await
+            {
                 Ok((output, Some(0))) => {
+                    let (output, cost_usd) = parse_claude_output(output, parse_claude_json);
                     // CLI shell-outs report no usage; estimate from chars/4 and
                     // mark the row as estimated.
                     record_cli(&tool.name, &ledger_model, prompt, &output, true);
-                    (output, Some(0))
+                    (output, Some(0), cost_usd)
                 }
                 Ok((output, exit_code)) => {
                     record_cli(&tool.name, &ledger_model, prompt, &output, false);
@@ -160,7 +211,7 @@ pub async fn invoke_agent(
                         false,
                         true,
                     );
-                    (resp.content, None)
+                    (resp.content, None, None)
                 }
                 Err(err) => {
                     record_cli(&tool.name, model, prompt, "", false);
@@ -180,6 +231,7 @@ pub async fn invoke_agent(
         mode_used,
         model,
         output,
+        cost_usd,
         exit_code,
         ms: started.elapsed().as_millis() as u64,
     })
@@ -445,6 +497,14 @@ const TRANSIENT_MARKERS: &[&str] = &[
     "not installed",
 ];
 
+pub(crate) fn reject_blank_outcome(outcome: InvokeOutcome) -> Result<InvokeOutcome> {
+    if outcome.output.trim().is_empty() {
+        Err(Error::Provider(EMPTY_COMPLETION_ERROR.to_string()))
+    } else {
+        Ok(outcome)
+    }
+}
+
 /// Same-target retries a transient failure earns before the walk falls over.
 const DEFAULT_TRANSIENT_RETRIES: u32 = 1;
 
@@ -513,6 +573,13 @@ impl FailurePolicy {
             if markers.iter().any(|marker| lower.contains(marker.as_str())) {
                 return class;
             }
+        }
+
+        // A transport-level success with no completion is an ordinary,
+        // recoverable provider failure. Keep it outside the legacy marker table
+        // so existing classifier compatibility remains byte-for-byte stable.
+        if lower == EMPTY_COMPLETION_ERROR {
+            return FailureClass::Transient;
         }
 
         // 2. Built-ins, fatal first.
@@ -654,18 +721,31 @@ pub async fn invoke_with_policy(
     prompt: &str,
     timeout: Duration,
 ) -> Result<PolicyOutcome> {
+    invoke_with_policy_context(targets, prompt, timeout, None).await
+}
+
+pub async fn invoke_with_policy_context(
+    targets: &[RankedTarget],
+    prompt: &str,
+    timeout: Duration,
+    provenance: Option<InvocationContext>,
+) -> Result<PolicyOutcome> {
     walk_with_policy(
         effective_policy(),
         targets,
         prompt,
         timeout,
-        |candidate, prompt, timeout| async move {
-            let opts = InvokeOptions {
-                mode: Some(candidate.mode),
-                model: candidate.model.clone(),
-                timeout,
-            };
-            invoke_agent(&candidate.target, &prompt, opts).await
+        move |candidate, prompt, timeout| {
+            let provenance = provenance.clone();
+            async move {
+                let opts = InvokeOptions {
+                    mode: Some(candidate.mode),
+                    model: candidate.model.clone(),
+                    timeout,
+                    provenance,
+                };
+                invoke_agent(&candidate.target, &prompt, opts).await
+            }
         },
     )
     .await
@@ -696,7 +776,10 @@ where
         let mut tries = 0u32;
         loop {
             tries += 1;
-            match invoke(candidate.clone(), prompt.to_string(), timeout).await {
+            match invoke(candidate.clone(), prompt.to_string(), timeout)
+                .await
+                .and_then(reject_blank_outcome)
+            {
                 Ok(outcome) => {
                     return Ok(PolicyOutcome {
                         served: Some(outcome),
@@ -757,6 +840,17 @@ pub async fn invoke_with_failover(
     timeout: Duration,
 ) -> Result<FailoverOutcome> {
     invoke_with_policy(targets, prompt, timeout)
+        .await?
+        .into_failover()
+}
+
+pub async fn invoke_with_failover_context(
+    targets: &[RankedTarget],
+    prompt: &str,
+    timeout: Duration,
+    provenance: Option<InvocationContext>,
+) -> Result<FailoverOutcome> {
+    invoke_with_policy_context(targets, prompt, timeout, provenance)
         .await?
         .into_failover()
 }
@@ -914,15 +1008,90 @@ fn auto_mode_for(tool: &DetectedTool) -> Mode {
     }
 }
 
-async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Option<i32>)> {
+fn prepare_claude_json_output(target: &str, argv: &mut Vec<String>) -> bool {
+    if target != "claude" {
+        return false;
+    }
+    for (index, arg) in argv.iter().enumerate() {
+        if arg == "--output-format" {
+            return argv.get(index + 1).is_some_and(|format| format == "json");
+        }
+        if let Some(format) = arg.strip_prefix("--output-format=") {
+            return format == "json";
+        }
+    }
+    argv.splice(1..1, ["--output-format".to_string(), "json".to_string()]);
+    true
+}
+
+fn parse_claude_output(output: String, parse_json: bool) -> (String, Option<f64>) {
+    if !parse_json {
+        return (output, None);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return (output, None);
+    };
+    let Some(result) = value.get("result").and_then(serde_json::Value::as_str) else {
+        return (output, None);
+    };
+    let cost_usd = value
+        .get("total_cost_usd")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    (result.to_string(), cost_usd)
+}
+
+async fn run_cli_argv(
+    argv: &[String],
+    timeout: Duration,
+    provenance: Option<&InvocationContext>,
+    tool: &DetectedTool,
+    model: Option<&str>,
+) -> Result<(String, Option<i32>)> {
     let (program, args) = argv.split_first().ok_or_else(|| {
         Error::Provider("invoke: cannot spawn an empty CLI invocation".to_string())
     })?;
-    let mut child = Command::new(program)
-        .args(args)
+    let mut command = if tool.name == "claude" {
+        let root = canonical_project_root()?;
+        rtrt_core::detect::strict_claude_command(
+            argv,
+            &root,
+            tool.path.as_deref().map(std::path::Path::new),
+        )?
+    } else {
+        Command::new(program)
+    };
+    append_original_args(&mut command, args, &tool.name);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(provenance) = provenance {
+        command.env("RTRT_INVOCATION_ID", &provenance.invocation_id);
+        if let Some(value) = &provenance.parent_project {
+            command.env("RTRT_PARENT_PROJECT", value);
+        }
+        if let Some(value) = &provenance.parent_session_id {
+            command.env("RTRT_PARENT_SESSION_ID", value);
+        }
+        if let Some(value) = &provenance.parent_call_id {
+            command.env("RTRT_PARENT_CALL_ID", value);
+        }
+        if let Some(value) = &provenance.caller_agent {
+            command.env("RTRT_PARENT_AGENT", value);
+        }
+        if let Some(value) = &provenance.parent_cwd {
+            command.env("RTRT_PARENT_CWD", value);
+        }
+        if let Some(value) = &provenance.parent_worktree {
+            command.env("RTRT_PARENT_WORKTREE", value);
+        }
+        command.env("RTRT_CHILD_TARGET", &tool.name);
+        if let Some(value) = model {
+            command.env("RTRT_CHILD_MODEL", value);
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| Error::Provider(format!("invoke: spawn '{program}': {e}")))?;
 
@@ -951,6 +1120,20 @@ async fn run_cli_argv(argv: &[String], timeout: Duration) -> Result<(String, Opt
     output.push_str(&String::from_utf8_lossy(&stderr));
     let output = sanitize_cli_output(&output);
     Ok((output, status.code()))
+}
+
+fn append_original_args(command: &mut Command, args: &[String], target: &str) {
+    if target != "claude" {
+        command.args(args);
+    }
+}
+
+fn canonical_project_root() -> Result<std::path::PathBuf> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    cwd.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| Error::Provider("strict Claude invocation requires a Git project".into()))
 }
 
 fn cli_exit_error(program: &str, exit_code: Option<i32>, output: &str) -> Error {
@@ -1062,9 +1245,23 @@ where
     R: Read + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut buf = Vec::new();
-        pipe.read_to_end(&mut buf)?;
-        Ok(buf)
+        let mut retained = Vec::with_capacity(MAX_CLI_PIPE_BYTES);
+        let mut chunk = [0_u8; 16 * 1024];
+        let mut truncated = false;
+        loop {
+            let read = pipe.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_CLI_PIPE_BYTES.saturating_sub(retained.len());
+            let keep = remaining.min(read);
+            retained.extend_from_slice(&chunk[..keep]);
+            truncated |= keep < read;
+        }
+        if truncated {
+            retained.extend_from_slice(CLI_TRUNCATION_MARKER);
+        }
+        Ok(retained)
     })
 }
 
@@ -1100,6 +1297,122 @@ mod tests {
     use rtrt_core::{Capability, ToolKind};
 
     use super::*;
+
+    #[test]
+    fn strict_claude_never_appends_original_argv_a_second_time() {
+        let original = vec!["-p".to_string(), "prompt".to_string()];
+        let mut strict = Command::new("/trusted/claude");
+        strict.args(["-p", "prompt"]);
+        append_original_args(&mut strict, &original, "claude");
+        let args: Vec<_> = strict.get_args().collect();
+        assert_eq!(args, ["-p", "prompt"]);
+
+        let mut regular = Command::new("opencode");
+        append_original_args(&mut regular, &original, "opencode");
+        assert_eq!(regular.get_args().collect::<Vec<_>>(), ["-p", "prompt"]);
+    }
+
+    #[test]
+    fn claude_json_output_is_requested_and_parsed_with_cost() {
+        let mut argv = vec!["claude".into(), "-p".into(), "task".into()];
+
+        assert!(prepare_claude_json_output("claude", &mut argv));
+        assert_eq!(&argv[1..3], ["--output-format", "json"]);
+
+        let raw = r#"{"result":"completed","total_cost_usd":0.0125}"#.to_string();
+        let (output, cost_usd) = parse_claude_output(raw, true);
+        assert_eq!(output, "completed");
+        assert_eq!(cost_usd, Some(0.0125));
+    }
+
+    #[test]
+    fn claude_json_without_cost_reports_none() {
+        let raw = r#"{"result":"completed"}"#.to_string();
+
+        let (output, cost_usd) = parse_claude_output(raw, true);
+
+        assert_eq!(output, "completed");
+        assert_eq!(cost_usd, None);
+    }
+
+    #[test]
+    fn malformed_or_plain_claude_json_falls_back_to_raw_output() {
+        for raw in [r#"{"result":"partial""#, "plain answer"] {
+            let (output, cost_usd) = parse_claude_output(raw.to_string(), true);
+
+            assert_eq!(output, raw);
+            assert_eq!(cost_usd, None);
+        }
+    }
+
+    #[test]
+    fn explicit_claude_output_format_is_preserved() {
+        let mut text_argv = vec![
+            "claude".into(),
+            "--output-format".into(),
+            "text".into(),
+            "-p".into(),
+            "task".into(),
+        ];
+        let original = text_argv.clone();
+
+        assert!(!prepare_claude_json_output("claude", &mut text_argv));
+        assert_eq!(text_argv, original);
+
+        let mut json_argv = vec![
+            "claude".into(),
+            "--output-format=json".into(),
+            "-p".into(),
+            "task".into(),
+        ];
+        let original = json_argv.clone();
+        assert!(prepare_claude_json_output("claude", &mut json_argv));
+        assert_eq!(json_argv, original);
+    }
+
+    #[test]
+    fn non_claude_output_is_unchanged() {
+        let mut argv = vec!["opencode".into(), "run".into(), "task".into()];
+        let original = argv.clone();
+
+        assert!(!prepare_claude_json_output("opencode", &mut argv));
+        assert_eq!(argv, original);
+
+        let raw = "plain answer".to_string();
+        assert_eq!(parse_claude_output(raw.clone(), false), (raw, None));
+    }
+
+    #[tokio::test]
+    async fn oversized_cli_pipe_is_fully_drained_and_marked() {
+        let input = vec![0xff; MAX_CLI_PIPE_BYTES + 32 * 1024];
+        let retained = join_reader(Some(read_pipe(std::io::Cursor::new(input))))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retained.len(),
+            MAX_CLI_PIPE_BYTES + CLI_TRUNCATION_MARKER.len()
+        );
+        assert_eq!(
+            &retained[MAX_CLI_PIPE_BYTES..],
+            CLI_TRUNCATION_MARKER,
+            "truncation must be explicit and deterministic"
+        );
+        assert!(
+            String::from_utf8_lossy(&retained)
+                .ends_with("\n...[rtrt CLI output truncated at 8388608 bytes]")
+        );
+    }
+
+    #[test]
+    fn invoke_outcome_deserializes_without_cost() {
+        let outcome: InvokeOutcome = serde_json::from_str(
+            r#"{"target":"claude","mode_used":"cli","model":null,"output":"ok","exit_code":0,"ms":1}"#,
+        )
+        .expect("legacy outcome should deserialize");
+
+        assert_eq!(outcome.cost_usd, None);
+    }
 
     #[test]
     fn template_substitution_keeps_prompt_and_model_as_single_args() {
@@ -1295,6 +1608,7 @@ mod tests {
                 mode_used: Mode::Api,
                 model: Some("gpt-x".to_string()),
                 output: "ok".to_string(),
+                cost_usd: None,
                 exit_code: None,
                 ms: 1,
             },
@@ -1319,6 +1633,7 @@ mod tests {
                 mode_used: Mode::Cli,
                 model: Some("provider/model-c".to_string()),
                 output: "ok".to_string(),
+                cost_usd: None,
                 exit_code: Some(0),
                 ms: 1,
             },
@@ -1664,6 +1979,7 @@ mod tests {
                     mode_used: Mode::Cli,
                     model: None,
                     output: "ok".to_string(),
+                    cost_usd: None,
                     exit_code: Some(0),
                     ms: 1,
                 }),

@@ -1,11 +1,147 @@
-use std::time::Duration;
+use std::{
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use rtrt_core::{Config, CostClass, Error, Result, TeamConfig, TeamMember};
+use rtrt_core::{Config, CostClass, Error, Result, TeamConfig, TeamMember, TeamPolicy};
+use rtrt_orchestrator::{
+    NodeId, RecursionLimits, ResultProvenance, TeamNode, TeamTree, WorkerResult, WorkerReturn,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    FailoverOutcome, FailurePolicy, RankedTarget,
-    lane::{AGENT_INVOKER, LaneRunner, LaneTask, LedgerRoom, mode_from_team, resolve_leader_lane},
+    AgentInvoker, FailoverOutcome, FailurePolicy, InvocationContext, LaneRun, RankedTarget,
+    lane::{LaneRunner, LaneTask, LedgerRoom, mode_from_team, resolve_leader_lane},
 };
+
+/// Successful dispatch plus the bounded root run retained for MCP integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamDispatchResult {
+    pub outcome: FailoverOutcome,
+    pub run: LaneRun,
+    pub recursion: RecursiveRunMetadata,
+}
+
+/// Runtime recursion projection and root snapshot. No child bridge is created
+/// here: a parent coordinator must admit and dispatch every future child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecursiveRunMetadata {
+    pub enabled: bool,
+    pub limits: RecursionLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<TeamNode>,
+    pub node_count: u32,
+}
+
+/// Why lane provenance cannot be represented by the strict orchestrator DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceProjectionError {
+    pub reason: String,
+}
+
+impl fmt::Display for ProvenanceProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ProvenanceProjectionError {}
+
+impl TeamDispatchResult {
+    /// Convert the successful lane only when the strict assigned/actual model
+    /// can express it. Full retry/failure detail remains in `run.attempts`.
+    pub fn result_provenance(
+        &self,
+    ) -> std::result::Result<ResultProvenance, ProvenanceProjectionError> {
+        let assigned = self
+            .run
+            .assigned
+            .as_deref()
+            .filter(|lane| !lane.trim().is_empty())
+            .ok_or_else(|| projection_error("successful run has no assigned lane"))?;
+        let actual = self
+            .run
+            .served_by
+            .as_deref()
+            .filter(|lane| !lane.trim().is_empty())
+            .ok_or_else(|| projection_error("successful run has no actual lane"))?;
+        if assigned == actual {
+            return Ok(ResultProvenance::assigned(assigned));
+        }
+
+        let served_index = self
+            .run
+            .attempts
+            .iter()
+            .rposition(|attempt| attempt.class.is_none() && attempt.actual == actual)
+            .ok_or_else(|| {
+                projection_error("successful fallback lacks retained LaneAttempt provenance")
+            })?;
+        let served = &self.run.attempts[served_index];
+        let from_lane = self.run.attempts[..served_index]
+            .iter()
+            .rev()
+            .find(|attempt| attempt.class.is_some())
+            .map(|attempt| attempt.actual.as_str())
+            .ok_or_else(|| {
+                projection_error(
+                    "actual lane differs from assignment without a preceding failed lane",
+                )
+            })?;
+        let provenance = ResultProvenance::fallback(
+            assigned,
+            actual,
+            from_lane,
+            served.reason.clone(),
+            served.redo.is_some(),
+        );
+        provenance
+            .validate()
+            .map_err(|error| projection_error(error.to_string()))?;
+        Ok(provenance)
+    }
+
+    /// Build strict result only from caller-supplied worker metadata. Provider
+    /// output cannot safely invent files, tests, or a detail reference.
+    pub fn worker_result(
+        &self,
+        output: WorkerReturn,
+    ) -> std::result::Result<WorkerResult, ProvenanceProjectionError> {
+        let result = WorkerResult {
+            output,
+            provenance: self.result_provenance()?,
+        };
+        result
+            .validate()
+            .map_err(|error| projection_error(error.to_string()))?;
+        Ok(result)
+    }
+}
+
+fn projection_error(reason: impl Into<String>) -> ProvenanceProjectionError {
+    ProvenanceProjectionError {
+        reason: reason.into(),
+    }
+}
+
+/// Project already-validated config into orchestration runtime limits.
+pub fn recursion_limits(policy: &TeamPolicy) -> Result<RecursionLimits> {
+    policy.recursion.validate()?;
+    let recursion = &policy.recursion;
+    Ok(RecursionLimits {
+        max_depth: recursion.effective_max_depth(),
+        max_fan_out: recursion.effective_max_fan_out(),
+        max_total_nodes: recursion.effective_max_total_nodes(),
+        max_tokens: recursion.effective_max_tokens(),
+        deadline_secs: recursion.effective_deadline_secs(),
+        max_payload_bytes: recursion.effective_max_payload_bytes(),
+        subleader_tiers: if recursion.enabled {
+            recursion.subleader_tiers.clone()
+        } else {
+            Vec::new()
+        },
+    })
+}
 
 /// Dispatch a task to the first available configured team leader.
 ///
@@ -22,6 +158,36 @@ pub async fn dispatch_team(
     prompt: &str,
     timeout: Duration,
 ) -> Result<FailoverOutcome> {
+    Ok(dispatch_team_rich(config, prompt, timeout).await?.outcome)
+}
+
+pub async fn dispatch_team_with_context(
+    config: &TeamConfig,
+    prompt: &str,
+    timeout: Duration,
+    provenance: Option<InvocationContext>,
+) -> Result<FailoverOutcome> {
+    Ok(
+        dispatch_team_rich_with_context(config, prompt, timeout, provenance)
+            .await?
+            .outcome,
+    )
+}
+
+pub async fn dispatch_team_rich(
+    config: &TeamConfig,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<TeamDispatchResult> {
+    dispatch_team_rich_with_context(config, prompt, timeout, None).await
+}
+
+pub async fn dispatch_team_rich_with_context(
+    config: &TeamConfig,
+    prompt: &str,
+    timeout: Duration,
+    provenance: Option<InvocationContext>,
+) -> Result<TeamDispatchResult> {
     if prompt.trim().is_empty() {
         return Err(Error::Provider(
             "team dispatch prompt must not be empty".to_string(),
@@ -31,12 +197,14 @@ pub async fn dispatch_team(
     // disabled config or an unknown leader.
     ranked_leaders(config)?;
     let leader_prompt = build_team_leader_prompt(config, prompt);
+    let recursion = root_metadata(config, leader_prompt.len())?;
     let effective = Config::load_effective_for_cwd();
     let failure = FailurePolicy::from_config(&effective.failover);
     let room = LedgerRoom::new(effective);
     let steps = resolve_leader_lane(config, &room)?;
 
-    let run = LaneRunner::new(config, &AGENT_INVOKER)
+    let invoker = AgentInvoker::with_provenance(provenance);
+    let run = LaneRunner::new(config, &invoker)
         .with_room(&room)
         .with_failure_policy(failure)
         .with_timeout(timeout)
@@ -45,7 +213,47 @@ pub async fn dispatch_team(
     if let Some(reason) = run.unresolved {
         return Err(Error::Config(reason));
     }
-    run.into_policy_outcome().into_failover()
+    let outcome = run.clone().into_policy_outcome().into_failover()?;
+    Ok(TeamDispatchResult {
+        outcome,
+        run,
+        recursion,
+    })
+}
+
+fn root_metadata(config: &TeamConfig, payload_len: usize) -> Result<RecursiveRunMetadata> {
+    let limits = recursion_limits(&config.policy)?;
+    if !config.policy.recursion.enabled {
+        return Ok(RecursiveRunMetadata {
+            enabled: false,
+            limits,
+            root: None,
+            node_count: 0,
+        });
+    }
+    if payload_len > limits.max_payload_bytes as usize {
+        return Err(Error::Config(format!(
+            "team recursive root payload is {payload_len} bytes, exceeding max_payload_bytes {}",
+            limits.max_payload_bytes
+        )));
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let tree = TeamTree::new(limits.clone(), now_ms)
+        .map_err(|error| Error::Config(format!("team recursive root admission failed: {error}")))?;
+    let root = tree.node(NodeId::ROOT).cloned().ok_or_else(|| {
+        Error::Config("team recursive root admission produced no root node".to_string())
+    })?;
+    let node_count = u32::try_from(tree.nodes().count()).unwrap_or(u32::MAX);
+    Ok(RecursiveRunMetadata {
+        enabled: true,
+        limits,
+        root: Some(root),
+        node_count,
+    })
 }
 
 /// The leader's task.
@@ -76,11 +284,12 @@ pub fn build_team_leader_prompt(config: &TeamConfig, prompt: &str) -> String {
         .join("\n");
     let routing = format_routing(config);
     let policy = format_policy(config);
+    let delegation = format_delegation(config);
 
     format!(
         "You are selected available team leader.\n\
          Analyze the user task, retain responsibility for architecture and integration, and split independent work into parallel tasks.\n\
-         Delegate through the rtrt MCP agent_call tool, calling independent members in parallel with each member's target and model.\n\
+         {delegation}\
          {routing}\
          Do not assign work back to the member matching your own target and model when doing so would recurse.\n\
          Review all delegated results, resolve conflicts, integrate the work, and verify the final result.\n\
@@ -90,6 +299,29 @@ pub fn build_team_leader_prompt(config: &TeamConfig, prompt: &str) -> String {
          Failure and fallback policy:\n{policy}\n\
          \n\
          <original_user_task>\n{prompt}\n</original_user_task>"
+    )
+}
+
+fn format_delegation(config: &TeamConfig) -> String {
+    if !config.policy.recursion.enabled {
+        return "Delegate through the rtrt MCP agent_call tool, calling independent members in parallel with each member's target and model.\n".to_string();
+    }
+    let recursion = &config.policy.recursion;
+    format!(
+        "The parent remains coordinator and exclusively owns recursive admission, dispatch, integration, and cancellation.\n\
+         Do not invoke OpenCode Task, rtrt agent_call/team_dispatch, or contact sibling/child agents directly; return proposed child tasks to the parent coordinator.\n\
+         Recursive proposals are bounded to depth {}, fan-out {}, total nodes {}, {} tokens, {} seconds, and {} payload bytes; only these tiers may sublead: {}.\n",
+        recursion.max_depth,
+        recursion.max_fan_out,
+        recursion.max_total_nodes,
+        recursion.max_tokens,
+        recursion.deadline_secs,
+        recursion.max_payload_bytes,
+        if recursion.subleader_tiers.is_empty() {
+            "<none>".to_string()
+        } else {
+            recursion.subleader_tiers.join(", ")
+        }
     )
 }
 
@@ -295,6 +527,20 @@ mod tests {
         }
     }
 
+    fn recursive_config() -> TeamConfig {
+        let mut config = config();
+        config.tiers = TierMap::from_pairs([("lead", vec!["second"])]);
+        config.policy.recursion.enabled = true;
+        config.policy.recursion.max_depth = 2;
+        config.policy.recursion.max_fan_out = 2;
+        config.policy.recursion.max_total_nodes = 5;
+        config.policy.recursion.max_tokens = 10_000;
+        config.policy.recursion.deadline_secs = 60;
+        config.policy.recursion.max_payload_bytes = 16_384;
+        config.policy.recursion.subleader_tiers = vec!["lead".to_string()];
+        config
+    }
+
     #[test]
     fn leaders_follow_exact_configured_order() {
         let leaders = ranked_leaders(&config()).unwrap();
@@ -333,6 +579,114 @@ mod tests {
                 "name: worker; target: ollama; model: <default>; roles: routine, bulk-edit"
             )
         );
+    }
+
+    #[test]
+    fn recursive_policy_projects_to_a_bounded_root_without_child_permissions() {
+        let config = recursive_config();
+        config.validate().unwrap();
+        let prompt = build_team_leader_prompt(&config, "task");
+        let metadata = root_metadata(&config, prompt.len()).unwrap();
+
+        assert!(metadata.enabled);
+        assert_eq!(metadata.node_count, 1);
+        assert_eq!(metadata.limits.max_depth, 2);
+        assert_eq!(metadata.limits.max_fan_out, 2);
+        assert_eq!(metadata.limits.max_total_nodes, 5);
+        assert_eq!(metadata.limits.subleader_tiers, vec!["lead"]);
+        let root = metadata.root.unwrap();
+        assert_eq!(root.id, NodeId::ROOT);
+        assert_eq!(root.parent, None);
+        assert!(root.children.is_empty());
+        assert_eq!(root.grant.nodes, 4);
+        assert!(prompt.contains("The parent remains coordinator"));
+        assert!(prompt.contains("Do not invoke OpenCode Task, rtrt agent_call/team_dispatch"));
+        assert!(!prompt.contains("Delegate through the rtrt MCP agent_call tool"));
+    }
+
+    #[test]
+    fn recursive_root_rejects_payload_above_projected_limit() {
+        let mut config = recursive_config();
+        config.policy.recursion.max_payload_bytes = 1;
+        let error = root_metadata(&config, 2).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("team recursive root payload is 2 bytes, exceeding max_payload_bytes 1")
+        );
+    }
+
+    #[test]
+    fn rich_result_projects_real_fallback_provenance_without_worker_fictions() {
+        let outcome = crate::InvokeOutcome {
+            target: "claude".to_string(),
+            mode_used: Mode::Cli,
+            model: Some("sonnet".to_string()),
+            output: "done".to_string(),
+            cost_usd: None,
+            exit_code: Some(0),
+            ms: 1,
+        };
+        let failed = crate::LaneAttempt {
+            assigned: "second".to_string(),
+            actual: "second".to_string(),
+            target: "opencode".to_string(),
+            model: Some("openai/gpt-5.6-sol".to_string()),
+            role: crate::LaneRole::Primary,
+            reason: "first configured leader".to_string(),
+            class: Some(crate::FailureClass::Transient),
+            retried: true,
+            redo: None,
+            error: Some("provider timed out".to_string()),
+        };
+        let served = crate::LaneAttempt {
+            assigned: "second".to_string(),
+            actual: "first".to_string(),
+            target: "claude".to_string(),
+            model: Some("sonnet".to_string()),
+            role: crate::LaneRole::Fallback,
+            reason: "fallback 1 of second".to_string(),
+            class: None,
+            retried: false,
+            redo: Some(crate::RedoDirective {
+                from_lane: "second".to_string(),
+                to_lane: "first".to_string(),
+                artifacts: Vec::new(),
+            }),
+            error: None,
+        };
+        let result = TeamDispatchResult {
+            outcome: FailoverOutcome {
+                outcome: outcome.clone(),
+                failed_over: Vec::new(),
+            },
+            run: LaneRun {
+                task_id: "team-leader".to_string(),
+                assigned: Some("second".to_string()),
+                served_by: Some("first".to_string()),
+                served: Some(outcome),
+                attempts: vec![failed, served],
+                trail: Vec::new(),
+                halted: None,
+                retries_used: 1,
+                unresolved: None,
+            },
+            recursion: RecursiveRunMetadata {
+                enabled: false,
+                limits: recursion_limits(&TeamPolicy::default()).unwrap(),
+                root: None,
+                node_count: 0,
+            },
+        };
+
+        let provenance = result.result_provenance().unwrap();
+        assert_eq!(provenance.assigned_lane, "second");
+        assert_eq!(provenance.actual_lane, "first");
+        let fallback = provenance.fallback.unwrap();
+        assert_eq!(fallback.from_lane, "second");
+        assert_eq!(fallback.reason, "fallback 1 of second");
+        assert!(fallback.redo_from_scratch);
     }
 
     #[test]
@@ -530,6 +884,7 @@ mod tests {
         config.members[1].sibling = Some("worker".to_string());
         config.members[1].fallback = vec!["first".to_string()];
         config.members[2].logical = Some("gpt-5.6-sol".to_string());
+        config.members[2].sibling = Some("second".to_string());
         config.validate().unwrap();
 
         let steps = resolve_leader_lane(&config, &UNKNOWN_ROOM).unwrap();

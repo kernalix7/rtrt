@@ -10,12 +10,14 @@ description = "RTRT multi-provider AI client abstraction."
 
 [dependencies]
 rtrt-core.workspace = true
+rtrt-orchestrator.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
 axum.workspace = true

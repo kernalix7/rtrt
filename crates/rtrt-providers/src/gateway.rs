@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rtrt_core::{Error, Result};
+use rtrt_core::{Error, Result, config::normalize_provider_id};
 use serde::{Deserialize, Serialize};
 
 use crate::{ChatRequest, ChatResponse, Provider, Role, Usage, usage_ledger};
@@ -174,7 +174,14 @@ impl Budget {
     /// USD cost estimate for a (model, usage) pair. Returns `0.0` when the
     /// model has no pricing entry.
     pub fn cost_for(&self, model: &str, usage: &Usage) -> f64 {
-        let p = match self.pricing.get(model) {
+        let upstream = model
+            .split_once('/')
+            .map_or(model, |(_, upstream)| upstream);
+        let p = match self
+            .pricing
+            .get(model)
+            .or_else(|| self.pricing.get(upstream))
+        {
             Some(p) => *p,
             None => return 0.0,
         };
@@ -186,6 +193,7 @@ impl Budget {
 
 struct Registration {
     name: String,
+    transport: String,
     prefixes: Vec<String>,
     provider: Box<dyn Provider>,
 }
@@ -333,6 +341,7 @@ impl Gateway {
     /// which must count toward routing headroom.
     pub fn from_env() -> Self {
         let mut gw = Gateway::new().with_usage_recording(true);
+        let cfg = rtrt_core::Config::load_effective_for_cwd();
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             gw = gw.register(
                 "anthropic",
@@ -351,14 +360,18 @@ impl Gateway {
         // `RTRT_PROVIDER_BASE_URL` the `rtrt provider chat` CLI uses, so a
         // single env var configures the local/OpenAI-compatible backend
         // everywhere (CLI, dashboard daemon, SessionEnd compress hook).
-        if let Ok(url) = std::env::var("RTRT_OPENAI_COMPAT_URL")
+        if let Some(url) = std::env::var("RTRT_OPENAI_COMPAT_URL")
             .or_else(|_| std::env::var("RTRT_PROVIDER_BASE_URL"))
+            .ok()
+            .or_else(|| cfg.auto_compress.base_url.clone())
         {
-            let mut p = crate::OpenAICompatibleProvider::new("openai-compat", url);
+            let provider_id = cfg.auto_compress.effective_provider(&url);
+            let mut p = crate::OpenAICompatibleProvider::new(&provider_id, url)
+                .with_model(&cfg.auto_compress.model);
             if let Ok(key) = std::env::var("RTRT_OPENAI_COMPAT_API_KEY") {
                 p = p.with_api_key(key);
             }
-            gw = gw.register("openai-compat", Box::new(p), [] as [&'static str; 0]);
+            gw = gw.register(provider_id, Box::new(p), [] as [&'static str; 0]);
             gw = gw.with_default_last();
         }
         gw
@@ -432,12 +445,39 @@ impl Gateway {
         provider: Box<dyn Provider>,
         model_prefixes: impl IntoIterator<Item = &'static str>,
     ) -> Self {
+        let transport = provider.transport().to_string();
         self.providers.push(Registration {
-            name: name.into(),
+            name: normalize_provider_id(&name.into()),
+            transport,
             prefixes: model_prefixes.into_iter().map(|s| s.to_string()).collect(),
             provider,
         });
         self
+    }
+
+    /// Canonical model IDs this gateway can accept and route back to the same
+    /// registered provider. Providers with no advertised model list contribute
+    /// no speculative entries.
+    pub fn canonical_models(&self) -> Vec<(String, String, String)> {
+        let mut models = Vec::new();
+        for registration in &self.providers {
+            for upstream in registration.provider.model_ids() {
+                let id = match upstream.split_once('/') {
+                    Some((prefix, rest)) if normalize_provider_id(prefix) == registration.name => {
+                        format!("{}/{rest}", registration.name)
+                    }
+                    _ => format!("{}/{upstream}", registration.name),
+                };
+                if !models.iter().any(|(existing, _, _)| existing == &id) {
+                    models.push((
+                        id,
+                        registration.name.clone(),
+                        registration.transport.clone(),
+                    ));
+                }
+            }
+        }
+        models
     }
 
     /// Mark the most-recently-registered provider as the fallback for models
@@ -515,12 +555,10 @@ impl Gateway {
                 )));
             }
         }
-        let Some(primary_idx) = self.lookup_index(&req.model) else {
-            return Err(Error::Provider(format!(
-                "gateway: no provider registered for model '{}'",
-                req.model
-            )));
-        };
+        let (primary_idx, upstream_model, explicitly_routed) = self.resolve_model(&req.model)?;
+        let requested_model = req.model.clone();
+        let mut upstream_req = req.clone();
+        upstream_req.model = upstream_model;
         let attempts = self.retry.max_attempts.max(1);
         let mut last_err: Option<Error> = None;
         let key = cache_key(&req);
@@ -536,7 +574,12 @@ impl Gateway {
                 tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
             }
             match self
-                .dispatch_once(primary_idx, req.clone(), parent_id)
+                .dispatch_once(
+                    primary_idx,
+                    upstream_req.clone(),
+                    &requested_model,
+                    parent_id,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -550,11 +593,15 @@ impl Gateway {
                 Err(e) => last_err = Some(e),
             }
         }
-        if self.retry.fallback_to_default
+        if !explicitly_routed
+            && self.retry.fallback_to_default
             && let Some(default_idx) = self.default
             && default_idx != primary_idx
         {
-            match self.dispatch_once(default_idx, req, parent_id).await {
+            match self
+                .dispatch_once(default_idx, upstream_req, &requested_model, parent_id)
+                .await
+            {
                 Ok(resp) => {
                     if let Some(cache) = &self.cache
                         && let Ok(mut g) = cache.lock()
@@ -578,10 +625,50 @@ impl Gateway {
         self.default
     }
 
+    fn resolve_model(&self, model: &str) -> Result<(usize, String, bool)> {
+        if let Some((provider_hint, upstream)) = model.split_once('/') {
+            if provider_hint.is_empty() || upstream.is_empty() {
+                return Err(Error::Provider(format!(
+                    "gateway: invalid canonical model id '{model}'"
+                )));
+            }
+            let normalized_hint = normalize_provider_id(provider_hint);
+            let Some((idx, registration)) = self
+                .providers
+                .iter()
+                .enumerate()
+                .find(|(_, registration)| registration.name == normalized_hint)
+            else {
+                return Err(Error::Provider(format!(
+                    "gateway: no provider registered for canonical model '{model}'"
+                )));
+            };
+            if !registration.prefixes.is_empty()
+                && !registration
+                    .prefixes
+                    .iter()
+                    .any(|prefix| upstream.starts_with(prefix))
+            {
+                return Err(Error::Provider(format!(
+                    "gateway: model '{upstream}' does not match provider '{provider_hint}'"
+                )));
+            }
+            return Ok((idx, upstream.to_string(), true));
+        }
+        self.lookup_index(model)
+            .map(|idx| (idx, model.to_string(), false))
+            .ok_or_else(|| {
+                Error::Provider(format!(
+                    "gateway: no provider registered for model '{model}'"
+                ))
+            })
+    }
+
     async fn dispatch_once(
         &self,
         idx: usize,
         req: ChatRequest,
+        requested_model: &str,
         parent_id: Option<u64>,
     ) -> Result<ChatResponse> {
         let registration = &self.providers[idx];
@@ -591,7 +678,7 @@ impl Gateway {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let model = req.model.clone();
+        let model = requested_model.to_string();
         // Char count of the outbound messages, kept for the estimated ledger
         // row when the provider fails (or reports no usage block).
         let prompt_chars: String = if self.record_usage {
@@ -819,6 +906,103 @@ mod tests {
         assert_eq!(claude.provider, "anthropic");
         let gpt = gw.chat(req("gpt-5.4-mini")).await.unwrap();
         assert_eq!(gpt.provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn canonical_id_routes_explicit_provider_and_strips_only_upstream() {
+        let gw = Gateway::new()
+            .register(
+                "anthropic",
+                Box::new(Echo {
+                    name: "anthropic",
+                    tokens: (1, 1),
+                }),
+                ["claude-"],
+            )
+            .register(
+                "ollama",
+                Box::new(Echo {
+                    name: "ollama",
+                    tokens: (2, 3),
+                }),
+                [] as [&'static str; 0],
+            );
+        let response = gw.chat(req("ollama/gemma3:4b-it-qat")).await.unwrap();
+        assert_eq!(response.provider, "ollama");
+        assert_eq!(response.model, "gemma3:4b-it-qat");
+        let metrics = gw.metrics();
+        let metrics = metrics.lock().unwrap();
+        let metric = &metrics.recent(1)[0];
+        assert_eq!(metric.provider, "ollama");
+        assert_eq!(metric.model, "ollama/gemma3:4b-it-qat");
+    }
+
+    #[tokio::test]
+    async fn canonical_routes_normalize_provider_case_and_preserve_nested_model() {
+        for requested in ["OLLAMA/gemma3:4b-it-qat", "ollama/org/family/model:tag"] {
+            let gw = Gateway::new().register(
+                "Ollama",
+                Box::new(Echo {
+                    name: "ollama",
+                    tokens: (1, 1),
+                }),
+                [] as [&'static str; 0],
+            );
+            let response = gw.chat(req(requested)).await.unwrap();
+            assert_eq!(response.provider, "ollama", "{requested}");
+            assert_eq!(
+                response.model,
+                requested.split_once('/').unwrap().1,
+                "{requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_model_list_normalizes_own_prefix_without_double_prefixing() {
+        struct Models;
+        #[async_trait]
+        impl Provider for Models {
+            fn name(&self) -> &str {
+                "ollama"
+            }
+            fn supported_models(&self) -> &[&'static str] {
+                &[]
+            }
+            fn model_ids(&self) -> Vec<String> {
+                vec![
+                    "OLLAMA/org/model:tag".to_string(),
+                    "plain:latest".to_string(),
+                ]
+            }
+            async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse> {
+                unreachable!()
+            }
+        }
+
+        let gw = Gateway::new().register("Ollama", Box::new(Models), []);
+        let ids = gw
+            .canonical_models()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["ollama/org/model:tag", "ollama/plain:latest"]);
+    }
+
+    #[tokio::test]
+    async fn canonical_id_rejects_unknown_or_mismatched_provider() {
+        let gw = Gateway::new().register(
+            "anthropic",
+            Box::new(Echo {
+                name: "anthropic",
+                tokens: (1, 1),
+            }),
+            ["claude-"],
+        );
+        let unknown = gw.chat(req("ollama/gemma3:4b")).await.unwrap_err();
+        assert!(format!("{unknown}").contains("no provider registered"));
+        let mismatched = gw.chat(req("anthropic/gpt-5.4-mini")).await.unwrap_err();
+        assert!(format!("{mismatched}").contains("does not match provider"));
     }
 
     #[tokio::test]

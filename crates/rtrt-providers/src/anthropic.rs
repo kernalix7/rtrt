@@ -133,12 +133,24 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         capture_rate_limit(&req.model, &resp);
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = stream::read_body_bounded(
+                resp,
+                ANTHROPIC_TARGET,
+                "error",
+                stream::MAX_ERROR_BODY_BYTES,
+            )
+            .await?;
+            let body = String::from_utf8_lossy(&body);
             return Err(Error::Provider(format!("anthropic {status}: {body}")));
         }
-        let parsed: MessagesResponse = resp
-            .json()
-            .await
+        let body = stream::read_body_bounded(
+            resp,
+            ANTHROPIC_TARGET,
+            "success",
+            stream::MAX_SUCCESS_BODY_BYTES,
+        )
+        .await?;
+        let parsed: MessagesResponse = serde_json::from_slice(&body)
             .map_err(|e| Error::Provider(format!("anthropic decode: {e}")))?;
         let content = parsed
             .content
@@ -175,10 +187,17 @@ impl Provider for AnthropicProvider {
         let status = resp.status();
         capture_rate_limit(&req.model, &resp);
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = stream::read_body_bounded(
+                resp,
+                ANTHROPIC_TARGET,
+                "error",
+                stream::MAX_ERROR_BODY_BYTES,
+            )
+            .await?;
+            let body = String::from_utf8_lossy(&body);
             return Err(Error::Provider(format!("anthropic {status}: {body}")));
         }
-        Ok(stream::decode(resp, decode_event))
+        Ok(stream::decode(resp, ANTHROPIC_TARGET, decode_event))
     }
 }
 

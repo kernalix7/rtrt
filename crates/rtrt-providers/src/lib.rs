@@ -36,8 +36,9 @@ pub use gateway_server::{
 };
 pub use invoke::{
     DEFAULT_TIMEOUT_SECS, FailoverAttempt, FailoverOutcome, FailureClass, FailurePolicy,
-    InvokeOptions, InvokeOutcome, Mode, PolicyAttempt, PolicyOutcome, classify_error, invoke_agent,
-    invoke_with_failover, invoke_with_policy, is_retryable_error,
+    InvocationContext, InvokeOptions, InvokeOutcome, Mode, PolicyAttempt, PolicyOutcome,
+    classify_error, invoke_agent, invoke_with_failover, invoke_with_failover_context,
+    invoke_with_policy, invoke_with_policy_context, is_retryable_error,
 };
 pub use lane::{
     AGENT_INVOKER, AgentInvoker, LaneAttempt, LaneHalt, LaneInvoker, LaneReport, LaneRole,
@@ -49,7 +50,11 @@ pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
 };
-pub use team::{build_team_leader_prompt, dispatch_team};
+pub use team::{
+    ProvenanceProjectionError, RecursiveRunMetadata, TeamDispatchResult, build_team_leader_prompt,
+    dispatch_team, dispatch_team_rich, dispatch_team_rich_with_context, dispatch_team_with_context,
+    recursion_limits,
+};
 pub use usage::{PoolQuota, ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{
     CapScope, LedgerRow, PoolCap, PoolHeadroom, PoolRanking, RateLimitAxis, RateLimitSignal,
@@ -105,7 +110,19 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent>> + Send>
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
+    /// Wire protocol used to reach this provider. Runtime identity (`name`) and
+    /// transport are intentionally independent.
+    fn transport(&self) -> &str {
+        self.name()
+    }
     fn supported_models(&self) -> &[&'static str];
+    /// Owned model list for providers whose configured models are dynamic.
+    fn model_ids(&self) -> Vec<String> {
+        self.supported_models()
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect()
+    }
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse>;
     async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream> {
         Err(Error::Provider(format!(

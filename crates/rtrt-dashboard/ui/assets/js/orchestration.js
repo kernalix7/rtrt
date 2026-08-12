@@ -824,32 +824,8 @@ async function saveOrchestration() {
     const el = document.getElementById(id);
     if (el) el.addEventListener(event, handler);
   };
-  on('orch-add-lane', addOrchLane);
-  on('orch-add-tier', addOrchTier);
-  on('orch-pin-tiers', pinOrchEffectiveTiers);
-  on('orch-save-btn', saveOrchestration);
   on('orch-reload-btn', () => loadOrchestration());
   on('orch-fail-save-btn', saveOrchFailover);
-  on('orch-leader-add-btn', () => {
-    const select = document.getElementById('orch-leader-add');
-    const name = select ? select.value : '';
-    if (!name) return;
-    ORCH_TEAM.leader_order = ORCH_TEAM.leader_order || [];
-    ORCH_TEAM.leader_order.push(name);
-    renderOrchLeaders();
-  });
-  on('orch-tier-name', (ev) => { if (ev.key === 'Enter') addOrchTier(); }, 'keydown');
-  // The design-only "follow the shipped default" switch flips the policy field
-  // between `null` (inherit) and an explicit list seeded from what is in force.
-  on('orch-design-default', () => {
-    const following = document.getElementById('orch-design-default').checked;
-    if (!ORCH_TEAM) return;
-    ORCH_TEAM.policy = ORCH_TEAM.policy || {};
-    ORCH_TEAM.policy.design_only_tiers = following
-      ? null
-      : (((ORCH_TEAM.effective || {}).design_only_tiers) || []).slice();
-    renderOrchPolicy();
-  }, 'change');
   // Scope radios. Rendered by the shared `applyScopeToggle`; wired exactly like
   // the other form-and-Save settings cards (providers, agents): "Follow global"
   // clears this project's override immediately, "Custom" flips the card and

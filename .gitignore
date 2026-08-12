@@ -67,4 +67,8 @@ demo.png
 .rtrt/*.sqlite-journal
 .rtrt/*.sqlite-wal
 .rtrt/*.sqlite-shm
+# Crate-local .rtrt/ is test residue (model-cache tempdirs), never source.
+crates/**/.rtrt/
+# Local agent session state.
+/.omo/
 .claude/settings.local.json

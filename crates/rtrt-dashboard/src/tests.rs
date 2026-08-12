@@ -1626,23 +1626,6 @@ fn post_empty(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// A roster with no lane in common with the shipped one, so "the project's own"
-/// and "the global" can never be confused for each other.
-const PROJECT_ROSTER: &str = r#"{
-    "enabled": true,
-    "manager_provider": "project-manager",
-    "manager_model": "project-model",
-    "manager_base_url": "",
-    "leader_order": ["project-lane"],
-    "members": [
-        {"name":"project-lane","target":"project-target","model":null,"mode":"cli",
-         "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-         "fallback":[],"allow_impl":true,"flags":{}}
-    ],
-    "tiers": [],
-    "policy": null
-}"#;
-
 /// Register `demo` as an on-disk project rooted at `<tmp>/repo` and return it.
 async fn register_demo_project(
     state: crate::state::AppState,

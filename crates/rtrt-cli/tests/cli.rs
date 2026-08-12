@@ -654,6 +654,7 @@ fn opencode_setup_has_no_shared_memory_argv_and_restores_history_keybinds() {
     assert_eq!(installed["keybinds"]["history_previous"], "none");
     assert_eq!(installed["keybinds"]["history_next"], "none");
     assert_eq!(installed["keybinds"]["other"], "keep");
+    assert!(!opencode.join("agents").exists());
 
     rtrt(home.path())
         .args(["uninstall", "--agent", "opencode", "--apply"])
@@ -890,6 +891,7 @@ fn opencode_setup_and_uninstall_ignore_all_global_claude_config() {
         .args(["setup", "--agent", "opencode", "--apply"])
         .assert()
         .success();
+    assert!(!home.path().join(".config/opencode/agents").exists());
     assert_eq!(std::fs::read(&claude_json).unwrap(), conflicting);
     assert_eq!(std::fs::read(&claude_settings).unwrap(), hook_conflict);
 
@@ -1053,7 +1055,7 @@ fn setup_never_probes_ollama_or_mutates_embeddings() {
 }
 
 #[test]
-fn opencode_unsandboxed_setup_preserves_config_and_denies_all_agent_bash() {
+fn opencode_unsandboxed_setup_preserves_config_and_does_not_create_agents() {
     let home = tempfile::tempdir().unwrap();
     let opencode = home.path().join(".config/opencode");
     let config = opencode.join("opencode.json");
@@ -1071,19 +1073,7 @@ fn opencode_unsandboxed_setup_preserves_config_and_denies_all_agent_bash() {
     let root: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     assert_eq!(root["foreign"]["keep"], true);
-    // Set may be empty; the asserted property is "every generated agent denies
-    // bash", which must keep holding rather than be skipped.
-    let agents = opencode.join("agents");
-    if let Ok(entries) = std::fs::read_dir(&agents) {
-        for entry in entries.flatten() {
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("md") {
-                continue;
-            }
-            let body = std::fs::read_to_string(entry.path()).unwrap();
-            assert!(body.contains("  bash:\n    \"*\": deny"), "{body}");
-            assert!(!body.contains("  bash:\n    \"*\": allow"), "{body}");
-        }
-    }
+    assert!(!opencode.join("agents").exists());
 }
 
 #[test]

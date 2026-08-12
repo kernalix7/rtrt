@@ -76,7 +76,7 @@ pub(crate) fn default_context() -> usize {
 }
 
 pub(crate) async fn proxy_filter(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<ProxyRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mode = req.mode.as_deref().unwrap_or("command");
@@ -142,7 +142,7 @@ Read the captured error output and respond with: (1) one-sentence root cause; \
 (2) the smallest concrete fix (file + change). No filler. Cite line numbers when present.";
 
 pub(crate) async fn diagnose(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<DiagnoseRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let filtered = rtrt_proxy::errors_only(&req.raw, req.context);
@@ -199,19 +199,21 @@ pub(crate) fn default_max_bytes() -> u64 {
 }
 
 pub(crate) async fn repo_map(
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<RepoMapRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !req.root.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("root not found: {}", req.root.display()),
-        ));
-    }
+    let root = state.contained_path(&req.root)?;
     let mut entries = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut signature_chars: usize = 0;
     let restrict_ext = req.ext.trim();
-    for entry in walk_files(&req.root) {
+    for entry in walk_files(&root) {
+        let Ok(entry) = std::fs::canonicalize(entry) else {
+            continue;
+        };
+        if !entry.starts_with(state.project.checkout_root()) {
+            continue;
+        }
         let name = entry.to_string_lossy();
         if !restrict_ext.is_empty() && !name.ends_with(restrict_ext) {
             continue;
@@ -233,7 +235,7 @@ pub(crate) async fn repo_map(
         total_bytes += src.len() as u64;
         signature_chars += sig.chars().count();
         let rel = entry
-            .strip_prefix(&req.root)
+            .strip_prefix(&root)
             .unwrap_or(&entry)
             .display()
             .to_string();
@@ -263,14 +265,17 @@ pub(crate) struct SetupRequest {
 }
 
 pub(crate) async fn setup_snippet(
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<SetupRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let binary = req.binary.clone().unwrap_or_else(|| "rtrt-mcp".to_string());
-    let memory = req.memory.clone().unwrap_or_else(|| {
-        rtrt_core::default_memory_store_path()
-            .to_string_lossy()
-            .into_owned()
-    });
+    if req.memory.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "memory path override is unavailable in project mode".into(),
+        ));
+    }
+    let memory = state.memory_path.to_string_lossy().into_owned();
     let (target_path, snippet) = match req.agent.as_str() {
         "claude-code" => (
             "~/.claude/mcp.json".to_string(),
@@ -323,7 +328,7 @@ number. Drop filler, hedging, headings, and greetings. Plain text only. No comme
 preamble, no quotes — emit only the compressed text.";
 
 pub(crate) async fn compress(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<CompressRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     use rtrt_core::CompressionLevel;
@@ -342,34 +347,9 @@ pub(crate) async fn compress(
                 StatusCode::BAD_REQUEST,
                 "llm engine requires a `model` field".into(),
             ))?;
-            // Build a request-scoped gateway that honours Config::auto_compress.base_url
-            // when neither RTRT_PROVIDER_BASE_URL nor RTRT_OPENAI_COMPAT_URL is set —
-            // the same resolution order used by run_hook_compress in rtrt-cli. state.gateway
-            // was constructed at startup before config base_url was available, so we rebuild
-            // here. When the env vars are absent we temporarily set RTRT_PROVIDER_BASE_URL
-            // from config so Gateway::from_env registers the openai-compat provider.
-            let llm_gateway = {
-                let env_has_url = std::env::var_os("RTRT_PROVIDER_BASE_URL").is_some()
-                    || std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_some();
-                if env_has_url {
-                    rtrt_providers::Gateway::from_env()
-                } else {
-                    let cfg_url = rtrt_core::Config::load()
-                        .ok()
-                        .and_then(|c| c.auto_compress.base_url);
-                    if let Some(url) = cfg_url {
-                        // SAFETY: no await between set_var and remove_var; the var was
-                        // absent before this block so concurrent handlers that reach this
-                        // branch independently each set-and-remove their own value.
-                        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", &url) };
-                        let gw = rtrt_providers::Gateway::from_env();
-                        unsafe { std::env::remove_var("RTRT_PROVIDER_BASE_URL") };
-                        gw
-                    } else {
-                        rtrt_providers::Gateway::from_env()
-                    }
-                }
-            };
+            // Gateway::from_env also loads the effective configured base_url;
+            // no process-global environment mutation is needed per request.
+            let llm_gateway = rtrt_providers::Gateway::from_env();
             let chat_req = ChatRequest {
                 model: model.clone(),
                 messages: vec![

@@ -35,6 +35,33 @@ use tokio::sync::broadcast;
 
 use crate::prelude::*;
 
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// JSON merge-patch field preserving the distinction between omitted and null.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum JsonPatch<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for JsonPatch<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
 pub(crate) async fn healthz() -> &'static str {
     "ok"
 }
@@ -132,19 +159,10 @@ pub(crate) const SECS_PER_HOUR: i64 = 60 * 60;
 pub(crate) const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
 
 /// Is `path` a SPA HTML-shell route (served either by `GET /` or the catch-all
-/// fallback)? These bootstrap the UI and carry no secrets — they are token-exempt
-/// exactly like `/`. The API, static assets, and vendored libs are NOT shell
-/// routes: they keep their normal token requirement.
+/// fallback)? Everything outside `/api` is public bootstrap content and carries
+/// no dashboard token or API data.
 pub(crate) fn is_spa_shell_path(path: &str) -> bool {
-    if matches!(path, "/" | "/healthz" | "/favicon.ico") {
-        return true;
-    }
-    // Anything not under an explicit prefix is a deep SPA route the fallback
-    // serves as the index shell. Prefixes below keep their own (guarded) handlers.
-    !(path.starts_with("/api/")
-        || path == "/api"
-        || path.starts_with("/assets/")
-        || path.starts_with("/vendor/"))
+    !(path.starts_with("/api/") || path == "/api")
 }
 
 pub(crate) async fn bearer_guard(
@@ -154,17 +172,18 @@ pub(crate) async fn bearer_guard(
 ) -> axum::response::Response {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     let path = req.uri().path().to_string();
-    // Always allow the SPA HTML shell, health probe, and favicon so the UI can
-    // bootstrap; the API + static-asset routes still require the token. Deep SPA
-    // routes (e.g. /memory/search) are served by the catch-all fallback as the
-    // very same shell as `/`, so a browser refresh on a deep URL must reach it
-    // without a bearer header (the browser can't attach one to a navigation).
-    // Carry the same exemption — but never for /api, /assets, or /vendor.
-    if is_spa_shell_path(&path) {
+    // Always allow the SPA HTML shell and its fixed compiled-in assets so the UI
+    // can bootstrap. Deep SPA routes (e.g. /memory/search) are served by the
+    // catch-all as the same shell as `/`, so browser navigation cannot attach a
+    // bearer header. Never extend this exemption beyond non-API paths and the
+    // exact POST-only bootstrap exchange below.
+    if is_spa_shell_path(&path)
+        || (path == "/api/auth/bootstrap" && req.method() == axum::http::Method::POST)
+    {
         return next.run(req).await;
     }
     let Some(expected) = expected else {
-        return next.run(req).await;
+        return unauthorized();
     };
     let presented = req
         .headers()
@@ -178,24 +197,26 @@ pub(crate) async fn bearer_guard(
     if ok {
         return next.run(req).await;
     }
+    unauthorized()
+}
+
+fn unauthorized() -> axum::response::Response {
     let mut resp = axum::response::Response::new(axum::body::Body::from(
         "unauthorized: bearer token missing or invalid",
     ));
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
     resp.headers_mut().insert(
         "WWW-Authenticate",
-        HeaderValue::from_static("Bearer realm=\"rtrt-dashboard\""),
+        axum::http::HeaderValue::from_static("Bearer realm=\"rtrt-dashboard\""),
     );
     resp
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let mut diff = a.len() ^ b.len();
+    for index in 0..a.len().max(b.len()) {
+        diff |=
+            usize::from(a.get(index).copied().unwrap_or(0) ^ b.get(index).copied().unwrap_or(0));
     }
     diff == 0
 }
@@ -248,13 +269,79 @@ pub(crate) fn api_error(
 pub(crate) fn write_config_file(
     cfg: &rtrt_core::Config,
 ) -> std::result::Result<String, (StatusCode, String)> {
+    let _guard = CONFIG_WRITE_LOCK.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config writer lock poisoned".into(),
+        )
+    })?;
+    write_config_file_locked(cfg)
+}
+
+/// Serialize a complete read-modify-write transaction. Handlers using PATCH
+/// semantics must load under this lock, otherwise two individually atomic
+/// writes can still lose each other's fields.
+pub(crate) fn update_config_file(
+    mutate: impl FnOnce(&mut rtrt_core::Config) -> std::result::Result<(), (StatusCode, String)>,
+) -> std::result::Result<(rtrt_core::Config, String), (StatusCode, String)> {
+    let _guard = CONFIG_WRITE_LOCK.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config writer lock poisoned".into(),
+        )
+    })?;
+    let path = rtrt_core::Config::default_path().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "cannot determine config path".into(),
+    ))?;
+    reject_unsafe_target(&path, false)?;
+    let mut cfg = rtrt_core::Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    mutate(&mut cfg)?;
+    let path = write_config_file_locked(&cfg)?;
+    Ok((cfg, path))
+}
+
+/// Serialize and atomically persist a project override with same path-safety
+/// checks as global config writes.
+pub(crate) fn write_project_config(
+    repo: &std::path::Path,
+    project: &rtrt_core::config::ProjectConfig,
+) -> rtrt_core::Result<()> {
+    project.validate()?;
+    let _guard = CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| rtrt_core::Error::Config("config writer lock poisoned".into()))?;
+    let path = rtrt_core::Config::project_config_path(repo);
+    reject_unsafe_target_io(&path, false)
+        .map_err(|error| rtrt_core::Error::Config(error.to_string()))?;
+    if project.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(rtrt_core::Error::Config(error.to_string())),
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| rtrt_core::Error::Config("project config has no parent".into()))?;
+    ensure_safe_dir(parent).map_err(|error| rtrt_core::Error::Config(error.to_string()))?;
+    let body = toml::to_string_pretty(project)
+        .map_err(|error| rtrt_core::Error::Config(error.to_string()))?;
+    atomic_write(&path, body.as_bytes())
+        .map_err(|error| rtrt_core::Error::Config(error.to_string()))
+}
+
+fn write_config_file_locked(
+    cfg: &rtrt_core::Config,
+) -> std::result::Result<String, (StatusCode, String)> {
     let path = rtrt_core::Config::default_path().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "cannot determine config path".into(),
     ))?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+        ensure_safe_dir(parent).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("create dir {}: {e}", parent.display()),
@@ -262,15 +349,118 @@ pub(crate) fn write_config_file(
         })?;
     }
 
+    reject_unsafe_target(&path, false)?;
+
     let toml_str = toml::to_string_pretty(cfg)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    std::fs::write(&path, toml_str).map_err(|e| {
+    atomic_write(&path, toml_str.as_bytes()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("write {}: {e}", path.display()),
         )
     })?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Atomic writer shared with security profiles. Existing symlinks are rejected
+/// rather than followed; on Unix, targets/directories owned by another user are
+/// rejected using the current HOME owner as the trusted uid.
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    reject_unsafe_target_io(path, false)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("target has no parent"))?;
+    reject_unsafe_target_io(parent, true)?;
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config");
+    let tmp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), n));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Create a private write directory only after checking every existing path
+/// component. This prevents `create_dir_all` from traversing a planted symlink.
+pub(crate) fn ensure_safe_dir(path: &std::path::Path) -> std::io::Result<()> {
+    reject_unsafe_target_io(path, false)?;
+    std::fs::create_dir_all(path)?;
+    reject_unsafe_target_io(path, true)
+}
+
+fn reject_unsafe_target(
+    path: &std::path::Path,
+    must_exist: bool,
+) -> std::result::Result<(), (StatusCode, String)> {
+    reject_unsafe_target_io(path, must_exist).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+fn reject_unsafe_target_io(path: &std::path::Path, must_exist: bool) -> std::io::Result<()> {
+    // Inspect components themselves: metadata on only the final path would
+    // follow an intermediate symlink and miss the traversal.
+    for component in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if component.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing symlink component {}",
+                    component.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing symlink target {}",
+                    path.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let trusted = std::env::var_os("HOME")
+                    .and_then(|home| std::fs::metadata(home).ok())
+                    .map(|home| home.uid());
+                if trusted.is_some_and(|uid| uid != metadata.uid()) {
+                    return Err(std::io::Error::other(format!(
+                        "refusing unsafe ownership for {}",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Err(e) if !must_exist && e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------

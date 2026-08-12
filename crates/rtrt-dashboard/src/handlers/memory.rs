@@ -37,7 +37,7 @@ use crate::prelude::*;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryRecallRequest {
-    project: String,
+    project: Option<String>,
     query: String,
     #[serde(default = "default_recall_limit")]
     limit: u32,
@@ -61,9 +61,10 @@ pub(crate) fn default_recall_limit() -> u32 {
 }
 
 pub(crate) async fn memory_recall(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<MemoryRecallRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -89,14 +90,14 @@ pub(crate) async fn memory_recall(
             // endpoint stays usable without an embedding server.
             let (scored, effective_mode) = if let Some(emb) = state.embedder.as_ref() {
                 let s = guard
-                    .recall_hybrid(&req.project, &req.query, fetch_limit, emb.as_ref())
+                    .recall_hybrid(project, &req.query, fetch_limit, emb.as_ref())
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 (s, "hybrid-vector")
             } else {
                 // No embedder available — use graph-blended BM25 as a
                 // graceful degradation.
                 let s = guard
-                    .recall_bm25_graph_blend(&req.project, &req.query, fetch_limit)
+                    .recall_bm25_graph_blend(project, &req.query, fetch_limit)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 (s, "hybrid-graph")
             };
@@ -127,11 +128,11 @@ pub(crate) async fn memory_recall(
                     let f = PayloadFilter::parse(spec)
                         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
                     guard
-                        .recall_bm25_with_filter(&req.project, &req.query, fetch_limit, &f)
+                        .recall_bm25_with_filter(project, &req.query, fetch_limit, &f)
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 }
                 _ => guard
-                    .recall_bm25(&req.project, &req.query, fetch_limit)
+                    .recall_bm25(project, &req.query, fetch_limit)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             };
             let hits: Vec<_> = hits
@@ -145,28 +146,23 @@ pub(crate) async fn memory_recall(
 }
 
 pub(crate) async fn memory_projects(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
-    let rows = guard
-        .projects()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let projects: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(name, count, latest)| {
-            serde_json::json!({ "project": name, "count": count, "latest_ts": latest })
-        })
-        .collect();
+    let count = guard.count_by_project(state.project.slug()).unwrap_or(0);
+    let projects = vec![serde_json::json!({
+        "project": state.project.slug(), "label": state.project.label(), "count": count
+    })];
     Ok(Json(serde_json::json!({ "projects": projects })))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryTimelineQuery {
-    project: String,
+    project: Option<String>,
     #[serde(default = "default_timeline_limit")]
     limit: usize,
     #[serde(default)]
@@ -192,9 +188,10 @@ pub(crate) fn default_timeline_limit() -> usize {
 }
 
 pub(crate) async fn memory_timeline(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryTimelineQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -205,14 +202,14 @@ pub(crate) async fn memory_timeline(
     let sk = q.source_kind.as_deref().filter(|s| !s.is_empty());
     let role = q.role.as_deref();
     let total = guard
-        .count_by_project_filtered(&q.project, sk, role)
+        .count_by_project_filtered(project, sk, role)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<serde_json::Value> = if sort == "importance" {
         // Importance sort — returns DetailedRecord which already includes
         // body_full, metadata, and a pre-computed score.
         let rows = guard
-            .recent_paged_by_importance_filtered(&q.project, q.limit, q.offset, sk, role)
+            .recent_paged_by_importance_filtered(project, q.limit, q.offset, sk, role)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -234,7 +231,7 @@ pub(crate) async fn memory_timeline(
     } else {
         // Default: newest-first paged view.
         let rows = guard
-            .recent_paged_filtered(&q.project, q.limit, q.offset, sk, role)
+            .recent_paged_filtered(project, q.limit, q.offset, sk, role)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rows.into_iter()
             .map(|r| {
@@ -279,14 +276,15 @@ pub(crate) async fn memory_timeline(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryExportQuery {
-    project: String,
+    project: Option<String>,
 }
 
 pub(crate) async fn memory_export(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryExportQuery>,
 ) -> std::result::Result<axum::response::Response, (StatusCode, String)> {
     use axum::http::header;
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -294,9 +292,9 @@ pub(crate) async fn memory_export(
     let guard = store.lock().await;
     let mut buf = Vec::new();
     guard
-        .export_jsonl(&q.project, &mut buf)
+        .export_jsonl(project, &mut buf)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let filename = format!("{}.jsonl", q.project.replace(['/', '\\'], "_"));
+    let filename = format!("{}.jsonl", state.project.label().replace(['/', '\\'], "_"));
     let disposition = format!("attachment; filename=\"{filename}\"");
     let resp = axum::response::Response::builder()
         .status(StatusCode::OK)
@@ -309,7 +307,7 @@ pub(crate) async fn memory_export(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemorySaveRequest {
-    project: String,
+    project: Option<String>,
     #[serde(default = "default_kind")]
     kind: String,
     body: String,
@@ -323,63 +321,66 @@ pub(crate) fn default_kind() -> String {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetBlockRequest {
-    project: String,
+    project: Option<String>,
     name: String,
     body: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListBlocksQuery {
-    project: String,
+    project: Option<String>,
 }
 
 pub(crate) async fn list_blocks(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ListBlocksQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
     let blocks = guard
-        .list_blocks(&q.project)
+        .list_blocks(project)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "blocks": blocks })))
 }
 
 pub(crate) async fn set_block(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<SetBlockRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
     let id = guard
-        .set_block(&req.project, &req.name, &req.body)
+        .set_block(project, &req.name, &req.body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GetBlockQuery {
-    project: String,
+    project: Option<String>,
 }
 
 pub(crate) async fn get_block(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<GetBlockQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
     let block = guard
-        .get_block(&q.project, &name)
+        .get_block(project, &name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match block {
         Some(b) => {
@@ -392,9 +393,10 @@ pub(crate) async fn get_block(
 }
 
 pub(crate) async fn memory_save(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<MemorySaveRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -402,11 +404,11 @@ pub(crate) async fn memory_save(
     let guard = store.lock().await;
     let id = if req.metadata.is_empty() {
         guard
-            .save(&req.project, &req.kind, &req.body)
+            .save(project, &req.kind, &req.body)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
         guard
-            .save_with_metadata(&req.project, &req.kind, &req.body, &req.metadata)
+            .save_with_metadata(project, &req.kind, &req.body, &req.metadata)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "id": id })))
@@ -414,7 +416,7 @@ pub(crate) async fn memory_save(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryCompressRequest {
-    project: String,
+    project: Option<String>,
     #[serde(default)]
     model: Option<String>,
 }
@@ -429,9 +431,10 @@ pub(crate) struct MemoryCompressResponse {
 }
 
 pub(crate) async fn memory_compress(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<MemoryCompressRequest>,
 ) -> std::result::Result<Json<MemoryCompressResponse>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?.to_string();
     let store = state
         .memory
         .as_ref()
@@ -456,7 +459,7 @@ pub(crate) async fn memory_compress(
     let candidates = {
         let guard = store.lock().await;
         guard
-            .compress_candidates(&req.project, cutoff, min_chars, batch)
+            .compress_candidates(&project, cutoff, min_chars, batch)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
@@ -484,7 +487,7 @@ pub(crate) async fn memory_compress(
         let resp = match state.gateway.chat(chat_req).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("memory_compress {project}#{id}: {e}", project = req.project);
+                tracing::warn!("memory_compress {project}#{id}: {e}");
                 skipped_count += 1;
                 continue;
             }
@@ -504,7 +507,7 @@ pub(crate) async fn memory_compress(
         if let Err(e) = guard.compress_in_place(id, &new_body) {
             tracing::warn!(
                 "memory_compress {project}#{id}: compress_in_place: {e}",
-                project = req.project
+                project = project
             );
             skipped_count += 1;
             continue;
@@ -521,7 +524,7 @@ pub(crate) async fn memory_compress(
         total_saved_chars += (from_chars - to_chars).max(0);
         compressed_count += 1;
         tracing::info!(
-            project = %req.project,
+            project = %project,
             id,
             from = body.len(),
             to = new_body.len(),
@@ -548,7 +551,7 @@ pub(crate) async fn memory_compress(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryStatsQuery {
-    project: String,
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -575,12 +578,13 @@ pub(crate) struct MemoryStatsResponse {
 }
 
 pub(crate) async fn memory_stats(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryStatsQuery>,
 ) -> std::result::Result<Json<MemoryStatsResponse>, (StatusCode, String)> {
-    // Open a direct rusqlite connection to the same path used by open_memory_store().
-    let path = crate::state::memory_store_path();
+    let project = state.assert_project(q.project.as_deref())?;
+    let path = &state.memory_path;
 
-    let conn = rusqlite::Connection::open(&path).map_err(|e| {
+    let conn = rusqlite::Connection::open(path).map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("memory store: {e}"),
@@ -591,7 +595,7 @@ pub(crate) async fn memory_stats(
     let total: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM memories WHERE project = ?1",
-            rusqlite::params![q.project],
+            rusqlite::params![project],
             |row| row.get(0),
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -604,7 +608,7 @@ pub(crate) async fn memory_stats(
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![q.project], |row| {
+            .query_map(rusqlite::params![project], |row| {
                 Ok(KindCount {
                     kind: row.get(0)?,
                     count: row.get(1)?,
@@ -627,7 +631,7 @@ pub(crate) async fn memory_stats(
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![q.project], |row| {
+            .query_map(rusqlite::params![project], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -660,7 +664,7 @@ pub(crate) async fn memory_stats(
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![q.project], |row| {
+            .query_map(rusqlite::params![project], |row| {
                 Ok(DayCount {
                     day: row.get(0)?,
                     count: row.get(1)?,
@@ -683,7 +687,7 @@ pub(crate) async fn memory_stats(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryQueueQuery {
-    project: String,
+    project: Option<String>,
 }
 
 /// Compression queue: rows that are eligible for LLM compression (body
@@ -691,11 +695,13 @@ pub(crate) struct MemoryQueueQuery {
 /// done. `ready` = the cool-off age has also passed, so the daemon /
 /// "compress now" will pick it up; `waiting` rows are still too recent.
 pub(crate) async fn memory_queue(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryQueueQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = crate::state::memory_store_path();
+    let project = state.assert_project(q.project.as_deref())?;
+    let path = &state.memory_path;
     let cfg = rtrt_core::Config::load().unwrap_or_default().auto_compress;
-    let conn = rusqlite::Connection::open(&path).map_err(|e| {
+    let conn = rusqlite::Connection::open(path).map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("memory store: {e}"),
@@ -715,7 +721,7 @@ pub(crate) async fn memory_queue(
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let rows = stmt
-        .query_map(rusqlite::params![q.project, cfg.min_chars as i64], |row| {
+        .query_map(rusqlite::params![project, cfg.min_chars as i64], |row| {
             let id: i64 = row.get(0)?;
             let kind: String = row.get(1)?;
             let chars: i64 = row.get(2)?;
@@ -759,7 +765,7 @@ pub(crate) async fn memory_queue(
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn memory_detail(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> std::result::Result<Json<DetailedRecord>, (StatusCode, String)> {
     let store = state
@@ -771,7 +777,8 @@ pub(crate) async fn memory_detail(
         .get_row(id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        Some(r) => Ok(Json(r)),
+        Some(r) if r.project == state.project.slug() => Ok(Json(r)),
+        Some(_) => Err((StatusCode::NOT_FOUND, format!("memory {id} not found"))),
         None => Err((StatusCode::NOT_FOUND, format!("memory {id} not found"))),
     }
 }
@@ -787,7 +794,7 @@ pub(crate) struct DeleteOneResponse {
 }
 
 pub(crate) async fn memory_delete_one(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> std::result::Result<Json<DeleteOneResponse>, (StatusCode, String)> {
     let store = state
@@ -795,6 +802,11 @@ pub(crate) async fn memory_delete_one(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
+    match guard.get_row(id) {
+        Ok(Some(row)) if row.project == state.project.slug() => {}
+        Ok(_) => return Err((StatusCode::NOT_FOUND, format!("memory {id} not found"))),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
     let deleted = guard
         .delete_row(id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -826,7 +838,7 @@ pub(crate) struct DeleteBatchResponse {
 }
 
 pub(crate) async fn memory_delete_batch(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<DeleteBatchRequest>,
 ) -> std::result::Result<Json<DeleteBatchResponse>, (StatusCode, String)> {
     if req.ids.is_empty() {
@@ -837,6 +849,13 @@ pub(crate) async fn memory_delete_batch(
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "memory disabled".into()))?;
     let guard = store.lock().await;
+    for id in &req.ids {
+        match guard.get_row(*id) {
+            Ok(Some(row)) if row.project == state.project.slug() => {}
+            Ok(_) => return Err((StatusCode::NOT_FOUND, format!("memory {id} not found"))),
+            Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        }
+    }
     let deleted = guard
         .delete_rows(&req.ids)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -859,7 +878,7 @@ pub(crate) async fn memory_delete_batch(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryEmbedRequest {
-    project: String,
+    project: Option<String>,
 }
 
 // Kicks off a NON-BLOCKING background backfill. A big project (20k rows) takes
@@ -868,9 +887,10 @@ pub(crate) struct MemoryEmbedRequest {
 // connection (WAL mode = concurrent with the main one) and backfills there, so
 // the UI stays live and `embedding_coverage` reflects progress as rows commit.
 pub(crate) async fn memory_embed(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<MemoryEmbedRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?.to_string();
     if state.embedder.is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -880,16 +900,15 @@ pub(crate) async fn memory_embed(
     // Dedup: refuse a second concurrent job for the same project.
     {
         let mut jobs = state.embedding_jobs.lock().unwrap();
-        if jobs.contains(&req.project) {
+        if jobs.contains(&project) {
             return Ok(Json(
                 serde_json::json!({ "started": false, "running": true }),
             ));
         }
-        jobs.insert(req.project.clone());
+        jobs.insert(project.clone());
     }
 
-    let path = state.memory_path.clone();
-    let project = req.project.clone();
+    let identity = state.project.clone();
     let jobs = state.embedding_jobs.clone();
     // Resolve embed config for the worker's own embedder.
     let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
@@ -902,7 +921,7 @@ pub(crate) async fn memory_embed(
     let model = ecfg.effective_model();
 
     std::thread::spawn(move || {
-        match MemoryStore::open(&path) {
+        match MemoryStore::open_project(&identity) {
             Ok(store) => {
                 let embedder = rtrt_memory::OllamaEmbedder::new(base_url, model);
                 match store.backfill_embeddings(&project, &embedder) {
@@ -922,15 +941,16 @@ pub(crate) async fn memory_embed(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryCoverageQuery {
-    project: String,
+    project: Option<String>,
 }
 
 // GET /api/memory/coverage?project=X -> { embedded, total, running }
 // Lets the UI poll embedding progress while a background backfill runs.
 pub(crate) async fn memory_coverage(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryCoverageQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -938,10 +958,10 @@ pub(crate) async fn memory_coverage(
     let (embedded, total) = {
         let guard = store.lock().await;
         guard
-            .embedding_coverage(&q.project)
+            .embedding_coverage(project)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    let running = state.embedding_jobs.lock().unwrap().contains(&q.project);
+    let running = state.embedding_jobs.lock().unwrap().contains(project);
     Ok(Json(
         serde_json::json!({ "embedded": embedded, "total": total, "running": running }),
     ))
@@ -959,15 +979,16 @@ pub(crate) async fn memory_coverage(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryEntitiesRequest {
-    project: String,
+    project: Option<String>,
     #[serde(default)]
     model: Option<String>,
 }
 
 pub(crate) async fn memory_entities(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<MemoryEntitiesRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(req.project.as_deref())?.to_string();
     let store = state
         .memory
         .as_ref()
@@ -981,27 +1002,8 @@ pub(crate) async fn memory_entities(
             .unwrap_or_else(|| "claude-haiku-4-5".to_string())
     });
 
-    // Build a per-request gateway the same way the auto-compress daemon does,
-    // so the config base_url is honoured even when env vars are absent.
-    let llm_gateway = {
-        let env_has_url = std::env::var_os("RTRT_PROVIDER_BASE_URL").is_some()
-            || std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_some();
-        if env_has_url {
-            Arc::new(rtrt_providers::Gateway::from_env())
-        } else {
-            let cfg_url = rtrt_core::Config::load()
-                .ok()
-                .and_then(|c| c.auto_compress.base_url);
-            Arc::new(if let Some(url) = cfg_url {
-                unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", &url) };
-                let gw = rtrt_providers::Gateway::from_env();
-                unsafe { std::env::remove_var("RTRT_PROVIDER_BASE_URL") };
-                gw
-            } else {
-                rtrt_providers::Gateway::from_env()
-            })
-        }
-    };
+    // Gateway::from_env includes the effective configured base_url.
+    let llm_gateway = Arc::new(rtrt_providers::Gateway::from_env());
 
     let summariser = rtrt_memory::LlmSummariser::new(Box::new(GatewayAdapter(llm_gateway)), model);
 
@@ -1012,7 +1014,7 @@ pub(crate) async fn memory_entities(
     let sources: Vec<(i64, String)> = {
         let guard = store.lock().await;
         guard
-            .list_by_project(&req.project, 10_000)
+            .list_by_project(&project, 10_000)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .into_iter()
             .map(|m| (m.id, m.body))
@@ -1031,7 +1033,7 @@ pub(crate) async fn memory_entities(
     let new_edges = {
         let guard = store.lock().await;
         guard
-            .link_extracted_bipartite(&req.project, &extracted)
+            .link_extracted_bipartite(&project, &extracted)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
     Ok(Json(serde_json::json!({ "edges": new_edges })))
@@ -1043,7 +1045,7 @@ pub(crate) async fn memory_entities(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemorySessionsQuery {
-    project: String,
+    project: Option<String>,
     /// When present, return the memory rows saved during this one session
     /// instead of the summary list. The empty string selects legacy rows that
     /// were captured before session tagging existed.
@@ -1062,9 +1064,10 @@ pub(crate) fn default_session_rows_limit() -> usize {
 /// `GET /api/memory/sessions?project=X&session=<id>` — the memory rows saved
 /// during that session, newest first.
 pub(crate) async fn memory_sessions(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemorySessionsQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?;
     let store = state
         .memory
         .as_ref()
@@ -1073,11 +1076,11 @@ pub(crate) async fn memory_sessions(
 
     if let Some(session) = q.session.as_deref() {
         let rows = guard
-            .session_records(&q.project, session, q.limit)
+            .session_records(project, session, q.limit)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let total = rows.len();
         return Ok(Json(serde_json::json!({
-            "project": q.project,
+            "project": project,
             "session_id": session,
             "items": rows,
             "total": total,
@@ -1085,7 +1088,7 @@ pub(crate) async fn memory_sessions(
     }
 
     let rows = guard
-        .sessions(&q.project)
+        .sessions(project)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let sessions: Vec<serde_json::Value> = rows
         .into_iter()
@@ -1099,7 +1102,7 @@ pub(crate) async fn memory_sessions(
         })
         .collect();
     Ok(Json(serde_json::json!({
-        "project": q.project,
+        "project": project,
         "total": sessions.len(),
         "sessions": sessions,
     })))

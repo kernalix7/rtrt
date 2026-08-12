@@ -59,7 +59,8 @@ pub(crate) use crate::handlers::orch::{
 };
 pub(crate) use crate::handlers::projects::{
     HiddenBucketView, ProjectUpsertReq, ProjectView, ProjectsResponse, ReassignProjectReq,
-    ReassignProjectResp, list_hidden_buckets, list_projects, reassign_project, upsert_project,
+    ReassignProjectResp, list_hidden_buckets, list_projects, projects_overview, reassign_project,
+    upsert_project,
 };
 pub(crate) use crate::handlers::prompts::{
     PromptSummary, get_prompt, list_prompt_versions, list_prompts, require_prompts,
@@ -114,7 +115,7 @@ pub(crate) use crate::handlers::usage::{
 pub(crate) use crate::state::{
     AppState, CLUSTER_INDEX_TTL, GatewayAdapter, LEVEL_TOKEN_SEQ, LEVEL_TOKEN_TTL, STALL_DOMINANCE,
     TokenEntry, broadcast_event, compress_saved_pct_from_meta, dynamic_branch, dynamic_leaf,
-    memory_store_path, mint_level_token, open_memory_store, open_prompt_registry,
+    mint_level_token, open_prompt_registry,
 };
 pub(crate) use crate::util::{
     ApiError, DashboardJsonResult, SECS_PER_DAY, SECS_PER_HOUR, api_error, bearer_guard,

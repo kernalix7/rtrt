@@ -103,54 +103,82 @@ pub(crate) async fn get_limits_config()
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetLimitsRequest {
     #[serde(default)]
-    targets: Vec<LimitTargetView>,
+    targets: Option<Vec<LimitTargetPatch>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LimitTargetPatch {
+    target: String,
+    #[serde(default)]
+    daily_tokens: crate::util::JsonPatch<u64>,
+    #[serde(default)]
+    daily_requests: crate::util::JsonPatch<u64>,
+    #[serde(default)]
+    pools: Option<Vec<LimitPoolView>>,
 }
 
 pub(crate) async fn post_limits_config(
     Json(req): Json<SetLimitsRequest>,
 ) -> std::result::Result<Json<LimitsConfigResponse>, (StatusCode, String)> {
-    let mut cfg = rtrt_core::Config::load()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut targets: BTreeMap<String, TargetLimit> = BTreeMap::new();
-    for view in req.targets {
-        let name = view.target.trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        // Per-pool caps: an absent `pools` field carries the configured ones
-        // across (a wholesale replace must not silently delete caps the sender
-        // never saw), while an explicit list replaces them.
-        let pools = match view.pools {
-            Some(views) => pool_views_to_limits(views),
-            None => cfg
-                .limits
-                .target(&name)
-                .map(|existing| existing.pools.clone())
-                .unwrap_or_default(),
+    let (cfg, path) = crate::util::update_config_file(|cfg| {
+        let Some(requested) = req.targets else {
+            return Ok(());
         };
-        // Skip a row that pins nothing at all — it would persist as an empty,
-        // meaningless `[limits.<name>]` table. A target whose only ceilings are
-        // per-pool ones is NOT empty.
-        if view.daily_tokens.is_none() && view.daily_requests.is_none() && pools.is_empty() {
-            continue;
+        let mut targets: BTreeMap<String, TargetLimit> = BTreeMap::new();
+        for view in requested {
+            let name = view.target.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            // Per-pool caps: an absent `pools` field carries the configured ones
+            // across (a wholesale replace must not silently delete caps the sender
+            // never saw), while an explicit list replaces them.
+            let existing = cfg.limits.target(&name);
+            let pools = match view.pools {
+                Some(views) => pool_views_to_limits(views),
+                None => cfg
+                    .limits
+                    .target(&name)
+                    .map(|existing| existing.pools.clone())
+                    .unwrap_or_default(),
+            };
+            // Skip a row that pins nothing at all — it would persist as an empty,
+            // meaningless `[limits.<name>]` table. A target whose only ceilings are
+            // per-pool ones is NOT empty.
+            let daily_tokens =
+                patch_limit_value(view.daily_tokens, existing.and_then(|v| v.daily_tokens))?;
+            let daily_requests =
+                patch_limit_value(view.daily_requests, existing.and_then(|v| v.daily_requests))?;
+            if daily_tokens.is_none() && daily_requests.is_none() && pools.is_empty() {
+                continue;
+            }
+            targets.insert(
+                name,
+                TargetLimit {
+                    daily_tokens,
+                    daily_requests,
+                    pools,
+                },
+            );
         }
-        targets.insert(
-            name,
-            TargetLimit {
-                daily_tokens: view.daily_tokens,
-                daily_requests: view.daily_requests,
-                pools,
-            },
-        );
-    }
-    cfg.limits = rtrt_core::config::LimitsConfig { targets };
-
-    let path = write_config_file(&cfg)?;
+        cfg.limits = rtrt_core::config::LimitsConfig { targets };
+        Ok(())
+    })?;
     Ok(Json(LimitsConfigResponse {
         targets: limits_to_views(&cfg.limits),
         path,
     }))
+}
+
+fn patch_limit_value(
+    value: crate::util::JsonPatch<u64>,
+    existing: Option<u64>,
+) -> std::result::Result<Option<u64>, (StatusCode, String)> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => Ok(Some(value)),
+    }
 }
 
 /// Same tidiness rule as targets: unnamed pools and pools that pin neither axis

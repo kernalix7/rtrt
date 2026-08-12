@@ -38,7 +38,7 @@ use crate::prelude::*;
 #[derive(Debug, Deserialize)]
 pub(crate) struct MemoryGraphQuery {
     #[serde(default)]
-    project: String,
+    project: Option<String>,
     #[serde(default = "default_graph_limit")]
     limit: usize,
     /// `similarity` (default — memory↔memory, no LLM), `entity` (bipartite
@@ -96,9 +96,10 @@ pub(crate) fn default_graph_limit() -> usize {
 }
 
 pub(crate) async fn memory_graph(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<MemoryGraphQuery>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = state.assert_project(q.project.as_deref())?.to_string();
     let store = state
         .memory
         .as_ref()
@@ -136,7 +137,7 @@ pub(crate) async fn memory_graph(
     if q.mode.as_deref() == Some("overview") {
         let group = q.group.as_deref().unwrap_or("context");
         let basis = q.basis.as_deref().unwrap_or("auto");
-        return memory_graph_overview(&state, store, &q.project, group, basis, q.target).await;
+        return memory_graph_overview(&state, store, &project, group, basis, q.target).await;
     }
 
     // Brain mode (`mode=brain`): the three-level "digital brain" map. Scope
@@ -148,14 +149,14 @@ pub(crate) async fn memory_graph(
     //   2. `community=ID`   → that community's CONCEPTS (`level:"concept"`)
     //   3. neither          → TOP-LEVEL communities     (`level:"community"`)
     if q.mode.as_deref() == Some("brain") {
-        let scope: Option<&str> = brain_scope(&q.project);
+        let scope: Option<&str> = Some(&project);
         if let Some(concept) = q.concept.as_deref().filter(|c| !c.is_empty()) {
             return memory_graph_brain_concept(store, scope, concept).await;
         }
         if let Some(community_id) = q.community {
             return memory_graph_brain_community(store, scope, community_id).await;
         }
-        return memory_graph_brain(&state, store, &q.project, scope).await;
+        return memory_graph_brain(&state, store, &project, scope).await;
     }
 
     let guard = store.lock().await;
@@ -163,7 +164,7 @@ pub(crate) async fn memory_graph(
     // Entity mode: bipartite memory↔entity graph (needs extracted entities).
     if q.mode.as_deref() == Some("entity") {
         let graph = guard
-            .graph_bipartite(&q.project, q.limit)
+            .graph_bipartite(&project, q.limit)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let mut nodes: Vec<serde_json::Value> =
             Vec::with_capacity(graph.memories.len() + graph.entities.len());
@@ -199,7 +200,7 @@ pub(crate) async fn memory_graph(
     // Default similarity mode: memory↔memory, no generative LLM (cosine over
     // stored embeddings, or BM25 lexical fallback).
     let graph = guard
-        .graph_similarity(&q.project, q.limit, 4, 0.15)
+        .graph_similarity(&project, q.limit, 4, 0.15)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let nodes: Vec<serde_json::Value> = graph
         .memories
@@ -245,15 +246,10 @@ pub(crate) const BRAIN_MIN_COOCCUR: usize = 2;
 /// empty project string is treated as global too.
 pub(crate) const GLOBAL_PROJECT_SENTINEL: &str = "__global__";
 
-/// Map a raw `project` query param to a [`MemoryStore::concept_graph`] scope:
-/// `None` (GLOBAL, all projects merged) for an empty string or the global
-/// sentinel, else `Some(project)` for one project's brain.
+/// Project dashboards never expose the global graph scope.
+#[allow(dead_code)]
 pub(crate) fn brain_scope(project: &str) -> Option<&str> {
-    if project.is_empty() || project == GLOBAL_PROJECT_SENTINEL {
-        None
-    } else {
-        Some(project)
-    }
+    (!project.is_empty() && project != GLOBAL_PROJECT_SENTINEL).then_some(project)
 }
 
 /// TOP LEVEL of the brain (`mode=brain`, no `community`/`concept` param): build

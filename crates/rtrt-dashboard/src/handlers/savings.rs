@@ -892,7 +892,7 @@ pub(crate) fn read_recall_savings(project: Option<&str>) -> i64 {
 }
 
 pub(crate) async fn optimizer_overview(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<OverviewQuery>,
 ) -> Json<serde_json::Value> {
     let project = q.project.as_deref().filter(|p| !p.is_empty());

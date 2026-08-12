@@ -38,7 +38,7 @@ use crate::prelude::*;
 /// Hourly background sweep — keeps each project's row count under
 /// `RTRT_CONSOLIDATE_KEEP` (default 1000) using the LLM-free archive path.
 /// Disabled when `RTRT_CONSOLIDATE_INTERVAL_SEC=0`.
-pub(crate) fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>) {
+pub(crate) fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>, project: String) {
     // OFF by default: this daemon DELETES the oldest rows beyond `keep` (no LLM
     // summary), which conflicts with rtrt's permanent-memory promise. Opt in
     // explicitly with RTRT_CONSOLIDATE_INTERVAL_SEC > 0 if you want a hard cap.
@@ -73,30 +73,22 @@ pub(crate) fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>
         loop {
             tick.tick().await;
             let guard = store.lock().await;
-            let projects = match guard.projects() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("consolidate: list projects: {e}");
-                    continue;
+            let count = guard.count_by_project(&project).unwrap_or(0);
+            if count <= keep {
+                continue;
+            }
+            match guard.archive_overflow_no_llm(&project, keep) {
+                Ok((removed, digest_id)) if removed > 0 => {
+                    tracing::info!(
+                        project = %project,
+                        removed,
+                        kept = keep,
+                        digest_id = digest_id.unwrap_or_default(),
+                        "consolidated into archival digest"
+                    );
                 }
-            };
-            for (project, count, _) in projects {
-                if count <= keep {
-                    continue;
-                }
-                match guard.archive_overflow_no_llm(&project, keep) {
-                    Ok((removed, digest_id)) if removed > 0 => {
-                        tracing::info!(
-                            project = %project,
-                            removed,
-                            kept = keep,
-                            digest_id = digest_id.unwrap_or_default(),
-                            "consolidated into archival digest"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("consolidate {project}: {e}"),
-                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("consolidate {project}: {e}"),
             }
         }
     });
@@ -114,6 +106,7 @@ pub(crate) fn spawn_consolidation_daemon(memory: Option<Arc<Mutex<MemoryStore>>>
 pub(crate) fn spawn_auto_compress_daemon(
     memory: Option<Arc<Mutex<MemoryStore>>>,
     gateway: Arc<Gateway>,
+    project: String,
 ) {
     // Resolution order: env var > ~/.rtrt/config.toml > built-in default.
     // So the daemon turns on when EITHER RTRT_AUTO_COMPRESS_LLM=1 OR the
@@ -167,29 +160,18 @@ pub(crate) fn spawn_auto_compress_daemon(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let cutoff = now - age_sec;
-            let projects = {
+            let candidates = {
                 let guard = store.lock().await;
-                match guard.projects() {
-                    Ok(p) => p,
+                match guard.compress_candidates(&project, cutoff, min_chars, batch) {
+                    Ok(rows) => rows,
                     Err(e) => {
-                        tracing::warn!("auto-compress: list projects: {e}");
+                        tracing::warn!("auto-compress {project}: candidates: {e}");
                         continue;
                     }
                 }
             };
-            for (project, _, _) in projects {
-                let candidates = {
-                    let guard = store.lock().await;
-                    match guard.compress_candidates(&project, cutoff, min_chars, batch) {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            tracing::warn!("auto-compress {project}: candidates: {e}");
-                            continue;
-                        }
-                    }
-                };
-                for (id, body) in candidates {
-                    let req = ChatRequest {
+            for (id, body) in candidates {
+                let req = ChatRequest {
                         model: model.clone(),
                         messages: vec![
                             ChatMessage {
@@ -204,42 +186,41 @@ pub(crate) fn spawn_auto_compress_daemon(
                         max_tokens: Some(max_tokens),
                         temperature: Some(0.0),
                     };
-                    let resp = match gateway.chat(req).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("auto-compress {project}#{id}: {e}");
-                            continue;
-                        }
-                    };
-                    let new_body = resp.content.trim().to_string();
-                    if new_body.is_empty() || new_body.len() >= body.len() {
-                        // No win — skip but still mark so we don't retry.
-                        let guard = store.lock().await;
-                        let mut meta = guard.get_metadata(id).unwrap_or_default();
-                        meta.insert("compressed_at".into(), now.to_string());
-                        meta.insert("compressed_skip".into(), "no-shrink".into());
-                        let _ = guard.set_metadata(id, &meta);
+                let resp = match gateway.chat(req).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("auto-compress {project}#{id}: {e}");
                         continue;
                     }
+                };
+                let new_body = resp.content.trim().to_string();
+                if new_body.is_empty() || new_body.len() >= body.len() {
+                    // No win — skip but still mark so we don't retry.
                     let guard = store.lock().await;
-                    if let Err(e) = guard.compress_in_place(id, &new_body) {
-                        tracing::warn!("auto-compress {project}#{id}: set_body: {e}");
-                        continue;
-                    }
                     let mut meta = guard.get_metadata(id).unwrap_or_default();
                     meta.insert("compressed_at".into(), now.to_string());
-                    meta.insert("compressed_model".into(), model.clone());
-                    meta.insert("compressed_from_chars".into(), body.len().to_string());
-                    meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+                    meta.insert("compressed_skip".into(), "no-shrink".into());
                     let _ = guard.set_metadata(id, &meta);
-                    tracing::info!(
-                        project = %project,
-                        id,
-                        from = body.len(),
-                        to = new_body.len(),
-                        "auto-compressed"
-                    );
+                    continue;
                 }
+                let guard = store.lock().await;
+                if let Err(e) = guard.compress_in_place(id, &new_body) {
+                    tracing::warn!("auto-compress {project}#{id}: set_body: {e}");
+                    continue;
+                }
+                let mut meta = guard.get_metadata(id).unwrap_or_default();
+                meta.insert("compressed_at".into(), now.to_string());
+                meta.insert("compressed_model".into(), model.clone());
+                meta.insert("compressed_from_chars".into(), body.len().to_string());
+                meta.insert("compressed_to_chars".into(), new_body.len().to_string());
+                let _ = guard.set_metadata(id, &meta);
+                tracing::info!(
+                    project = %project,
+                    id,
+                    from = body.len(),
+                    to = new_body.len(),
+                    "auto-compressed"
+                );
             }
         }
     });
@@ -260,7 +241,7 @@ pub(crate) fn spawn_auto_compress_daemon(
 /// engaging; if unreachable it logs once and does not spawn (no per-cycle spam).
 /// An embed error on a single row is logged and skipped — the row is retried next
 /// cycle, the daemon keeps going.
-pub(crate) fn spawn_auto_embed_daemon(path: PathBuf) {
+pub(crate) fn spawn_auto_embed_daemon(identity: Arc<rtrt_core::ProjectIdentity>) {
     let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
     if !ecfg.is_enabled() {
         tracing::info!(
@@ -268,7 +249,10 @@ pub(crate) fn spawn_auto_embed_daemon(path: PathBuf) {
         );
         return;
     }
-    if !ecfg.auto {
+    let auto = std::env::var("RTRT_EMBED_AUTO")
+        .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(ecfg.auto);
+    if !auto {
         tracing::info!("auto-embed daemon off ([embeddings] auto=false)");
         return;
     }
@@ -279,8 +263,16 @@ pub(crate) fn spawn_auto_embed_daemon(path: PathBuf) {
             .as_deref(),
     );
     let model = ecfg.effective_model();
-    let interval_sec = ecfg.auto_interval_sec.max(1);
-    let batch = ecfg.auto_batch.max(1);
+    let interval_sec = std::env::var("RTRT_EMBED_AUTO_INTERVAL_SEC")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ecfg.auto_interval_sec)
+        .max(1);
+    let batch = std::env::var("RTRT_EMBED_AUTO_BATCH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ecfg.auto_batch)
+        .max(1);
 
     tokio::spawn(async move {
         // Probe the embedder reachable ONCE before engaging. If Ollama is
@@ -318,14 +310,14 @@ pub(crate) fn spawn_auto_embed_daemon(path: PathBuf) {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let path = path.clone();
+            let identity = identity.clone();
             let base_url = base_url.clone();
             let model = model.clone();
             // Do the SQLite + embedding work off the async runtime: this opens its
             // OWN WAL connection (concurrent with the main store) and blocks on
             // Ollama HTTP, so it must not run on a tokio worker thread.
             let embedded = tokio::task::spawn_blocking(move || {
-                let store = match MemoryStore::open(&path) {
+                let store = match MemoryStore::open_project(&identity) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("auto-embed: open store failed: {e}");

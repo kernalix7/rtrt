@@ -52,7 +52,7 @@ pub(crate) fn require_prompts(
 }
 
 pub(crate) async fn list_prompts(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
 ) -> std::result::Result<Json<Vec<PromptSummary>>, (StatusCode, String)> {
     let reg = require_prompts(&state)?;
     let names = reg
@@ -74,7 +74,7 @@ pub(crate) async fn list_prompts(
 }
 
 pub(crate) async fn list_prompt_versions(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     AxPath(name): AxPath<String>,
 ) -> std::result::Result<Json<PromptSummary>, (StatusCode, String)> {
     let reg = require_prompts(&state)?;
@@ -93,7 +93,7 @@ pub(crate) async fn list_prompt_versions(
 }
 
 pub(crate) async fn get_prompt(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     AxPath((name, version)): AxPath<(String, u32)>,
 ) -> std::result::Result<Json<Prompt>, (StatusCode, String)> {
     let reg = require_prompts(&state)?;

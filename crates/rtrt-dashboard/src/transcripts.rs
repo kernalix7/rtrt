@@ -22,11 +22,13 @@
 //! UserPromptSubmit hooks don't get duplicated.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rtrt_memory::{MemoryStore, is_synthetic_prompt};
+use rtrt_memory::{InvocationProvenance, MemoryStore, is_synthetic_prompt};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
@@ -34,6 +36,51 @@ use walkdir::WalkDir;
 /// Polling interval. Cheap — the hot path is reading appended bytes off a few
 /// JSONL files, not walking the whole tree (mtime check filters out idle ones).
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_ENTRIES_PER_SWEEP: usize = 4096;
+const MAX_FILES_PER_SWEEP: usize = 512;
+const MAX_READ_PER_FILE: u64 = 1024 * 1024;
+const MAX_JSONL_LINE: usize = 256 * 1024;
+const MAX_ATTRIBUTION_BYTES: u64 = 256 * 1024;
+const MAX_ATTRIBUTION_FILES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                created: metadata.created().ok(),
+                modified: metadata.modified().ok(),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FileCursor {
+    offset: u64,
+    discarding_oversized_line: bool,
+    identity: FileIdentity,
+}
 
 /// Boot migration: re-home every transcript row onto the project of its
 /// `<encoded>` dir (Claude Code's per-project session dir), folding rows that a
@@ -41,7 +88,10 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 /// agent-*, p<n>-*) back under their real project. No name patterns — purely
 /// the file's encoded dir. Idempotent: a settled row is skipped, so the work
 /// shrinks to zero across runs.
-pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
+pub fn spawn_reattribution(
+    memory: Option<Arc<Mutex<MemoryStore>>>,
+    identity: Arc<rtrt_core::ProjectIdentity>,
+) {
     let Some(memory) = memory else { return };
     tokio::spawn(async move {
         let candidates = {
@@ -67,21 +117,28 @@ pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
         let mut cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut moved = 0usize;
         let mut tagged = 0usize;
-        for (id, tf, project, source_kind) in candidates {
+        for (id, tf, project, source_kind, session_id, parent_session_id) in candidates {
+            if project != identity.slug() || !transcript_matches(Path::new(&tf), &base, &identity) {
+                continue;
+            }
             let is_subagent = tf.contains("/subagents/");
             let kind = if is_subagent { "subagent" } else { "main" };
-            let resolved = project_for_transcript(Path::new(&tf), &base, &mut cache);
-            let move_to = match &resolved {
-                Some(p) if *p != project => Some(p.as_str()),
-                _ => None,
+            let provenance = {
+                let guard = memory.lock().await;
+                provenance_for_sessions(&guard, session_id.as_deref(), parent_session_id.as_deref())
             };
-            // Skip the row entirely when it's already in the right project and
-            // already classified — no wasted UPDATE on a settled store.
-            if move_to.is_none() && source_kind.as_deref() == Some(kind) {
+            let _ = project_for_transcript(Path::new(&tf), &base, &mut cache);
+            let move_to: Option<&str> = None;
+            // Skip a settled row only when there is no durable provenance
+            // metadata left to merge.
+            if move_to.is_none() && source_kind.as_deref() == Some(kind) && provenance.is_none() {
                 continue;
             }
             let guard = memory.lock().await;
-            if guard.reattribute(id, kind, move_to).is_ok() {
+            if guard
+                .reattribute_with_provenance(id, kind, move_to, provenance.as_ref())
+                .is_ok()
+            {
                 tagged += 1;
                 if move_to.is_some() {
                     moved += 1;
@@ -96,7 +153,10 @@ pub fn spawn_reattribution(memory: Option<Arc<Mutex<MemoryStore>>>) {
 
 /// Spawn the transcript watcher as a background task. No-op when `memory` is
 /// `None` (memory disabled at the dashboard level).
-pub fn spawn_transcript_watcher(memory: Option<Arc<Mutex<MemoryStore>>>) {
+pub fn spawn_transcript_watcher(
+    memory: Option<Arc<Mutex<MemoryStore>>>,
+    identity: Arc<rtrt_core::ProjectIdentity>,
+) {
     let Some(memory) = memory else {
         tracing::info!("transcript watcher disabled (memory store not available)");
         return;
@@ -119,12 +179,12 @@ pub fn spawn_transcript_watcher(memory: Option<Arc<Mutex<MemoryStore>>>) {
     }
     tracing::info!("transcript watcher on: {}", base.display());
     tokio::spawn(async move {
-        let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
+        let mut offsets: HashMap<PathBuf, FileCursor> = HashMap::new();
         let mut proj_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut tick = tokio::time::interval(DEFAULT_INTERVAL);
         loop {
             tick.tick().await;
-            if let Err(e) = sweep(&base, &memory, &mut offsets, &mut proj_cache).await {
+            if let Err(e) = sweep(&base, &memory, &mut offsets, &mut proj_cache, &identity).await {
                 tracing::warn!("transcript sweep failed: {e}");
             }
         }
@@ -141,66 +201,244 @@ fn transcripts_base_dir() -> Option<PathBuf> {
 async fn sweep(
     base: &Path,
     memory: &Arc<Mutex<MemoryStore>>,
-    offsets: &mut HashMap<PathBuf, u64>,
+    offsets: &mut HashMap<PathBuf, FileCursor>,
     proj_cache: &mut HashMap<PathBuf, Option<String>>,
+    identity: &rtrt_core::ProjectIdentity,
 ) -> anyhow::Result<()> {
     let files: Vec<PathBuf> = WalkDir::new(base)
+        .max_depth(4)
+        .follow_links(false)
         .into_iter()
+        .take(MAX_ENTRIES_PER_SWEEP)
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .map(|e| e.into_path())
+        .take(MAX_FILES_PER_SWEEP)
         .collect();
 
+    // Prevent churn in the watched tree from growing cursor/cache state forever.
+    offsets.retain(|path, _| files.contains(path));
+    proj_cache.retain(|dir, _| files.iter().any(|path| path.starts_with(dir)));
+
     for path in files {
-        let len = match std::fs::metadata(&path).map(|m| m.len()) {
-            Ok(n) => n,
+        let (mut file, opened_identity, len) = match open_regular_file(&path) {
+            Ok(opened) => opened,
             Err(_) => continue,
         };
-        let start = offsets.get(&path).copied().unwrap_or(0);
-        // File truncated / rotated — restart from the top.
-        let start = if len < start { 0 } else { start };
+        if !transcript_matches(&path, base, identity) {
+            continue;
+        }
+        let previous = offsets.get(&path).copied();
+        let reset =
+            previous.is_none_or(|cursor| cursor.identity != opened_identity || len < cursor.offset);
+        let mut cursor = if reset {
+            FileCursor {
+                offset: 0,
+                discarding_oversized_line: false,
+                identity: opened_identity,
+            }
+        } else {
+            previous.expect("checked above")
+        };
+        let start = cursor.offset;
         if len == start {
             continue;
         }
-        let new_bytes = match read_range(&path, start, len) {
+        let end = len.min(start.saturating_add(MAX_READ_PER_FILE));
+        let new_bytes = match read_range(&mut file, start, end) {
             Ok(b) => b,
             Err(_) => continue,
         };
         // Resolve the project from the file's `<encoded>` dir (the real project,
         // worktree-stable), computed once per file and cached per encoded dir.
         let resolved_project = project_for_transcript(&path, base, proj_cache);
+        // Attribution inspected path names. Ensure path still names exact file
+        // opened above before any bytes from that handle can be accepted.
+        if !opened_file_is_current(&path, opened_identity) {
+            offsets.remove(&path);
+            continue;
+        }
         // Track the offset of the *last full* line so we resume cleanly even
         // when the writer is mid-write at the EOF (partial trailing line).
         let mut consumed = start;
         for line in new_bytes.split_inclusive(|&b| b == b'\n') {
-            if !line.ends_with(b"\n") {
-                break; // partial line — wait for next sweep
+            let next_offset = consumed + line.len() as u64;
+            if cursor.discarding_oversized_line {
+                consumed = next_offset;
+                if line.ends_with(b"\n") {
+                    cursor.discarding_oversized_line = false;
+                }
+                continue;
             }
-            consumed += line.len() as u64;
+            if !line.ends_with(b"\n") {
+                if line.len() > MAX_JSONL_LINE {
+                    // Consume bounded chunks until newline. This hostile line
+                    // is never parsed and cannot pin cursor at its beginning.
+                    cursor.discarding_oversized_line = true;
+                    consumed = next_offset;
+                }
+                break;
+            }
+            if line.len() - 1 > MAX_JSONL_LINE {
+                consumed = next_offset;
+                continue;
+            }
             // Strip the trailing newline before parsing.
             let s = match std::str::from_utf8(&line[..line.len() - 1]) {
                 Ok(s) if !s.trim().is_empty() => s,
-                _ => continue,
+                _ => {
+                    consumed = next_offset;
+                    continue;
+                }
             };
-            if let Some(turn) = parse_line(s, &path, resolved_project.as_deref()) {
-                if let Err(e) = save_turn(memory, &turn).await {
+            if let Some(mut turn) = parse_line(s, &path, resolved_project.as_deref()) {
+                turn.project = identity.slug().to_string();
+                if let Err(e) = save_turn(memory, &turn, identity.slug()).await {
                     tracing::warn!("transcript save {}: {e}", path.display());
+                    // Keep the failed line pending. Advancing here silently
+                    // loses it when another writer holds SQLite past the busy
+                    // timeout.
+                    break;
                 }
             }
+            consumed = next_offset;
         }
-        offsets.insert(path, consumed);
+        cursor.offset = consumed;
+        offsets.insert(path, cursor);
     }
     Ok(())
 }
 
-fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
+fn transcript_matches(file: &Path, base: &Path, identity: &rtrt_core::ProjectIdentity) -> bool {
+    let Some(encoded) = file
+        .strip_prefix(base)
+        .ok()
+        .and_then(|path| path.components().next())
+    else {
+        return false;
+    };
+    let encoded_dir = base.join(encoded.as_os_str());
+    let Ok(entries) = std::fs::read_dir(encoded_dir) else {
+        return false;
+    };
+    let mut sessions: Vec<_> = entries
+        .take(MAX_ATTRIBUTION_FILES)
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_regular_nonsymlink(path))
+        .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
+        .collect();
+    sessions.sort();
+    sessions
+        .into_iter()
+        .filter_map(|path| first_cwd_in(&path))
+        .any(|cwd| {
+            rtrt_core::ProjectIdentity::derive(cwd)
+                .is_ok_and(|candidate| candidate.fingerprint() == identity.fingerprint())
+        })
+}
+
+/// External `claude -p` lanes launched by OpenCode may run from a disposable
+/// `/tmp/opencode/<project>-<lane>` directory. Once that directory disappears,
+/// Git-root attribution can only see the lane basename. Fold only this explicit
+/// transcript shape onto an already-known scoped project (`00G_oxrdp`, etc.)
+/// whose stem is an exact lane-name prefix.
+#[cfg(test)]
+fn canonical_project_for_opencode_temp(
+    file: &Path,
+    base: &Path,
+    current: &str,
+    known_projects: &[String],
+) -> String {
+    let is_opencode_temp = file
+        .strip_prefix(base)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|encoded| encoded.starts_with("-tmp-opencode-"));
+    if !is_opencode_temp {
+        return current.to_string();
+    }
+
+    let lane = normalize_project_stem(current);
+    let mut best: Option<(&str, usize)> = None;
+    let mut ambiguous = false;
+    for project in known_projects {
+        let Some(stem) = scoped_project_stem(project) else {
+            continue;
+        };
+        if lane != stem && !lane.starts_with(&format!("{stem}-")) {
+            continue;
+        }
+        match best {
+            Some((_, length)) if stem.len() < length => {}
+            Some((_, length)) if stem.len() == length => ambiguous = true,
+            _ => {
+                best = Some((project, stem.len()));
+                ambiguous = false;
+            }
+        }
+    }
+    match (best, ambiguous) {
+        (Some((project, _)), false) => project.to_string(),
+        _ => current.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn scoped_project_stem(project: &str) -> Option<String> {
+    let (scope, name) = project.split_once('_')?;
+    if scope.len() < 2
+        || name.is_empty()
+        || !scope.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        || !scope.as_bytes().iter().skip(2).all(u8::is_ascii_uppercase)
+    {
+        return None;
+    }
+    Some(normalize_project_stem(name))
+}
+
+#[cfg(test)]
+fn normalize_project_stem(project: &str) -> String {
+    project.replace('_', "-").to_ascii_lowercase()
+}
+
+fn read_range(f: &mut File, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     f.seek(SeekFrom::Start(start))?;
     let mut buf = vec![0u8; (end - start) as usize];
     f.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn is_regular_nonsymlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn open_regular_file(path: &Path) -> std::io::Result<(File, FileIdentity, u64)> {
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transcript path is not a regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    let identity = FileIdentity::from_metadata(&opened_metadata);
+    if !opened_metadata.is_file() || identity != FileIdentity::from_metadata(&path_metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transcript changed while opening",
+        ));
+    }
+    Ok((file, identity, opened_metadata.len()))
+}
+
+fn opened_file_is_current(path: &Path, identity: FileIdentity) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file() && FileIdentity::from_metadata(&metadata) == identity
+    })
 }
 
 /// A single capturable transcript line — either an assistant/teammate turn or
@@ -260,9 +498,11 @@ fn project_for_transcript(
 fn representative_project(encoded_dir: &Path) -> Option<String> {
     let rd = std::fs::read_dir(encoded_dir).ok()?;
     let mut sessions: Vec<PathBuf> = rd
+        .take(MAX_ATTRIBUTION_FILES)
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .filter(|p| is_regular_nonsymlink(p))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .collect();
     sessions.sort();
     for s in &sessions {
@@ -312,10 +552,16 @@ fn fallback_capture_bucket(session_id: &str, agent_id: Option<&str>) -> String {
 
 /// Read the first `cwd` field from a transcript file (scanning the first lines).
 fn first_cwd_in(jsonl: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader};
-    let f = std::fs::File::open(jsonl).ok()?;
-    for line in BufReader::new(f).lines().map_while(Result::ok).take(50) {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+    let (mut file, identity, len) = open_regular_file(jsonl).ok()?;
+    let bytes = read_range(&mut file, 0, len.min(MAX_ATTRIBUTION_BYTES)).ok()?;
+    if !opened_file_is_current(jsonl, identity) {
+        return None;
+    }
+    for line in bytes.split_inclusive(|byte| *byte == b'\n').take(50) {
+        if !line.ends_with(b"\n") || line.len() - 1 > MAX_JSONL_LINE {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len() - 1]) {
             if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
                 return Some(c.to_string());
             }
@@ -516,20 +762,21 @@ fn parse_line(line: &str, file: &Path, resolved_project: Option<&str>) -> Option
     }
 }
 
-async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &Turn) -> anyhow::Result<()> {
+async fn save_turn(
+    memory: &Arc<Mutex<MemoryStore>>,
+    t: &Turn,
+    pinned_project: &str,
+) -> anyhow::Result<()> {
     let sha = rtrt_memory::MemoryStore::body_sha(&t.text);
     let guard = memory.lock().await;
+    let provenance = turn_provenance(&guard, t);
+    let project = pinned_project;
     // Dedup against everything already in this project's bucket — e.g. the
     // live UserPromptSubmit hook and the SessionStart / Stop / SubagentStop
     // hooks already cover a lot of this ground, so the watcher only adds what
     // they miss (backfilled transcripts, subagent transcripts) without
     // doubling up on what's already there.
-    if guard
-        .body_seen_at(&t.project, &sha)
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if guard.body_seen_at(project, &sha).ok().flatten().is_some() {
         return Ok(());
     }
     let mut meta: BTreeMap<String, String> = BTreeMap::new();
@@ -552,18 +799,118 @@ async fn save_turn(memory: &Arc<Mutex<MemoryStore>>, t: &Turn) -> anyhow::Result
     if let Some(s) = &t.slug {
         meta.insert("slug".into(), s.clone());
     }
+    if let Some(value) = &provenance {
+        meta.insert("invocation_id".into(), value.invocation_id.clone());
+        if let Some(parent) = &value.parent_session_id {
+            meta.insert("parent_session_id".into(), parent.clone());
+        }
+        if let Some(call) = &value.parent_call_id {
+            meta.insert("parent_call_id".into(), call.clone());
+        }
+        if let Some(agent) = &value.caller_agent {
+            meta.insert("caller_agent".into(), agent.clone());
+        }
+        if let Some(target) = &value.target {
+            meta.insert("child_target".into(), target.clone());
+        }
+        if let Some(model) = &value.model {
+            meta.insert("child_model".into(), model.clone());
+        }
+    }
     meta.insert(
         "transcript_file".into(),
         t.file.to_string_lossy().into_owned(),
     );
-    let id = guard.save_with_metadata(&t.project, t.kind, &t.text, &meta)?;
+    let id = guard.save_with_metadata(project, t.kind, &t.text, &meta)?;
     let _ = guard.tag_row(id, Some(&t.session_id), Some(&sha));
     Ok(())
+}
+
+fn turn_provenance(store: &MemoryStore, turn: &Turn) -> Option<InvocationProvenance> {
+    provenance_for_sessions(
+        store,
+        Some(&turn.session_id),
+        turn.parent_session.as_deref(),
+    )
+}
+
+fn provenance_for_sessions(
+    store: &MemoryStore,
+    child_session_id: Option<&str>,
+    parent_session_id: Option<&str>,
+) -> Option<InvocationProvenance> {
+    [child_session_id, parent_session_id]
+        .into_iter()
+        .flatten()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .find_map(|session_id| store.invocation_provenance(session_id).ok().flatten())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SweepFixture {
+        _temp: tempfile::TempDir,
+        base: PathBuf,
+        transcript: PathBuf,
+        identity: rtrt_core::ProjectIdentity,
+        memory: Arc<Mutex<MemoryStore>>,
+        offsets: HashMap<PathBuf, FileCursor>,
+        cache: HashMap<PathBuf, Option<String>>,
+    }
+
+    impl SweepFixture {
+        fn new(initial: &[u8]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            let base = temp.path().join("claude-projects");
+            let encoded = base.join("encoded");
+            std::fs::create_dir_all(&encoded).unwrap();
+            std::fs::write(
+                encoded.join("000-attribution.jsonl"),
+                serde_json::json!({"cwd": project}).to_string() + "\n",
+            )
+            .unwrap();
+            let transcript = encoded.join("session.jsonl");
+            std::fs::write(&transcript, initial).unwrap();
+            let identity = rtrt_core::ProjectIdentity::derive(&project).unwrap();
+            let store = MemoryStore::open(temp.path().join("memory.sqlite")).unwrap();
+            Self {
+                _temp: temp,
+                base,
+                transcript,
+                identity,
+                memory: Arc::new(Mutex::new(store)),
+                offsets: HashMap::new(),
+                cache: HashMap::new(),
+            }
+        }
+
+        async fn sweep(&mut self) {
+            sweep(
+                &self.base,
+                &self.memory,
+                &mut self.offsets,
+                &mut self.cache,
+                &self.identity,
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn bodies(&self) -> Vec<String> {
+            self.memory
+                .lock()
+                .await
+                .list_by_project(self.identity.slug(), 20)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.body)
+                .collect()
+        }
+    }
 
     fn subagent_line(session_id: &str, agent_id: Option<&str>, cwd: Option<&str>) -> String {
         serde_json::json!({
@@ -663,6 +1010,31 @@ mod tests {
         assert!(rtrt_memory::is_capture_bucket_name(&unknown_everything));
     }
 
+    #[test]
+    fn opencode_temp_lane_folds_to_the_longest_scoped_project_stem() {
+        let base = Path::new("/home/u/.claude/projects");
+        let file = base.join("-tmp-opencode-oxrdp-planar-sol/session.jsonl");
+        let projects = vec![
+            "00G_oxrdp".to_string(),
+            "00G_oxrdp-tools".to_string(),
+            "oxrdp-planar-sol".to_string(),
+        ];
+
+        assert_eq!(
+            canonical_project_for_opencode_temp(&file, base, "oxrdp-planar-sol", &projects),
+            "00G_oxrdp"
+        );
+        assert_eq!(
+            canonical_project_for_opencode_temp(
+                &base.join("-home-u-project/session.jsonl"),
+                base,
+                "oxrdp-planar-sol",
+                &projects
+            ),
+            "oxrdp-planar-sol"
+        );
+    }
+
     /// When capture-time resolution genuinely can't determine a project (no
     /// encoded-dir project AND no resolvable line cwd), the turn must still
     /// be captured — never silently dropped — and land somewhere the orphan
@@ -745,6 +1117,100 @@ mod tests {
         assert_eq!(turn.text, "here's the fix");
     }
 
+    #[test]
+    fn transcript_directory_fingerprint_rejects_same_basename_spoof() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("one").join("repo");
+        let foreign = temp.path().join("two").join("repo");
+        std::fs::create_dir_all(current.join(".git")).unwrap();
+        std::fs::create_dir_all(foreign.join(".git")).unwrap();
+        let base = temp.path().join("claude-projects");
+        let encoded = base.join("encoded-foreign");
+        std::fs::create_dir_all(&encoded).unwrap();
+        let transcript = encoded.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({"cwd": foreign, "type": "user", "message": {"content": "spoof"}})
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let identity = rtrt_core::ProjectIdentity::derive(current).unwrap();
+        assert!(!transcript_matches(&transcript, &base, &identity));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_swapped_transcripts_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real.jsonl");
+        let link = temp.path().join("link.jsonl");
+        std::fs::write(&real, b"{}\n").unwrap();
+        symlink(&real, &link).unwrap();
+        assert!(open_regular_file(&link).is_err());
+
+        let (_, identity, _) = open_regular_file(&real).unwrap();
+        let replacement = temp.path().join("replacement.jsonl");
+        std::fs::write(&replacement, b"{}\n").unwrap();
+        std::fs::rename(&replacement, &real).unwrap();
+        assert!(!opened_file_is_current(&real, identity));
+    }
+
+    #[tokio::test]
+    async fn normal_incremental_capture_waits_for_complete_lines() {
+        let mut fixture = SweepFixture::new(b"");
+        let first = user_text_line("sess-1", None, "one");
+        std::fs::write(&fixture.transcript, first.as_bytes()).unwrap();
+        fixture.sweep().await;
+        assert!(fixture.bodies().await.is_empty());
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.transcript)
+            .unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "{}", user_text_line("sess-1", None, "two")).unwrap();
+        fixture.sweep().await;
+        let bodies = fixture.bodies().await;
+        assert!(bodies.contains(&"one".to_string()));
+        assert!(bodies.contains(&"two".to_string()));
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_skipped_and_cannot_stall_following_capture() {
+        let mut bytes = vec![b'x'; MAX_READ_PER_FILE as usize + MAX_JSONL_LINE];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(user_text_line("sess-1", None, "after giant").as_bytes());
+        bytes.push(b'\n');
+        let mut fixture = SweepFixture::new(&bytes);
+
+        fixture.sweep().await;
+        let first_offset = fixture.offsets[&fixture.transcript].offset;
+        assert_eq!(first_offset, MAX_READ_PER_FILE);
+        assert!(fixture.bodies().await.is_empty());
+        fixture.sweep().await;
+        assert_eq!(fixture.bodies().await, vec!["after giant"]);
+    }
+
+    #[tokio::test]
+    async fn truncation_resets_cursor_without_parsing_old_partial_bytes() {
+        let initial = format!("{}\n", user_text_line("sess-1", None, "before"));
+        let mut fixture = SweepFixture::new(initial.as_bytes());
+        fixture.sweep().await;
+        std::fs::write(
+            &fixture.transcript,
+            format!("{}\n", user_text_line("sess-2", None, "new")),
+        )
+        .unwrap();
+        fixture.sweep().await;
+        let bodies = fixture.bodies().await;
+        assert!(bodies.contains(&"before".to_string()));
+        assert!(bodies.contains(&"new".to_string()));
+    }
+
     #[tokio::test]
     async fn duplicate_body_in_same_project_is_saved_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -763,10 +1229,10 @@ mod tests {
             source_kind: "main",
         };
 
-        save_turn(&memory, &turn)
+        save_turn(&memory, &turn, "00G_rtrt")
             .await
             .expect("first save succeeds");
-        save_turn(&memory, &turn)
+        save_turn(&memory, &turn, "00G_rtrt")
             .await
             .expect("second save succeeds");
 
@@ -777,5 +1243,89 @@ mod tests {
         assert_eq!(rows.len(), 1, "the same body must dedup to a single row");
         assert_eq!(rows[0].kind, "user-prompt-submit");
         assert_eq!(rows[0].body, turn.text);
+    }
+
+    #[tokio::test]
+    async fn durable_provenance_overrides_transcript_path_attribution() {
+        let store = MemoryStore::open_in_memory().expect("open memory store");
+        store
+            .upsert_invocation_provenance(&InvocationProvenance {
+                child_session_id: "child-session".into(),
+                invocation_id: "invocation-1".into(),
+                parent_project: "00G_rtrt".into(),
+                parent_session_id: Some("opencode-session".into()),
+                parent_call_id: Some("call-1".into()),
+                caller_agent: Some("build".into()),
+                parent_cwd: Some("/tmp/opencode/rtrt-lane".into()),
+                parent_worktree: Some("/repo/00G_rtrt".into()),
+                target: Some("claude".into()),
+                model: Some("sonnet".into()),
+                created_at: 1,
+            })
+            .expect("save provenance");
+        let memory = Arc::new(Mutex::new(store));
+        let turn = Turn {
+            project: "rtrt-lane".into(),
+            text: "child result".into(),
+            session_id: "child-session".into(),
+            parent_session: None,
+            agent_id: None,
+            slug: None,
+            file: PathBuf::from("/home/u/.claude/projects/-tmp-opencode-rtrt-lane/child.jsonl"),
+            kind: "assistant-turn",
+            source_kind: "main",
+        };
+
+        save_turn(&memory, &turn, "00G_rtrt")
+            .await
+            .expect("save attributed turn");
+
+        let guard = memory.lock().await;
+        assert!(guard.list_by_project("rtrt-lane", 10).unwrap().is_empty());
+        let rows = guard.list_by_project("00G_rtrt", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let metadata = guard.get_metadata(rows[0].id).unwrap();
+        assert_eq!(
+            metadata.get("invocation_id").map(String::as_str),
+            Some("invocation-1")
+        );
+        assert_eq!(
+            metadata.get("caller_agent").map(String::as_str),
+            Some("build")
+        );
+    }
+
+    #[test]
+    fn provenance_lookup_prefers_child_then_falls_back_to_stored_parent() {
+        let store = MemoryStore::open_in_memory().expect("open memory store");
+        let provenance = |child: &str, project: &str| InvocationProvenance {
+            child_session_id: child.into(),
+            invocation_id: format!("invocation-{child}"),
+            parent_project: project.into(),
+            parent_session_id: None,
+            parent_call_id: None,
+            caller_agent: None,
+            parent_cwd: None,
+            parent_worktree: None,
+            target: Some("claude".into()),
+            model: None,
+            created_at: 1,
+        };
+        store
+            .upsert_invocation_provenance(&provenance("parent-session", "parent-project"))
+            .unwrap();
+
+        let fallback =
+            provenance_for_sessions(&store, Some("missing-child"), Some("parent-session"))
+                .expect("parent fallback");
+        assert_eq!(fallback.parent_project, "parent-project");
+
+        store
+            .upsert_invocation_provenance(&provenance("child-session", "child-project"))
+            .unwrap();
+        let preferred =
+            provenance_for_sessions(&store, Some("child-session"), Some("parent-session"))
+                .expect("child provenance");
+        assert_eq!(preferred.parent_project, "child-project");
     }
 }

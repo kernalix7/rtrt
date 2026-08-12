@@ -37,11 +37,19 @@ use crate::prelude::*;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ConfigResponse {
+    dashboard: rtrt_core::config::DashboardConfig,
+    providers: rtrt_core::config::ProvidersConfig,
     capture: rtrt_core::config::CaptureConfig,
     auto_compress: rtrt_core::config::AutoCompressConfig,
     embeddings: rtrt_core::config::EmbeddingsConfig,
     security: rtrt_core::config::SecurityConfig,
     path: String,
+    scope: &'static str,
+    restart_required_fields: Vec<&'static str>,
+    dashboard_effective: serde_json::Value,
+    capture_effective: serde_json::Value,
+    embeddings_effective: serde_json::Value,
+    provider_runtime: serde_json::Value,
 }
 
 pub(crate) async fn get_config() -> std::result::Result<Json<ConfigResponse>, (StatusCode, String)>
@@ -51,12 +59,93 @@ pub(crate) async fn get_config() -> std::result::Result<Json<ConfigResponse>, (S
     let path = rtrt_core::Config::default_path()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let effective_bind =
+        std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| cfg.dashboard.bind.clone());
+    let bind_source = if std::env::var_os("RTRT_DASHBOARD_BIND").is_some() {
+        "RTRT_DASHBOARD_BIND"
+    } else {
+        "config"
+    };
+    let compatible_url = std::env::var("RTRT_OPENAI_COMPAT_URL")
+        .or_else(|_| std::env::var("RTRT_PROVIDER_BASE_URL"))
+        .ok()
+        .or_else(|| cfg.auto_compress.base_url.clone());
+    let runtime = compatible_url
+        .as_deref()
+        .map(|url| cfg.auto_compress.effective_provider(url))
+        .unwrap_or_else(|| "provider gateway".to_string());
+    let configured_bind = cfg.dashboard.bind.clone();
+    let capture_enabled = std::env::var("RTRT_AUTO_CAPTURE")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(cfg.capture.enabled);
+    let capture_redact = std::env::var("RTRT_AUTO_REDACT")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(cfg.capture.redact);
+    let capture_dedup = std::env::var("RTRT_AUTO_DEDUP_WINDOW_SEC")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(cfg.capture.dedup_window_sec);
+    let embed_url = cfg
+        .embeddings
+        .resolved_base_url(cfg.auto_compress.base_url.as_deref());
+    let embed_model = cfg.embeddings.effective_model();
+    let embed_enabled = cfg.embeddings.is_enabled();
+    let effective_api_max_tokens = cfg.providers.effective_api_max_tokens();
+    let api_max_tokens_source = if std::env::var_os("RTRT_API_MAX_TOKENS").is_some() {
+        "RTRT_API_MAX_TOKENS"
+    } else if cfg.providers.api_max_tokens.is_some() {
+        "config"
+    } else {
+        "default"
+    };
     Ok(Json(ConfigResponse {
+        dashboard: cfg.dashboard,
+        providers: cfg.providers,
         capture: cfg.capture,
         auto_compress: cfg.auto_compress,
         embeddings: cfg.embeddings,
         security: cfg.security,
         path,
+        scope: "global",
+        restart_required_fields: vec![
+            "dashboard.bind",
+            "capture.enabled",
+            "capture.redact",
+            "capture.dedup_window_sec",
+            "auto_compress.*",
+            "embeddings.*",
+        ],
+        dashboard_effective: serde_json::json!({
+            "bind": effective_bind,
+            "source": bind_source,
+            "configured_bind": configured_bind,
+            "restart_required": true,
+        }),
+        capture_effective: serde_json::json!({
+            "enabled": capture_enabled,
+            "redact": capture_redact,
+            "dedup_window_sec": capture_dedup,
+            "source": if std::env::var_os("RTRT_AUTO_CAPTURE").is_some()
+                || std::env::var_os("RTRT_AUTO_REDACT").is_some()
+                || std::env::var_os("RTRT_AUTO_DEDUP_WINDOW_SEC").is_some() { "environment/config" } else { "config" },
+            "restart_required": true,
+        }),
+        embeddings_effective: serde_json::json!({
+            "enabled": embed_enabled,
+            "model": embed_model,
+            "base_url": embed_url,
+            "source": if std::env::var_os("RTRT_EMBED_ENABLED").is_some()
+                || std::env::var_os("RTRT_EMBED_MODEL").is_some()
+                || std::env::var_os("RTRT_EMBED_BASE_URL").is_some() { "environment/config" } else { "config" },
+            "restart_required": true,
+        }),
+        provider_runtime: serde_json::json!({
+            "provider": runtime,
+            "transport": if compatible_url.is_some() { "openai-compatible" } else { "provider-native" },
+            "base_url": compatible_url,
+            "api_max_tokens": effective_api_max_tokens,
+            "api_max_tokens_source": api_max_tokens_source,
+        }),
     }))
 }
 
@@ -66,15 +155,62 @@ pub(crate) async fn get_config() -> std::result::Result<Json<ConfigResponse>, (S
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConfigWriteRequest {
-    capture: rtrt_core::config::CaptureConfig,
-    auto_compress: rtrt_core::config::AutoCompressConfig,
-    /// Optional so older dashboard builds (no embeddings UI) still POST cleanly;
-    /// when absent the on-disk embeddings section is preserved untouched.
     #[serde(default)]
-    embeddings: Option<rtrt_core::config::EmbeddingsConfig>,
-    /// Optional global security defaults (default profile). Preserved when absent.
+    capture: Option<CapturePatch>,
     #[serde(default)]
-    security: Option<rtrt_core::config::SecurityConfig>,
+    auto_compress: Option<AutoCompressPatch>,
+    #[serde(default)]
+    embeddings: Option<EmbeddingsPatch>,
+    #[serde(default)]
+    security: Option<SecurityPatch>,
+    #[serde(default)]
+    dashboard: Option<DashboardPatch>,
+    #[serde(default)]
+    providers: Option<ProvidersPatch>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CapturePatch {
+    enabled: Option<bool>,
+    redact: Option<bool>,
+    dedup_window_sec: Option<i64>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct AutoCompressPatch {
+    enabled: Option<bool>,
+    model: Option<String>,
+    #[serde(default)]
+    base_url: crate::util::JsonPatch<String>,
+    #[serde(default)]
+    provider: crate::util::JsonPatch<String>,
+    interval_sec: Option<u64>,
+    age_sec: Option<i64>,
+    min_chars: Option<usize>,
+    batch: Option<usize>,
+    max_tokens: Option<u32>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct EmbeddingsPatch {
+    enabled: Option<bool>,
+    model: Option<String>,
+    #[serde(default)]
+    base_url: crate::util::JsonPatch<String>,
+    auto: Option<bool>,
+    auto_interval_sec: Option<u64>,
+    auto_batch: Option<usize>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct SecurityPatch {
+    default_profile: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct DashboardPatch {
+    bind: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+struct ProvidersPatch {
+    #[serde(default)]
+    api_max_tokens: crate::util::JsonPatch<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,57 +222,107 @@ pub(crate) struct ConfigWriteResponse {
 pub(crate) async fn post_config(
     Json(req): Json<ConfigWriteRequest>,
 ) -> std::result::Result<Json<ConfigWriteResponse>, (StatusCode, String)> {
-    // Build an updated Config preserving any non-exposed fields from disk.
-    let mut cfg = rtrt_core::Config::load()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    cfg.capture = req.capture;
-    cfg.auto_compress = req.auto_compress;
-    if let Some(emb) = req.embeddings {
-        cfg.embeddings = emb;
-    }
-    if let Some(sec) = req.security {
-        cfg.security = sec;
-    }
-
-    let path = rtrt_core::Config::default_path().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "cannot determine config path".into(),
-    ))?;
-
-    // Create parent directory if needed.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("create dir {}: {e}", parent.display()),
-            )
-        })?;
-    }
-
-    // Back up the existing file before overwriting.
-    if path.exists() {
-        let bak = path.with_extension("toml.bak");
-        std::fs::copy(&path, &bak).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("backup {}: {e}", path.display()),
-            )
-        })?;
-    }
-
-    let toml_str = toml::to_string_pretty(&cfg)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    std::fs::write(&path, toml_str).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write {}: {e}", path.display()),
-        )
+    let (_, path) = crate::util::update_config_file(|cfg| {
+        if let Some(p) = req.capture {
+            apply_capture(&mut cfg.capture, p);
+        }
+        if let Some(p) = req.auto_compress {
+            apply_auto_compress(&mut cfg.auto_compress, p);
+        }
+        if let Some(p) = req.embeddings {
+            apply_embeddings(&mut cfg.embeddings, p);
+        }
+        if let Some(p) = req.security.and_then(|p| p.default_profile) {
+            cfg.security.default_profile = p;
+        }
+        if let Some(p) = req.dashboard.and_then(|p| p.bind) {
+            cfg.dashboard.bind = p;
+        }
+        if let Some(p) = req.providers {
+            match p.api_max_tokens {
+                crate::util::JsonPatch::Missing => {}
+                crate::util::JsonPatch::Null => cfg.providers.api_max_tokens = None,
+                crate::util::JsonPatch::Value(value) if value > 0 => {
+                    cfg.providers.api_max_tokens = Some(value)
+                }
+                crate::util::JsonPatch::Value(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "providers.api_max_tokens must be greater than zero".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     })?;
 
-    Ok(Json(ConfigWriteResponse {
-        ok: true,
-        path: path.to_string_lossy().into_owned(),
-    }))
+    Ok(Json(ConfigWriteResponse { ok: true, path }))
+}
+
+fn apply_capture(c: &mut rtrt_core::config::CaptureConfig, p: CapturePatch) {
+    if let Some(v) = p.enabled {
+        c.enabled = v;
+    }
+    if let Some(v) = p.redact {
+        c.redact = v;
+    }
+    if let Some(v) = p.dedup_window_sec {
+        c.dedup_window_sec = v;
+    }
+}
+fn apply_auto_compress(c: &mut rtrt_core::config::AutoCompressConfig, p: AutoCompressPatch) {
+    if let Some(v) = p.enabled {
+        c.enabled = v
+    }
+    if let Some(v) = p.model {
+        c.model = v
+    }
+    apply_optional_string(&mut c.base_url, p.base_url);
+    apply_optional_string(&mut c.provider, p.provider);
+    if let Some(v) = p.interval_sec {
+        c.interval_sec = v
+    }
+    if let Some(v) = p.age_sec {
+        c.age_sec = v
+    }
+    if let Some(v) = p.min_chars {
+        c.min_chars = v
+    }
+    if let Some(v) = p.batch {
+        c.batch = v
+    }
+    if let Some(v) = p.max_tokens {
+        c.max_tokens = v
+    }
+}
+fn apply_embeddings(c: &mut rtrt_core::config::EmbeddingsConfig, p: EmbeddingsPatch) {
+    if let Some(v) = p.enabled {
+        c.enabled = v
+    }
+    if let Some(v) = p.model {
+        c.model = v
+    }
+    apply_optional_string(&mut c.base_url, p.base_url);
+    if let Some(v) = p.auto {
+        c.auto = v
+    }
+    if let Some(v) = p.auto_interval_sec {
+        c.auto_interval_sec = v
+    }
+    if let Some(v) = p.auto_batch {
+        c.auto_batch = v
+    }
+}
+fn nonblank(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
+fn apply_optional_string(target: &mut Option<String>, patch: crate::util::JsonPatch<String>) {
+    match patch {
+        crate::util::JsonPatch::Missing => {}
+        crate::util::JsonPatch::Null => *target = None,
+        crate::util::JsonPatch::Value(value) => *target = nonblank(value),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,57 +343,69 @@ pub(crate) struct MemorySettingsResponse {
     /// Memory store path as configured (defaults to the toolkit-wide
     /// `~/.rtrt/memory.sqlite`).
     path: String,
-    embed_model: String,
+    model: String,
     /// Config file the values live in (so the UI can show provenance).
     config_path: String,
+    project_identity: Option<String>,
+    status: &'static str,
+    provenance: &'static str,
+    restart_required: bool,
 }
 
-fn memory_settings_response(cfg: &rtrt_core::Config) -> MemorySettingsResponse {
+fn memory_settings_response(
+    cfg: &rtrt_core::Config,
+    project: Option<&str>,
+) -> MemorySettingsResponse {
     let config_path = rtrt_core::Config::default_path()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let identity = project
+        .and_then(|name| cfg.project(name))
+        .and_then(|entry| entry.path.as_deref())
+        .and_then(|repo| rtrt_core::ProjectIdentity::derive(repo).ok());
+    let path = identity
+        .as_ref()
+        .and_then(|identity| rtrt_core::project_memory_db_path(identity).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Select a registered project with a valid path".to_string());
     MemorySettingsResponse {
-        path: cfg.memory.path.to_string_lossy().into_owned(),
-        embed_model: cfg.memory.embed_model.clone(),
+        path,
+        model: cfg.embeddings.model.clone(),
         config_path,
+        project_identity: identity.map(|identity| identity.slug().to_string()),
+        status: "strict-project-isolation",
+        provenance: "derived from canonical project identity; repository config ignored",
+        restart_required: true,
     }
 }
 
-pub(crate) async fn get_memory_settings()
--> std::result::Result<Json<MemorySettingsResponse>, (StatusCode, String)> {
+pub(crate) async fn get_memory_settings(
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+) -> std::result::Result<Json<MemorySettingsResponse>, (StatusCode, String)> {
+    state.assert_project(q.project.as_deref())?;
     let cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(memory_settings_response(&cfg)))
+    let mut response = memory_settings_response(&cfg, None);
+    response.path = state.memory_path.to_string_lossy().into_owned();
+    response.project_identity = Some(state.project.slug().to_string());
+    Ok(Json(response))
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct SetMemorySettingsRequest {
-    /// New memory store path. Absent/empty keeps the existing path.
-    #[serde(default)]
-    path: Option<String>,
-    /// New embedding model name. Absent/empty keeps the existing model.
-    #[serde(default)]
-    embed_model: Option<String>,
-}
+pub(crate) type SetMemorySettingsRequest = serde_json::Value;
 
 pub(crate) async fn post_memory_settings(
-    Json(req): Json<SetMemorySettingsRequest>,
+    Json(_req): Json<SetMemorySettingsRequest>,
 ) -> std::result::Result<Json<MemorySettingsResponse>, (StatusCode, String)> {
-    let mut cfg = rtrt_core::Config::load()
+    let cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Some(path) = req.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        cfg.memory.path = std::path::PathBuf::from(path);
-    }
-    if let Some(model) = req
-        .embed_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        cfg.memory.embed_model = model.to_string();
-    }
-    write_config_file(&cfg)?;
-    Ok(Json(memory_settings_response(&cfg)))
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "memory.path is derived by strict project isolation and memory.embed_model is deprecated; configure embeddings.model instead ({})",
+            memory_settings_response(&cfg, None).path
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +415,12 @@ pub(crate) async fn post_memory_settings(
 #[derive(Debug, Serialize)]
 pub(crate) struct ModelEntry {
     id: String,
+    upstream_id: String,
+    provider: String,
+    transport: String,
     source: &'static str,
+    available: bool,
+    label: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,54 +430,177 @@ pub(crate) struct ModelsResponse {
 
 pub(crate) async fn get_models() -> Json<ModelsResponse> {
     let cfg = rtrt_core::Config::load().unwrap_or_default();
-    // Derive the Ollama host root: strip a trailing `/v1` (OpenAI-compat
-    // path prefix) and any trailing slash so `/api/tags` lands at the right
-    // place regardless of how base_url was configured.
-    let ollama_host = cfg
-        .auto_compress
-        .base_url
-        .as_deref()
-        .unwrap_or("http://127.0.0.1:11434")
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string();
-
     let mut models: Vec<ModelEntry> = Vec::new();
 
-    // Attempt to list Ollama models; any failure is silently ignored.
-    let ollama_url = format!("{ollama_host}/api/tags");
-    if let Ok(resp) = reqwest::Client::new()
-        .get(&ollama_url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
-        if let Ok(body) = resp.json::<serde_json::Value>().await {
-            if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
-                for m in arr {
-                    if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
-                        models.push(ModelEntry {
-                            id: name.to_string(),
-                            source: "ollama",
-                        });
-                    }
-                }
-            }
+    // Keep the configured choice even when its endpoint is down or the model
+    // has not been pulled. Dashboard refreshes must never reset saved intent.
+    let compatible_base_url = std::env::var("RTRT_OPENAI_COMPAT_URL")
+        .or_else(|_| std::env::var("RTRT_PROVIDER_BASE_URL"))
+        .ok()
+        .or_else(|| cfg.auto_compress.base_url.clone());
+    let configured = configured_model_entry(&cfg, compatible_base_url.as_deref());
+    upsert_model(&mut models, configured);
+
+    if let Some(base_url) = compatible_base_url.as_deref() {
+        let provider = cfg.auto_compress.effective_provider(base_url);
+        for upstream in probe_compatible_models(base_url, &provider).await {
+            upsert_model(
+                &mut models,
+                model_entry_with_transport(&provider, &upstream, "local", true, true),
+            );
         }
     }
 
-    // Always append the cloud defaults.
-    models.push(ModelEntry {
-        id: "claude-haiku-4-5".to_string(),
-        source: "cloud",
-    });
-    models.push(ModelEntry {
-        id: "gpt-5.4-mini".to_string(),
-        source: "cloud",
-    });
+    for (provider, upstream, available) in [
+        (
+            "anthropic",
+            "claude-haiku-4-5",
+            std::env::var_os("ANTHROPIC_API_KEY").is_some(),
+        ),
+        (
+            "openai",
+            "gpt-5.4-mini",
+            std::env::var_os("OPENAI_API_KEY").is_some(),
+        ),
+    ] {
+        upsert_model(
+            &mut models,
+            model_entry(provider, upstream, "cloud", available),
+        );
+    }
 
     Json(ModelsResponse { models })
+}
+
+fn configured_model_entry(
+    cfg: &rtrt_core::Config,
+    compatible_base_url: Option<&str>,
+) -> ModelEntry {
+    let configured = cfg.auto_compress.model.trim();
+    let (provider, upstream) = if let Some((provider, upstream)) = configured.split_once('/') {
+        (
+            rtrt_core::config::normalize_provider_id(provider),
+            upstream.to_string(),
+        )
+    } else if let Some(base_url) = compatible_base_url {
+        (
+            cfg.auto_compress.effective_provider(base_url),
+            configured.to_string(),
+        )
+    } else if configured.starts_with("claude-") {
+        ("anthropic".to_string(), configured.to_string())
+    } else if configured.starts_with("gpt-") || configured.starts_with("o1-") {
+        ("openai".to_string(), configured.to_string())
+    } else {
+        ("openai-compat".to_string(), configured.to_string())
+    };
+    let available = match provider.as_str() {
+        "anthropic" => std::env::var_os("ANTHROPIC_API_KEY").is_some(),
+        "openai" => std::env::var_os("OPENAI_API_KEY").is_some(),
+        _ => false,
+    };
+    model_entry_with_transport(
+        &provider,
+        &upstream,
+        "configured",
+        available,
+        compatible_base_url.is_some(),
+    )
+}
+
+pub(crate) fn model_entry(
+    provider: &str,
+    upstream: &str,
+    source: &'static str,
+    available: bool,
+) -> ModelEntry {
+    model_entry_with_transport(provider, upstream, source, available, false)
+}
+
+pub(crate) fn model_entry_with_transport(
+    provider: &str,
+    upstream: &str,
+    source: &'static str,
+    available: bool,
+    compatible_transport: bool,
+) -> ModelEntry {
+    let provider = rtrt_core::config::normalize_provider_id(provider);
+    let upstream = upstream.trim();
+    let upstream = upstream
+        .split_once('/')
+        .filter(|(prefix, _)| rtrt_core::config::normalize_provider_id(prefix) == provider.as_str())
+        .map_or(upstream, |(_, rest)| rest);
+    let known_compatible = matches!(
+        provider.as_str(),
+        "ollama" | "openai-compat" | "lm-studio" | "llama.cpp" | "vllm"
+    );
+    let transport = match provider.as_str() {
+        "anthropic" => "anthropic",
+        "openai" => "openai",
+        _ if compatible_transport || known_compatible => "openai-compatible",
+        _ => "unknown",
+    };
+    let provider_label = match provider.as_str() {
+        "ollama" => "Ollama (OpenAI-compatible)".to_string(),
+        "openai-compat" => "OpenAI-compatible endpoint".to_string(),
+        "anthropic" => "Anthropic".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "lm-studio" => "LM Studio (OpenAI-compatible)".to_string(),
+        "llama.cpp" => "llama.cpp (OpenAI-compatible)".to_string(),
+        "vllm" => "vLLM (OpenAI-compatible)".to_string(),
+        other if compatible_transport => format!("{other} (OpenAI-compatible)"),
+        other => other.to_string(),
+    };
+    ModelEntry {
+        id: format!("{provider}/{upstream}"),
+        upstream_id: upstream.to_string(),
+        provider,
+        transport: transport.to_string(),
+        source,
+        available,
+        label: format!("{upstream} — {provider_label}"),
+    }
+}
+
+fn upsert_model(models: &mut Vec<ModelEntry>, incoming: ModelEntry) {
+    if let Some(existing) = models.iter_mut().find(|model| model.id == incoming.id) {
+        existing.available |= incoming.available;
+        return;
+    }
+    models.push(incoming);
+}
+
+async fn probe_compatible_models(base_url: &str, provider: &str) -> Vec<String> {
+    let client = reqwest::Client::new();
+    let base = base_url.trim_end_matches('/');
+    let (url, array_key, id_key) =
+        if provider == "ollama" && rtrt_core::config::is_default_ollama_compatible_url(base_url) {
+            (
+                format!("{}/api/tags", base.trim_end_matches("/v1")),
+                "models",
+                "name",
+            )
+        } else {
+            (format!("{base}/models"), "data", "id")
+        };
+    let Ok(response) = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    body.get(array_key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get(id_key).and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

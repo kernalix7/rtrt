@@ -61,6 +61,7 @@ pub(crate) struct ProjectQuery {
 /// and carries an absolute `.path` (a real, on-disk repo). `None` (the global
 /// scope) is returned for the `"global"`/empty sentinel, an unknown project, or
 /// a memory-only project with no path.
+#[allow(dead_code)]
 pub(crate) fn resolve_project_repo(project: Option<&str>) -> Option<PathBuf> {
     let name = project.map(str::trim).filter(|n| !n.is_empty())?;
     if name.eq_ignore_ascii_case("global") {
@@ -80,6 +81,7 @@ pub(crate) fn resolve_project_repo(project: Option<&str>) -> Option<PathBuf> {
 /// endpoints need the name — unlike the `.rtrt/config.toml`-backed settings
 /// that go through `resolve_project_repo`. Returns `None` for the
 /// `global`/empty sentinel.
+#[allow(dead_code)]
 pub(crate) fn resolve_project_name(project: Option<&str>) -> Option<String> {
     let name = project.map(str::trim).filter(|n| !n.is_empty())?;
     if name.eq_ignore_ascii_case("global") {
@@ -96,30 +98,31 @@ fn upsert_project_field(
     name: &str,
     mutate: impl FnOnce(&mut rtrt_core::ProjectEntry),
 ) -> std::result::Result<(), Box<axum::response::Response>> {
-    let mut cfg = rtrt_core::Config::load().map_err(|e| Box::new(clear_field_error(e)))?;
-    let mut entry = cfg
-        .project(name)
-        .cloned()
-        .unwrap_or(rtrt_core::ProjectEntry {
-            name: name.to_string(),
-            path: None,
-            security_profile: None,
-            embeddings_enabled: None,
-        });
-    mutate(&mut entry);
-    cfg.upsert_project(entry);
-    if let Err((status, msg)) = write_config_file(&cfg) {
-        return Err(Box::new(
-            (status, Json(serde_json::json!({ "error": msg }))).into_response(),
-        ));
-    }
-    Ok(())
+    crate::util::update_config_file(|cfg| {
+        let mut entry = cfg
+            .project(name)
+            .cloned()
+            .unwrap_or(rtrt_core::ProjectEntry {
+                name: name.to_string(),
+                path: None,
+                security_profile: None,
+                embeddings_enabled: None,
+            });
+        mutate(&mut entry);
+        cfg.upsert_project(entry);
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|(status, msg)| {
+        Box::new((status, Json(serde_json::json!({ "error": msg }))).into_response())
+    })
 }
 
 pub(crate) async fn get_optimizer_level(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let level = read_output_style_level_for(repo.as_deref());
     // `custom` is true when THIS project carries its own `output_level` override
     // in `<repo>/.rtrt/config.toml`; otherwise it inherits the global level.
@@ -144,12 +147,13 @@ pub(crate) async fn get_optimizer_level(
 }
 
 pub(crate) async fn post_optimizer_level(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     // Optional: the "Follow global" clear path (`?scope=global`) carries no body,
     // so a missing/empty JSON payload must be tolerated. A level write supplies it.
     body: Option<Json<SetLevelRequest>>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
 
     // "Follow global" action: `?scope=global` CLEARS this project's
     // `output_level` override so it inherits the global level again. Only
@@ -175,7 +179,7 @@ pub(crate) async fn post_optimizer_level(
                 }
             };
             project.output_level = None;
-            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            if let Err(e) = crate::util::write_project_config(path, &project) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": e.to_string() })),
@@ -274,9 +278,10 @@ pub(crate) struct SetCompressionRequest {
 }
 
 pub(crate) async fn get_compression_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     // `custom` is true when THIS project carries its own `compression` override.
     let custom = match &repo {
         Some(path) => rtrt_core::Config::load_project(path)
@@ -297,10 +302,11 @@ pub(crate) async fn get_compression_config(
 }
 
 pub(crate) async fn post_compression_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetCompressionRequest>>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let follow_global = q
         .scope
         .as_deref()
@@ -316,7 +322,7 @@ pub(crate) async fn post_compression_config(
                 Err(e) => return clear_field_error(e),
             };
             project.compression = None;
-            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            if let Err(e) = crate::util::write_project_config(path, &project) {
                 return clear_field_error(e);
             }
             let cfg = rtrt_core::Config::load_effective(Some(path)).unwrap_or_default();
@@ -354,7 +360,7 @@ pub(crate) async fn post_compression_config(
             Err(e) => return clear_field_error(e),
         };
         project.compression = Some(compression.clone());
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         return Json(serde_json::json!({
@@ -368,12 +374,10 @@ pub(crate) async fn post_compression_config(
     }
 
     // Global write.
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(c) => c,
-        Err(e) => return clear_field_error(e),
-    };
-    cfg.compression = compression.clone();
-    if let Err((status, msg)) = write_config_file(&cfg) {
+    if let Err((status, msg)) = crate::util::update_config_file(|cfg| {
+        cfg.compression = compression.clone();
+        Ok(())
+    }) {
         return (status, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     Json(serde_json::json!({
@@ -411,18 +415,19 @@ pub(crate) fn effective_provider_tools(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetProvidersRequest {
-    /// Active provider name; empty/absent leaves the active provider unset.
+    /// Active provider name; omitted preserves, null/blank clears.
     #[serde(default)]
-    active: Option<String>,
+    active: crate::util::JsonPatch<String>,
     /// Per-provider enable map to persist for the project override.
     #[serde(default)]
-    enabled: std::collections::BTreeMap<String, bool>,
+    enabled: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 pub(crate) async fn get_providers_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let custom = match &repo {
         Some(path) => rtrt_core::Config::load_project(path)
             .map(|p| p.providers.is_some())
@@ -440,10 +445,11 @@ pub(crate) async fn get_providers_config(
 }
 
 pub(crate) async fn post_providers_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetProvidersRequest>>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let follow_global = q
         .scope
         .as_deref()
@@ -456,7 +462,7 @@ pub(crate) async fn post_providers_config(
                 Err(e) => return clear_field_error(e),
             };
             project.providers = None;
-            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            if let Err(e) = crate::util::write_project_config(path, &project) {
                 return clear_field_error(e);
             }
             let (active, providers) = effective_provider_tools(Some(path));
@@ -478,18 +484,14 @@ pub(crate) async fn post_providers_config(
         )
             .into_response();
     };
-    let active = body
-        .active
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    // The UI form only carries `active` + the enable map; `api_max_tokens` is
-    // preserved from the layer being rewritten so saving here never wipes it.
-    let providers_cfg = rtrt_core::config::ProvidersConfig {
-        active,
-        api_max_tokens: None,
-        enabled: body.enabled.clone(),
+    let patch_active = |existing: Option<String>| -> Result<Option<String>, String> {
+        match &body.active {
+            crate::util::JsonPatch::Missing => Ok(existing),
+            crate::util::JsonPatch::Null => Ok(None),
+            crate::util::JsonPatch::Value(value) => {
+                Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
+            }
+        }
     };
 
     if let Some(path) = repo.as_deref() {
@@ -497,10 +499,24 @@ pub(crate) async fn post_providers_config(
             Ok(p) => p,
             Err(e) => return clear_field_error(e),
         };
-        let mut providers_cfg = providers_cfg;
-        providers_cfg.api_max_tokens = project.providers.as_ref().and_then(|p| p.api_max_tokens);
+        let current = project.providers.clone().unwrap_or_default();
+        let active = match patch_active(current.active) {
+            Ok(active) => active,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+        };
+        let providers_cfg = rtrt_core::config::ProvidersConfig {
+            active,
+            api_max_tokens: current.api_max_tokens,
+            enabled: body.enabled.clone().unwrap_or(current.enabled),
+        };
         project.providers = Some(providers_cfg);
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         let (active, providers) = effective_provider_tools(Some(path));
@@ -515,14 +531,14 @@ pub(crate) async fn post_providers_config(
     }
 
     // Global write.
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(c) => c,
-        Err(e) => return clear_field_error(e),
-    };
-    let mut providers_cfg = providers_cfg;
-    providers_cfg.api_max_tokens = cfg.providers.api_max_tokens;
-    cfg.providers = providers_cfg;
-    if let Err((status, msg)) = write_config_file(&cfg) {
+    if let Err((status, msg)) = crate::util::update_config_file(|cfg| {
+        cfg.providers.active = patch_active(cfg.providers.active.clone())
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        if let Some(enabled) = body.enabled {
+            cfg.providers.enabled = enabled;
+        }
+        Ok(())
+    }) {
         return (status, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     let (active, providers) = effective_provider_tools(None);
@@ -577,13 +593,14 @@ pub(crate) fn effective_agent_tools(repo: Option<&std::path::Path>) -> Vec<serde
 pub(crate) struct SetAgentsRequest {
     /// Per-agent enable map to persist for the project override.
     #[serde(default)]
-    enabled: std::collections::BTreeMap<String, bool>,
+    enabled: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 pub(crate) async fn get_agents_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let custom = match &repo {
         Some(path) => rtrt_core::Config::load_project(path)
             .map(|p| p.agents.is_some())
@@ -600,10 +617,11 @@ pub(crate) async fn get_agents_config(
 }
 
 pub(crate) async fn post_agents_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetAgentsRequest>>,
 ) -> impl IntoResponse {
-    let repo = resolve_project_repo(q.project.as_deref());
+    let repo = Some(state.project.memory_root().to_path_buf());
     let follow_global = q
         .scope
         .as_deref()
@@ -616,7 +634,7 @@ pub(crate) async fn post_agents_config(
                 Err(e) => return clear_field_error(e),
             };
             project.agents = None;
-            if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+            if let Err(e) = crate::util::write_project_config(path, &project) {
                 return clear_field_error(e);
             }
             return Json(serde_json::json!({
@@ -636,17 +654,16 @@ pub(crate) async fn post_agents_config(
         )
             .into_response();
     };
-    let agents_cfg = rtrt_core::config::AgentsConfig {
-        enabled: body.enabled.clone(),
-    };
-
     if let Some(path) = repo.as_deref() {
         let mut project = match rtrt_core::Config::load_project(path) {
             Ok(p) => p,
             Err(e) => return clear_field_error(e),
         };
-        project.agents = Some(agents_cfg);
-        if let Err(e) = rtrt_core::Config::save_project(path, &project) {
+        let current = project.agents.clone().unwrap_or_default();
+        project.agents = Some(rtrt_core::config::AgentsConfig {
+            enabled: body.enabled.clone().unwrap_or(current.enabled),
+        });
+        if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
         return Json(serde_json::json!({
@@ -659,12 +676,12 @@ pub(crate) async fn post_agents_config(
     }
 
     // Global write.
-    let mut cfg = match rtrt_core::Config::load() {
-        Ok(c) => c,
-        Err(e) => return clear_field_error(e),
-    };
-    cfg.agents = agents_cfg;
-    if let Err((status, msg)) = write_config_file(&cfg) {
+    if let Err((status, msg)) = crate::util::update_config_file(|cfg| {
+        if let Some(enabled) = body.enabled {
+            cfg.agents.enabled = enabled;
+        }
+        Ok(())
+    }) {
         return (status, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     Json(serde_json::json!({
@@ -712,9 +729,10 @@ fn embeddings_project_json(name_present: bool, over: Option<bool>) -> serde_json
 }
 
 pub(crate) async fn get_embeddings_project(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let name = resolve_project_name(q.project.as_deref());
+    let name = Some(state.project.slug().to_string());
     let over = match &name {
         Some(n) => rtrt_core::Config::load()
             .ok()
@@ -733,10 +751,11 @@ pub(crate) struct SetEmbeddingsProjectRequest {
 }
 
 pub(crate) async fn post_embeddings_project(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetEmbeddingsProjectRequest>>,
 ) -> impl IntoResponse {
-    let name = resolve_project_name(q.project.as_deref());
+    let name = Some(state.project.slug().to_string());
     let follow_global = q
         .scope
         .as_deref()
@@ -811,9 +830,10 @@ fn security_project_json(name_present: bool, over: Option<&str>) -> serde_json::
 }
 
 pub(crate) async fn get_security_project(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let name = resolve_project_name(q.project.as_deref());
+    let name = Some(state.project.slug().to_string());
     let over = match &name {
         Some(n) => rtrt_core::Config::load()
             .ok()
@@ -831,10 +851,11 @@ pub(crate) struct SetSecurityProjectRequest {
 }
 
 pub(crate) async fn post_security_project(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetSecurityProjectRequest>>,
 ) -> impl IntoResponse {
-    let name = resolve_project_name(q.project.as_deref());
+    let name = Some(state.project.slug().to_string());
     let follow_global = q
         .scope
         .as_deref()

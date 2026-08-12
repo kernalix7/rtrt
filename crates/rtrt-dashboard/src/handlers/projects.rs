@@ -34,15 +34,24 @@ use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
 use crate::prelude::*;
+use crate::project_catalog::{CatalogProjectView, DiagnosticCategory};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectView {
-    name: String,
-    path: Option<String>,
-    security_profile: Option<String>,
+    pub(crate) name: String,
+    pub(crate) slug: String,
+    pub(crate) label: Option<String>,
+    pub(crate) memory_root: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) available: bool,
+    pub(crate) diagnostic: Option<DiagnosticCategory>,
+    pub(crate) security_profile: Option<String>,
     /// Per-project embedding override (`None` = inherit global default).
-    embeddings_enabled: Option<bool>,
-    mem_count: usize,
+    pub(crate) embeddings_enabled: Option<bool>,
+    pub(crate) mem_count: Option<usize>,
+    pub(crate) database_schema_version: Option<i64>,
+    pub(crate) database_schema_compatible: Option<bool>,
+    pub(crate) integrity_ok: Option<bool>,
 }
 
 /// `GET /api/projects` response: the visible project list plus an honest
@@ -50,6 +59,11 @@ pub(crate) struct ProjectView {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProjectsResponse {
     projects: Vec<ProjectView>,
+    /// Present when one source could not be used. Kept short and generic so
+    /// parser/SQLite diagnostics (which can contain paths or config text) are
+    /// never exposed to the browser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
     /// Memory buckets whose name is unambiguously machine-generated (see
     /// [`rtrt_memory::is_capture_bucket_name`]) and that never made it into
     /// the config registry — excluded from `projects` so the selector stays
@@ -70,77 +84,116 @@ pub(crate) struct ProjectsResponse {
 /// `32hex-40hex`) are excluded from the visible list UNLESS they were
 /// explicitly registered in the config — see [`rtrt_memory::is_capture_bucket_name`].
 pub(crate) async fn list_projects(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
 ) -> std::result::Result<Json<ProjectsResponse>, (StatusCode, String)> {
-    use std::collections::BTreeMap;
+    state.catalog.refresh();
+    state.start_project_daemons();
+    let views = state.catalog.views();
+    let warning = views
+        .iter()
+        .any(|view| !view.available)
+        .then(|| "Some project stores are unavailable; diagnostics were redacted.".to_string());
+    Ok(Json(ProjectsResponse {
+        projects: views.into_iter().map(ProjectView::from).collect(),
+        warning,
+        hidden_capture_buckets: 0,
+        hidden_capture_bucket_rows: 0,
+    }))
+}
 
-    let mut views: BTreeMap<String, ProjectView> = BTreeMap::new();
-
-    // Registered config entries first.
-    let cfg = rtrt_core::Config::load()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let registered: std::collections::HashSet<&str> =
-        cfg.projects.iter().map(|p| p.name.as_str()).collect();
-    for entry in &cfg.projects {
-        views.insert(
-            entry.name.clone(),
-            ProjectView {
-                name: entry.name.clone(),
-                path: entry.path.clone(),
-                security_profile: entry.security_profile.clone(),
-                embeddings_enabled: entry.embeddings_enabled,
-                mem_count: 0,
-            },
-        );
-    }
-
-    let mut hidden_capture_buckets = 0usize;
-    let mut hidden_capture_bucket_rows = 0usize;
-
-    // Memory buckets contribute counts (and may introduce memory-only names).
-    if let Some(mem) = &state.memory {
-        let guard = mem.lock().await;
-        let projects = guard
-            .projects()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        drop(guard);
-        for (name, count, _last) in projects {
-            // A row's project is normally decided by the reattribution pass
-            // (transcript parent cwd), which folds stray subagent / workflow
-            // captures under their real project, leaving those buckets empty
-            // so they don't appear here at all. But reattribution needs the
-            // source transcript on disk — once that's gone, a stray bucket
-            // can never resolve a parent and would clutter the selector
-            // forever. Hide ONLY the unambiguously machine-shaped names that
-            // never got registered as a real project.
-            if !registered.contains(name.as_str()) && rtrt_memory::is_capture_bucket_name(&name) {
-                hidden_capture_buckets += 1;
-                hidden_capture_bucket_rows += count;
-                continue;
-            }
-            views
-                .entry(name.clone())
-                .and_modify(|v| v.mem_count = count)
-                .or_insert(ProjectView {
-                    name,
-                    path: None,
-                    security_profile: None,
-                    embeddings_enabled: None,
-                    mem_count: count,
-                });
+impl From<CatalogProjectView> for ProjectView {
+    fn from(view: CatalogProjectView) -> Self {
+        Self {
+            name: view.label.clone().unwrap_or_else(|| view.slug.clone()),
+            slug: view.slug,
+            label: view.label,
+            memory_root: view.memory_root,
+            path: view.path,
+            available: view.available,
+            diagnostic: view.diagnostic,
+            security_profile: view.security_profile,
+            embeddings_enabled: view.embeddings_enabled,
+            mem_count: view.memory_count,
+            database_schema_version: view.database_schema_version,
+            database_schema_compatible: view.database_schema_compatible,
+            integrity_ok: view.integrity_ok,
         }
     }
+}
 
-    // BTreeMap iteration is already sorted by name.
-    Ok(Json(ProjectsResponse {
-        projects: views.into_values().collect(),
-        hidden_capture_buckets,
-        hidden_capture_bucket_rows,
-    }))
+#[derive(Serialize)]
+pub(crate) struct ProjectsOverview {
+    available_projects: usize,
+    unavailable_projects: usize,
+    total_memories: usize,
+    partial: bool,
+    projects: Vec<ProjectOverview>,
+}
+
+#[derive(Serialize)]
+struct ProjectOverview {
+    slug: String,
+    label: String,
+    memory_count: Option<usize>,
+    available: bool,
+}
+
+pub(crate) async fn projects_overview(
+    axum::Extension(state): axum::Extension<AppState>,
+) -> Json<ProjectsOverview> {
+    state.catalog.refresh();
+    state.start_project_daemons();
+    let views = state.catalog.views();
+    let available_projects = views.iter().filter(|view| view.available).count();
+    let unavailable_projects = views.len().saturating_sub(available_projects);
+    let partial = unavailable_projects > 0
+        || views
+            .iter()
+            .any(|view| view.available && view.memory_count.is_none());
+    let total_memories = views.iter().filter_map(|view| view.memory_count).sum();
+    Json(ProjectsOverview {
+        available_projects,
+        unavailable_projects,
+        total_memories,
+        partial,
+        projects: views
+            .into_iter()
+            .map(|view| ProjectOverview {
+                label: view.label.unwrap_or_else(|| view.slug.clone()),
+                slug: view.slug,
+                memory_count: view.memory_count,
+                available: view.available,
+            })
+            .collect(),
+    })
+}
+
+/// Deserialize only the registry, deliberately ignoring unrelated sections.
+/// `None` means even that bounded recovery path could not read valid TOML.
+#[allow(dead_code)]
+fn load_project_registry_only() -> Option<Vec<rtrt_core::ProjectEntry>> {
+    #[derive(Deserialize)]
+    struct RegistryOnly {
+        #[serde(default)]
+        projects: Vec<rtrt_core::ProjectEntry>,
+    }
+
+    let path = rtrt_core::Config::default_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<RegistryOnly>(&raw)
+        .ok()
+        .map(|registry| registry.projects)
+}
+
+#[allow(dead_code)]
+fn bounded_warning(parts: &[&str]) -> Option<String> {
+    const MAX_WARNING_CHARS: usize = 320;
+    (!parts.is_empty()).then(|| parts.join(" ").chars().take(MAX_WARNING_CHARS).collect())
 }
 
 /// A capture bucket hidden from `GET /api/projects`, surfaced separately so
 /// the UI can offer a manual fold-in via `POST /api/projects/reassign`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HiddenBucketView {
     name: String,
@@ -151,8 +204,9 @@ pub(crate) struct HiddenBucketView {
 /// `list_projects`, with their row counts, so the UI can populate a
 /// "fold into project" picker without re-deriving the classification client
 /// side.
+#[allow(dead_code)]
 pub(crate) async fn list_hidden_buckets(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
 ) -> std::result::Result<Json<Vec<HiddenBucketView>>, (StatusCode, String)> {
     let cfg = rtrt_core::Config::load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -181,12 +235,14 @@ pub(crate) async fn list_hidden_buckets(
     Ok(Json(hidden))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReassignProjectReq {
     from: String,
     to: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub(crate) struct ReassignProjectResp {
     moved: usize,
@@ -199,8 +255,9 @@ pub(crate) struct ReassignProjectResp {
 /// orphan capture buckets it can never resolve on its own (source transcript
 /// deleted). Parameterized bulk `UPDATE`; no rows are deleted, only
 /// re-labelled — see [`rtrt_memory::MemoryStore::reassign_project`].
+#[allow(dead_code)]
 pub(crate) async fn reassign_project(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<ReassignProjectReq>,
 ) -> std::result::Result<Json<ReassignProjectResp>, (StatusCode, String)> {
     let from = req.from.trim();
@@ -242,13 +299,14 @@ pub(crate) async fn reassign_project(
     }))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProjectUpsertReq {
     name: String,
     #[serde(default)]
-    path: Option<String>,
+    path: crate::util::JsonPatch<String>,
     #[serde(default)]
-    security_profile: Option<String>,
+    security_profile: crate::util::JsonPatch<String>,
     /// Per-project embedding override as a tri-state string so the handler can
     /// tell "field absent" (preserve existing) from an explicit choice:
     /// `"on"` -> Some(true), `"off"` -> Some(false), `"inherit"` -> None.
@@ -259,45 +317,51 @@ pub(crate) struct ProjectUpsertReq {
 }
 
 /// `PUT /api/projects` — upsert a project entry into the config registry.
+#[allow(dead_code)]
 pub(crate) async fn upsert_project(
     Json(req): Json<ProjectUpsertReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let mut cfg = rtrt_core::Config::load()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let name = req.name.clone();
-    // Explicit choice wins; an absent field preserves the existing override.
-    let embeddings_enabled = match req.embeddings_mode.as_deref() {
-        Some("on") => Some(true),
-        Some("off") => Some(false),
-        Some("inherit") => None,
-        _ => cfg.project(&name).and_then(|p| p.embeddings_enabled),
-    };
-    cfg.upsert_project(rtrt_core::ProjectEntry {
-        name: req.name,
-        path: req.path,
-        security_profile: req.security_profile,
-        embeddings_enabled,
-    });
-
-    let path = rtrt_core::Config::default_path().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "cannot determine config path".to_string(),
-    ))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("create dir {}: {e}", parent.display()),
-            )
-        })?;
-    }
-    let s = toml::to_string_pretty(&cfg)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    std::fs::write(&path, s).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write {}: {e}", path.display()),
-        )
+    let (_, _) = crate::util::update_config_file(|cfg| {
+        let existing = cfg.project(&name).cloned();
+        let embeddings_enabled = match req.embeddings_mode.as_deref() {
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            Some("inherit") => None,
+            None => existing.as_ref().and_then(|p| p.embeddings_enabled),
+            Some(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "embeddings_mode must be on, off, or inherit".into(),
+                ));
+            }
+        };
+        let path = patch_string(req.path, existing.as_ref().and_then(|p| p.path.clone()))?;
+        let security_profile = patch_string(
+            req.security_profile,
+            existing.as_ref().and_then(|p| p.security_profile.clone()),
+        )?;
+        cfg.upsert_project(rtrt_core::ProjectEntry {
+            name: req.name.clone(),
+            path,
+            security_profile,
+            embeddings_enabled,
+        });
+        Ok(())
     })?;
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
+#[allow(dead_code)]
+fn patch_string(
+    value: crate::util::JsonPatch<String>,
+    existing: Option<String>,
+) -> std::result::Result<Option<String>, (StatusCode, String)> {
+    match value {
+        crate::util::JsonPatch::Missing => Ok(existing),
+        crate::util::JsonPatch::Null => Ok(None),
+        crate::util::JsonPatch::Value(value) => {
+            Ok((!value.trim().is_empty()).then(|| value.trim().to_string()))
+        }
+    }
 }

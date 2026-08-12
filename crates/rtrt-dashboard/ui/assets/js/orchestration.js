@@ -188,17 +188,10 @@ function orchShowError(message) {
 async function loadOrchestration() {
   const query = scopeProjectQuery();
   try {
-    const [teamRes, failRes, detectRes] = await Promise.all([
-      fetch(`/api/team/config${query}`),
+    const [failRes, detectRes] = await Promise.all([
       fetch(`/api/failover/config${query}`),
       fetch('/api/detect'),
     ]);
-    if (!teamRes.ok) {
-      const d = await teamRes.json().catch(() => ({}));
-      showToast(`Orchestration load failed: ${d.error || teamRes.status}`, 'err');
-      return;
-    }
-    ORCH_TEAM = await teamRes.json();
     ORCH_FAILOVER = failRes.ok ? await failRes.json() : null;
     ORCH_TOOLS = detectRes.ok ? await detectRes.json() : [];
   } catch (e) {
@@ -206,7 +199,7 @@ async function loadOrchestration() {
     return;
   }
   orchClearError();
-  applyOrchScope(ORCH_TEAM);
+  applyOrchScope();
   renderOrchestration();
 }
 
@@ -222,8 +215,8 @@ async function loadOrchestration() {
 // One radiogroup governs both sections on the page, so the card reads Custom
 // when the project pins EITHER `[team]` or `[failover]` — each Save writes only
 // its own section's override, and "Follow global" clears both.
-function applyOrchScope(team) {
-  const custom = !!(team && team.custom) || !!(ORCH_FAILOVER && ORCH_FAILOVER.custom);
+function applyOrchScope() {
+  const custom = !!(ORCH_FAILOVER && ORCH_FAILOVER.custom);
   applyScopeToggle('team', custom ? 'custom' : 'global', {
     hints: {
       custom: 'Custom: this project carries its own roster. Save writes <repo>/.rtrt/config.toml; the global roster is untouched.',
@@ -235,23 +228,11 @@ function applyOrchScope(team) {
   // response yet, and showing the global path next to a Custom card would name
   // a file that save is not going to touch. In that case the generic hint
   // `applyScopeToggle` already wrote is the accurate one.
-  if (!team || !team.path) return;
-  const hint = document.getElementById('team-config-hint');
-  if (hint) hint.textContent = `${team.path} [team]`;
   const failHint = document.getElementById('failover-config-hint');
   if (failHint && ORCH_FAILOVER && ORCH_FAILOVER.path) failHint.textContent = `${ORCH_FAILOVER.path} [failover]`;
 }
 
 function renderOrchestration() {
-  if (!ORCH_TEAM) return;
-  orchFillDatalist('orch-targets', ORCH_TOOLS.map(t => t.name));
-  orchFillDatalist('orch-models-all', orchAllModels());
-  orchFillDatalist('orch-lane-names', orchLaneNames());
-  orchFillDatalist('orch-tier-names', orchTierNames());
-  renderOrchManager();
-  renderOrchLanes();
-  renderOrchTiers();
-  renderOrchPolicy();
   renderOrchFailover();
 }
 
@@ -879,7 +860,7 @@ async function saveOrchestration() {
     if (!ev.target.checked || !scopeHasProject()) return;
     try {
       const responses = await Promise.all(
-        ['/api/team/config', '/api/failover/config'].map(base =>
+        ['/api/failover/config'].map(base =>
           fetch(scopeClearUrl(base), { method: 'POST' })
         )
       );

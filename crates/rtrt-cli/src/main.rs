@@ -21,7 +21,7 @@ use rtrt_compress::{
 };
 use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
-    PoolKey, ProjectIdentity, RosterPreset, TeamConfig, TeamMode, ToolKind,
+    PoolKey, ProjectIdentity, RosterPreset, ToolKind,
 };
 use rtrt_memory::{
     Embedder, InvocationProvenance, LlmSummariser, MemoryStore, OllamaEmbedder,
@@ -32,9 +32,9 @@ use rtrt_providers::{
     DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_TIMEOUT_SECS, InvokeOptions,
     Mode as InvokeMode, OpenAICompatibleProvider, OpenAIProvider, PoolCap, PoolHeadroom, Prefer,
     Provider, RankedTarget, Role, RoomBasis, RouteDecision, RouteRequest, TargetHeadroom,
-    TargetWindows, UsageSnapshot, dispatch_team, gateway_default_timeout, headroom_for_pool,
-    invoke_agent, invoke_with_failover, provider_usage_windows, rank_pools_by_room,
-    record_invocation, select_route, serve_gateway, target_headroom,
+    TargetWindows, UsageSnapshot, gateway_default_timeout, headroom_for_pool, invoke_agent,
+    invoke_with_failover, provider_usage_windows, rank_pools_by_room, record_invocation,
+    select_route, serve_gateway, target_headroom,
 };
 use rtrt_templates::PromptRegistry;
 use setup::{
@@ -323,12 +323,6 @@ enum Cmd {
         /// Prompt text. Multiple words are joined with spaces.
         #[arg(num_args = 1.., allow_hyphen_values = true)]
         prompt: Vec<String>,
-    },
-    /// Dispatch work through the configured manager and leader team.
-    #[command(hide = true)]
-    Team {
-        #[command(subcommand)]
-        cmd: TeamCmd,
     },
     /// Show per-target windowed provider usage and headroom.
     ///
@@ -684,35 +678,6 @@ enum GatewayCmd {
         #[arg(long, env = "RTRT_GATEWAY_TOKEN")]
         token: Option<String>,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum TeamCmd {
-    /// Preview or install a shipped team roster in the global RTRT config.
-    Preset {
-        /// Shipped roster to materialize.
-        #[arg(value_enum)]
-        roster: TeamPresetArg,
-        /// Write the roster. Without this, only a dry-run summary is printed.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Dispatch the prompt through the configured leader order with failover.
-    Dispatch {
-        /// Timeout in seconds for each manager or leader invocation.
-        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
-        timeout: u64,
-        /// Emit the complete dispatch result as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Prompt text. When omitted, reads stdin.
-        #[arg(num_args = 0.., allow_hyphen_values = true)]
-        prompt: Vec<String>,
-    },
-    /// Show the effective manager, leader order, and member roles.
-    Show,
-    /// Verify that the configured Ollama manager emits the expected tool call.
-    CheckManager,
 }
 
 #[derive(Debug, Subcommand)]
@@ -4120,7 +4085,6 @@ async fn run(command: Cmd) -> Result<()> {
             })
             .await?;
         }
-        Cmd::Team { cmd } => run_team(cmd).await?,
         Cmd::Usage { format } => run_usage(format)?,
         Cmd::Provider { cmd } => run_provider(cmd).await?,
         Cmd::Memory {
@@ -5577,254 +5541,6 @@ struct RouteCliOptions {
     dry_run: bool,
     failover: bool,
     prompt: Vec<String>,
-}
-
-const MANAGER_CHECK_PROMPT: &str = "rtrt-manager-tool-check";
-
-async fn run_team(cmd: TeamCmd) -> Result<()> {
-    if let TeamCmd::Preset { roster, apply } = &cmd {
-        let path = rtrt_core::Config::default_path()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve config path (no HOME?)"))?;
-        return run_team_preset(&path, (*roster).into(), *apply);
-    }
-
-    let config = rtrt_core::Config::load_effective(cwd_repo_root().as_deref())
-        .context("load effective team config")?;
-    match cmd {
-        TeamCmd::Dispatch {
-            timeout,
-            json,
-            prompt,
-        } => {
-            let prompt = read_team_prompt(prompt, std::io::stdin())?;
-            let outcome = dispatch_team(
-                &config.team,
-                &prompt,
-                std::time::Duration::from_secs(timeout),
-            )
-            .await
-            .context("rtrt team dispatch")?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&outcome)?);
-            } else {
-                print!("{}", outcome.outcome.output);
-                eprintln!("team: {}", outcome.summary());
-            }
-        }
-        TeamCmd::Show => print_team_config(&config.team),
-        TeamCmd::CheckManager => check_team_manager(&config).await?,
-        TeamCmd::Preset { .. } => unreachable!("preset handled before loading effective config"),
-    }
-    Ok(())
-}
-
-fn run_team_preset(path: &Path, roster: RosterPreset, apply: bool) -> Result<()> {
-    let team = TeamConfig::preset(roster);
-    if apply {
-        let mut root = match std::fs::read_to_string(path) {
-            Ok(raw) => toml::from_str::<toml::Value>(&raw)
-                .with_context(|| format!("parse {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                toml::Value::Table(toml::Table::new())
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        };
-        let table = root
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("config root is not a TOML table"))?;
-        table.remove("team");
-        let mut body = toml::to_string_pretty(&root).context("serialize global config")?;
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.push_str("[team]\n");
-        for line in toml::to_string_pretty(&team)
-            .context("serialize team preset")?
-            .lines()
-        {
-            if let Some(header) = line.strip_prefix("[[") {
-                body.push_str("[[team.");
-                body.push_str(header);
-            } else if let Some(header) = line.strip_prefix('[') {
-                body.push_str("[team.");
-                body.push_str(header);
-            } else {
-                body.push_str(line);
-            }
-            body.push('\n');
-        }
-        let materialized =
-            rtrt_core::Config::from_toml_str(&body).context("validate materialized team preset")?;
-        if materialized.team != team {
-            bail!("materialized team preset changed roster ordering");
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create directory {}", parent.display()))?;
-        }
-        std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    }
-
-    println!("mode: {}", if apply { "apply" } else { "dry-run" });
-    println!("path: {}", path.display());
-    println!("members: {}", team.members.len());
-    println!("leader order: {}", team.leader_order.join(" -> "));
-    if !apply {
-        println!("pass --apply to write");
-    }
-    Ok(())
-}
-
-fn read_team_prompt(args: Vec<String>, mut input: impl Read) -> Result<String> {
-    let prompt = if args.is_empty() {
-        let mut prompt = String::new();
-        input
-            .read_to_string(&mut prompt)
-            .context("read team prompt from stdin")?;
-        prompt
-    } else {
-        args.join(" ")
-    };
-    if prompt.trim().is_empty() {
-        bail!("rtrt team dispatch: prompt is empty");
-    }
-    Ok(prompt)
-}
-
-fn print_team_config(team: &TeamConfig) {
-    println!("enabled: {}", team.enabled);
-    println!("manager: {}/{}", team.manager_provider, team.manager_model);
-    println!("leader order: {}", team.leader_order.join(" -> "));
-    println!("members:");
-    for member in &team.members {
-        println!(
-            "  {}: target={} model={} mode={} roles={}",
-            member.name,
-            member.target,
-            member.model.as_deref().unwrap_or("-"),
-            team_mode_label(member.mode),
-            member.roles.join(", ")
-        );
-    }
-}
-
-fn team_mode_label(mode: TeamMode) -> &'static str {
-    match mode {
-        TeamMode::Cli => "cli",
-        TeamMode::Api => "api",
-        TeamMode::Auto => "auto",
-    }
-}
-
-async fn check_team_manager(config: &rtrt_core::Config) -> Result<()> {
-    let team = &config.team;
-    if !team.manager_provider.eq_ignore_ascii_case("ollama") {
-        bail!(
-            "rtrt team check-manager requires manager_provider=ollama (configured: {})",
-            team.manager_provider
-        );
-    }
-
-    let expected_arguments = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
-    let request = serde_json::json!({
-        "model": team.manager_model,
-        "messages": [{
-            "role": "user",
-            "content": format!(
-                "Call team_dispatch exactly once with this exact JSON argument and do not answer in text: {expected_arguments}"
-            )
-        }],
-        "stream": false,
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "team_dispatch",
-                "description": "Dispatch a prompt unchanged to the configured RTRT team.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "Prompt to dispatch unchanged."
-                        }
-                    },
-                    "required": ["prompt"],
-                    "additionalProperties": false
-                }
-            }
-        }],
-        "options": { "temperature": 0 }
-    });
-    let url = format!("{}/api/chat", ollama_base_url(config));
-    let http = OpenAIProvider::new(String::new()).http;
-    let response = http
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-        .json(&request)
-        .send()
-        .await
-        .with_context(|| format!("probe Ollama manager at {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("Ollama manager probe {status}: {body}");
-    }
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .context("decode Ollama manager response")?;
-    let (exact, received) = exact_manager_tool_call(&body, &expected_arguments);
-    println!("manager: {}/{}", team.manager_provider, team.manager_model);
-    println!("exact_tool_call: {exact}");
-    println!("expected: team_dispatch {expected_arguments}");
-    println!("received: {received}");
-    if !exact {
-        bail!("configured manager did not emit the exact team_dispatch tool call");
-    }
-    Ok(())
-}
-
-fn ollama_base_url(config: &rtrt_core::Config) -> String {
-    let fallback = config
-        .embeddings
-        .resolved_base_url(config.auto_compress.base_url.as_deref());
-    let raw = config.team.manager_base_url.as_deref().unwrap_or(&fallback);
-    raw.trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn exact_manager_tool_call(
-    body: &serde_json::Value,
-    expected_arguments: &serde_json::Value,
-) -> (bool, String) {
-    let Some(calls) = body
-        .pointer("/message/tool_calls")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return (false, "(none)".to_string());
-    };
-    let received = serde_json::to_string(calls).unwrap_or_else(|_| "(invalid)".to_string());
-    if calls.len() != 1 {
-        return (false, received);
-    }
-    let function = &calls[0]["function"];
-    let name_matches =
-        function.get("name").and_then(serde_json::Value::as_str) == Some("team_dispatch");
-    let arguments = function.get("arguments").and_then(normalize_tool_arguments);
-    (
-        name_matches && arguments.as_ref() == Some(expected_arguments),
-        received,
-    )
-}
-
-fn normalize_tool_arguments(arguments: &serde_json::Value) -> Option<serde_json::Value> {
-    match arguments {
-        serde_json::Value::Object(_) => Some(arguments.clone()),
-        serde_json::Value::String(raw) => serde_json::from_str(raw).ok(),
-        _ => None,
-    }
 }
 
 /// The routing request behind one `rtrt route` invocation.
@@ -11442,133 +11158,6 @@ mod route_tests {
             requests,
             sibling_pools: 2,
         }
-    }
-}
-
-#[cfg(test)]
-mod team_tests {
-    use super::*;
-
-    #[test]
-    fn parses_team_dispatch_flags_and_prompt_words() {
-        let cli = Cli::try_parse_from([
-            "rtrt",
-            "team",
-            "dispatch",
-            "--timeout",
-            "9",
-            "--json",
-            "fix",
-            "the build",
-        ])
-        .unwrap();
-
-        let Some(Cmd::Team {
-            cmd:
-                TeamCmd::Dispatch {
-                    timeout,
-                    json,
-                    prompt,
-                },
-        }) = cli.command
-        else {
-            panic!("expected team dispatch");
-        };
-        assert_eq!(timeout, 9);
-        assert!(json);
-        assert_eq!(prompt, ["fix", "the build"]);
-    }
-
-    #[test]
-    fn parses_team_preset_apply() {
-        let cli =
-            Cli::try_parse_from(["rtrt", "team", "preset", "opencode-lead", "--apply"]).unwrap();
-
-        let Some(Cmd::Team {
-            cmd:
-                TeamCmd::Preset {
-                    roster: TeamPresetArg::OpencodeLead,
-                    apply,
-                },
-        }) = cli.command
-        else {
-            panic!("expected team preset");
-        };
-        assert!(apply);
-    }
-
-    #[test]
-    fn team_dispatch_allows_stdin_prompt() {
-        let cli = Cli::try_parse_from(["rtrt", "team", "dispatch"]).unwrap();
-        let Some(Cmd::Team {
-            cmd: TeamCmd::Dispatch { prompt, .. },
-        }) = cli.command
-        else {
-            panic!("expected team dispatch");
-        };
-        assert!(prompt.is_empty());
-        assert_eq!(
-            read_team_prompt(prompt, "stdin prompt\n".as_bytes()).unwrap(),
-            "stdin prompt\n"
-        );
-        assert!(read_team_prompt(Vec::new(), " \n".as_bytes()).is_err());
-    }
-
-    #[test]
-    fn exact_manager_call_accepts_object_or_json_string_arguments() {
-        let expected = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
-        for arguments in [
-            expected.clone(),
-            serde_json::Value::String(expected.to_string()),
-        ] {
-            let body = serde_json::json!({
-                "message": {
-                    "tool_calls": [{
-                        "function": {
-                            "name": "team_dispatch",
-                            "arguments": arguments
-                        }
-                    }]
-                }
-            });
-            assert!(exact_manager_tool_call(&body, &expected).0);
-        }
-    }
-
-    #[test]
-    fn exact_manager_call_rejects_wrong_or_multiple_calls() {
-        let expected = serde_json::json!({ "prompt": MANAGER_CHECK_PROMPT });
-        let wrong = serde_json::json!({
-            "message": {
-                "tool_calls": [{
-                    "function": {
-                        "name": "team_dispatch",
-                        "arguments": { "prompt": "changed" }
-                    }
-                }]
-            }
-        });
-        assert!(!exact_manager_tool_call(&wrong, &expected).0);
-
-        let multiple = serde_json::json!({
-            "message": {
-                "tool_calls": [
-                    { "function": { "name": "team_dispatch", "arguments": expected } },
-                    { "function": { "name": "team_dispatch", "arguments": expected } }
-                ]
-            }
-        });
-        assert!(!exact_manager_tool_call(&multiple, &expected).0);
-    }
-
-    #[test]
-    fn ollama_base_uses_effective_config_and_strips_v1() {
-        let mut config = rtrt_core::Config::default();
-        config.auto_compress.base_url = Some("http://localhost:11434/v1/".to_string());
-        assert_eq!(ollama_base_url(&config), "http://localhost:11434");
-
-        config.team.manager_base_url = Some("https://manager.example/v1/".to_string());
-        assert_eq!(ollama_base_url(&config), "https://manager.example");
     }
 }
 

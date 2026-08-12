@@ -30,8 +30,8 @@ use rtrt_core::{Capability, CompressionLevel, DetectedTool, ProjectIdentity, poo
 use rtrt_memory::{Embedder, MemoryStore};
 use rtrt_providers::{
     ChatMessage, ChatRequest, DEFAULT_TIMEOUT_SECS, Gateway, InvocationContext, InvokeOptions,
-    Mode as InvokeMode, Prefer, Role, RouteRequest, TeamDispatchResult, UsageSnapshot,
-    dispatch_team_rich_with_context, invoke_agent, invoke_with_failover_context, select_route,
+    Mode as InvokeMode, Prefer, Role, RouteRequest, UsageSnapshot, invoke_agent,
+    invoke_with_failover_context, select_route,
 };
 use rtrt_templates::PromptRegistry;
 use serde::{Deserialize, Serialize};
@@ -178,7 +178,7 @@ impl ToolCapabilities {
 /// process/provider-network behavior is reviewed and classified here.
 fn tool_capabilities(name: &str) -> Option<ToolCapabilities> {
     Some(match name {
-        "agent_call" | "agent_route" | "team_dispatch" => ToolCapabilities::PROVIDER_EXECUTION,
+        "agent_call" | "agent_route" => ToolCapabilities::PROVIDER_EXECUTION,
         "provider_chat" => ToolCapabilities::PROVIDER_NETWORK,
         "permission_prompt"
         | "compress"
@@ -832,76 +832,6 @@ fn agent_route_request(args: &AgentRouteArgs) -> Result<RouteRequest, McpError> 
         mode: parse_agent_route_mode(args.mode.as_deref())?,
         failover: args.failover.unwrap_or(false),
     })
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TeamDispatchArgs {
-    prompt: String,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-    /// Project used for auto-capture. Required for shared HTTP servers.
-    #[serde(default)]
-    project: Option<String>,
-    #[serde(flatten)]
-    invocation: InvocationContextArgs,
-}
-
-fn team_dispatch_timeout(timeout_secs: Option<u64>) -> std::time::Duration {
-    std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
-}
-
-/// Public projection of the provider's rich result. `run` retains every lane
-/// attempt and fallback decision, while provider diagnostics are deliberately
-/// opaque: they may contain command lines, local paths, credentials, or a
-/// provider mailbox body. Coordination remains in this parent process; no
-/// spawn/bridge handle is serialized.
-fn team_dispatch_response(result: &TeamDispatchResult) -> Result<serde_json::Value, McpError> {
-    fn scrub_diagnostics(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    scrub_diagnostics(value);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for (key, value) in values {
-                    if key == "error" && !value.is_null() {
-                        *value = serde_json::Value::String("provider invocation failed".into());
-                    } else if key == "artifacts" {
-                        *value = serde_json::Value::Array(Vec::new());
-                    } else {
-                        scrub_diagnostics(value);
-                    }
-                }
-            }
-            serde_json::Value::String(value) => {
-                *value = rtrt_compress::redact_secrets(value);
-            }
-            _ => {}
-        }
-    }
-
-    let mut failed_over = serde_json::to_value(&result.outcome.failed_over).map_err(|error| {
-        McpError::internal_error(format!("team_dispatch serialize: {error}"), None)
-    })?;
-    let mut run = serde_json::to_value(&result.run).map_err(|error| {
-        McpError::internal_error(format!("team_dispatch serialize: {error}"), None)
-    })?;
-    scrub_diagnostics(&mut failed_over);
-    scrub_diagnostics(&mut run);
-
-    Ok(serde_json::json!({
-        // Compatibility fields: names and shapes remain unchanged.
-        "output": rtrt_compress::redact_secrets(&result.outcome.outcome.output),
-        "target": result.outcome.outcome.target,
-        "model": result.outcome.outcome.model,
-        "failed_over": failed_over,
-        "summary": result.outcome.summary(),
-        // Additive trusted-parent data. Recursion is a bounded root snapshot,
-        // not mutable spawn authority; run is complete lane provenance.
-        "run": run,
-        "recursion": result.recursion,
-    }))
 }
 
 /// The accepted `prefer` strategies, listed in the error the way the capability
@@ -2043,50 +1973,6 @@ impl RtrtMcp {
     }
 
     #[tool(
-        description = "Dispatch a task to RTRT's configured team. The local manager forwards the raw task and RTRT selects an available leader; the selected leader dynamically delegates workers by roles."
-    )]
-    async fn team_dispatch(
-        &self,
-        Parameters(args): Parameters<TeamDispatchArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let cfg = rtrt_core::Config::load_effective_for_cwd();
-        if !cfg.team.enabled {
-            return Err(McpError::invalid_params(
-                "team_dispatch: team is disabled; set [team] enabled = true",
-                None,
-            ));
-        }
-        if args.prompt.trim().is_empty() {
-            return Err(McpError::invalid_params(
-                "team_dispatch: prompt is empty",
-                None,
-            ));
-        }
-
-        let capture_project = self.state.pinned_project(args.project.as_deref())?;
-        let provenance = args.invocation.resolve(Some(&capture_project));
-        let result = dispatch_team_rich_with_context(
-            &cfg.team,
-            &args.prompt,
-            team_dispatch_timeout(args.timeout_secs),
-            provenance,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(format!("team_dispatch: {e}"), None))?;
-        self.state
-            .auto_capture(
-                "team_dispatch",
-                Some(&capture_project),
-                &result.outcome.outcome.output,
-            )
-            .await?;
-        let body = team_dispatch_response(&result)?;
-        Ok(CallToolResult::success(vec![Content::text(
-            body.to_string(),
-        )]))
-    }
-
-    #[tool(
         description = "Scan a directory for security & license issues in AI-generated code using a named profile (CIS / NIST SSDF / OWASP Top 10 / ASVS / ai-default / ai-strict). Returns a ScanReport: findings with severity, file:line, fix hint, and the standards each rule maps to (CWE/OWASP/NIST/...), plus per-severity counts."
     )]
     async fn security_scan(
@@ -2237,9 +2123,7 @@ impl ServerHandler for RtrtMcp {
                 network: true,
             }
             | RuntimeProfile::StdioFull
-            | RuntimeProfile::AdminStdio => {
-                "LLM tools: provider_chat / agent_call / agent_route / team_dispatch."
-            }
+            | RuntimeProfile::AdminStdio => "LLM tools: provider_chat / agent_call / agent_route.",
             RuntimeProfile::PermissionOnly => unreachable!("handled above"),
         };
         let instructions = format!(
@@ -3195,7 +3079,7 @@ mod tests {
         for (index, (profile, process, network)) in profiles.into_iter().enumerate() {
             let (server, path) = server_for_profile(profile, &format!("http-profile-{index}"));
             let names = listed_tool_names(&server);
-            for name in ["agent_call", "agent_route", "team_dispatch"] {
+            for name in ["agent_call", "agent_route"] {
                 assert_eq!(
                     names.iter().any(|listed| listed == name),
                     process && network,
@@ -3207,7 +3091,7 @@ mod tests {
                 network
             );
             let instructions = server.get_info().instructions.unwrap_or_default();
-            for name in ["agent_call", "agent_route", "team_dispatch"] {
+            for name in ["agent_call", "agent_route"] {
                 assert_eq!(
                     instructions.contains(name),
                     process && network,
@@ -3222,7 +3106,7 @@ mod tests {
 
     #[test]
     fn http_capability_classification_requires_every_opt_in_and_fails_closed() {
-        let execution = tool_capabilities("team_dispatch").unwrap();
+        let execution = tool_capabilities("agent_call").unwrap();
         assert!(!execution.allowed(false, false));
         assert!(!execution.allowed(true, false));
         assert!(!execution.allowed(false, true));
@@ -3272,7 +3156,6 @@ mod tests {
         );
         denied(&http_default, "agent_call");
         denied(&http_default, "agent_route");
-        denied(&http_default, "team_dispatch");
         denied(&http_default, "provider_chat");
 
         let (process_only, process_path) = server_for_profile(
@@ -3285,7 +3168,6 @@ mod tests {
         denied(&process_only, "provider_chat");
         denied(&process_only, "agent_call");
         denied(&process_only, "agent_route");
-        denied(&process_only, "team_dispatch");
 
         let (network_only, network_path) = server_for_profile(
             RuntimeProfile::Http {
@@ -3633,26 +3515,6 @@ mod tests {
         claude.cli_invocation = Some("claude -p {prompt}".to_string());
         claude.models = vec!["sonnet".to_string()];
         vec![pooled_tool(), claude]
-    }
-
-    #[test]
-    fn team_dispatch_timeout_defaults_and_accepts_override() {
-        assert_eq!(
-            team_dispatch_timeout(None),
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)
-        );
-        assert_eq!(
-            team_dispatch_timeout(Some(45)),
-            std::time::Duration::from_secs(45)
-        );
-    }
-
-    #[test]
-    fn team_dispatch_args_allow_omitted_timeout() {
-        let args: TeamDispatchArgs =
-            serde_json::from_str(r#"{"prompt":"ship it"}"#).expect("valid arguments");
-        assert_eq!(args.prompt, "ship it");
-        assert_eq!(args.timeout_secs, None);
     }
 
     #[test]

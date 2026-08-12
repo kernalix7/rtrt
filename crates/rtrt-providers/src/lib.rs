@@ -15,12 +15,10 @@ pub mod context7;
 pub mod gateway;
 pub mod gateway_server;
 pub mod invoke;
-pub mod lane;
 pub mod openai;
 pub mod openai_compatible;
 pub mod router;
 pub mod stream;
-pub mod team;
 pub mod usage;
 pub mod usage_ledger;
 
@@ -40,20 +38,10 @@ pub use invoke::{
     classify_error, invoke_agent, invoke_with_failover, invoke_with_failover_context,
     invoke_with_policy, invoke_with_policy_context, is_retryable_error,
 };
-pub use lane::{
-    AGENT_INVOKER, AgentInvoker, LaneAttempt, LaneHalt, LaneInvoker, LaneReport, LaneRole,
-    LaneRoom, LaneRun, LaneRunner, LaneStep, LaneTask, LedgerRoom, RedoDirective, StaticRoom,
-    UNKNOWN_ROOM, UnknownRoom, resolve_lane, resolve_leader_lane,
-};
 pub use openai::{OPENAI_TARGET, OpenAIProvider};
 pub use openai_compatible::OpenAICompatibleProvider;
 pub use router::{
     Prefer, RankedTarget, RouteAlternative, RouteDecision, RouteRequest, select_route,
-};
-pub use team::{
-    ProvenanceProjectionError, RecursiveRunMetadata, TeamDispatchResult, build_team_leader_prompt,
-    dispatch_team, dispatch_team_rich, dispatch_team_rich_with_context, dispatch_team_with_context,
-    recursion_limits,
 };
 pub use usage::{PoolQuota, ProxyUsage, QuotaHeadroom, Usage, UsageSnapshot};
 pub use usage_ledger::{

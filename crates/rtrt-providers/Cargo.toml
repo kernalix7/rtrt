@@ -10,7 +10,6 @@ description = "RTRT multi-provider AI client abstraction."
 
 [dependencies]
 rtrt-core.workspace = true
-rtrt-orchestrator.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

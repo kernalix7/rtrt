@@ -12,7 +12,6 @@ members = [
     "crates/rtrt-templates",
     "crates/rtrt-eval",
     "crates/rtrt-security",
-    "crates/rtrt-orchestrator",
 ]
 # `fuzz/` is a cargo-fuzz crate that depends on libfuzzer-sys; keep it out of
 # the workspace so a default `cargo build` doesn't drag nightly-only deps in.
@@ -37,7 +36,6 @@ rtrt-memory = { path = "crates/rtrt-memory", version = "0.1.0" }
 rtrt-providers = { path = "crates/rtrt-providers", version = "0.1.0" }
 rtrt-templates = { path = "crates/rtrt-templates", version = "0.1.0" }
 rtrt-security = { path = "crates/rtrt-security", version = "0.1.0" }
-rtrt-orchestrator = { path = "crates/rtrt-orchestrator", version = "0.1.0" }
 
 anyhow = "1"
 thiserror = "2"

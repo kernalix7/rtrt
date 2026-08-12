@@ -28,22 +28,26 @@ irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 | `--source PATH` | `-Source` | `RTRT_SOURCE` | 로컬 복사본 빌드 (오프라인) |
 | `--dir PATH` | `-InstallDir` | — | 설치 경로 변경 |
 | `--skip-deps` | `-SkipDeps` | `RTRT_SKIP_DEPS=1` | cargo / git 툴체인 체크 우회 |
-| `--no-setup` | — | `RTRT_NO_SETUP=1` | Claude Code MCP 설정 + 훅 자동 갱신 안 함 |
+| `--no-setup` | `-NoSetup` | `RTRT_NO_SETUP=1` | Claude 갱신과 Linux OpenCode bootstrap/session migration 모두 끔 |
 | `--no-service` | `-NoService` | `RTRT_NO_SERVICE=1` | `rtrt-dashboard` 백그라운드 서비스 자동 시작 안 함 |
-| `--uninstall` | `-Uninstall` | — | 호환성 셰임 — `uninstall.sh` / `uninstall.ps1` 권장 |
+| `--uninstall` | `-Uninstall` | — | 데이터를 보존하는 호환성 셰임; 대화형/purge는 플랫폼 uninstaller 사용 |
 | `--dry-run` | `-DryRun` | — | 실제 쓰기 없이 동작만 출력 |
 
 플래그가 환경 변수보다 우선. 릴리스 없고 플래그도 없으면 안내 후 `--ref main`으로 자동 폴백.
 
+Linux/WSL에서 기존 OpenCode config/managed state 또는 안전한 absolute `command -v opencode` 결과와 operator-installed fixed `bwrap` 증거가 있고 root가 아니면, 새로 설치한 exact `rtrt`로 machine-only 보안 bootstrap을 자동 적용합니다. 디렉터리를 검색하거나 OpenCode를 실행하지 않습니다. 설치 cwd는 승인하지 않고 기존 global session을 lossless migration합니다. 실패해도 binary와 source DB를 보존하고 manual command를 출력합니다. Native Windows/macOS는 strict `bwrap` setup을 건너뜁니다. 이후 `rtrt opencode --`만 명시적으로 실행한 checkout을 승인합니다.
+
 ### 백그라운드 대시보드 서비스
 
-기본적으로 설치 시 `rtrt-dashboard`를 백그라운드 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동. `--no-service`(Windows는 `-NoService`, 또는 `RTRT_NO_SERVICE=1`)로 끔.
+기본적으로 사용자별 machine-scope `rtrt-dashboard`를 등록해 로그인 후 실행합니다. repository cwd, project slug, `RTRT_MEMORY_PATH`, token argv를 사용하지 않고 정확히 `~/.rtrt/dashboard/dashboard.env`를 읽으며, `~/.rtrt/projects`의 검증된 store를 selector로 표시합니다. **All projects**는 집계 보기이므로 project-specific write 전에는 구체적 project를 선택해야 합니다. `--no-service`(Windows는 `-NoService`, 또는 `RTRT_NO_SERVICE=1`)는 service/token 생성을 모두 건너뜁니다. `--dry-run` / `-DryRun`은 쓰지 않지만 일반 pipe/noninteractive 설치는 service를 설치합니다.
 
 - **Linux** — systemd **user** 유닛 `~/.config/systemd/user/rtrt-dashboard.service`.
 - **macOS** — launchd LaunchAgent `~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`.
-- **Windows** — `rtrt-dashboard` 로그온 예약 작업.
+- **Windows** — installer-owned `rtrt-dashboard` 로그온 예약 작업 (`rtrt-dashboard.exe --machine --state-dir "%USERPROFILE%\.rtrt\dashboard"`). Private state ACL은 설치 사용자만 허용하고 재설치는 32-byte CSPRNG token을 재사용하며 확인된 owned task만 갱신합니다.
 
-직접 관리: `rtrt service install|uninstall|status` (Linux/macOS; 기본 dry-run, `--apply`로 실행). 언인스톨러는 바이너리 삭제 전에 서비스를 먼저 제거.
+Linux/macOS 직접 관리: `~/.local/bin/rtrt service install|uninstall|status` (기본 dry-run, `--apply`로 실행). Windows task 생성은 installer가 담당합니다. Unix uninstall과 `install.ps1 -Uninstall`은 확인된 owned service/task definition만 제거하고, 명시적 purge 전에는 machine token과 project DB를 보존합니다.
+
+Windows에서는 현재 `rtrt service` 관리/open을 지원하지 않습니다. <http://127.0.0.1:7311/>을 열고 dashboard bootstrap prompt에만 token을 입력하세요. Token을 command, URL, task definition에 넣지 마세요.
 
 예시:
 
@@ -64,7 +68,7 @@ sh install.sh --dir /opt/rtrt/bin --skip-deps
 ### 원라이너 제거
 
 ```bash
-# Linux / macOS / WSL — Claude Code 연동(MCP + 훅 + 상태줄) 해제 + 대시보드
+# Linux / macOS / WSL — OpenCode/Claude Code 연동 해제 + 대시보드
 # 서비스 + 바이너리 제거 (~/.rtrt 상태 유지)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | bash -s -- --confirm
 
@@ -78,9 +82,9 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.ps1))) -Purge
 ```
 
-언인스톨러는 `install.sh` / `rtrt setup`이 만든 모든 것 — Claude Code MCP 등록, 훅, 상태줄, 스킬(내부적으로 `rtrt uninstall --agent claude --plugin --apply`), 대시보드 백그라운드 서비스, 바이너리 3종 — 을 제거하되, `--purge` / `-Purge`를 넘기지 않는 한 데이터(`~/.rtrt` 메모리 저장소, 프롬프트 레지스트리)는 보존합니다.
+언인스톨러는 binary 삭제 전에 기록된 OpenCode prior shell을 복원하고 managed agent/service surface를 제거합니다. `--purge` / `-Purge`가 없으면 session DB를 포함한 데이터를 보존합니다.
 
-로컬에서 `--confirm` / `-Confirm` 없이 실행하면 단계마다 확인을 묻는 대화형 모드로 동작합니다. 기존 `install.sh --uninstall` / `install.ps1 -Uninstall`은 상태를 건드리지 않는 호환성 셰임으로 남아 있습니다.
+로컬 실행은 대화형 모드를 지원합니다. 호환성 셰임은 데이터를 보존하며 `install.sh --uninstall`은 managed OpenCode shell을 먼저 복원하고 안전하지 않은 binary 삭제를 거부합니다.
 
 ## 소스 빌드
 

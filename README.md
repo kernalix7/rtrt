@@ -112,6 +112,7 @@ rtrt templates                                  # list built-in templates
 rtrt new rust-cli ./hello --var project_name=hello
 rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
 rtrt setup --agent opencode --apply             # wire RTRT into OpenCode's MCP config
+rtrt setup --agent opencode --sandbox --machine-only --apply # machine shell only; authorizes no cwd
 rtrt team check-manager                          # verify the local manager's exact tool call
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
@@ -131,7 +132,7 @@ rtrt migrate --apply                            # migrate a repo to the rtrt pro
 rtrt project refresh --apply                    # contract render + canonical settings + audit
 rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
 rtrt benchmark                                  # cargo bench wrapper
-rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 12 tools, bearer-token guard
+rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 24 tools, bearer-token guard
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.
@@ -216,7 +217,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 </td><td width="50%">
 
 **MCP server + dashboard**
-- `rtrt-mcp` (rmcp 1.x) ships 11 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`
+- `rtrt-mcp` (rmcp 1.x) ships 24 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `repo_map`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_timeline`, `memory_profile`, `memory_relations`, `memory_smart_search`, `memory_export`, `memory_consolidate`, `memory_sessions`, `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`, `agent_call`, `agent_route`, `team_dispatch`, `security_scan`, `permission_prompt`
 - HTTP transport hardens with `--http-token` (constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
 - `rtrt-dashboard` (axum) — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle. Routes: `/api/{metrics,budget,prompts,memory/*,templates*,compress,proxy,diagnose,repo-map,setup,chat,stats}`. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
 - `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf / opencode
@@ -253,8 +254,9 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | `rtrt-providers` | Multi-provider chat trait + Gateway + Budget + usage ledger / headroom router + invoke bridge + Context7 doc fetcher |
 | `rtrt-templates` | Built-in + custom scaffolds + handlebars rendering + `PromptRegistry` |
 | `rtrt-security` | Profile-driven security & license scanning (secrets / licenses / deps / patterns / ai engines, standards-mapped profiles) |
+| `rtrt-orchestrator` | Worktree leases, agent protocol, event tree, contract + relay primitives |
 | `rtrt-eval` | Opt-in evaluation harness — recall R@K / MRR + compression ratio + BERTScore (feature-gated) |
-| `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 11 tools, bearer-token guard |
+| `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 24 tools, bearer-token guard |
 | `rtrt-dashboard` | Axum web dashboard + REST API (`/api/{chat,metrics,templates,stats}`) |
 | `rtrt-cli` | `rtrt` command-line entry point |
 
@@ -271,14 +273,14 @@ CI runs the same three gates on every push and pull request to `main`.
 
 ## Roadmap
 
-- [x] Workspace scaffold (11 crates, edition 2024)
+- [x] Workspace scaffold (12 crates, edition 2024)
 - [x] `rtrt-compress` rule engine + extreme level + secret redactor + tree-sitter signatures + LLM mode
 - [x] `rtrt-proxy` filters for git + cargo
 - [x] `rtrt-memory` SQLite + FTS5 BM25 + dense-vector + RRF hybrid + edges graph + HNSW + memory tiers
 - [x] `rtrt-memory` LLM-driven extract / compress / archival via any provider (local Ollama OK)
 - [x] `rtrt-templates` 6 built-ins + custom loader + handlebars + versioned `PromptRegistry`
 - [x] `rtrt-providers` real Anthropic / OpenAI / OpenAI-compatible HTTP + streaming + Gateway + Budget + Context7 docs
-- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 11 tools (compress / compress_ml / proxy / memory_* / templates_* / provider_chat), bearer-token + RFC 6454 Origin guards
+- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 24 tools (compress / compress_ml / proxy / repo_map / memory_* / templates_* / provider_chat / agent_* / team_dispatch / security_scan / permission_prompt), bearer-token + RFC 6454 Origin guards
 - [x] `rtrt-dashboard` axum UI — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
 - [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
 - [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf / opencode

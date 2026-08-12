@@ -8,8 +8,8 @@ set -euo pipefail
 # Interactive (asks before each step):
 #   ./uninstall.sh
 #
-# Auto (removes agent wiring + service + binaries, keeps memory store +
-# prompt registry under ~/.rtrt):
+# Auto (removes agent wiring + owned machine service + binaries, keeps the
+# machine token, project databases, memory store, and prompt registry under ~/.rtrt):
 #   curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh \
 #       | bash -s -- --confirm
 #
@@ -101,6 +101,45 @@ if [ ! -x "$rtrt_bin" ]; then
     rtrt_bin="$(command -v rtrt 2>/dev/null || true)"
 fi
 
+# Restore the machine-global OpenCode shell before any binary can disappear.
+# The Rust command is cwd-independent and handles an empty project registry.
+opencode_registry="$HOME/.config/opencode/.rtrt-sandbox-state.json"
+managed_shell_without_registry=false
+managed_shell_target="$INSTALL_DIR/rtrt"
+if [ ! -e "$opencode_registry" ]; then
+    for config in "$HOME/.config/opencode/opencode.json" "$HOME/.config/opencode/opencode.jsonc"; do
+        if [ -f "$config" ] \
+            && { grep -F "\"shell\":\"$managed_shell_target\"" "$config" >/dev/null 2>&1 \
+                || grep -F "\"shell\": \"$managed_shell_target\"" "$config" >/dev/null 2>&1; }; then
+            managed_shell_without_registry=true
+        fi
+    done
+fi
+if [ "$managed_shell_without_registry" = true ]; then
+    err "OpenCode shell points to $managed_shell_target but its ownership registry is missing; refusing binary removal."
+    err "Restore/remove that shell entry manually, then rerun uninstall."
+    exit 1
+fi
+if [ -e "$opencode_registry" ]; then
+    if [ -z "$rtrt_bin" ] || [ ! -x "$rtrt_bin" ]; then
+        err "OpenCode shell is managed by RTRT but no rtrt binary is available; refusing binary removal."
+        err "Reinstall RTRT, then run: rtrt uninstall --agent opencode --apply"
+        exit 1
+    fi
+    if ask "Restore prior OpenCode shell and remove managed global wiring?"; then
+        if "$rtrt_bin" uninstall --agent opencode --apply >/dev/null; then
+            log "  OpenCode integration removed; session databases preserved"
+        else
+            err "could not safely unwire OpenCode; binaries retained."
+            err "Run: $rtrt_bin uninstall --agent opencode --apply"
+            exit 1
+        fi
+    else
+        warn "OpenCode remains wired; refusing binary removal."
+        exit 1
+    fi
+fi
+
 # Unwire the Claude Code integration first, while the rtrt binary still
 # exists to do it — otherwise ~/.claude/settings.json keeps hooks + a
 # statusline that point at deleted binaries and every session logs errors.
@@ -132,20 +171,34 @@ service_unit="$HOME/.config/systemd/user/rtrt-dashboard.service"
 launch_agent="$HOME/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist"
 if [ -e "$service_unit" ] || [ -e "$launch_agent" ] || [ -n "$rtrt_bin" ]; then
     if ask "Stop + remove the rtrt-dashboard service?"; then
-        if [ -n "$rtrt_bin" ] && [ -x "$rtrt_bin" ] \
+        owned_service=""
+        if [ -f "$service_unit" ] && [ ! -L "$service_unit" ] \
+            && grep -Fx '# rtrt-managed-dashboard-service' "$service_unit" >/dev/null 2>&1 \
+            && grep -F -- '--machine' "$service_unit" >/dev/null 2>&1 \
+            && grep -F -- '--state-dir' "$service_unit" >/dev/null 2>&1; then
+            owned_service="$service_unit"
+        elif [ -f "$launch_agent" ] && [ ! -L "$launch_agent" ] \
+            && grep -F '<!-- rtrt-managed-dashboard-service -->' "$launch_agent" >/dev/null 2>&1 \
+            && grep -F -- '--machine' "$launch_agent" >/dev/null 2>&1 \
+            && grep -F -- '--state-dir' "$launch_agent" >/dev/null 2>&1; then
+            owned_service="$launch_agent"
+        fi
+        if { [ -e "$service_unit" ] || [ -e "$launch_agent" ]; } && [ -z "$owned_service" ]; then
+            warn "  refusing unrecognized or unsafe dashboard service definition"
+        elif [ -n "$owned_service" ] && [ -n "$rtrt_bin" ] && [ -x "$rtrt_bin" ] \
             && "$rtrt_bin" service uninstall --apply >/dev/null 2>&1; then
             log "  dashboard service removed"
-        elif [ -e "$service_unit" ]; then
+        elif [ "$owned_service" = "$service_unit" ]; then
             systemctl --user disable --now rtrt-dashboard.service >/dev/null 2>&1 || true
             rm -f "$service_unit"
             systemctl --user daemon-reload >/dev/null 2>&1 || true
             log "  dashboard service removed (unit file cleanup)"
-        elif [ -e "$launch_agent" ]; then
+        elif [ "$owned_service" = "$launch_agent" ]; then
             launchctl unload -w "$launch_agent" >/dev/null 2>&1 || true
             rm -f "$launch_agent"
             log "  dashboard service removed (LaunchAgent cleanup)"
         else
-            warn "  no dashboard service to remove (or systemd/launchd absent)"
+            warn "  no owned dashboard service to remove (or systemd/launchd absent)"
         fi
     fi
 fi

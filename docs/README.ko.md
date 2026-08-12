@@ -111,6 +111,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - **`rtrt-dashboard`** — axum 10탭 (Metrics SVG 스파크라인 / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup). `/api/stream` SSE 라이브 활동, `/api/tokens/summary` 게이트웨이 시간/일 집계, `/api/memory/{projects,timeline}` 페이지네이션. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
 - **Claude Code 플러그인** — `plugins/claude-code/rtrt/` 훅 12종 (PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd). CLI 우선, 대시보드 POST 폴백.
 - **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/opencode/aider --apply`.
+- **Linux OpenCode 보안 부트스트랩** — eligible 설치는 machine shell과 기존 global session migration을 자동 적용하며 `--no-setup`으로 끕니다. 설치 cwd는 승인하지 않습니다.
 - **보안 & 라이선스 스캔** — `rtrt-security`: 프로파일 기반 5 엔진(secrets / licenses / deps / patterns / ai), 표준 매핑 빌트인 프로파일 6종(CWE / OWASP / NIST / CIS / SLSA / EU AI Act), `rtrt security scan | profile | gate | init` + 대시보드 보안 페이지 + MCP `security_scan`.
 - **2단 설정 & 프로젝트 라이프사이클** — 글로벌 베이스 커널(`~/.rtrt/config.toml`, `rtrt setup` 관리) + 프로젝트별 `<repo>/.rtrt/config.toml` 오버라이드(유효 설정 = 글로벌 ⊕ 프로젝트, 대시보드 글로벌 따름/커스텀 토글); `rtrt migrate` / `rtrt project refresh`(기본 dry-run, `--apply`) + `rtrt project status/health/repair`.
 - **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`, `rtrt benchmark`.

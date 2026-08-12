@@ -23,8 +23,8 @@
 #   --skip-deps         Skip the toolchain check. Fail early if cargo / git
 #                       aren't already present.
 #                       (env: RTRT_SKIP_DEPS=1)
-#   --no-setup          Don't auto-refresh the Claude Code MCP config + hooks
-#                       even when a prior `rtrt setup` is detected.
+#   --no-setup          Disable all agent setup: Claude refresh plus Linux
+#                       OpenCode strict bootstrap/session migration.
 #                       (env: RTRT_NO_SETUP=1)
 #   --no-service        Don't install the rtrt-dashboard background service
 #                       (systemd --user on Linux, launchd on macOS).
@@ -61,14 +61,14 @@ INSTALL_DIR="${HOME}/.local/bin"
 SKIP_DEPS=0
 UNINSTALL=0
 DRY_RUN=0
-# Auto-reconfigure: when a prior `rtrt setup` is detected, refresh the
-# Claude Code MCP config + hooks against the just-installed binary.
+# Auto agent setup: refresh prior Claude wiring and securely bootstrap an
+# eligible Linux OpenCode installation without authorizing installer cwd.
 # `--no-setup` / RTRT_NO_SETUP=1 disables.
-NO_SETUP="${RTRT_NO_SETUP:-0}"
+case "${RTRT_NO_SETUP:-0}" in 1) NO_SETUP=1 ;; *) NO_SETUP=0 ;; esac
 # Auto-start: install rtrt-dashboard as a background OS service so it runs
 # without `rtrt-dashboard` being launched by hand. `--no-service` /
 # RTRT_NO_SERVICE=1 disables. Skipped on platforms without systemd/launchd.
-NO_SERVICE="${RTRT_NO_SERVICE:-0}"
+case "${RTRT_NO_SERVICE:-0}" in 1) NO_SERVICE=1 ;; *) NO_SERVICE=0 ;; esac
 
 # ---------- colour logger ----------
 if [ -t 1 ]; then
@@ -104,7 +104,7 @@ Local-path option (offline / air-gapped):
 Install dir + toolchain:
   --dir PATH          Install dir (default: $HOME/.local/bin).
   --skip-deps         Skip the toolchain check. (env: RTRT_SKIP_DEPS=1)
-  --no-setup          Don't auto-refresh the Claude Code MCP config + hooks. (env: RTRT_NO_SETUP=1)
+  --no-setup          Disable Claude refresh and Linux OpenCode bootstrap/session migration. (env: RTRT_NO_SETUP=1)
   --no-service        Don't install the rtrt-dashboard background service. (env: RTRT_NO_SERVICE=1)
 
 Compat shims:
@@ -138,10 +138,12 @@ done
 [ "$SKIP_DEPS" -eq 0 ] && [ -n "$RTRT_SKIP_DEPS" ] && SKIP_DEPS=1
 
 run() {
+    action="$1"
+    shift
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] %s\n' "$*"
+        printf '[dry-run] %s\n' "$action"
     else
-        eval "$*"
+        "$@"
     fi
 }
 
@@ -161,10 +163,38 @@ if [ "$UNINSTALL" -eq 1 ]; then
     log "For an interactive / purge flow, use uninstall.sh instead:"
     log "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | bash -s -- --confirm"
     echo
+    rtrt_bin="$INSTALL_DIR/rtrt"
+    registry="$HOME/.config/opencode/.rtrt-sandbox-state.json"
+    managed_shell_without_registry=0
+    if [ ! -e "$registry" ]; then
+        for config in "$HOME/.config/opencode/opencode.json" "$HOME/.config/opencode/opencode.jsonc"; do
+            if [ -f "$config" ] \
+                && { grep -F "\"shell\":\"$rtrt_bin\"" "$config" >/dev/null 2>&1 \
+                    || grep -F "\"shell\": \"$rtrt_bin\"" "$config" >/dev/null 2>&1; }; then
+                managed_shell_without_registry=1
+            fi
+        done
+    fi
+    if [ "$managed_shell_without_registry" -eq 1 ]; then
+        err "OpenCode shell points to $rtrt_bin but ownership registry is missing; refusing deletion. Restore the shell entry manually first."
+        exit 1
+    fi
+    if [ -e "$registry" ]; then
+        if [ ! -x "$rtrt_bin" ]; then
+            err "OpenCode sandbox is managed but $rtrt_bin is unavailable; refusing to delete binaries."
+            exit 1
+        fi
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '[dry-run] %s uninstall --agent opencode --apply\n' "$rtrt_bin"
+        elif ! "$rtrt_bin" uninstall --agent opencode --apply; then
+            err "could not restore OpenCode shell; binaries retained. Run: $rtrt_bin uninstall --agent opencode --apply"
+            exit 1
+        fi
+    fi
     for bin in $BINS; do
         target="$INSTALL_DIR/$bin"
         if [ -f "$target" ]; then
-            run "rm -f \"$target\""
+            run "remove $target" rm -f "$target"
             log "  removed $target"
         else
             warn "  skip $target (not present)"
@@ -217,12 +247,89 @@ install_check() {
         log "  $INSTALL_DIR/$bin"
     done
     reconfigure_if_present
+    bootstrap_opencode_if_eligible
     install_dashboard_service
     echo
     log "Next:"
     log "  rtrt --version"
     log "  rtrt info"
     log "  rtrt templates"
+}
+
+# Passive eligibility only. Rust performs authoritative ownership, mode,
+# canonical-path, config, backend-usability, and registry checks.
+safe_passive_executable() {
+    candidate="$1"
+    case "$candidate" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$candidate" in
+        *'
+'*) return 1 ;;
+    esac
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -x "$candidate" ] || return 1
+    candidate_uid="$(stat -c %u "$candidate" 2>/dev/null || printf invalid)"
+    { [ "$candidate_uid" = 0 ] || [ "$candidate_uid" = "$(id -u)" ]; } || return 1
+    mode="$(stat -c %a "$candidate" 2>/dev/null || printf invalid)"
+    case "$mode" in *[2367][0-7]|*[0-7][2367]|invalid) return 1 ;; esac
+
+    ancestor="${candidate%/*}"
+    [ -n "$ancestor" ] || ancestor=/
+    while :; do
+        [ -d "$ancestor" ] && [ ! -L "$ancestor" ] || return 1
+        ancestor_uid="$(stat -c %u "$ancestor" 2>/dev/null || printf invalid)"
+        { [ "$ancestor_uid" = 0 ] || [ "$ancestor_uid" = "$(id -u)" ]; } || return 1
+        mode="$(stat -c %a "$ancestor" 2>/dev/null || printf invalid)"
+        case "$mode" in *[2367][0-7]|*[0-7][2367]|invalid) return 1 ;; esac
+        [ "$ancestor" = / ] && break
+        ancestor="${ancestor%/*}"
+        [ -n "$ancestor" ] || ancestor=/
+    done
+}
+
+bootstrap_opencode_if_eligible() {
+    [ "$NO_SETUP" -eq 1 ] && return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    [ "$(uname -s)" = "Linux" ] || return 0
+    [ "$(id -u)" -ne 0 ] || { warn "skipping OpenCode bootstrap for root/sudo install"; return 0; }
+    if [ ! -d "$HOME" ] || [ -L "$HOME" ]; then
+        warn "skipping OpenCode bootstrap: HOME is not a real directory"
+        return 0
+    fi
+    home_uid="$(stat -c %u "$HOME" 2>/dev/null || printf invalid)"
+    [ "$home_uid" = "$(id -u)" ] || { warn "skipping OpenCode bootstrap: HOME is not owned by invoking user"; return 0; }
+    evidence=0
+    [ -f "$HOME/.config/opencode/opencode.json" ] && evidence=1
+    [ -f "$HOME/.config/opencode/opencode.jsonc" ] && evidence=1
+    [ -f "$HOME/.config/opencode/.rtrt-sandbox-state.json" ] && evidence=1
+    if [ "$evidence" -eq 0 ]; then
+        opencode_evidence="$(command -v opencode 2>/dev/null || true)"
+        safe_passive_executable "$opencode_evidence" || return 0
+    fi
+    bwrap_evidence=""
+    for candidate in /usr/bin/bwrap /bin/bwrap; do
+        mode="$(stat -c %a "$candidate" 2>/dev/null || printf invalid)"
+        case "$mode" in *[2367][0-7]|*[0-7][2367]|invalid) safe_mode=0 ;; *) safe_mode=1 ;; esac
+        if [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -x "$candidate" ] \
+            && [ "$(stat -c %u "$candidate" 2>/dev/null || printf invalid)" = 0 ] \
+            && [ "$safe_mode" -eq 1 ]; then
+            bwrap_evidence="$candidate"; break
+        fi
+    done
+    [ -n "$bwrap_evidence" ] || return 0
+    rtrt_bin="$INSTALL_DIR/rtrt"
+    echo
+    log "eligible OpenCode installation detected — applying strict machine bootstrap"
+    if ! "$rtrt_bin" setup --agent opencode --sandbox --machine-only --apply; then
+        warn "OpenCode bootstrap failed; RTRT binaries remain installed. Run: $rtrt_bin setup --agent opencode --sandbox --machine-only --apply"
+        return 0
+    fi
+    if "$rtrt_bin" opencode sessions apply; then
+        log "  existing global OpenCode sessions migrated to project-private stores"
+    else
+        warn "OpenCode session migration failed; source database was retained. Run: $rtrt_bin opencode sessions apply"
+    fi
 }
 
 # Install rtrt-dashboard as a background OS service (systemd --user on Linux,
@@ -242,11 +349,11 @@ install_dashboard_service() {
     esac
     echo
     log "installing rtrt-dashboard background service"
-    if "$rtrt_bin" service install --apply >/dev/null 2>&1; then
+    if "$rtrt_bin" service install --apply; then
         log "  dashboard service started — http://127.0.0.1:7311"
         log "  stop/remove: rtrt service uninstall --apply"
     else
-        warn "  service install skipped (no systemd/launchd?) — run rtrt-dashboard manually"
+        warn "  service install failed; binaries remain installed. Retry: $rtrt_bin service install --apply"
     fi
 }
 
@@ -254,8 +361,7 @@ install_dashboard_service() {
 # config + hooks against the just-installed binary. This keeps the
 # wiring in lockstep with binary upgrades so the user never has to run
 # uninstall / setup by hand after an install. Skipped on --no-setup, in
-# --dry-run, and when no prior setup is found (a first-time install
-# stays non-invasive — the user opts in by running `rtrt setup`).
+# --dry-run, and when no prior Claude setup is found.
 reconfigure_if_present() {
     [ "$NO_SETUP" -eq 1 ] && return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
@@ -288,10 +394,14 @@ build_from_source() {
     if [ "$SKIP_DEPS" -eq 0 ]; then
         need_cmd cargo
     fi
-    run "cd \"$src_dir\" && cargo build --release --workspace"
-    run "mkdir -p \"$INSTALL_DIR\""
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] cargo build --release --workspace (in %s)\n' "$src_dir"
+    else
+        (cd "$src_dir" && cargo build --release --workspace)
+    fi
+    run "mkdir $INSTALL_DIR" mkdir -p "$INSTALL_DIR"
     for bin in $BINS; do
-        run "install -m 0755 \"$src_dir/target/release/$bin\" \"$INSTALL_DIR/$bin\""
+        run "install $bin" install -m 0755 "$src_dir/target/release/$bin" "$INSTALL_DIR/$bin"
     done
     install_check
 }
@@ -313,12 +423,21 @@ if [ -n "$REF" ]; then
         need_cmd git
         need_cmd cargo
     fi
-    WORK="$(mktemp -d)"
-    trap 'rm -rf "$WORK"' EXIT INT TERM
+    if [ "$DRY_RUN" -eq 1 ]; then
+        WORK="${TMPDIR:-/tmp}/rtrt-install-dry-run"
+    else
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "$WORK"' EXIT INT TERM
+    fi
     log "  ref: $REF (source build into $WORK)"
     # Group the fallback: a plain `a || b && c` would run the checkout even
     # after a successful shallow clone.
-    run "git clone --depth 1 --branch \"$REF\" \"https://github.com/$REPO\" \"$WORK\" 2>/dev/null || { git clone \"https://github.com/$REPO\" \"$WORK\" && git -C \"$WORK\" checkout \"$REF\"; }"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] clone ref %s into %s\n' "$REF" "$WORK"
+    elif ! git clone --depth 1 --branch "$REF" "https://github.com/$REPO" "$WORK" 2>/dev/null; then
+        git clone "https://github.com/$REPO" "$WORK"
+        git -C "$WORK" checkout "$REF"
+    fi
     build_from_source "$WORK"
     exit 0
 fi
@@ -345,10 +464,14 @@ if [ -z "$VERSION" ]; then
             need_cmd git
             need_cmd cargo
         fi
-        WORK="$(mktemp -d)"
-        trap 'rm -rf "$WORK"' EXIT INT TERM
+        if [ "$DRY_RUN" -eq 1 ]; then
+            WORK="${TMPDIR:-/tmp}/rtrt-install-dry-run"
+        else
+            WORK="$(mktemp -d)"
+            trap 'rm -rf "$WORK"' EXIT INT TERM
+        fi
         log "  ref: main (auto-fallback into $WORK)"
-        run "git clone --depth 1 \"https://github.com/$REPO\" \"$WORK\""
+        run "clone main into $WORK" git clone --depth 1 "https://github.com/$REPO" "$WORK"
         build_from_source "$WORK"
         exit 0
     fi
@@ -359,11 +482,15 @@ ASSET="rtrt-${VERSION#v}-${TARGET_TRIPLE}.tar.gz"
 URL="https://github.com/$REPO/releases/download/${VERSION}/${ASSET}"
 CHECKSUM_URL="${URL}.sha256"
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+if [ "$DRY_RUN" -eq 1 ]; then
+    WORK="${TMPDIR:-/tmp}/rtrt-install-dry-run"
+else
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT INT TERM
+fi
 
 log "  downloading $URL"
-run "curl -fsSL -o \"$WORK/$ASSET\" \"$URL\""
+run "download $ASSET" curl -fsSL -o "$WORK/$ASSET" "$URL"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     # A missing .sha256 asset (`curl -f` fails) must surface as an empty
@@ -392,12 +519,12 @@ if [ "$DRY_RUN" -eq 0 ]; then
     fi
 fi
 
-run "tar -xzf \"$WORK/$ASSET\" -C \"$WORK\""
-run "mkdir -p \"$INSTALL_DIR\""
+run "extract $ASSET" tar -xzf "$WORK/$ASSET" -C "$WORK"
+run "mkdir $INSTALL_DIR" mkdir -p "$INSTALL_DIR"
 for bin in $BINS; do
     if [ "$DRY_RUN" -eq 1 ]; then
         # Nothing was downloaded in dry-run mode, so skip the existence probe.
-        run "install -m 0755 \"$WORK/$bin\" \"$INSTALL_DIR/$bin\""
+        run "install $bin" install -m 0755 "$WORK/$bin" "$INSTALL_DIR/$bin"
         continue
     fi
     src=""
@@ -407,7 +534,7 @@ for bin in $BINS; do
     if [ -z "$src" ]; then
         err "binary missing from tarball: $bin"; exit 1
     fi
-    run "install -m 0755 \"$src\" \"$INSTALL_DIR/$bin\""
+    run "install $bin" install -m 0755 "$src" "$INSTALL_DIR/$bin"
 done
 
 install_check

@@ -14,7 +14,9 @@
 #   -InstallDir <path>    Install dir (default: $env:LOCALAPPDATA\Programs\rtrt).
 #   -SkipDeps             Skip toolchain check (fail early if missing).
 #                         (env: RTRT_SKIP_DEPS=1)
-#   -Uninstall            Compat shim — defers to uninstall.ps1.
+#   -Uninstall            Compat shim — removes only an owned task + binaries.
+#   -NoSetup              Disable agent setup. Linux strict OpenCode bootstrap
+#                         is unsupported on native Windows. (env: RTRT_NO_SETUP=1)
 #   -NoService            Don't register the rtrt-dashboard logon task.
 #   -DryRun               Print intended actions without writing anything.
 
@@ -27,6 +29,7 @@ param(
     [string]   $InstallDir = (Join-Path $env:LOCALAPPDATA "Programs\rtrt"),
     [switch]   $SkipDeps,
     [switch]   $Uninstall,
+    [switch]   $NoSetup,
     [switch]   $NoService,
     [switch]   $DryRun
 )
@@ -44,11 +47,17 @@ try {
 
 $Repo = "kernalix7/rtrt"
 $Bins = @("rtrt.exe", "rtrt-mcp.exe", "rtrt-dashboard.exe")
+$DashboardTaskName = "rtrt-dashboard"
+$DashboardTaskMarker = "rtrt-managed-dashboard-service"
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentSid = $CurrentIdentity.User
 
 # Env-var fallbacks. Flag values above already take precedence.
 if (-not $Ref    -and $env:RTRT_REF)        { $Ref    = $env:RTRT_REF }
 if (-not $Source -and $env:RTRT_SOURCE)     { $Source = $env:RTRT_SOURCE }
 if (-not $SkipDeps -and $env:RTRT_SKIP_DEPS) { $SkipDeps = $true }
+if (-not $NoSetup -and $env:RTRT_NO_SETUP -eq "1") { $NoSetup = $true }
+if (-not $NoService -and $env:RTRT_NO_SERVICE -eq "1") { $NoService = $true }
 if ($Main) { $Ref = "main" }
 
 function Write-Log($Message)  { Write-Host "[rtrt] $Message"  -ForegroundColor Green }
@@ -71,12 +80,35 @@ function Require-Cmd($Name) {
     }
 }
 
+function Test-OwnedDashboardTask($Task) {
+    if ($Task.Description -ne $DashboardTaskMarker) { return $false }
+    if (@($Task.Actions).Count -ne 1) { return $false }
+    try {
+        if ($Task.Principal.UserId -match '^S-1-') {
+            $principalSid = New-Object Security.Principal.SecurityIdentifier($Task.Principal.UserId)
+        } else {
+            $principalSid = (New-Object Security.Principal.NTAccount($Task.Principal.UserId)).Translate([Security.Principal.SecurityIdentifier])
+        }
+    } catch { return $false }
+    return ($principalSid.Value -eq $CurrentSid.Value)
+}
+
 # ---------- uninstall (compat shim) ----------
 if ($Uninstall) {
     Write-Log "== rtrt uninstall (compat shim) =="
     Write-Log "For interactive / purge flow, use uninstall.ps1:"
     Write-Log "  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/uninstall.ps1))) -Confirm"
     Write-Host ""
+    $task = Get-ScheduledTask -TaskName $DashboardTaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        if (-not (Test-OwnedDashboardTask $task)) {
+            throw "refusing foreign scheduled task: $DashboardTaskName"
+        }
+        Invoke-Step "remove owned dashboard task" {
+            Stop-ScheduledTask -TaskName $DashboardTaskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $DashboardTaskName -Confirm:`$false
+        }
+    }
     foreach ($bin in $Bins) {
         $target = Join-Path $InstallDir $bin
         if (Test-Path $target) {
@@ -117,6 +149,9 @@ function Show-InstallCheck {
     foreach ($bin in $Bins) {
         Write-Log "  $(Join-Path $InstallDir $bin)"
     }
+    if (-not $NoSetup) {
+        Write-Log "native Windows: skipping Linux-only strict OpenCode bootstrap/session migration (bubblewrap unsupported)"
+    }
     Install-DashboardTask
     Write-Host ""
     Write-Log "Next:"
@@ -125,29 +160,117 @@ function Show-InstallCheck {
     Write-Log "  rtrt templates"
 }
 
+function Set-PrivateDirectoryAcl([string] $Path) {
+    $security = New-Object Security.AccessControl.DirectorySecurity
+    $security.SetOwner($CurrentSid)
+    $security.SetAccessRuleProtection($true, $false)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @(
+        $CurrentSid, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+    )
+    $security.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $security
+}
+
+function Assert-SafeDirectory([string] $Path) {
+    $parent = Split-Path -LiteralPath $Path -Parent
+    while ($parent) {
+        $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+        if ($parentItem -and (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "unsafe dashboard state ancestor: $parent"
+        }
+        $next = Split-Path -LiteralPath $parent -Parent
+        if ($next -eq $parent) { break }
+        $parent = $next
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "unsafe dashboard state path: $Path"
+        }
+    } else {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        $item = Get-Item -LiteralPath $Path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "unsafe dashboard state path: $Path" }
+    }
+    Set-PrivateDirectoryAcl $Path
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier])
+    if ($owner -ne $CurrentSid) { throw "dashboard state owner mismatch: $Path" }
+}
+
+function Protect-PrivateFile([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "unsafe dashboard token file: $Path" }
+    $security = New-Object Security.AccessControl.FileSecurity
+    $security.SetOwner($CurrentSid)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @($CurrentSid, "FullControl", "Allow")))
+    Set-Acl -LiteralPath $Path -AclObject $security
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier])
+    if ($owner -ne $CurrentSid) { throw "dashboard token owner mismatch: $Path" }
+}
+
+function Ensure-MachineDashboardToken([string] $StateDir) {
+    $envPath = Join-Path $StateDir "dashboard.env"
+    $existing = Get-Item -LiteralPath $envPath -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.PSIsContainer -or (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "unsafe dashboard token file: $envPath" }
+        Protect-PrivateFile $envPath
+        $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
+        if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
+        return
+    }
+    $bytes = New-Object byte[] 32
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $token = ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    $tmp = Join-Path $StateDir (".dashboard.env.{0}.tmp" -f ([Guid]::NewGuid().ToString('N')))
+    try {
+        $stream = New-Object IO.FileStream($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Dispose()
+        Protect-PrivateFile $tmp
+        [IO.File]::WriteAllText($tmp, "RTRT_DASHBOARD_TOKEN=$token`n", (New-Object Text.UTF8Encoding($false)))
+        try { [IO.File]::Move($tmp, $envPath) }
+        catch [IO.IOException] {
+            # Another installer won the create race; validate and reuse its token.
+            if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) { throw }
+        }
+    } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
+    Protect-PrivateFile $envPath
+    $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
+    if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
+    $token = $null
+}
+
 # Register a logon scheduled task that starts rtrt-dashboard in the background
 # (Windows has no `rtrt service` path; this is the equivalent auto-start).
-# Default-on; `-NoService` disables. Best-effort — never fails the install.
+# Default-on; `-NoService` disables. Unsafe state or foreign tasks fail closed.
 function Install-DashboardTask {
     if ($NoService -or $DryRun) { return }
     $dash = Join-Path $InstallDir "rtrt-dashboard.exe"
-    if (-not (Test-Path $dash)) { return }
+    $dashItem = Get-Item -LiteralPath $dash -Force -ErrorAction SilentlyContinue
+    if (-not $dashItem) { return }
+    if ($dashItem.PSIsContainer -or (($dashItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "unsafe dashboard executable: $dash"
+    }
+    $existing = Get-ScheduledTask -TaskName $DashboardTaskName -ErrorAction SilentlyContinue
+    if ($existing -and -not (Test-OwnedDashboardTask $existing)) {
+        throw "refusing foreign scheduled task: $DashboardTaskName"
+    }
+    $stateDir = Join-Path $env:USERPROFILE ".rtrt\dashboard"
+    Assert-SafeDirectory $stateDir
+    Ensure-MachineDashboardToken $stateDir
     Write-Host ""
     Write-Log "registering rtrt-dashboard logon task"
-    try {
-        $action  = New-ScheduledTaskAction -Execute $dash
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName "rtrt-dashboard" -Action $action `
-            -Trigger $trigger -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName "rtrt-dashboard"
-        Write-Log "  dashboard task registered + started — http://127.0.0.1:7311"
-        Write-Log "  remove: Unregister-ScheduledTask -TaskName rtrt-dashboard -Confirm:`$false"
-    } catch {
-        Write-Warn "  task registration skipped: $($_.Exception.Message)"
-        Write-Warn "  run rtrt-dashboard manually if you want the web UI"
-    }
+    $arguments = "--machine --state-dir `"$stateDir`""
+    $action = New-ScheduledTaskAction -Execute $dash -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentIdentity.Name
+    $principal = New-ScheduledTaskPrincipal -UserId $CurrentIdentity.Name -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName $DashboardTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Description $DashboardTaskMarker -Force | Out-Null
+    Start-ScheduledTask -TaskName $DashboardTaskName
+    Write-Log "  dashboard task registered + started — http://127.0.0.1:7311"
 }
 
 function Build-FromSource($SrcDir) {
@@ -233,25 +356,29 @@ $asset = "rtrt-$versionBare-$TargetTriple.zip"
 $url = "https://github.com/$Repo/releases/download/$Version/$asset"
 $checksumUrl = "$url.sha256"
 
-$work = Join-Path $env:TEMP "rtrt-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $work | Out-Null
+$work = Join-Path $env:TEMP "rtrt-install-dry-run"
+if (-not $DryRun) {
+    $work = Join-Path $env:TEMP "rtrt-install-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $work | Out-Null
+}
 try {
     $archivePath = Join-Path $work $asset
     Invoke-Step "downloading $url" { Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing }
     if (-not $DryRun) {
+        $checksumContent = $null
         try {
-            $expected = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content.Trim().Split(' ')[0]
-            if ($expected) {
-                $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
-                if ($actual -ne $expected.ToLower()) {
-                    throw "checksum mismatch: expected $expected actual $actual"
-                }
-                Write-Log "  checksum: ok"
-            } else {
-                Write-Warn "  checksum: no SHA256 file at release; skipping verification"
-            }
+            $checksumContent = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content
         } catch {
             Write-Warn "  checksum: SHA256 file not yet attached; skipping verification"
+        }
+        if ($null -ne $checksumContent) {
+            $expected = $checksumContent.Trim().Split(' ')[0]
+            if (-not $expected) { throw "invalid empty checksum response from $checksumUrl" }
+            $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+            if ($actual -ne $expected.ToLower()) {
+                throw "checksum mismatch: expected $expected actual $actual"
+            }
+            Write-Log "  checksum: ok"
         }
     }
     $extract = Join-Path $work "extracted"

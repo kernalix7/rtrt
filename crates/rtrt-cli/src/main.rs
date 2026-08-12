@@ -1,6 +1,7 @@
 //! rtrt (Retort) — top-level CLI for the Rust toolkit that distills AI agent context.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 mod doctor;
+pub mod opencode_sessions;
 mod proxy_stats;
+mod sandbox;
 mod security;
 mod service;
 mod setup;
@@ -18,10 +21,11 @@ use rtrt_compress::{
 };
 use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
-    PoolKey, TeamConfig, TeamMode, ToolKind,
+    PoolKey, ProjectIdentity, RosterPreset, TeamConfig, TeamMode, ToolKind,
 };
 use rtrt_memory::{
-    Embedder, LlmSummariser, MemoryStore, OllamaEmbedder, is_synthetic_prompt, truncate_for_embed,
+    Embedder, InvocationProvenance, LlmSummariser, MemoryStore, OllamaEmbedder,
+    is_synthetic_prompt, truncate_for_embed,
 };
 use rtrt_providers::{
     AnthropicProvider, ChatMessage, ChatRequest, ChatStreamEvent, Context7Client,
@@ -49,7 +53,8 @@ Command groups (run `rtrt <command> --help` for details):
                        benchmark, repo-map, run, context
   Memory               memory
   Routing & Providers  provider, call, route, team, usage, diagnose
-  Project              templates, new, init, migrate, project, docs, security
+  Project              templates, new, init, migrate, project, opencode, docs,
+                       security
   Setup & Install      setup, uninstall, mcp, service, detect, config, info,
                        doctor, prompt
 
@@ -71,6 +76,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Launch OpenCode with project-private data and state.
+    #[command(hide = true)]
+    Opencode {
+        /// Project checkout (defaults to cwd).
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<OpenCodeAction>,
+        /// OpenCode arguments. The `--` separator is mandatory.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Compress text read from stdin or --file.
     #[command(hide = true)]
     Compress {
@@ -327,6 +344,10 @@ enum Cmd {
     /// Persistent memory operations (SQLite-backed).
     #[command(hide = true)]
     Memory {
+        /// Explicit arbitrary legacy/admin SQLite store. Normal commands are
+        /// always pinned to the canonical current project.
+        #[arg(long, global = true, value_name = "PATH")]
+        admin_legacy_store: Option<PathBuf>,
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
@@ -355,9 +376,9 @@ enum Cmd {
         /// HTTP mount path for the MCP endpoint.
         #[arg(long, default_value = "/mcp")]
         path: String,
-        /// Path to the SQLite memory store.
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        memory: PathBuf,
+        /// Explicit arbitrary/global SQLite store (admin/legacy mode only).
+        #[arg(long, value_name = "PATH")]
+        admin_legacy_memory: Option<PathBuf>,
         /// Bearer token for HTTP transport. Reads from RTRT_MCP_HTTP_TOKEN by default.
         #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
         http_token: Option<String>,
@@ -413,6 +434,30 @@ enum Cmd {
         /// Override the first rich statusline template.
         #[arg(long)]
         format: Option<String>,
+        /// Emit one compact OpenCode status JSON object without reading stdin.
+        #[arg(long)]
+        opencode: bool,
+        /// Working directory supplied by OpenCode.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// OpenCode session identifier.
+        #[arg(long)]
+        session: Option<String>,
+        /// Active OpenCode model identifier.
+        #[arg(long)]
+        model: Option<String>,
+        /// Available status-line width in columns.
+        #[arg(long, default_value_t = 100)]
+        width: usize,
+        /// Best-effort collection budget in milliseconds.
+        #[arg(long, default_value_t = 120)]
+        budget_ms: u64,
+        /// Omit Git data even when the width permits it.
+        #[arg(long)]
+        no_git: bool,
+        /// Refresh local snapshots instead of preferring fresh caches.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Wire RTRT into a popular coding agent's MCP config.
     ///
@@ -427,9 +472,6 @@ enum Cmd {
         /// Apply the change. Without this, only a dry-run snippet is printed.
         #[arg(long)]
         apply: bool,
-        /// Path to the memory store (passed to `rtrt-mcp --memory`).
-        #[arg(long)]
-        memory: Option<PathBuf>,
         /// Override the discovered `rtrt-mcp` binary path.
         #[arg(long)]
         binary: Option<PathBuf>,
@@ -437,6 +479,17 @@ enum Cmd {
         /// (only valid with `--agent claude`).
         #[arg(long)]
         plugin: bool,
+        /// Enable strict Linux sandboxing for OpenCode's built-in shell tool.
+        #[arg(long, conflicts_with = "no_sandbox")]
+        sandbox: bool,
+        /// Remove execution agents, then restore RTRT-owned shell; recreated
+        /// agents deny every Bash pattern.
+        #[arg(long, conflicts_with = "sandbox")]
+        no_sandbox: bool,
+        /// Configure only machine-global strict OpenCode shell ownership.
+        /// Never discovers or authorizes the current checkout.
+        #[arg(long)]
+        machine_only: bool,
     },
     /// Run `rtrt-dashboard` as a background OS service.
     ///
@@ -590,6 +643,33 @@ enum Cmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum OpenCodeAction {
+    /// Inspect or migrate the global OpenCode session graph.
+    Sessions {
+        #[command(subcommand)]
+        command: OpenCodeSessionsAction,
+    },
+    /// Report known global prompt-history files; never writes.
+    HistoryStatus,
+    /// Quarantine known global prompt-history files. Dry-run by default.
+    HistoryQuarantine {
+        /// Rename files to timestamp-free `.rtrt-quarantine` siblings.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenCodeSessionsAction {
+    /// Probe and report; never writes.
+    Status,
+    /// Plan migration; never writes.
+    DryRun,
+    /// Migrate every attributable graph and archive the remainder.
+    Apply,
+}
+
+#[derive(Debug, Subcommand)]
 enum GatewayCmd {
     /// Start the OpenAI-compatible HTTP server. Binds loopback by default.
     Serve {
@@ -608,6 +688,15 @@ enum GatewayCmd {
 
 #[derive(Debug, Subcommand)]
 enum TeamCmd {
+    /// Preview or install a shipped team roster in the global RTRT config.
+    Preset {
+        /// Shipped roster to materialize.
+        #[arg(value_enum)]
+        roster: TeamPresetArg,
+        /// Write the roster. Without this, only a dry-run summary is printed.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Dispatch the prompt through the configured leader order with failover.
     Dispatch {
         /// Timeout in seconds for each manager or leader invocation.
@@ -637,6 +726,19 @@ enum ConfigCmd {
     },
     /// Print the resolved config path and whether it exists.
     Path,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TeamPresetArg {
+    OpencodeLead,
+}
+
+impl From<TeamPresetArg> for RosterPreset {
+    fn from(preset: TeamPresetArg) -> Self {
+        match preset {
+            TeamPresetArg::OpencodeLead => RosterPreset::OpencodeLead,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -683,6 +785,12 @@ enum ProjectCmd {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCmd {
+    /// Open this project's dashboard and authenticate this browser tab.
+    Open {
+        /// Print a URL containing only the 60-second bootstrap credential.
+        #[arg(long)]
+        print_bootstrap: bool,
+    },
     /// Write + enable the OS service for `rtrt-dashboard`.
     Install {
         /// Apply the change. Without this, only a dry-run is printed.
@@ -717,6 +825,15 @@ enum HookCmd {
         /// hook fire lands in the same SQLite file as the MCP server.
         #[arg(long, env = "RTRT_MEMORY_PATH")]
         store: Option<PathBuf>,
+    },
+    /// Persist an OpenCode/RTRT parent invocation against the Claude child
+    /// session in the SessionStart payload. No-op outside a propagated call.
+    Provenance {
+        #[arg(long, env = "RTRT_MEMORY_PATH")]
+        store: Option<PathBuf>,
+        /// Setup-owner marker used to uninstall the correct hook entry.
+        #[arg(long, hide = true)]
+        owner: Option<String>,
     },
     /// Update or reinforce Output Optimizer terse mode on user prompts.
     Style,
@@ -770,12 +887,12 @@ enum MemoryCmd {
     /// Save a raw memory record (BM25-indexed). Body from arg or stdin.
     Save {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         #[arg(long, default_value = "note")]
         kind: String,
         body: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// Metadata pair `key=value` (repeatable) — wires into qdrant-style
         /// payload filtering on recall.
         #[arg(long = "meta", value_parser = parse_var)]
@@ -789,13 +906,13 @@ enum MemoryCmd {
     /// Recall memories by BM25 (FTS5).
     Recall {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         #[arg(long)]
         query: String,
         #[arg(long, default_value_t = 5)]
         limit: usize,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// qdrant-style payload filter (e.g. `source=claude,topic~^auth`).
         #[arg(long)]
         filter: Option<String>,
@@ -803,17 +920,17 @@ enum MemoryCmd {
     /// Export every memory row in a project to JSON Lines (stdout if `--out` omitted).
     Export {
         #[arg(long)]
-        project: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        project: Option<String>,
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// Destination file. `-` (or omit) writes to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
     },
     /// Import JSON Lines emitted by `rtrt memory export` (stdin if `--in` omitted).
     Import {
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// Source file. `-` (or omit) reads from stdin.
         #[arg(long = "in")]
         input: Option<PathBuf>,
@@ -828,8 +945,8 @@ enum MemoryCmd {
     /// `INSERT OR REPLACE` so resuming after an interrupt skips nothing
     /// already upgraded. Stays a no-op when no row is stale.
     Reembed {
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
         /// Limit the sweep to one project. Omit (or pass `--all`) to sweep
         /// the whole store in `id ASC` order.
         #[arg(long)]
@@ -864,7 +981,7 @@ enum MemoryCmd {
     /// Extract atomic facts from a passage via LLM and save each.
     Extract {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         #[arg(long, default_value = "note")]
         kind: String,
         body: Option<String>,
@@ -874,13 +991,13 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// Compress old memories — keep the most recent N, summarise the rest.
     Compress {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         #[arg(long, default_value_t = 20)]
         keep: usize,
         #[arg(short, long, value_enum)]
@@ -889,8 +1006,22 @@ enum MemoryCmd {
         model: String,
         #[arg(long, env = "RTRT_PROVIDER_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// Copy attributable rows from a legacy mixed DB into this project's
+    /// isolated store. Dry-run unless `--apply`; source remains untouched.
+    LegacyIsolate {
+        #[arg(long, value_name = "PATH")]
+        source: PathBuf,
+        #[arg(long)]
+        apply: bool,
+        /// Explicitly claim rows carrying this project's ambiguous basename.
+        #[arg(long, requires = "accept_mixed_history")]
+        claim_basename: bool,
+        /// Acknowledge historical basename mixing cannot be disentangled.
+        #[arg(long)]
+        accept_mixed_history: bool,
     },
 }
 
@@ -1000,26 +1131,26 @@ enum BlockCmd {
     /// Upsert a block (overwrites any existing slot with the same name).
     Set {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         name: String,
         body: Option<String>,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// Print one block.
     Get {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
         name: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// List every block in a project.
     List {
         #[arg(long)]
-        project: String,
-        #[arg(long, env = "RTRT_MEMORY_PATH", default_value_os_t = rtrt_core::default_memory_store_path())]
-        store: PathBuf,
+        project: Option<String>,
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
 }
 
@@ -1360,6 +1491,9 @@ fn run_migrate(
         memory_path: None,
         binary: mcp_binary,
         plugin: true,
+        sandbox: false,
+        no_sandbox: false,
+        machine_only: false,
     })?;
 
     println!("\nSTEP 3 — Audit whole-project consistency");
@@ -2438,7 +2572,1229 @@ fn print_quickstart() {
 /// identically on every platform.
 const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+const OPENCODE_NESTED_MARKERS: &[&str] = &[
+    "OPENCODE_SESSION_ID",
+    "OPENCODE_PROJECT_ID",
+    "OPENCODE_SERVER",
+    "OPENCODE_PID",
+    "RTRT_OPENCODE_PLUGIN_ACTIVE",
+    "RTRT_STRICT_CLAUDE_SANDBOX",
+];
+
+#[derive(Debug)]
+struct OpenCodeProjectPaths {
+    data: PathBuf,
+    state: PathBuf,
+    db: PathBuf,
+}
+
+fn refuse_nested_opencode() -> Result<()> {
+    if let Some(marker) = nested_opencode_marker(|marker| std::env::var_os(marker).is_some()) {
+        bail!("refusing nested OpenCode launch: {marker} is set");
+    }
+    Ok(())
+}
+
+fn nested_opencode_marker(mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
+    OPENCODE_NESTED_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| present(marker))
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "private OpenCode path is not a real directory: {}",
+                    path.display()
+                );
+            }
+            let uid = unsafe_geteuid();
+            if metadata.uid() != uid {
+                bail!(
+                    "private OpenCode directory has unsafe owner: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("private OpenCode directory has no parent"))?;
+            if !parent.exists() {
+                ensure_private_directory(parent)?;
+            }
+            std::fs::create_dir(path)
+                .with_context(|| format!("create private directory {}", path.display()))?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unsafe_geteuid() -> u32 {
+    // Read from proc instead of introducing libc or an unsafe FFI block.
+    std::fs::metadata("/proc/self").map_or_else(
+        |_| {
+            std::fs::metadata(".").map_or(0, |metadata| {
+                use std::os::unix::fs::MetadataExt;
+                metadata.uid()
+            })
+        },
+        |metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid()
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            std::fs::symlink_metadata(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "private OpenCode path is not a real directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_private_file(path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!(
+                    "private OpenCode file is not a real regular file: {}",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.uid() != unsafe_geteuid()
+                    || metadata.permissions().mode() & 0o777 != 0o600
+                {
+                    bail!(
+                        "private OpenCode file has unsafe owner or mode: {}",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn global_xdg_data_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"))
+}
+
+fn copy_opencode_auth_once(global_data: &Path, private_data: &Path) -> Result<()> {
+    let source = global_data.join("opencode/auth.json");
+    let destination = private_data.join("opencode/auth.json");
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        let metadata = std::fs::symlink_metadata(&destination)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "refusing unsafe private OpenCode auth destination: {}",
+                destination.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.uid() != unsafe_geteuid() || metadata.permissions().mode() & 0o777 != 0o600
+            {
+                bail!(
+                    "private OpenCode auth destination has unsafe owner or mode: {}",
+                    destination.display()
+                );
+            }
+        }
+        return Ok(());
+    }
+    if !source.exists() {
+        return Ok(());
+    }
+    let mut source_file = std::fs::File::open(&source)?;
+    let metadata = source_file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(&source)?;
+    if path_metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "refusing unsafe global OpenCode auth source: {}",
+            source.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+            || metadata.uid() != unsafe_geteuid()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!(
+                "global OpenCode auth source has unsafe owner or mode: {}",
+                source.display()
+            );
+        }
+    }
+    if metadata.len() > 1024 * 1024 {
+        bail!("global OpenCode auth source exceeds 1 MiB");
+    }
+    ensure_private_directory(
+        destination
+            .parent()
+            .context("auth destination has no parent")?,
+    )?;
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut source_file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() > 1024 * 1024 {
+        bail!("global OpenCode auth source exceeds 1 MiB");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&destination)?.write_all(&contents)?;
+    Ok(())
+}
+
+fn prepare_opencode_project(
+    identity: &ProjectIdentity,
+    home: &Path,
+) -> Result<OpenCodeProjectPaths> {
+    let rtrt = home.join(".rtrt");
+    let projects = rtrt.join("projects");
+    let project = rtrt_core::project::project_storage_dir_in(home, identity);
+    let root = project.join("opencode");
+    let data = root.join("data");
+    let state = root.join("state");
+    let app_data = data.join("opencode");
+    for directory in [&rtrt, &projects, &project, &root, &data, &state] {
+        ensure_private_directory(directory)?;
+    }
+    ensure_private_directory(&app_data)?;
+    ensure_private_directory(&state.join("opencode"))?;
+    let db = app_data.join("opencode.db");
+    ensure_private_file(&db)?;
+    copy_opencode_auth_once(&global_xdg_data_home(home), &data)?;
+    Ok(OpenCodeProjectPaths { data, state, db })
+}
+
+fn trusted_direct_launch_candidate(
+    boundary: &sandbox::ProjectBoundary,
+    candidate: &Path,
+) -> Result<PathBuf> {
+    sandbox::validate_direct_launch_executable(boundary, candidate)?;
+    let canonical = std::fs::canonicalize(candidate)
+        .with_context(|| format!("canonicalize OpenCode executable {}", candidate.display()))?;
+    if canonical != candidate {
+        bail!(
+            "OpenCode executable must already be a canonical path without symlinks: {}",
+            candidate.display()
+        );
+    }
+    sandbox::validate_direct_launch_executable(boundary, &canonical)?;
+    Ok(canonical)
+}
+
+fn first_trusted_opencode_candidate(
+    boundary: &sandbox::ProjectBoundary,
+    candidates: impl IntoIterator<Item = PathBuf>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    candidates.into_iter().find_map(|candidate| {
+        let canonical = trusted_direct_launch_candidate(boundary, &candidate).ok()?;
+        seen.insert(canonical.clone()).then_some(canonical)
+    })
+}
+
+fn opencode_path_candidates(path: Option<OsString>) -> Vec<PathBuf> {
+    path.into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .filter(|component| !component.as_os_str().is_empty() && component.is_absolute())
+        .map(|component| component.join("opencode"))
+        .collect()
+}
+
+fn resolve_trusted_opencode(identity: &ProjectIdentity) -> Result<PathBuf> {
+    let home = setup::dirs_home()?;
+    let candidates = [
+        home.join(".opencode/bin/opencode"),
+        home.join(".local/bin/opencode"),
+        home.join(".cargo/bin/opencode"),
+        PathBuf::from("/usr/local/bin/opencode"),
+        PathBuf::from("/usr/bin/opencode"),
+        PathBuf::from("/opt/homebrew/bin/opencode"),
+    ];
+    let boundary = sandbox::ProjectBoundary {
+        root: identity.checkout_root().to_path_buf(),
+        cwd: identity.checkout_root().to_path_buf(),
+        git_writable: Vec::new(),
+    };
+    if let Some(configured) = std::env::var_os("RTRT_OPENCODE_BIN") {
+        let configured = PathBuf::from(configured);
+        return trusted_direct_launch_candidate(&boundary, &configured).with_context(|| {
+            format!(
+                "RTRT_OPENCODE_BIN is not a trusted executable: {}",
+                configured.display()
+            )
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(executable) = first_trusted_opencode_candidate(&boundary, candidates, &mut seen) {
+        return Ok(executable);
+    }
+    let path_candidates = opencode_path_candidates(std::env::var_os("PATH"));
+    if let Some(executable) =
+        first_trusted_opencode_candidate(&boundary, path_candidates, &mut seen)
+    {
+        return Ok(executable);
+    }
+    bail!("trusted OpenCode executable not found in fixed locations or absolute PATH components")
+}
+
+#[cfg(all(test, unix))]
+mod trusted_opencode_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn executable(path: &Path, marker: &Path) {
+        std::fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        sandbox::ProjectBoundary,
+        PathBuf,
+        PathBuf,
+    ) {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let base = tempfile::Builder::new()
+            .prefix("trusted-opencode-")
+            .tempdir_in(workspace)
+            .unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let project = base.path().join("project");
+        let bin = base.path().join("safe-bin");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let marker = base.path().join("executed");
+        let boundary = sandbox::ProjectBoundary {
+            root: project.clone(),
+            cwd: project,
+            git_writable: Vec::new(),
+        };
+        (base, boundary, bin, marker)
+    }
+
+    #[test]
+    fn safe_absolute_path_candidate_is_accepted_without_execution() {
+        let (_base, boundary, bin, marker) = fixture();
+        let candidate = bin.join("opencode");
+        executable(&candidate, &marker);
+        let path = std::env::join_paths([bin]).unwrap();
+        let candidates = opencode_path_candidates(Some(path));
+        let resolved = first_trusted_opencode_candidate(
+            &boundary,
+            candidates,
+            &mut std::collections::HashSet::new(),
+        );
+        assert_eq!(resolved.as_deref(), Some(candidate.as_path()));
+        assert!(!marker.exists(), "candidate discovery executed OpenCode");
+    }
+
+    #[test]
+    fn unsafe_path_candidates_are_rejected() {
+        let (_base, boundary, bin, marker) = fixture();
+        let safe = bin.join("opencode");
+        executable(&safe, &marker);
+
+        let project_bin = boundary.root.join("bin");
+        std::fs::create_dir(&project_bin).unwrap();
+        let project_candidate = project_bin.join("opencode");
+        executable(&project_candidate, &marker);
+        assert!(trusted_direct_launch_candidate(&boundary, &project_candidate).is_err());
+
+        let writable_bin = bin.parent().unwrap().join("writable-bin");
+        std::fs::create_dir(&writable_bin).unwrap();
+        std::fs::set_permissions(&writable_bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let writable_candidate = writable_bin.join("opencode");
+        executable(&writable_candidate, &marker);
+        assert!(trusted_direct_launch_candidate(&boundary, &writable_candidate).is_err());
+
+        let link = bin.join("linked-opencode");
+        symlink(&safe, &link).unwrap();
+        assert!(trusted_direct_launch_candidate(&boundary, &link).is_err());
+
+        let relative = std::env::join_paths([PathBuf::from("relative"), PathBuf::new()]).unwrap();
+        assert!(opencode_path_candidates(Some(relative)).is_empty());
+        assert!(!marker.exists(), "candidate validation executed OpenCode");
+    }
+
+    #[test]
+    fn installer_config_evidence_does_not_require_fixed_opencode_path() {
+        let installer = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"));
+        assert!(installer.contains("if [ \"$evidence\" -eq 0 ]; then\n        opencode_evidence=\"$(command -v opencode 2>/dev/null || true)\""));
+        assert!(!installer.contains("for candidate in /usr/bin/opencode"));
+    }
+
+    #[test]
+    fn continue_detection_accepts_only_exact_boolean_forms() {
+        assert!(requests_opencode_continue(&[OsString::from("-c")]));
+        assert!(requests_opencode_continue(&[OsString::from("--continue")]));
+        assert!(!requests_opencode_continue(&[OsString::from(
+            "--continue=true"
+        )]));
+        assert!(!requests_opencode_continue(&[OsString::from("topic-c")]));
+    }
+
+    #[test]
+    fn runtime_probe_uses_fixed_argv_private_env_and_checkout_cwd() {
+        let (base, _boundary, bin, _marker) = fixture();
+        let checkout = base.path().join("project");
+        std::fs::create_dir(checkout.join(".git")).unwrap();
+        let identity = ProjectIdentity::derive(&checkout).unwrap();
+        let log = base.path().join("probe.log");
+        let executable = bin.join("opencode");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\" \"$OPENCODE_DB\" \"$PWD\" > '{}'\nprintf forbidden-output\nprintf forbidden-error >&2\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = OpenCodeProjectPaths {
+            data: base.path().join("private/data"),
+            state: base.path().join("private/state"),
+            db: base.path().join("private/data/opencode/opencode.db"),
+        };
+        assert!(
+            probe_opencode_runtime_project(&executable, &identity, &paths)
+                .unwrap()
+                .success()
+        );
+        let lines = std::fs::read_to_string(log).unwrap();
+        let expected = format!(
+            "session list --max-count 1 --format json\n{}\n{}\n{}\n{}\n",
+            paths.data.display(),
+            paths.state.display(),
+            paths.db.display(),
+            identity.checkout_root().display()
+        );
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn opencode_project_cache_is_strict_and_common_to_linked_worktrees() {
+        let (base, mut boundary, _bin, _marker) = fixture();
+        let common = base.path().join("common.git");
+        std::fs::create_dir(&common).unwrap();
+        boundary.git_writable = vec![common.clone(), base.path().join("linked-admin")];
+        assert_eq!(opencode_common_git_dir(&boundary), common);
+        std::fs::write(
+            common.join("opencode"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_sessions::read_runtime_project_cache(&common).unwrap(),
+            Some("0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+
+        boundary.git_writable.clear();
+        assert_eq!(
+            opencode_common_git_dir(&boundary),
+            boundary.root.join(".git")
+        );
+        std::fs::write(common.join("opencode"), "stale").unwrap();
+        assert!(opencode_sessions::read_runtime_project_cache(&common).is_err());
+    }
+
+    #[test]
+    fn post_probe_authority_fails_closed_without_cache_on_failure() {
+        let runtime = "0123456789abcdef0123456789abcdef01234567".to_string();
+        assert_eq!(runtime_authority_after_probe(true, None).unwrap(), "global");
+        assert_eq!(
+            runtime_authority_after_probe(true, Some(runtime.clone())).unwrap(),
+            runtime
+        );
+        assert_eq!(
+            runtime_authority_after_probe(false, Some(runtime.clone())).unwrap(),
+            runtime
+        );
+        assert!(runtime_authority_after_probe(false, None).is_err());
+        assert!(should_refresh_runtime_checkpoint(true, true));
+        assert!(!should_refresh_runtime_checkpoint(false, true));
+        assert!(!should_refresh_runtime_checkpoint(true, false));
+    }
+}
+
+fn validate_opencode_args(args: &[OsString], identity: &ProjectIdentity) -> Result<()> {
+    let mut directory_value = false;
+    for arg in args {
+        let path = PathBuf::from(arg);
+        if directory_value {
+            let selected = ProjectIdentity::derive(&path).with_context(|| {
+                format!("resolve OpenCode directory argument {}", path.display())
+            })?;
+            if selected.fingerprint() != identity.fingerprint() {
+                bail!(
+                    "OpenCode directory argument selects a different project: {}",
+                    path.display()
+                );
+            }
+            directory_value = false;
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if matches!(text.as_ref(), "--directory" | "--dir" | "--cwd") {
+            directory_value = true;
+            continue;
+        }
+        if let Some(value) = ["--directory=", "--dir=", "--cwd="]
+            .iter()
+            .find_map(|prefix| text.strip_prefix(prefix))
+        {
+            let selected = ProjectIdentity::derive(value)?;
+            if selected.fingerprint() != identity.fingerprint() {
+                bail!("OpenCode directory argument selects a different project: {value}");
+            }
+        } else if path.is_dir() {
+            let selected = ProjectIdentity::derive(&path)?;
+            if selected.fingerprint() != identity.fingerprint() {
+                bail!(
+                    "OpenCode directory argument selects a different project: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if directory_value {
+        bail!("OpenCode directory option is missing its value");
+    }
+    Ok(())
+}
+
+fn opencode_process(
+    executable: &Path,
+    identity: &ProjectIdentity,
+    paths: &OpenCodeProjectPaths,
+    args: &[OsString],
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(args)
+        .current_dir(identity.checkout_root())
+        .env("XDG_DATA_HOME", &paths.data)
+        .env("XDG_STATE_HOME", &paths.state)
+        .env("OPENCODE_DB", &paths.db);
+    command
+}
+
+fn requests_opencode_continue(args: &[OsString]) -> bool {
+    args.iter().any(|arg| arg == "-c" || arg == "--continue")
+}
+
+fn opencode_common_git_dir(boundary: &sandbox::ProjectBoundary) -> PathBuf {
+    boundary
+        .git_writable
+        .first()
+        .cloned()
+        .unwrap_or_else(|| boundary.root.join(".git"))
+}
+
+fn probe_opencode_runtime_project(
+    executable: &Path,
+    identity: &ProjectIdentity,
+    paths: &OpenCodeProjectPaths,
+) -> Result<std::process::ExitStatus> {
+    opencode_process(
+        executable,
+        identity,
+        paths,
+        &[
+            OsString::from("session"),
+            OsString::from("list"),
+            OsString::from("--max-count"),
+            OsString::from("1"),
+            OsString::from("--format"),
+            OsString::from("json"),
+        ],
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .with_context(|| {
+        format!(
+            "probe OpenCode runtime project using {}",
+            executable.display()
+        )
+    })
+}
+
+fn report_nonfatal_opencode_catch_up(result: Result<opencode_sessions::MigrationReport>) -> bool {
+    match result {
+        Ok(report) => {
+            if report.private_preserved_conflicts > 0 || report.archived_event_forks > 0 {
+                eprintln!(
+                    "OpenCode session catch-up preserved {} private conflict(s); archived {} event fork(s)",
+                    report.private_preserved_conflicts, report.archived_event_forks
+                );
+            } else if report.skipped_locked {
+                eprintln!("OpenCode session catch-up deferred: another migration is active");
+            }
+            true
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: OpenCode session catch-up skipped; private launch will continue; run `rtrt opencode sessions status` then `rtrt opencode sessions apply` from a trusted terminal"
+            );
+            false
+        }
+    }
+}
+
+fn run_opencode_launcher(project: Option<PathBuf>, args: Vec<OsString>) -> Result<()> {
+    refuse_nested_opencode()?;
+    let selected = project.unwrap_or(std::env::current_dir()?);
+    let boundary = sandbox::discover_project_from(&selected)?;
+    let identity = ProjectIdentity::derive(&selected)?;
+    if identity.checkout_root() != boundary.root {
+        bail!("selected checkout identity and strict sandbox boundary disagree");
+    }
+    validate_opencode_args(&args, &identity)?;
+    let authorized = sandbox::authorize_project_for_launch(&boundary).with_context(|| {
+        "strict OpenCode sandbox is not ready; run `rtrt setup --agent opencode --sandbox --apply` once from a trusted checkout"
+    })?;
+    if authorized {
+        println!(
+            "authorized strict OpenCode sandbox for {}",
+            boundary.root.display()
+        );
+    }
+    let home = setup::dirs_home()?;
+    let paths = prepare_opencode_project(&identity, &home)?;
+    // Incremental, compare-before-insert catch-up handles sessions created by
+    // direct global OpenCode after installation and never replaces private rows.
+    report_nonfatal_opencode_catch_up(opencode_sessions::migrate(
+        &opencode_sessions::MigrationOptions {
+            home: home.clone(),
+            source: None,
+            mode: opencode_sessions::MigrationMode::CatchUp,
+        },
+    ));
+    let executable = resolve_trusted_opencode(&identity)?;
+    let common_git = opencode_common_git_dir(&boundary);
+    let cached_runtime_id = opencode_sessions::read_runtime_project_cache(&common_git)?;
+    let (repair, runtime_id) = if let Some(runtime_id) = cached_runtime_id {
+        match opencode_sessions::repair_runtime_attribution(&paths.db, &runtime_id, false)? {
+            opencode_sessions::RuntimeRepair::Complete(report) => (report, runtime_id),
+            opencode_sessions::RuntimeRepair::NeedsProbe => {
+                probe_then_repair(&executable, &identity, &paths, &common_git)?
+            }
+        }
+    } else {
+        match opencode_sessions::repair_runtime_attribution(&paths.db, "global", false)? {
+            opencode_sessions::RuntimeRepair::Complete(report) => (report, "global".to_string()),
+            opencode_sessions::RuntimeRepair::NeedsProbe => {
+                // Stale project_directory rows are not runtime evidence.
+                probe_then_repair(&executable, &identity, &paths, &common_git)?
+            }
+        }
+    };
+    if repair.quarantined_sessions > 0 {
+        eprintln!(
+            "OpenCode private-history repair quarantined {} malformed session(s) under {}",
+            repair.quarantined_sessions,
+            repair
+                .archive
+                .as_deref()
+                .unwrap_or_else(|| Path::new("rtrt-repair-archives"))
+                .display()
+        );
+    }
+    if requests_opencode_continue(&args) && repair.valid_root_sessions == 0 {
+        bail!(
+            "OpenCode --continue requested, but no valid private root session exists; launch without -c to create one"
+        );
+    }
+    let status = opencode_process(&executable, &identity, &paths, &args)
+        .status()
+        .with_context(|| format!("launch {}", executable.display()))?;
+    if status.success() {
+        let post_cache = opencode_sessions::read_runtime_project_cache(&common_git)?;
+        let post_authority = post_cache.unwrap_or_else(|| "global".to_string());
+        if should_refresh_runtime_checkpoint(true, post_authority == runtime_id) {
+            if let Err(error) =
+                opencode_sessions::refresh_runtime_checkpoint(&paths.db, &runtime_id)
+            {
+                eprintln!(
+                    "warning: OpenCode runtime checkpoint refresh failed; next launch will perform full repair: {error}"
+                );
+            }
+        } else {
+            eprintln!(
+                "warning: OpenCode runtime authority changed during launch; next launch will perform full repair"
+            );
+        }
+    }
+    if !status.success() {
+        debug_assert!(!should_refresh_runtime_checkpoint(false, true));
+        bail!("OpenCode exited with status {status}");
+    }
+    Ok(())
+}
+
+fn should_refresh_runtime_checkpoint(child_succeeded: bool, authority_unchanged: bool) -> bool {
+    child_succeeded && authority_unchanged
+}
+
+fn probe_then_repair(
+    executable: &Path,
+    identity: &ProjectIdentity,
+    paths: &OpenCodeProjectPaths,
+    common_git: &Path,
+) -> Result<(opencode_sessions::RuntimeRepairReport, String)> {
+    let probe_status = probe_opencode_runtime_project(executable, identity, paths)?;
+    let runtime_id = runtime_authority_after_probe(
+        probe_status.success(),
+        opencode_sessions::read_runtime_project_cache(common_git)?,
+    )?;
+    let report = match opencode_sessions::repair_runtime_attribution(&paths.db, &runtime_id, true)?
+    {
+        opencode_sessions::RuntimeRepair::Complete(report) => report,
+        opencode_sessions::RuntimeRepair::NeedsProbe => {
+            bail!("OpenCode runtime project attribution remains unresolved after trusted probe")
+        }
+    };
+    // OpenCode 1.18.11 may return nonzero after persisting project evidence
+    // when decoding a malformed legacy session. No other failure is ignored.
+    if !probe_status.success() && report.quarantined_sessions == 0 {
+        bail!("OpenCode runtime project probe exited with status {probe_status}")
+    }
+    Ok((report, runtime_id))
+}
+
+fn runtime_authority_after_probe(
+    probe_succeeded: bool,
+    cached_runtime_id: Option<String>,
+) -> Result<String> {
+    match (probe_succeeded, cached_runtime_id) {
+        (_, Some(runtime_id)) => Ok(runtime_id),
+        (true, None) => Ok("global".to_string()),
+        (false, None) => bail!(
+            "OpenCode runtime project probe failed without committing project authority; refusing global attribution"
+        ),
+    }
+}
+
+fn global_prompt_history_paths(home: &Path) -> [PathBuf; 2] {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/state"));
+    [
+        state.join("opencode/prompt-history.jsonl"),
+        global_xdg_data_home(home).join("opencode/prompt-history.jsonl"),
+    ]
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryQuarantinePhase {
+    AfterOpen,
+    BeforeLink,
+    AfterLink,
+    BeforeUnlink,
+}
+
+#[cfg(unix)]
+fn same_opened_file(opened: &std::fs::Metadata, path: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    opened.dev() == path.dev() && opened.ino() == path.ino()
+}
+
+#[cfg(unix)]
+fn remove_created_history_link(destination: &Path, opened: &std::fs::Metadata) {
+    let Ok(metadata) = std::fs::symlink_metadata(destination) else {
+        return;
+    };
+    if !metadata.file_type().is_symlink() && same_opened_file(opened, &metadata) {
+        let _ = std::fs::remove_file(destination);
+    }
+}
+
+#[cfg(unix)]
+fn quarantine_prompt_history_with(
+    source: &Path,
+    destination: &Path,
+    mut phase: impl FnMut(HistoryQuarantinePhase),
+) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    anyhow::ensure!(
+        source.parent() == destination.parent(),
+        "prompt-history quarantine destination must be a sibling"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Linux exposes O_NOFOLLOW through OpenOptionsExt but std does not publish
+    // the flag constant. Other Unix targets still reject a followed symlink by
+    // comparing the opened inode with symlink_metadata below before mutation.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    options.custom_flags(0o400000);
+    let opened = match options.open(source) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open prompt history without following symlinks: {}",
+                    source.display()
+                )
+            });
+        }
+    };
+    let opened_metadata = opened.metadata()?;
+    if !opened_metadata.is_file() || opened_metadata.uid() != unsafe_geteuid() {
+        bail!(
+            "prompt history has unsafe type or owner: {}",
+            source.display()
+        );
+    }
+
+    phase(HistoryQuarantinePhase::AfterOpen);
+    let path_metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("reinspect prompt history: {}", source.display()))?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !same_opened_file(&opened_metadata, &path_metadata)
+    {
+        bail!("prompt history changed while opening: {}", source.display());
+    }
+
+    phase(HistoryQuarantinePhase::BeforeLink);
+    std::fs::hard_link(source, destination).with_context(|| {
+        format!(
+            "create no-overwrite prompt-history quarantine {}",
+            destination.display()
+        )
+    })?;
+
+    phase(HistoryQuarantinePhase::AfterLink);
+    let destination_metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("verify prompt-history quarantine {}", destination.display())
+            });
+        }
+    };
+    if destination_metadata.file_type().is_symlink()
+        || !destination_metadata.is_file()
+        || !same_opened_file(&opened_metadata, &destination_metadata)
+    {
+        // Do not remove a destination an attacker exchanged after hard_link.
+        bail!(
+            "prompt-history quarantine destination changed: {}",
+            destination.display()
+        );
+    }
+
+    phase(HistoryQuarantinePhase::BeforeUnlink);
+    let source_metadata = std::fs::symlink_metadata(source).with_context(|| {
+        format!(
+            "reinspect prompt history before unlink: {}",
+            source.display()
+        )
+    })?;
+    if source_metadata.file_type().is_symlink()
+        || !source_metadata.is_file()
+        || !same_opened_file(&opened_metadata, &source_metadata)
+    {
+        remove_created_history_link(destination, &opened_metadata);
+        bail!("prompt history changed before unlink: {}", source.display());
+    }
+
+    if let Err(error) = opened.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        remove_created_history_link(destination, &opened_metadata);
+        return Err(error).context("chmod opened prompt history to 0600");
+    }
+    // remove_file unlinks the directory entry itself and never follows a final
+    // symlink. A final identity check narrows replacement races before unlink.
+    let source_metadata = std::fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink()
+        || !same_opened_file(&opened_metadata, &source_metadata)
+    {
+        remove_created_history_link(destination, &opened_metadata);
+        bail!("prompt history changed before unlink: {}", source.display());
+    }
+    if let Err(error) = std::fs::remove_file(source) {
+        if std::fs::symlink_metadata(source)
+            .is_ok_and(|metadata| same_opened_file(&opened_metadata, &metadata))
+        {
+            remove_created_history_link(destination, &opened_metadata);
+        }
+        return Err(error).with_context(|| format!("unlink prompt history: {}", source.display()));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn quarantine_prompt_history(source: &Path, destination: &Path) -> Result<bool> {
+    quarantine_prompt_history_with(source, destination, |_| {})
+}
+
+#[cfg(not(unix))]
+fn quarantine_prompt_history(_source: &Path, _destination: &Path) -> Result<bool> {
+    bail!("secure prompt-history quarantine is unsupported on this platform")
+}
+
+fn run_opencode_history(apply: Option<bool>) -> Result<()> {
+    let home = setup::dirs_home()?;
+    for path in global_prompt_history_paths(&home) {
+        let destination = path.with_file_name("prompt-history.jsonl.rtrt-quarantine");
+        if apply == Some(true) {
+            if quarantine_prompt_history(&path, &destination)? {
+                println!(
+                    "quarantined {} -> {}",
+                    path.display(),
+                    destination.display()
+                );
+            } else {
+                println!("absent {}", path.display());
+            }
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!("absent {}", path.display());
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "refusing non-regular or symlink prompt history: {}",
+                path.display()
+            );
+        }
+        if apply.is_none() {
+            println!("present {}", path.display());
+            continue;
+        }
+        if apply == Some(false) {
+            println!(
+                "[dry-run] would quarantine {} -> {}",
+                path.display(),
+                destination.display()
+            );
+            continue;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod opencode_launcher_tests {
+    use super::*;
+    use std::fs;
+
+    fn repo(path: &Path) {
+        fs::create_dir_all(path.join(".git")).unwrap();
+    }
+
+    fn linked_worktree(main: &Path, linked: &Path) {
+        let admin = main.join(".git/worktrees/linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(linked).unwrap();
+        let dot_git = linked.join(".git");
+        fs::write(&dot_git, format!("gitdir: {}\n", admin.display())).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(admin.join("gitdir"), format!("{}\n", dot_git.display())).unwrap();
+    }
+
+    #[test]
+    fn future_global_schema_catch_up_error_does_not_block_child_path() {
+        let continued = !report_nonfatal_opencode_catch_up(Err(anyhow::anyhow!(
+            "unknown OpenCode graph-dependent table: future_session_graph"
+        )));
+        assert!(continued);
+        let child_launch_path_reached = true;
+        assert!(child_launch_path_reached);
+    }
+
+    #[cfg(unix)]
+    fn private_history(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_never_overwrites_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("prompt-history.jsonl");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        private_history(&source, "source");
+        private_history(&destination, "existing");
+
+        let error = quarantine_prompt_history(&source, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("create no-overwrite"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_rejects_source_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let source = temp.path().join("prompt-history.jsonl");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        private_history(&target, "target");
+        symlink(&target, &source).unwrap();
+
+        assert!(quarantine_prompt_history(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+        assert!(
+            fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_detects_source_exchange_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("prompt-history.jsonl");
+        let original = temp.path().join("original");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        private_history(&source, "original");
+
+        let error = quarantine_prompt_history_with(&source, &destination, |phase| {
+            if phase == HistoryQuarantinePhase::AfterOpen {
+                fs::rename(&source, &original).unwrap();
+                private_history(&source, "replacement");
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed while opening"));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_does_not_remove_exchanged_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("prompt-history.jsonl");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let displaced_link = temp.path().join("displaced-quarantine-link");
+        private_history(&source, "original");
+
+        let error = quarantine_prompt_history_with(&source, &destination, |phase| {
+            if phase == HistoryQuarantinePhase::AfterLink {
+                fs::rename(&destination, &displaced_link).unwrap();
+                private_history(&destination, "replacement");
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("destination changed"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(&displaced_link).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_detects_source_exchange_before_unlink_and_cleans_own_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("prompt-history.jsonl");
+        let original = temp.path().join("original");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        private_history(&source, "original");
+
+        let error = quarantine_prompt_history_with(&source, &destination, |phase| {
+            if phase == HistoryQuarantinePhase::BeforeUnlink {
+                fs::rename(&source, &original).unwrap();
+                private_history(&source, "replacement");
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed before unlink"));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_quarantine_links_chmods_handle_then_unlinks_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("prompt-history.jsonl");
+        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        private_history(&source, "private");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(quarantine_prompt_history(&source, &destination).unwrap());
+
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "private");
+        assert_eq!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn same_basename_projects_get_distinct_opencode_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("one/repo");
+        let second = temp.path().join("two/repo");
+        repo(&first);
+        repo(&second);
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+
+        let first =
+            prepare_opencode_project(&ProjectIdentity::derive(first).unwrap(), &home).unwrap();
+        let second =
+            prepare_opencode_project(&ProjectIdentity::derive(second).unwrap(), &home).unwrap();
+        assert_ne!(first.data, second.data);
+        assert_ne!(first.db, second.db);
+    }
+
+    #[test]
+    fn linked_worktree_shares_data_but_keeps_checkout_cwd_and_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let linked = temp.path().join("linked");
+        repo(&main);
+        linked_worktree(&main, &linked);
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let main_identity = ProjectIdentity::derive(&main).unwrap();
+        let linked_identity = ProjectIdentity::derive(&linked).unwrap();
+        let main_paths = prepare_opencode_project(&main_identity, &home).unwrap();
+        let linked_paths = prepare_opencode_project(&linked_identity, &home).unwrap();
+        assert_eq!(main_paths.data, linked_paths.data);
+
+        let args = [
+            OsString::from("--model"),
+            OsString::from("provider/model with space"),
+        ];
+        let command = opencode_process(
+            Path::new("/usr/bin/opencode"),
+            &linked_identity,
+            &linked_paths,
+            &args,
+        );
+        assert_eq!(command.get_current_dir(), Some(linked.as_path()));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            args.iter().map(OsString::as_os_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_db_rejects_unsafe_mode_and_data_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        repo(&project);
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let identity = ProjectIdentity::derive(&project).unwrap();
+        let paths = prepare_opencode_project(&identity, &home).unwrap();
+        fs::set_permissions(&paths.db, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(prepare_opencode_project(&identity, &home).is_err());
+
+        fs::set_permissions(&paths.db, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(&paths.data).unwrap();
+        symlink(temp.path(), &paths.data).unwrap();
+        assert!(prepare_opencode_project(&identity, &home).is_err());
+    }
+
+    #[test]
+    fn nested_markers_refuse_launch() {
+        assert_eq!(
+            nested_opencode_marker(|marker| marker == "OPENCODE_SESSION_ID"),
+            Some("OPENCODE_SESSION_ID")
+        );
+        assert_eq!(nested_opencode_marker(|_| false), None);
+    }
+}
+
 fn main() -> Result<()> {
+    if let Some(code) = sandbox::dispatch_from_env()? {
+        std::process::exit(code);
+    }
     let worker = std::thread::Builder::new()
         .name("rtrt-main".into())
         .stack_size(MAIN_STACK_SIZE)
@@ -2464,6 +3820,31 @@ fn run_cli() -> Result<()> {
         print_quickstart();
         return Ok(());
     };
+    let command = match command {
+        Cmd::Statusline {
+            opencode: true,
+            cwd,
+            session,
+            model,
+            width,
+            budget_ms,
+            no_git,
+            refresh,
+            ..
+        } => {
+            print_opencode_statusline(OpenCodeStatuslineOptions {
+                cwd,
+                session,
+                model,
+                width,
+                budget_ms,
+                no_git,
+                refresh,
+            });
+            return Ok(());
+        }
+        command => command,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -2474,6 +3855,43 @@ fn run_cli() -> Result<()> {
 /// Dispatch a parsed subcommand.
 async fn run(command: Cmd) -> Result<()> {
     match command {
+        Cmd::Opencode {
+            project,
+            action,
+            args,
+        } => match action {
+            Some(OpenCodeAction::Sessions { command }) => {
+                let mode = match command {
+                    OpenCodeSessionsAction::Status => opencode_sessions::MigrationMode::Status,
+                    OpenCodeSessionsAction::DryRun => opencode_sessions::MigrationMode::DryRun,
+                    OpenCodeSessionsAction::Apply => opencode_sessions::MigrationMode::Apply,
+                };
+                let report = opencode_sessions::migrate(&opencode_sessions::MigrationOptions {
+                    home: setup::dirs_home()?,
+                    source: None,
+                    mode,
+                })?;
+                if let Some(source) = report.source {
+                    println!(
+                        "source={} sessions={} projects={} archived={} skipped_malformed={} rows={} changed={} private_preserved_conflicts={} archived_event_forks={}",
+                        source.display(),
+                        report.sessions,
+                        report.projects,
+                        report.archived_sessions,
+                        report.skipped_malformed_sessions,
+                        report.rows,
+                        report.changed_rows,
+                        report.private_preserved_conflicts,
+                        report.archived_event_forks
+                    );
+                } else {
+                    println!("no supported global OpenCode database found");
+                }
+            }
+            Some(OpenCodeAction::HistoryStatus) => run_opencode_history(None)?,
+            Some(OpenCodeAction::HistoryQuarantine { apply }) => run_opencode_history(Some(apply))?,
+            None => run_opencode_launcher(project, args)?,
+        },
         Cmd::Compress {
             level,
             file,
@@ -2665,6 +4083,7 @@ async fn run(command: Cmd) -> Result<()> {
                         mode: Some(mode.into()),
                         model,
                         timeout,
+                        provenance: None,
                     },
                 )
                 .await
@@ -2704,7 +4123,10 @@ async fn run(command: Cmd) -> Result<()> {
         Cmd::Team { cmd } => run_team(cmd).await?,
         Cmd::Usage { format } => run_usage(format)?,
         Cmd::Provider { cmd } => run_provider(cmd).await?,
-        Cmd::Memory { cmd } => run_memory(cmd).await?,
+        Cmd::Memory {
+            admin_legacy_store,
+            cmd,
+        } => run_memory(cmd, admin_legacy_store).await?,
         Cmd::Prompt { cmd } => run_prompt(cmd)?,
         Cmd::Context { cmd } => run_context(cmd)?,
         Cmd::Diagnose {
@@ -2833,7 +4255,7 @@ async fn run(command: Cmd) -> Result<()> {
             transport,
             bind,
             path,
-            memory,
+            admin_legacy_memory,
             http_token,
             allowed_origins,
             binary,
@@ -2845,7 +4267,9 @@ async fn run(command: Cmd) -> Result<()> {
                     .unwrap_or_else(|| PathBuf::from("rtrt-mcp"))
             });
             let mut cmd = std::process::Command::new(&binary);
-            cmd.arg("--memory").arg(&memory);
+            if let Some(memory) = admin_legacy_memory {
+                cmd.arg("--memory").arg(memory);
+            }
             cmd.arg("--transport").arg(&transport);
             if transport == "http" {
                 cmd.arg("--bind").arg(&bind);
@@ -2897,6 +4321,7 @@ async fn run(command: Cmd) -> Result<()> {
                     store,
                     limit,
                 } => run_hook_session_inject(project, store, limit),
+                HookCmd::Provenance { store, owner: _ } => run_hook_provenance(store),
                 HookCmd::Style => run_hook_style(),
                 HookCmd::StyleInject => run_hook_style_inject(),
                 HookCmd::Statusline => {
@@ -2910,15 +4335,40 @@ async fn run(command: Cmd) -> Result<()> {
                 eprintln!("rtrt hook: {e}");
             }
         }
-        Cmd::Statusline { rich, format } => {
-            print_statusline(StatuslineOptions { rich, format });
+        Cmd::Statusline {
+            rich,
+            format,
+            opencode,
+            cwd,
+            session,
+            model,
+            width,
+            budget_ms,
+            no_git,
+            refresh,
+        } => {
+            if opencode {
+                print_opencode_statusline(OpenCodeStatuslineOptions {
+                    cwd,
+                    session,
+                    model,
+                    width,
+                    budget_ms,
+                    no_git,
+                    refresh,
+                });
+            } else {
+                print_statusline(StatuslineOptions { rich, format });
+            }
         }
         Cmd::Setup {
             agent,
             apply,
-            memory,
             binary,
             plugin,
+            sandbox,
+            no_sandbox,
+            machine_only,
         } => {
             let binary = binary.unwrap_or_else(|| {
                 // Best-effort: assume `rtrt-mcp` is on PATH at the same prefix as the running CLI.
@@ -2930,9 +4380,12 @@ async fn run(command: Cmd) -> Result<()> {
             setup::run(SetupPlan {
                 agent,
                 apply,
-                memory_path: memory,
+                memory_path: None,
                 binary,
                 plugin,
+                sandbox,
+                no_sandbox,
+                machine_only,
             })?;
         }
         Cmd::Service { cmd } => {
@@ -2946,6 +4399,11 @@ async fn run(command: Cmd) -> Result<()> {
                 })
             };
             let plan = match cmd {
+                ServiceCmd::Open { print_bootstrap } => service::ServicePlan {
+                    action: service::ServiceAction::Open { print_bootstrap },
+                    apply: false,
+                    binary: resolve_dash(None),
+                },
                 ServiceCmd::Install { apply, binary } => service::ServicePlan {
                     action: service::ServiceAction::Install,
                     apply,
@@ -3804,9 +5262,14 @@ struct SourceSavings {
 }
 
 fn print_memory_savings() {
-    let path = std::env::var_os("RTRT_MEMORY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(rtrt_core::default_memory_store_path);
+    let Ok(identity) = current_project_identity() else {
+        println!("memory: unavailable (project identity unavailable)");
+        return;
+    };
+    let Ok(path) = rtrt_core::project_memory_db_path(&identity) else {
+        println!("memory: unavailable (project store unavailable)");
+        return;
+    };
     if !path.exists() {
         println!("memory: unavailable ({} not found)", path.display());
         println!("savings: unavailable (memory store unavailable)");
@@ -3815,7 +5278,7 @@ fn print_memory_savings() {
         }
         return;
     }
-    let store = match MemoryStore::open(&path) {
+    let store = match MemoryStore::open_project(&identity) {
         Ok(store) => store,
         Err(e) => {
             println!("memory: unavailable ({}: {e})", path.display());
@@ -3826,8 +5289,8 @@ fn print_memory_savings() {
             return;
         }
     };
-    let projects = match store.projects() {
-        Ok(projects) => projects,
+    let projects = match store.count_by_project(identity.slug()) {
+        Ok(count) => vec![(identity.slug().to_string(), count, 0_i64)],
         Err(e) => {
             println!("memory: unavailable ({}: {e})", path.display());
             println!("savings: unavailable (memory metadata query failed)");
@@ -4119,6 +5582,12 @@ struct RouteCliOptions {
 const MANAGER_CHECK_PROMPT: &str = "rtrt-manager-tool-check";
 
 async fn run_team(cmd: TeamCmd) -> Result<()> {
+    if let TeamCmd::Preset { roster, apply } = &cmd {
+        let path = rtrt_core::Config::default_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve config path (no HOME?)"))?;
+        return run_team_preset(&path, (*roster).into(), *apply);
+    }
+
     let config = rtrt_core::Config::load_effective(cwd_repo_root().as_deref())
         .context("load effective team config")?;
     match cmd {
@@ -4144,6 +5613,64 @@ async fn run_team(cmd: TeamCmd) -> Result<()> {
         }
         TeamCmd::Show => print_team_config(&config.team),
         TeamCmd::CheckManager => check_team_manager(&config).await?,
+        TeamCmd::Preset { .. } => unreachable!("preset handled before loading effective config"),
+    }
+    Ok(())
+}
+
+fn run_team_preset(path: &Path, roster: RosterPreset, apply: bool) -> Result<()> {
+    let team = TeamConfig::preset(roster);
+    if apply {
+        let mut root = match std::fs::read_to_string(path) {
+            Ok(raw) => toml::from_str::<toml::Value>(&raw)
+                .with_context(|| format!("parse {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(toml::Table::new())
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let table = root
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("config root is not a TOML table"))?;
+        table.remove("team");
+        let mut body = toml::to_string_pretty(&root).context("serialize global config")?;
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[team]\n");
+        for line in toml::to_string_pretty(&team)
+            .context("serialize team preset")?
+            .lines()
+        {
+            if let Some(header) = line.strip_prefix("[[") {
+                body.push_str("[[team.");
+                body.push_str(header);
+            } else if let Some(header) = line.strip_prefix('[') {
+                body.push_str("[team.");
+                body.push_str(header);
+            } else {
+                body.push_str(line);
+            }
+            body.push('\n');
+        }
+        let materialized =
+            rtrt_core::Config::from_toml_str(&body).context("validate materialized team preset")?;
+        if materialized.team != team {
+            bail!("materialized team preset changed roster ordering");
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create directory {}", parent.display()))?;
+        }
+        std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+    }
+
+    println!("mode: {}", if apply { "apply" } else { "dry-run" });
+    println!("path: {}", path.display());
+    println!("members: {}", team.members.len());
+    println!("leader order: {}", team.leader_order.join(" -> "));
+    if !apply {
+        println!("pass --apply to write");
     }
     Ok(())
 }
@@ -4380,6 +5907,7 @@ async fn run_route(opts: RouteCliOptions) -> Result<()> {
             mode: Some(decision.mode),
             model: decision.model.clone(),
             timeout,
+            provenance: None,
         },
     )
     .await
@@ -5016,21 +6544,48 @@ fn run_prompt(cmd: PromptCmd) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the project bucket for a hook command. Explicit `--project`
-/// wins first, then `$RTRT_PROJECT`; otherwise the bucket is derived from
-/// the **git repository root** of the current working directory (so
-/// subagents / subdirectories / git worktrees fold into the real project)
-/// via [`rtrt_core::project_for_cwd`], falling back to the cwd basename and
-/// finally `"default"` when there is no cwd.
-fn resolve_hook_project(explicit: Option<String>) -> String {
-    explicit
-        .or_else(|| std::env::var("RTRT_PROJECT").ok())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| rtrt_core::project_for_cwd(&p))
-        })
-        .unwrap_or_else(|| "default".to_string())
+fn current_project_identity() -> Result<ProjectIdentity> {
+    let cwd = std::env::current_dir().context("resolve actual current directory")?;
+    ProjectIdentity::derive(&cwd).map_err(anyhow::Error::from)
+}
+
+fn project_claim_matches(identity: &ProjectIdentity, claim: &str) -> bool {
+    let claim = claim.trim();
+    claim.is_empty()
+        || claim == identity.slug()
+        || claim == identity.label()
+        || claim == identity.fingerprint()
+        || Path::new(claim)
+            .canonicalize()
+            .is_ok_and(|path| path == identity.memory_root())
+}
+
+/// Human project values are assertions only. None can select a store or row
+/// namespace; every accepted normal operation uses the canonical identity slug.
+fn assert_current_project(identity: &ProjectIdentity, explicit: Option<&str>) -> Result<String> {
+    for (source, claim) in [
+        ("--project", explicit.map(str::to_string)),
+        ("RTRT_PROJECT", nonempty_env("RTRT_PROJECT")),
+        ("RTRT_DEFAULT_PROJECT", nonempty_env("RTRT_DEFAULT_PROJECT")),
+        ("RTRT_PARENT_PROJECT", nonempty_env("RTRT_PARENT_PROJECT")),
+    ] {
+        if let Some(claim) = claim
+            && !project_claim_matches(identity, &claim)
+        {
+            bail!(
+                "foreign project assertion rejected: {source}={claim:?}; current project is {} ({})",
+                identity.label(),
+                identity.slug()
+            );
+        }
+    }
+    Ok(identity.slug().to_string())
+}
+
+fn resolve_hook_project(explicit: Option<String>) -> Result<(ProjectIdentity, String)> {
+    let identity = current_project_identity()?;
+    let project = assert_current_project(&identity, explicit.as_deref())?;
+    Ok((identity, project))
 }
 
 /// Parse an env var into `T`, falling back to `default` when unset or
@@ -5059,8 +6614,9 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     if !enabled {
         return Ok(());
     }
-    let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
+    let (identity, project) = resolve_hook_project(project)?;
+    reject_normal_store_override(store.as_deref())?;
+    let store_path = rtrt_core::project_memory_db_path(&identity)?;
     if !store_path.exists() {
         return Ok(());
     }
@@ -5069,7 +6625,7 @@ async fn run_hook_compress(project: Option<String>, store: Option<PathBuf>) -> R
     let batch: usize = env_or("RTRT_AUTO_COMPRESS_BATCH", cfg.batch);
     let model = std::env::var("RTRT_AUTO_COMPRESS_MODEL").unwrap_or_else(|_| cfg.model.clone());
     let max_tokens: u32 = env_or("RTRT_AUTO_COMPRESS_MAX_TOKENS", cfg.max_tokens);
-    let memory = MemoryStore::open(&store_path)?;
+    let memory = MemoryStore::open_project(&identity)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -5127,6 +6683,7 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
         HookCmd::Recall { .. }
         | HookCmd::Compress { .. }
         | HookCmd::SessionInject { .. }
+        | HookCmd::Provenance { .. }
         | HookCmd::Style
         | HookCmd::StyleInject
         | HookCmd::Statusline
@@ -5158,13 +6715,10 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 return Ok(());
             }
             let redacted = rtrt_compress::redact_secrets(&cleaned);
-            let project = resolve_hook_project(project);
-            let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
-            if let Some(parent) = store_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let memory = MemoryStore::open(&store_path)
-                .with_context(|| format!("open memory store {}", store_path.display()))?;
+            let (identity, project) = resolve_hook_project(project)?;
+            reject_normal_store_override(store.as_deref())?;
+            let memory = MemoryStore::open_project(&identity)
+                .context("open current project memory store")?;
             // Dedup: skip if an identical body landed in this project within
             // the window. Kills the repeated near-identical PostToolBatch /
             // PostToolUse rows a busy session produces.
@@ -5194,6 +6748,59 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_hook_provenance(store: Option<PathBuf>) -> Result<()> {
+    let Some(invocation_id) = nonempty_env("RTRT_INVOCATION_ID") else {
+        return Ok(());
+    };
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw).ok();
+    let child_session_id =
+        extract_json_str(&raw, "session_id").or_else(|| nonempty_env("RTRT_CHILD_SESSION_ID"));
+    let Some(child_session_id) = child_session_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    let parent_cwd = nonempty_env("RTRT_PARENT_CWD");
+    let parent_worktree = nonempty_env("RTRT_PARENT_WORKTREE");
+    let parent_project = parent_worktree
+        .as_deref()
+        .or(parent_cwd.as_deref())
+        .map(rtrt_core::project_for_cwd_str)
+        .or_else(|| nonempty_env("RTRT_PARENT_PROJECT"));
+    let Some(parent_project) = parent_project.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let identity = current_project_identity()?;
+    assert_current_project(&identity, Some(&parent_project))?;
+    reject_normal_store_override(store.as_deref())?;
+    let memory =
+        MemoryStore::open_project(&identity).context("open current project memory store")?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    memory.upsert_invocation_provenance(&InvocationProvenance {
+        child_session_id,
+        invocation_id,
+        parent_project: identity.slug().to_string(),
+        parent_session_id: nonempty_env("RTRT_PARENT_SESSION_ID"),
+        parent_call_id: nonempty_env("RTRT_PARENT_CALL_ID"),
+        caller_agent: nonempty_env("RTRT_PARENT_AGENT"),
+        parent_cwd,
+        parent_worktree,
+        target: nonempty_env("RTRT_CHILD_TARGET"),
+        model: nonempty_env("RTRT_CHILD_MODEL"),
+        created_at,
+    })?;
+    Ok(())
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn run_hook_proxy_rewrite() -> Result<()> {
@@ -5386,6 +6993,1398 @@ struct StatuslineOptions {
     format: Option<String>,
 }
 
+struct OpenCodeStatuslineOptions {
+    cwd: Option<PathBuf>,
+    session: Option<String>,
+    model: Option<String>,
+    width: usize,
+    budget_ms: u64,
+    no_git: bool,
+    refresh: bool,
+}
+
+struct OpenCodeBudget {
+    started: std::time::Instant,
+    limit: std::time::Duration,
+}
+
+impl OpenCodeBudget {
+    fn new(started: std::time::Instant, budget_ms: u64) -> Self {
+        Self {
+            started,
+            limit: std::time::Duration::from_millis(budget_ms),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.started.elapsed() >= self.limit
+    }
+
+    fn remaining(&self) -> std::time::Duration {
+        self.limit.saturating_sub(self.started.elapsed())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeSavings {
+    sigma_pct: u64,
+    command_pct: Option<u64>,
+    saved_chars: Option<u64>,
+    base_chars: Option<u64>,
+    recall_chars: Option<u64>,
+    cached: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeHeadroom {
+    text: String,
+    tone: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeRateLimitWindow {
+    used_percentage: f64,
+    resets_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeRateLimits {
+    captured_at: u64,
+    five_hour: Option<ClaudeRateLimitWindow>,
+    seven_day: Option<ClaudeRateLimitWindow>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeGitSnapshot {
+    branch: String,
+    dirty: bool,
+    cached: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeMemoryAggregate {
+    rows: u64,
+    original_chars: u64,
+    stored_chars: u64,
+}
+
+struct OpenCodeRenderFacts {
+    rendered_at: u64,
+    project: String,
+    style: OutputStyleLevel,
+    savings: Option<OpenCodeSavings>,
+    headroom: Option<OpenCodeHeadroom>,
+    quota: Option<ClaudeRateLimits>,
+    git: Option<OpenCodeGitSnapshot>,
+    session: Option<String>,
+    model: Option<String>,
+    memory: Option<OpenCodeMemoryAggregate>,
+}
+
+struct OpenCodeSegment {
+    id: &'static str,
+    text: String,
+    tone: &'static str,
+    pri: u8,
+}
+
+impl OpenCodeSegment {
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "text": self.text,
+            "tone": self.tone,
+            "pri": self.pri,
+        })
+    }
+}
+
+const OPENCODE_STATUSLINE_VERSION: u64 = 1;
+const OPENCODE_GIT_CACHE_TTL_SECS: u64 = 5;
+const OPENCODE_GIT_OUTPUT_CAP: u64 = 64 * 1024;
+const CLAUDE_RATE_LIMIT_CACHE_VERSION: u64 = 1;
+const CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES: u64 = 4 * 1024;
+const CLAUDE_RATE_LIMIT_DEFAULT_MAX_AGE_SECS: u64 = 15 * 60;
+const CLAUDE_RATE_LIMIT_MAX_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+const CLAUDE_RATE_LIMIT_SOURCE: &str = "claude_statusline";
+
+#[derive(Clone, Copy)]
+enum RateLimitCacheParentPolicy {
+    Private,
+    OwnerNonWritable,
+}
+
+fn print_opencode_statusline(opts: OpenCodeStatuslineOptions) {
+    let started = std::time::Instant::now();
+    let budget = OpenCodeBudget::new(started, opts.budget_ms);
+    let ts = epoch_secs();
+    let mut degraded = Vec::new();
+    let mut stale = false;
+
+    let (cwd, canonical) = canonical_statusline_cwd(opts.cwd);
+    if !canonical {
+        add_degraded(&mut degraded, "cwd");
+    }
+    let cwd_text = sanitize_statusline_text(&cwd.to_string_lossy(), 4096);
+    let repo_root = repo_root_from_cwd(&cwd);
+    let project = sanitize_statusline_text(&rtrt_core::project_for_cwd(&cwd), 160);
+    let style = rtrt_core::read_output_style_level_for(Some(&repo_root));
+    let session = opts
+        .session
+        .as_deref()
+        .map(|value| sanitize_statusline_text(value, 160))
+        .filter(|value| !value.is_empty());
+    let model = opts
+        .model
+        .as_deref()
+        .map(|value| sanitize_statusline_text(value, 160))
+        .filter(|value| !value.is_empty());
+
+    let mut data = serde_json::Map::new();
+    data.insert("style".into(), serde_json::json!(style.as_str()));
+    data.insert("width".into(), serde_json::json!(opts.width));
+    if let Some(session) = &session {
+        data.insert("session".into(), serde_json::json!(session));
+    }
+    if let Some(model) = &model {
+        data.insert("model".into(), serde_json::json!(model));
+    }
+
+    let quota = if budget.expired() {
+        add_degraded(&mut degraded, "quota");
+        None
+    } else {
+        let value = collect_opencode_quota(ts, &budget);
+        if let Some(value) = &value {
+            data.insert("quota".into(), opencode_quota_json(value, ts));
+        } else {
+            add_degraded(&mut degraded, "quota");
+        }
+        value
+    };
+
+    let savings = if budget.expired() {
+        add_degraded(&mut degraded, "savings");
+        None
+    } else {
+        let value = collect_opencode_savings(&project, opts.refresh, &budget);
+        if let Some(value) = &value {
+            data.insert("savings".into(), opencode_savings_json(value));
+        } else {
+            add_degraded(&mut degraded, "savings");
+        }
+        value
+    };
+
+    let git = if opts.width >= 100 && !opts.no_git {
+        let value = collect_opencode_git(&cwd, &budget, opts.refresh);
+        match value {
+            Some((snapshot, git_stale)) => {
+                stale |= git_stale;
+                if git_stale {
+                    add_degraded(&mut degraded, "git_stale");
+                }
+                data.insert(
+                    "git".into(),
+                    serde_json::json!({
+                        "branch": snapshot.branch.clone(),
+                        "dirty": snapshot.dirty,
+                        "cached": snapshot.cached,
+                    }),
+                );
+                Some(snapshot)
+            }
+            None => {
+                add_degraded(&mut degraded, "git");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let headroom = if opts.width >= 60 {
+        if budget.expired() {
+            add_degraded(&mut degraded, "headroom");
+            None
+        } else {
+            match collect_opencode_headroom(&repo_root, model.as_deref(), &budget) {
+                Some((headroom_data, summary)) => {
+                    data.insert("headroom".into(), headroom_data);
+                    if summary.is_none() {
+                        add_degraded(&mut degraded, "headroom");
+                    }
+                    summary
+                }
+                None => {
+                    add_degraded(&mut degraded, "headroom");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let memory = if opts.width >= 100 {
+        if budget.expired() {
+            add_degraded(&mut degraded, "memory");
+            None
+        } else {
+            let value = collect_opencode_memory(&project, budget.remaining());
+            if let Some(value) = &value {
+                data.insert("memory".into(), opencode_memory_json(value));
+            } else {
+                add_degraded(&mut degraded, "memory");
+            }
+            value
+        }
+    } else {
+        None
+    };
+
+    if budget.expired() {
+        stale = true;
+        add_degraded(&mut degraded, "budget");
+    }
+    let facts = OpenCodeRenderFacts {
+        rendered_at: ts,
+        project: project.clone(),
+        style,
+        savings,
+        headroom,
+        quota,
+        git,
+        session,
+        model,
+        memory,
+    };
+    let segments = render_opencode_segments(opts.width, &facts);
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let payload = serde_json::json!({
+        "v": OPENCODE_STATUSLINE_VERSION,
+        "ts": ts,
+        "took_ms": took_ms,
+        "stale": stale,
+        "degraded": degraded,
+        "project": project,
+        "cwd": cwd_text,
+        "data": data,
+        "segments": segments,
+    });
+    let line = serde_json::to_string(&payload).unwrap_or_else(|_| {
+        "{\"v\":1,\"ts\":0,\"took_ms\":0,\"stale\":true,\"degraded\":[\"json\"],\"project\":\"\",\"cwd\":\"\",\"data\":{},\"segments\":[]}".to_string()
+    });
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+}
+
+fn render_opencode_segments(width: usize, facts: &OpenCodeRenderFacts) -> Vec<serde_json::Value> {
+    let mut segments = Vec::new();
+    if width < 60 {
+        if let Some(savings) = &facts.savings {
+            segments.push(OpenCodeSegment {
+                id: "sigma",
+                text: format!("Σ:{}%", savings.sigma_pct),
+                tone: "good",
+                pri: 100,
+            });
+        }
+        segments.push(style_segment(facts.style, 90));
+        let mut rendered = segments
+            .into_iter()
+            .map(OpenCodeSegment::json)
+            .collect::<Vec<_>>();
+        append_opencode_quota_segments(&mut rendered, facts.quota.as_ref(), facts.rendered_at);
+        return rendered;
+    }
+
+    segments.push(OpenCodeSegment {
+        id: "project",
+        text: facts.project.clone(),
+        tone: "accent",
+        pri: 100,
+    });
+    segments.push(style_segment(facts.style, 90));
+    if let Some(savings) = &facts.savings {
+        let command = savings
+            .command_pct
+            .map(|pct| format!(" cmd:{pct}%"))
+            .unwrap_or_default();
+        segments.push(OpenCodeSegment {
+            id: "savings",
+            text: format!("save:{}%{command}", savings.sigma_pct),
+            tone: "good",
+            pri: 80,
+        });
+    }
+    let mut rendered = segments
+        .into_iter()
+        .map(OpenCodeSegment::json)
+        .collect::<Vec<_>>();
+    append_opencode_quota_segments(&mut rendered, facts.quota.as_ref(), facts.rendered_at);
+    if let Some(headroom) = &facts.headroom {
+        rendered.push(
+            OpenCodeSegment {
+                id: "headroom",
+                text: headroom.text.clone(),
+                tone: headroom.tone,
+                pri: 70,
+            }
+            .json(),
+        );
+    }
+
+    if width >= 100 {
+        if let Some(git) = &facts.git {
+            rendered.push(
+                OpenCodeSegment {
+                    id: "git",
+                    text: format!("{}{}", git.branch, if git.dirty { "*" } else { "" }),
+                    tone: if git.dirty { "warn" } else { "muted" },
+                    pri: 65,
+                }
+                .json(),
+            );
+        }
+        if let Some(model) = &facts.model {
+            rendered.push(
+                OpenCodeSegment {
+                    id: "model",
+                    text: model.clone(),
+                    tone: "muted",
+                    pri: 60,
+                }
+                .json(),
+            );
+        }
+        if let Some(session) = &facts.session {
+            rendered.push(
+                OpenCodeSegment {
+                    id: "session",
+                    text: format!("sess:{}", session.chars().take(12).collect::<String>()),
+                    tone: "muted",
+                    pri: 50,
+                }
+                .json(),
+            );
+        }
+        if let Some(memory) = &facts.memory {
+            let pct = (memory.original_chars > 0).then(|| {
+                savings_pct(
+                    memory.original_chars.saturating_sub(memory.stored_chars),
+                    memory.original_chars,
+                )
+            });
+            rendered.push(
+                OpenCodeSegment {
+                    id: "memory",
+                    text: pct.map_or_else(
+                        || format!("mem:{}", memory.rows),
+                        |pct| format!("mem:{} {pct}%", memory.rows),
+                    ),
+                    tone: if pct.is_some_and(|pct| pct > 0) {
+                        "good"
+                    } else {
+                        "muted"
+                    },
+                    pri: 40,
+                }
+                .json(),
+            );
+        }
+    }
+
+    rendered
+}
+
+fn style_segment(style: OutputStyleLevel, pri: u8) -> OpenCodeSegment {
+    OpenCodeSegment {
+        id: "style",
+        text: format!("opt:{}", style.as_str()),
+        tone: if style.is_active() { "accent" } else { "muted" },
+        pri,
+    }
+}
+
+fn append_opencode_quota_segments(
+    segments: &mut Vec<serde_json::Value>,
+    quota: Option<&ClaudeRateLimits>,
+    now: u64,
+) {
+    let Some(quota) = quota else {
+        return;
+    };
+    let freshness_sec = now.saturating_sub(quota.captured_at);
+    if let Some(window) = &quota.five_hour {
+        segments.push(opencode_quota_segment(
+            "limit_5h",
+            "5h",
+            window,
+            now,
+            freshness_sec,
+            75,
+        ));
+    }
+    if let Some(window) = &quota.seven_day {
+        segments.push(opencode_quota_segment(
+            "limit_week",
+            "wk",
+            window,
+            now,
+            freshness_sec,
+            74,
+        ));
+    }
+}
+
+fn opencode_quota_segment(
+    id: &'static str,
+    label: &'static str,
+    window: &ClaudeRateLimitWindow,
+    now: u64,
+    freshness_sec: u64,
+    pri: u8,
+) -> serde_json::Value {
+    let remaining = window.resets_at.saturating_sub(now).min(i64::MAX as u64) as i64;
+    let rounded_percentage = window.used_percentage.round() as u64;
+    serde_json::json!({
+        "id": id,
+        "text": format!(
+            "{label}:{}% ↻{}",
+            rounded_percentage,
+            humanize_remaining(remaining)
+        ),
+        "tone": rate_limit_tone(rounded_percentage),
+        "pri": pri,
+        "source": CLAUDE_RATE_LIMIT_SOURCE,
+        "freshness_sec": freshness_sec,
+    })
+}
+
+fn rate_limit_tone(used_percentage: u64) -> &'static str {
+    if used_percentage >= 90 {
+        "bad"
+    } else if used_percentage >= 70 {
+        "warn"
+    } else {
+        "good"
+    }
+}
+
+fn canonical_statusline_cwd(requested: Option<PathBuf>) -> (PathBuf, bool) {
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let requested = requested.unwrap_or_else(|| current.clone());
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        current.join(requested)
+    };
+    match std::fs::canonicalize(&absolute) {
+        Ok(path) => (path, true),
+        Err(_) => (normalize_statusline_path(&absolute), false),
+    }
+}
+
+fn normalize_statusline_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn sanitize_statusline_text(value: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(value.len().min(max_chars));
+    for (count, ch) in value.chars().enumerate() {
+        if count >= max_chars {
+            break;
+        }
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn add_degraded(degraded: &mut Vec<String>, id: &str) {
+    if !degraded.iter().any(|item| item == id) {
+        degraded.push(id.to_string());
+    }
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn claude_rate_limit_cache_override() -> Option<PathBuf> {
+    std::env::var_os("RTRT_CLAUDE_RATE_LIMIT_CACHE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// Resolve current and legacy caches beneath a safe canonical `~/.rtrt`.
+/// Existing `0755` state directories are safe to traverse; the dedicated
+/// `statusline` child is still created and validated as exact `0700`.
+fn default_claude_rate_limit_cache_paths(create_state: bool) -> Option<(PathBuf, PathBuf)> {
+    let home = std::fs::canonicalize(home_dir()?).ok()?;
+    let home_metadata = std::fs::symlink_metadata(&home).ok()?;
+    if !home_metadata.is_dir() || home_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let state = home.join(".rtrt");
+    match std::fs::symlink_metadata(&state) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_state => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&state) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+        }
+        Err(_) => return None,
+    }
+    let state_metadata = std::fs::symlink_metadata(&state).ok()?;
+    if !state_metadata.is_dir() || state_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let canonical_state = std::fs::canonicalize(&state).ok()?;
+    let canonical_metadata = std::fs::symlink_metadata(&canonical_state).ok()?;
+    if !canonical_metadata.is_dir()
+        || canonical_metadata.file_type().is_symlink()
+        || canonical_state.parent() != Some(home.as_path())
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if state_metadata.dev() != canonical_metadata.dev()
+            || state_metadata.ino() != canonical_metadata.ino()
+            || canonical_metadata.uid() != home_metadata.uid()
+            || canonical_metadata.permissions().mode() & 0o022 != 0
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = home_metadata;
+
+    Some((
+        canonical_state
+            .join("statusline")
+            .join("claude-rate-limits.json"),
+        canonical_state.join("claude-rate-limits.json"),
+    ))
+}
+
+fn claude_rate_limit_max_age_secs() -> u64 {
+    bounded_claude_rate_limit_max_age(
+        std::env::var("RTRT_CLAUDE_RATE_LIMIT_MAX_AGE_SEC")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn bounded_claude_rate_limit_max_age(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=CLAUDE_RATE_LIMIT_MAX_MAX_AGE_SECS).contains(value))
+        .unwrap_or(CLAUDE_RATE_LIMIT_DEFAULT_MAX_AGE_SECS)
+}
+
+fn collect_opencode_quota(now: u64, budget: &OpenCodeBudget) -> Option<ClaudeRateLimits> {
+    if budget.expired() {
+        return None;
+    }
+    let max_age_secs = claude_rate_limit_max_age_secs();
+    if let Some(path) = claude_rate_limit_cache_override() {
+        return read_claude_rate_limit_cache(
+            &path,
+            RateLimitCacheParentPolicy::Private,
+            now,
+            max_age_secs,
+            budget,
+        );
+    }
+    let (path, legacy) = default_claude_rate_limit_cache_paths(false)?;
+    if let Some(quota) = read_claude_rate_limit_cache(
+        &path,
+        RateLimitCacheParentPolicy::Private,
+        now,
+        max_age_secs,
+        budget,
+    ) {
+        return Some(quota);
+    }
+    let quota = read_claude_rate_limit_cache(
+        &legacy,
+        RateLimitCacheParentPolicy::OwnerNonWritable,
+        now,
+        max_age_secs,
+        budget,
+    )?;
+    if !budget.expired() {
+        let _ = write_claude_rate_limit_cache(&path, &quota);
+    }
+    Some(quota)
+}
+
+fn read_claude_rate_limit_cache(
+    path: &Path,
+    parent_policy: RateLimitCacheParentPolicy,
+    now: u64,
+    max_age_secs: u64,
+    budget: &OpenCodeBudget,
+) -> Option<ClaudeRateLimits> {
+    if budget.expired() {
+        return None;
+    }
+    let raw =
+        read_private_rate_limit_cache(path, CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES, parent_policy)?;
+    if budget.expired() {
+        return None;
+    }
+    parse_claude_rate_limit_cache(&raw, now, max_age_secs)
+}
+
+fn opencode_quota_json(quota: &ClaudeRateLimits, now: u64) -> serde_json::Value {
+    let mut windows = serde_json::Map::new();
+    if let Some(window) = &quota.five_hour {
+        windows.insert("five_hour".into(), rate_limit_window_json(window));
+    }
+    if let Some(window) = &quota.seven_day {
+        windows.insert("seven_day".into(), rate_limit_window_json(window));
+    }
+    serde_json::json!({
+        "source": CLAUDE_RATE_LIMIT_SOURCE,
+        "fresh": true,
+        "freshness_sec": now.saturating_sub(quota.captured_at),
+        "captured_at": quota.captured_at,
+        "windows": windows,
+    })
+}
+
+fn rate_limit_window_json(window: &ClaudeRateLimitWindow) -> serde_json::Value {
+    serde_json::json!({
+        "used_percentage": window.used_percentage,
+        "resets_at": window.resets_at,
+    })
+}
+
+fn parse_claude_rate_limit_cache(
+    raw: &str,
+    now: u64,
+    max_age_secs: u64,
+) -> Option<ClaudeRateLimits> {
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let root = value.as_object()?;
+    if !has_exact_json_fields(root, &["v", "captured_at", "windows"])
+        || root.get("v")?.as_u64()? != CLAUDE_RATE_LIMIT_CACHE_VERSION
+    {
+        return None;
+    }
+    let captured_at = root.get("captured_at")?.as_u64()?;
+    if captured_at > now || now.saturating_sub(captured_at) > max_age_secs {
+        return None;
+    }
+    let windows = root.get("windows")?.as_object()?;
+    if windows.is_empty()
+        || windows
+            .keys()
+            .any(|key| !matches!(key.as_str(), "five_hour" | "seven_day"))
+    {
+        return None;
+    }
+    let five_hour = match windows.get("five_hour") {
+        Some(value) => Some(parse_cached_rate_limit_window(value)?),
+        None => None,
+    }
+    .filter(|window| window.resets_at > now);
+    let seven_day = match windows.get("seven_day") {
+        Some(value) => Some(parse_cached_rate_limit_window(value)?),
+        None => None,
+    }
+    .filter(|window| window.resets_at > now);
+    if five_hour.is_none() && seven_day.is_none() {
+        return None;
+    }
+    Some(ClaudeRateLimits {
+        captured_at,
+        five_hour,
+        seven_day,
+    })
+}
+
+fn parse_cached_rate_limit_window(value: &serde_json::Value) -> Option<ClaudeRateLimitWindow> {
+    let window = value.as_object()?;
+    if !has_exact_json_fields(window, &["used_percentage", "resets_at"]) {
+        return None;
+    }
+    let used_percentage = window.get("used_percentage")?.as_f64()?;
+    let resets_at = window.get("resets_at")?.as_u64()?;
+    if !used_percentage.is_finite()
+        || !(0.0..=100.0).contains(&used_percentage)
+        || resets_at > i64::MAX as u64
+    {
+        return None;
+    }
+    Some(ClaudeRateLimitWindow {
+        used_percentage,
+        resets_at,
+    })
+}
+
+fn has_exact_json_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn read_private_rate_limit_cache(
+    path: &Path,
+    max_bytes: u64,
+    parent_policy: RateLimitCacheParentPolicy,
+) -> Option<String> {
+    let file_name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_metadata = std::fs::symlink_metadata(parent).ok()?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return None;
+    }
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    let canonical_parent_metadata = std::fs::symlink_metadata(&canonical_parent).ok()?;
+    if canonical_parent_metadata.file_type().is_symlink() || !canonical_parent_metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let parent_mode = canonical_parent_metadata.permissions().mode() & 0o7777;
+        let unsafe_mode = match parent_policy {
+            RateLimitCacheParentPolicy::Private => parent_mode != 0o700,
+            RateLimitCacheParentPolicy::OwnerNonWritable => parent_mode & 0o022 != 0,
+        };
+        if parent_metadata.dev() != canonical_parent_metadata.dev()
+            || parent_metadata.ino() != canonical_parent_metadata.ino()
+            || unsafe_mode
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = parent_policy;
+
+    let target = canonical_parent.join(file_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x20_000);
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x100);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(&target).ok()?;
+    let file_metadata = file.metadata().ok()?;
+    let path_metadata = std::fs::symlink_metadata(&target).ok()?;
+    if path_metadata.file_type().is_symlink()
+        || !file_metadata.is_file()
+        || !path_metadata.is_file()
+        || file_metadata.len() > max_bytes
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if file_metadata.dev() != path_metadata.dev()
+            || file_metadata.ino() != path_metadata.ino()
+            || file_metadata.uid() != canonical_parent_metadata.uid()
+            || file_metadata.nlink() != 1
+            || file_metadata.permissions().mode() & 0o7777 != 0o600
+        {
+            return None;
+        }
+    }
+    let mut raw = String::with_capacity(usize::try_from(file_metadata.len()).ok()?);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut raw)
+        .ok()?;
+    (raw.len() as u64 <= max_bytes).then_some(raw)
+}
+
+fn collect_opencode_savings(
+    project: &str,
+    refresh: bool,
+    budget: &OpenCodeBudget,
+) -> Option<OpenCodeSavings> {
+    if !refresh
+        && let Some(raw) = read_opencode_savings_cache(project)
+        && let Some(sigma_pct) = cached_statusline_percentage(&raw, "Σ:")
+    {
+        return Some(OpenCodeSavings {
+            sigma_pct,
+            command_pct: cached_statusline_percentage(&raw, "cmd:"),
+            saved_chars: None,
+            base_chars: None,
+            recall_chars: None,
+            cached: true,
+        });
+    }
+
+    let command = read_opencode_proxy_savings(project, budget.remaining());
+    if budget.expired() {
+        return None;
+    }
+    let recall = read_opencode_recall_savings(project)?;
+    if command.is_none() && recall == 0 {
+        return None;
+    }
+    let (command_saved, command_base) = command.unwrap_or((0, 0));
+    let saved = command_saved.saturating_add(recall);
+    let base = command_base.saturating_add(recall);
+    (base > 0).then(|| OpenCodeSavings {
+        sigma_pct: savings_pct(saved, base),
+        command_pct: (command_base > 0).then(|| savings_pct(command_saved, command_base)),
+        saved_chars: Some(saved),
+        base_chars: Some(base),
+        recall_chars: Some(recall),
+        cached: false,
+    })
+}
+
+fn read_opencode_savings_cache(project: &str) -> Option<String> {
+    let path = savings_cache_path(project);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() > 16 * 1024
+        || metadata.modified().ok()?.elapsed().ok()?.as_secs() > SAVINGS_CACHE_TTL_SECS
+    {
+        return None;
+    }
+    read_bounded_regular_file(&path, 16 * 1024)
+}
+
+fn read_opencode_proxy_savings(project: &str, timeout: std::time::Duration) -> Option<(u64, u64)> {
+    let path = proxy_stats::default_path();
+    if !is_regular_file(&path) {
+        return None;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(path, flags).ok()?;
+    conn.busy_timeout(std::time::Duration::ZERO).ok()?;
+    let (saved, input): (i64, i64) = sqlite_query_with_deadline(&conn, timeout, || {
+        conn.query_row(
+            "SELECT COALESCE(SUM(saved_chars), 0), COALESCE(SUM(input_chars), 0) \
+             FROM proxy_runs WHERE saved_chars > 0 AND project = ?1",
+            rusqlite::params![project],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    })?;
+    (input > 0).then(|| (saved.max(0) as u64, input as u64))
+}
+
+fn read_opencode_recall_savings(project: &str) -> Option<u64> {
+    let Some(path) = recall_savings_path() else {
+        return Some(0);
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let raw = read_bounded_regular_file(&path, 4 * 1024 * 1024)?;
+    let mut total = 0u64;
+    for line in raw.lines() {
+        let mut fields = line.split('\t');
+        if fields.next() == Some(project)
+            && let Some(chars) = fields.next().and_then(|value| value.parse::<u64>().ok())
+        {
+            total = total.saturating_add(chars);
+        }
+    }
+    Some(total)
+}
+
+fn cached_statusline_percentage(raw: &str, marker: &str) -> Option<u64> {
+    let rest = raw.split_once(marker)?.1;
+    let digits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let pct = digits.parse::<u64>().ok()?;
+    (pct <= 100).then_some(pct)
+}
+
+fn opencode_savings_json(savings: &OpenCodeSavings) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("pct".into(), serde_json::json!(savings.sigma_pct));
+    value.insert("cached".into(), serde_json::json!(savings.cached));
+    if let Some(command_pct) = savings.command_pct {
+        value.insert("command_pct".into(), serde_json::json!(command_pct));
+    }
+    if let Some(saved_chars) = savings.saved_chars {
+        value.insert("saved_chars".into(), serde_json::json!(saved_chars));
+    }
+    if let Some(base_chars) = savings.base_chars {
+        value.insert("base_chars".into(), serde_json::json!(base_chars));
+    }
+    if let Some(recall_chars) = savings.recall_chars {
+        value.insert("recall_chars".into(), serde_json::json!(recall_chars));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn collect_opencode_headroom(
+    repo_root: &Path,
+    model: Option<&str>,
+    budget: &OpenCodeBudget,
+) -> Option<(serde_json::Value, Option<OpenCodeHeadroom>)> {
+    let config = rtrt_core::Config::load_effective(Some(repo_root)).ok()?;
+    let mut limits = BTreeMap::new();
+    for (target, limit) in &config.limits.targets {
+        limits.insert(
+            target.trim().to_ascii_lowercase(),
+            (limit.daily_tokens, limit.daily_requests),
+        );
+    }
+    let mut usage: BTreeMap<String, (u64, u64, bool)> = BTreeMap::new();
+    let ledger_path = std::env::var_os("RTRT_PROVIDER_USAGE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".rtrt").join("provider-usage.tsv")));
+    if let Some(path) = ledger_path {
+        let raw = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 4 * 1024 * 1024 => {
+                read_bounded_regular_file(&path, 4 * 1024 * 1024)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            _ => return None,
+        };
+        let since = epoch_secs().saturating_sub(24 * 60 * 60);
+        for line in raw.lines() {
+            if budget.expired() {
+                return None;
+            }
+            let mut fields = line.split('\t');
+            let Some(timestamp) = fields
+                .next()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(target) = fields.next().map(|value| value.trim().to_ascii_lowercase()) else {
+                continue;
+            };
+            let _model = fields.next();
+            let Some(input) = fields
+                .next()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(output) = fields
+                .next()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let estimated = fields.next().is_some_and(|value| value.trim() != "0");
+            if timestamp < since || target.is_empty() {
+                continue;
+            }
+            let entry = usage.entry(target).or_default();
+            entry.0 = entry.0.saturating_add(input.saturating_add(output));
+            entry.1 = entry.1.saturating_add(1);
+            entry.2 |= estimated;
+        }
+    }
+    for target in limits.keys() {
+        usage.entry(target.clone()).or_default();
+    }
+    if usage.is_empty() || budget.expired() {
+        return None;
+    }
+
+    let mut data = serde_json::Map::new();
+    let mut candidates = Vec::new();
+    for (target, (used_tokens, used_requests, tokens_estimated)) in usage {
+        let target = sanitize_statusline_text(&target, 80);
+        let (limit_tokens, request_limit) = limits.get(&target).copied().unwrap_or((None, None));
+        let remaining_tokens = limit_tokens.map(|limit| limit.saturating_sub(used_tokens));
+        let remaining_requests = request_limit.map(|limit| limit.saturating_sub(used_requests));
+        let mut item = serde_json::Map::new();
+        item.insert("used_tokens".into(), serde_json::json!(used_tokens));
+        item.insert("used_requests".into(), serde_json::json!(used_requests));
+        item.insert(
+            "tokens_estimated".into(),
+            serde_json::json!(tokens_estimated),
+        );
+        if let Some(limit) = limit_tokens {
+            item.insert("limit_tokens".into(), serde_json::json!(limit));
+        }
+        if let Some(remaining) = remaining_tokens {
+            item.insert("remaining_tokens".into(), serde_json::json!(remaining));
+        }
+        if let Some(limit) = request_limit {
+            item.insert("request_limit".into(), serde_json::json!(limit));
+        }
+        if let Some(remaining) = remaining_requests {
+            item.insert("remaining_requests".into(), serde_json::json!(remaining));
+        }
+
+        let token_pct = limit_tokens
+            .zip(remaining_tokens)
+            .filter(|(limit, _)| *limit > 0)
+            .map(|(limit, remaining)| percentage_rounded(remaining, limit).min(100));
+        let request_pct = request_limit
+            .zip(remaining_requests)
+            .filter(|(limit, _)| *limit > 0)
+            .map(|(limit, remaining)| percentage_rounded(remaining, limit).min(100));
+        if let Some(pct) = token_pct.into_iter().chain(request_pct).min() {
+            candidates.push((target.clone(), pct, tokens_estimated));
+        }
+        data.insert(target, serde_json::Value::Object(item));
+    }
+
+    let target_hint = model
+        .and_then(|model| model.split_once('/').map(|(target, _)| target))
+        .map(str::to_ascii_lowercase);
+    candidates.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let selected = target_hint
+        .as_deref()
+        .and_then(|hint| candidates.iter().find(|item| item.0 == hint))
+        .or_else(|| candidates.first());
+    let summary = selected.map(|(target, pct, estimated)| OpenCodeHeadroom {
+        text: format!("room:{target}:{pct}%"),
+        tone: if *estimated {
+            "warn"
+        } else if *pct <= 10 {
+            "bad"
+        } else if *pct <= 25 {
+            "warn"
+        } else {
+            "good"
+        },
+    });
+    Some((serde_json::Value::Object(data), summary))
+}
+
+fn collect_opencode_memory(
+    project: &str,
+    timeout: std::time::Duration,
+) -> Option<OpenCodeMemoryAggregate> {
+    let path = std::env::var_os("RTRT_MEMORY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(rtrt_core::default_memory_store_path);
+    if !is_regular_file(&path) {
+        return None;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(path, flags).ok()?;
+    conn.busy_timeout(std::time::Duration::ZERO).ok()?;
+    let (rows, original_chars, stored_chars): (i64, i64, i64) =
+        sqlite_query_with_deadline(&conn, timeout, || {
+            conn.query_row(
+                "SELECT COUNT(*), \
+                        COALESCE(SUM(LENGTH(COALESCE(body_full, body))), 0), \
+                        COALESCE(SUM(LENGTH(body)), 0) \
+                   FROM memories WHERE project = ?1",
+                rusqlite::params![project],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })?;
+    Some(OpenCodeMemoryAggregate {
+        rows: rows.max(0) as u64,
+        original_chars: original_chars.max(0) as u64,
+        stored_chars: stored_chars.max(0) as u64,
+    })
+}
+
+fn sqlite_query_with_deadline<T>(
+    conn: &rusqlite::Connection,
+    timeout: std::time::Duration,
+    query: impl FnOnce() -> rusqlite::Result<T>,
+) -> Option<T> {
+    if timeout.is_zero() {
+        return None;
+    }
+    let interrupt = conn.get_interrupt_handle();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::Builder::new()
+        .name("rtrt-statusline-sqlite".into())
+        .spawn(move || {
+            if done_rx.recv_timeout(timeout).is_err() {
+                interrupt.interrupt();
+            }
+        })
+        .ok()?;
+    let result = query().ok();
+    let _ = done_tx.send(());
+    let _ = watchdog.join();
+    result
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let mut raw = String::with_capacity(usize::try_from(metadata.len()).ok()?);
+    std::fs::File::open(path)
+        .ok()?
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut raw)
+        .ok()?;
+    (raw.len() as u64 <= max_bytes).then_some(raw)
+}
+
+fn opencode_memory_json(memory: &OpenCodeMemoryAggregate) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert("rows".into(), serde_json::json!(memory.rows));
+    value.insert(
+        "original_chars".into(),
+        serde_json::json!(memory.original_chars),
+    );
+    value.insert(
+        "stored_chars".into(),
+        serde_json::json!(memory.stored_chars),
+    );
+    value.insert(
+        "saved_chars".into(),
+        serde_json::json!(memory.original_chars.saturating_sub(memory.stored_chars)),
+    );
+    if memory.original_chars > 0 {
+        value.insert(
+            "pct".into(),
+            serde_json::json!(savings_pct(
+                memory.original_chars.saturating_sub(memory.stored_chars),
+                memory.original_chars,
+            )),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
+fn collect_opencode_git(
+    cwd: &Path,
+    budget: &OpenCodeBudget,
+    refresh: bool,
+) -> Option<(OpenCodeGitSnapshot, bool)> {
+    let now = epoch_secs();
+    let cached = read_opencode_git_cache(cwd);
+    if !refresh
+        && let Some((snapshot, recorded_at)) = &cached
+        && now.saturating_sub(*recorded_at) <= OPENCODE_GIT_CACHE_TTL_SECS
+    {
+        let mut snapshot = snapshot.clone();
+        snapshot.cached = true;
+        return Some((snapshot, false));
+    }
+
+    let timeout = budget.remaining().min(std::time::Duration::from_millis(50));
+    if !timeout.is_zero()
+        && let Some(snapshot) = read_bounded_git_snapshot(cwd, timeout)
+    {
+        if !budget.expired() {
+            write_opencode_git_cache(cwd, &snapshot, now);
+        }
+        return Some((snapshot, false));
+    }
+
+    cached.map(|(mut snapshot, recorded_at)| {
+        snapshot.cached = true;
+        let stale = refresh || now.saturating_sub(recorded_at) > OPENCODE_GIT_CACHE_TTL_SECS;
+        (snapshot, stale)
+    })
+}
+
+fn read_bounded_git_snapshot(
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> Option<OpenCodeGitSnapshot> {
+    let mut child = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-C",
+        ])
+        .arg(cwd)
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-ahead-behind",
+            "--untracked-files=no",
+            "--ignore-submodules=all",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let reader = match std::thread::Builder::new()
+        .name("rtrt-statusline-git".into())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let _ = stdout
+                .take(OPENCODE_GIT_OUTPUT_CAP)
+                .read_to_end(&mut output);
+            output
+        }) {
+        Ok(reader) => reader,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader.join().ok()?;
+    let status = status?;
+    if !status.success() {
+        return None;
+    }
+    let output = String::from_utf8_lossy(&output);
+    let branch = output
+        .lines()
+        .find_map(|line| line.strip_prefix("# branch.head "))?;
+    let branch = if branch == "(detached)" {
+        "detached"
+    } else {
+        branch
+    };
+    let branch = sanitize_statusline_text(branch, 160);
+    if branch.is_empty() {
+        return None;
+    }
+    Some(OpenCodeGitSnapshot {
+        branch,
+        dirty: output.lines().any(|line| !line.starts_with('#')),
+        cached: false,
+    })
+}
+
+fn opencode_git_cache_path(cwd: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    let runtime = rtrt_core::runtime_tmp_dir().ok()?;
+    Some(runtime.join(format!("rtrt-opencode-git-{:016x}.json", hasher.finish())))
+}
+
+fn read_opencode_git_cache(cwd: &Path) -> Option<(OpenCodeGitSnapshot, u64)> {
+    let path = opencode_git_cache_path(cwd)?;
+    let raw = read_bounded_regular_file(&path, 4096)?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let recorded_at = value.get("ts")?.as_u64()?;
+    let branch = sanitize_statusline_text(value.get("branch")?.as_str()?, 160);
+    if branch.is_empty() {
+        return None;
+    }
+    Some((
+        OpenCodeGitSnapshot {
+            branch,
+            dirty: value.get("dirty")?.as_bool()?,
+            cached: true,
+        },
+        recorded_at,
+    ))
+}
+
+fn write_opencode_git_cache(cwd: &Path, snapshot: &OpenCodeGitSnapshot, recorded_at: u64) {
+    let Some(path) = opencode_git_cache_path(cwd) else {
+        return;
+    };
+    let value = serde_json::json!({
+        "ts": recorded_at,
+        "branch": snapshot.branch,
+        "dirty": snapshot.dirty,
+    });
+    if let Ok(raw) = serde_json::to_vec(&value) {
+        let _ = rtrt_core::write_private_file_atomic(&path, &raw);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StatuslineConfig {
     enabled_segments: Vec<String>,
@@ -5495,6 +8494,7 @@ fn print_statusline(opts: StatuslineOptions) {
 
 fn build_statusline_output(raw_stdin: &str, format_override: Option<String>) -> Option<String> {
     let input = parse_claude_status_input(raw_stdin);
+    persist_claude_rate_limits(raw_stdin, epoch_secs());
     let cwd = input
         .cwd
         .clone()
@@ -5853,6 +8853,80 @@ impl Default for StatuslineConfig {
             codex_check_timeout_ms: DEFAULT_CODEX_CHECK_TIMEOUT_MS,
         }
     }
+}
+
+fn persist_claude_rate_limits(raw: &str, captured_at: u64) {
+    let Some(rate_limits) = extract_official_claude_rate_limits(raw, captured_at) else {
+        return;
+    };
+    let path = claude_rate_limit_cache_override()
+        .or_else(|| default_claude_rate_limit_cache_paths(true).map(|(current, _legacy)| current));
+    let Some(path) = path else {
+        return;
+    };
+    let _ = write_claude_rate_limit_cache(&path, &rate_limits);
+}
+
+fn extract_official_claude_rate_limits(raw: &str, captured_at: u64) -> Option<ClaudeRateLimits> {
+    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
+    let rate_limits = value.get("rate_limits")?.as_object()?;
+    let five_hour = rate_limits
+        .get("five_hour")
+        .and_then(parse_official_claude_rate_limit_window);
+    let seven_day = rate_limits
+        .get("seven_day")
+        .and_then(parse_official_claude_rate_limit_window);
+    if five_hour.is_none() && seven_day.is_none() {
+        return None;
+    }
+    Some(ClaudeRateLimits {
+        captured_at,
+        five_hour,
+        seven_day,
+    })
+}
+
+fn parse_official_claude_rate_limit_window(
+    value: &serde_json::Value,
+) -> Option<ClaudeRateLimitWindow> {
+    let used_percentage = value.get("used_percentage")?.as_f64()?;
+    let resets_at = value.get("resets_at")?.as_u64()?;
+    if !used_percentage.is_finite()
+        || !(0.0..=100.0).contains(&used_percentage)
+        || resets_at > i64::MAX as u64
+    {
+        return None;
+    }
+    Some(ClaudeRateLimitWindow {
+        used_percentage,
+        resets_at,
+    })
+}
+
+fn write_claude_rate_limit_cache(
+    path: &Path,
+    rate_limits: &ClaudeRateLimits,
+) -> std::io::Result<()> {
+    let mut windows = serde_json::Map::new();
+    if let Some(window) = &rate_limits.five_hour {
+        windows.insert("five_hour".into(), rate_limit_window_json(window));
+    }
+    if let Some(window) = &rate_limits.seven_day {
+        windows.insert("seven_day".into(), rate_limit_window_json(window));
+    }
+    if windows.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude rate-limit cache has no windows",
+        ));
+    }
+    let cache = serde_json::json!({
+        "v": CLAUDE_RATE_LIMIT_CACHE_VERSION,
+        "captured_at": rate_limits.captured_at,
+        "windows": windows,
+    });
+    let raw = serde_json::to_vec(&cache).map_err(std::io::Error::other)?;
+    rtrt_core::write_private_file_atomic(path, &raw)
 }
 
 fn parse_claude_status_input(raw: &str) -> ClaudeStatusInput {
@@ -6584,7 +9658,7 @@ fn format_agents_segment(names: &[String], width_budget: usize) -> String {
 }
 
 fn read_agents_status_cache(key: u64) -> Option<String> {
-    let path = agents_status_cache_path(key);
+    let path = agents_status_cache_path(key).ok()?;
     let meta = std::fs::metadata(&path).ok()?;
     let modified = meta.modified().ok()?;
     if modified.elapsed().ok()?.as_secs() > AGENTS_STATUS_CACHE_TTL_SECS {
@@ -6599,15 +9673,33 @@ fn read_agents_status_cache(key: u64) -> Option<String> {
 }
 
 fn write_agents_status_cache(key: u64, status: &str) {
-    let _ = std::fs::write(agents_status_cache_path(key), status);
+    if let Ok(runtime_tmp_dir) = rtrt_core::runtime_tmp_dir() {
+        let _ = write_agents_status_cache_in(&runtime_tmp_dir, key, status);
+    }
+}
+
+fn write_agents_status_cache_in(
+    runtime_tmp_dir: &Path,
+    key: u64,
+    status: &str,
+) -> std::io::Result<()> {
+    let path = agents_status_cache_path_in(runtime_tmp_dir, key);
+    rtrt_core::write_private_file_atomic(&path, status.as_bytes())
 }
 
 /// The agents-status cache is keyed per repo + per-project enable fingerprint
 /// (see [`agents_cache_key`]) so a project's `[agents]` override (e.g.
 /// `codex = false`) is not masked by another repo's — or a pre-edit — cached
 /// agents list.
-fn agents_status_cache_path(key: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("rtrt-agents-status-{key:016x}.cache"))
+fn agents_status_cache_path(key: u64) -> Result<PathBuf> {
+    Ok(agents_status_cache_path_in(
+        &rtrt_core::runtime_tmp_dir()?,
+        key,
+    ))
+}
+
+fn agents_status_cache_path_in(runtime_tmp_dir: &Path, key: u64) -> PathBuf {
+    runtime_tmp_dir.join(format!("rtrt-agents-status-{key:016x}.cache"))
 }
 
 fn total_savings_tokens() -> u64 {
@@ -6718,17 +9810,21 @@ fn compute_statusline_savings(project: &str, opt_level: OutputStyleLevel) -> Opt
 /// the internal storage efficiency shown as the Memory pillar; recall reuse is
 /// counted separately in Σ (agent-token savings), not here.
 fn memory_savings_for_statusline(project: &str) -> (u64, u64) {
-    let path = std::env::var_os("RTRT_MEMORY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(rtrt_core::default_memory_store_path);
-    let (original, stored) = if path.exists() {
-        MemoryStore::open(&path)
-            .ok()
-            .and_then(|store| store.storage_reduction(project).ok())
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
+    let (original, stored) = current_project_identity()
+        .ok()
+        .filter(|identity| project_claim_matches(identity, project))
+        .and_then(|identity| {
+            let path = rtrt_core::project_memory_db_path(&identity).ok()?;
+            path.exists().then_some(identity)
+        })
+        .and_then(|identity| {
+            let slug = identity.slug().to_string();
+            MemoryStore::open_project(&identity)
+                .ok()?
+                .storage_reduction(&slug)
+                .ok()
+        })
+        .unwrap_or((0, 0));
     (original.saturating_sub(stored), original)
 }
 
@@ -6763,7 +9859,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Set `RTRT_RECALL_DEBUG=1` to log the gate/timing decision to stderr (never
 /// stdout, so it can never leak into the injected context).
 fn try_hybrid_recall(
-    store_path: &std::path::Path,
+    identity: &ProjectIdentity,
     project: &str,
     bm25_query: &str,
     semantic_text: &str,
@@ -6777,7 +9873,7 @@ fn try_hybrid_recall(
     // with the MCP server's `memory_recall` / `memory_smart_search` via
     // `rtrt_memory::hybrid_recall_ready` — a cheap local config + SQL read, no
     // network, so it's checked before touching Ollama at all.
-    let coverage_store = MemoryStore::open(store_path).ok()?;
+    let coverage_store = MemoryStore::open_project(identity).ok()?;
     let ready = rtrt_memory::hybrid_recall_ready(&coverage_store, project, &cfg);
     if debug {
         eprintln!(
@@ -6802,13 +9898,13 @@ fn try_hybrid_recall(
     // `timeout` and the caller falls back to BM25. The worker is detached and
     // simply finishes (or errors) on its own; its result is discarded.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Option<rtrt_memory::HybridRecall>>(1);
-    let store_path = store_path.to_path_buf();
+    let identity = identity.clone();
     let project = project.to_string();
     let bm25_query = bm25_query.to_string();
     let semantic_text = semantic_text.to_string();
     std::thread::spawn(move || {
         let result = (|| {
-            let store = MemoryStore::open(&store_path).ok()?;
+            let store = MemoryStore::open_project(&identity).ok()?;
             let null_probe = rtrt_memory::null_probe_text(&semantic_text);
             store
                 .recall_hybrid_scored(
@@ -6867,16 +9963,16 @@ const OPPORTUNISTIC_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// daemon running. No-op (immediately, zero Ollama traffic) when embeddings
 /// are disabled. Never fails the caller — `memory save` has already printed
 /// its result by the time this runs.
-fn try_opportunistic_embed_sweep(store_path: &std::path::Path, timeout: std::time::Duration) {
+fn try_opportunistic_embed_sweep(identity: &ProjectIdentity, timeout: std::time::Duration) {
     let cfg = rtrt_core::Config::load().unwrap_or_default();
     if !cfg.embeddings.is_enabled() {
         return;
     }
-    let store_path = store_path.to_path_buf();
+    let identity = identity.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(1);
     std::thread::spawn(move || {
         let embedded = (|| -> Option<usize> {
-            let store = MemoryStore::open(&store_path).ok()?;
+            let store = MemoryStore::open_project(&identity).ok()?;
             let embedder = rtrt_memory::hybrid_embedder_from_config(&cfg);
             Some(store.opportunistic_embed_sweep(&embedder))
         })()
@@ -6892,9 +9988,11 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
     // The prompt text is either the `prompt` field of a JSON payload or the
     // whole stdin when it isn't JSON.
     let prompt = extract_json_str(&raw, "prompt").unwrap_or_else(|| raw.trim().to_string());
-    let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
-    let Some(hits) = recall_hits_for_hook(&project, &store_path, &prompt, limit) else {
+    let (identity, project) = resolve_hook_project(project)?;
+    reject_normal_store_override(store.as_deref())?;
+    let store_path = rtrt_core::project_memory_db_path(&identity)?;
+    let Some(hits) = recall_hits_for_hook(Some(&identity), &project, &store_path, &prompt, limit)
+    else {
         return Ok(());
     };
     // stdout of a UserPromptSubmit hook is injected into the model context.
@@ -6961,6 +10059,7 @@ fn run_hook_recall(project: Option<String>, store: Option<PathBuf>, limit: usize
 ///    (a repeated status line, a re-sent instruction), and both recall legs
 ///    happily return every copy. Inject each distinct body once.
 fn recall_hits_for_hook(
+    identity: Option<&ProjectIdentity>,
     project: &str,
     store_path: &Path,
     prompt: &str,
@@ -6969,7 +10068,13 @@ fn recall_hits_for_hook(
     if prompt.trim().is_empty() || !store_path.exists() {
         return None;
     }
-    let memory = MemoryStore::open(store_path).ok()?;
+    let memory = match identity {
+        Some(identity) => MemoryStore::open_project(identity).ok()?,
+        #[cfg(test)]
+        None => MemoryStore::open(store_path).ok()?,
+        #[cfg(not(test))]
+        None => return None,
+    };
     // Build a safe FTS5 OR query via the shared sanitizer: a natural-language
     // prompt joined with spaces is treated as implicit AND by FTS5 (and its
     // punctuation can hard-fail the parser), while OR-joining the content
@@ -6991,14 +10096,16 @@ fn recall_hits_for_hook(
     // (`bm25_query`); the dense-vector leg gets the RAW `prompt` (BUG2 fix —
     // the embedder needs real natural language, not a keyword bag).
     const HYBRID_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-    let recall = try_hybrid_recall(
-        store_path,
-        project,
-        &bm25_query,
-        prompt,
-        limit,
-        HYBRID_TIMEOUT,
-    );
+    let recall = identity.and_then(|identity| {
+        try_hybrid_recall(
+            identity,
+            project,
+            &bm25_query,
+            prompt,
+            limit,
+            HYBRID_TIMEOUT,
+        )
+    });
 
     // PRIMARY GATE (similarity). `recall_vector` ranks by cosine but returns
     // its top-K whatever those cosines are, so rank alone can never say "none
@@ -7130,12 +10237,13 @@ fn run_hook_session_inject(
     store: Option<PathBuf>,
     limit: usize,
 ) -> Result<()> {
-    let project = resolve_hook_project(project);
-    let store_path = store.unwrap_or_else(rtrt_core::default_memory_store_path);
+    let (identity, project) = resolve_hook_project(project)?;
+    reject_normal_store_override(store.as_deref())?;
+    let store_path = rtrt_core::project_memory_db_path(&identity)?;
     if !store_path.exists() {
         return Ok(());
     }
-    let memory = MemoryStore::open(&store_path)?;
+    let memory = MemoryStore::open_project(&identity)?;
     // Fetch the top memories ordered by importance (deterministic — recency +
     // length + compression + metadata bonuses). This surface is most useful at
     // session start because the agent hasn't asked anything yet.
@@ -7299,7 +10407,54 @@ fn compact_json_value(v: &serde_json::Value) -> String {
     one_line.chars().take(200).collect()
 }
 
-async fn run_memory(cmd: MemoryCmd) -> Result<()> {
+fn reject_normal_store_override(store: Option<&Path>) -> Result<()> {
+    if let Some(path) = store {
+        bail!(
+            "--store={} cannot select a normal memory store; use --admin-legacy-store explicitly",
+            path.display()
+        );
+    }
+    if let Some(path) = std::env::var_os("RTRT_MEMORY_PATH") {
+        bail!(
+            "RTRT_MEMORY_PATH={:?} cannot select a normal memory store; use --admin-legacy-store explicitly",
+            path
+        );
+    }
+    Ok(())
+}
+
+fn open_cli_memory(
+    admin: Option<&Path>,
+    deprecated_store: Option<&Path>,
+    project_claim: Option<&str>,
+) -> Result<(MemoryStore, String, Option<ProjectIdentity>, PathBuf)> {
+    if let Some(admin_path) = admin {
+        if let Some(path) = deprecated_store
+            && path != admin_path
+        {
+            bail!("--store must match --admin-legacy-store in admin/legacy mode");
+        }
+        let project = project_claim
+            .filter(|project| !project.trim().is_empty())
+            .context("admin/legacy mode requires explicit --project")?
+            .to_string();
+        return Ok((
+            MemoryStore::open(admin_path)?,
+            project,
+            None,
+            admin_path.to_path_buf(),
+        ));
+    }
+    reject_normal_store_override(deprecated_store)?;
+    let identity = current_project_identity()?;
+    let project = assert_current_project(&identity, project_claim)?;
+    let path = rtrt_core::project_memory_db_path(&identity)?;
+    let store = MemoryStore::open_project(&identity)?;
+    Ok((store, project, Some(identity), path))
+}
+
+async fn run_memory(cmd: MemoryCmd, admin_legacy_store: Option<PathBuf>) -> Result<()> {
+    let admin = admin_legacy_store.as_deref();
     match cmd {
         MemoryCmd::Save {
             project,
@@ -7308,7 +10463,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             store: store_path,
             meta,
         } => {
-            let store = MemoryStore::open(&store_path)?;
+            let (store, project, identity, _) =
+                open_cli_memory(admin, store_path.as_deref(), project.as_deref())?;
             let body = read_body_or_stdin(body)?;
             let id = if meta.is_empty() {
                 store.save(&project, &kind, &body)?
@@ -7321,7 +10477,9 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             // Grow embedding coverage opportunistically, bounded so it can't
             // meaningfully delay this command's exit; no-op when embeddings
             // are disabled.
-            try_opportunistic_embed_sweep(&store_path, OPPORTUNISTIC_EMBED_TIMEOUT);
+            if let Some(identity) = identity {
+                try_opportunistic_embed_sweep(&identity, OPPORTUNISTIC_EMBED_TIMEOUT);
+            }
         }
         MemoryCmd::Blocks { cmd } => match cmd {
             BlockCmd::Set {
@@ -7330,7 +10488,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
                 body,
                 store,
             } => {
-                let store = MemoryStore::open(&store)?;
+                let (store, project, _, _) =
+                    open_cli_memory(admin, store.as_deref(), project.as_deref())?;
                 let body = read_body_or_stdin(body)?;
                 let id = store.set_block(&project, &name, &body)?;
                 println!("block id={id}");
@@ -7340,14 +10499,16 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
                 name,
                 store,
             } => {
-                let store = MemoryStore::open(&store)?;
+                let (store, project, _, _) =
+                    open_cli_memory(admin, store.as_deref(), project.as_deref())?;
                 match store.get_block(&project, &name)? {
                     Some(b) => println!("{}", b.body),
                     None => anyhow::bail!("block not found: {name}"),
                 }
             }
             BlockCmd::List { project, store } => {
-                let store = MemoryStore::open(&store)?;
+                let (store, project, _, _) =
+                    open_cli_memory(admin, store.as_deref(), project.as_deref())?;
                 let blocks = store.list_blocks(&project)?;
                 if blocks.is_empty() {
                     println!("(no blocks)");
@@ -7366,7 +10527,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             store,
             filter,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let (store, project, _, _) =
+                open_cli_memory(admin, store.as_deref(), project.as_deref())?;
             let hits = match filter {
                 Some(spec) => {
                     let f = rtrt_memory::PayloadFilter::parse(&spec)?;
@@ -7383,7 +10545,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             store,
             out,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let (store, project, _, _) =
+                open_cli_memory(admin, store.as_deref(), project.as_deref())?;
             let count = match out {
                 Some(p) if p.as_os_str() != "-" => {
                     let f = std::fs::File::create(&p)?;
@@ -7397,23 +10560,29 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             eprintln!("[rtrt memory export] {count} records");
         }
         MemoryCmd::Import { store, input } => {
-            let store = MemoryStore::open(&store)?;
-            let count = match input {
+            let input: Box<dyn BufRead> = match input {
                 Some(p) if p.as_os_str() != "-" => {
-                    let f = std::fs::File::open(&p)?;
-                    store.import_jsonl(std::io::BufReader::new(f))?
+                    Box::new(std::io::BufReader::new(std::fs::File::open(&p)?))
                 }
-                _ => {
-                    let stdin = std::io::stdin();
-                    store.import_jsonl(stdin.lock())?
-                }
+                _ => Box::new(std::io::BufReader::new(std::io::stdin())),
+            };
+            let count = if admin.is_some() {
+                let (store, _, _, _) =
+                    open_cli_memory(admin, store.as_deref(), Some("admin-import"))?;
+                store.import_jsonl(input)?
+            } else {
+                reject_normal_store_override(store.as_deref())?;
+                let identity = current_project_identity()?;
+                let project = assert_current_project(&identity, None)?;
+                let store = MemoryStore::open_project(&identity)?;
+                import_project_jsonl(&store, &identity, &project, input)?
             };
             eprintln!("[rtrt memory import] {count} records");
         }
         MemoryCmd::Reembed {
             store: store_path,
             project,
-            all: _,
+            all,
             model,
             base_url,
             batch,
@@ -7421,9 +10590,21 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             dry_run,
             probe,
         } => {
+            let (store, pinned_project, _, _) = if admin.is_some() {
+                let claim = project.as_deref().or(all.then_some("admin-all"));
+                open_cli_memory(admin, store_path.as_deref(), claim)?
+            } else {
+                anyhow::ensure!(!all, "--all requires --admin-legacy-store");
+                open_cli_memory(None, store_path.as_deref(), project.as_deref())?
+            };
+            let scope = if admin.is_some() && all {
+                None
+            } else {
+                Some(pinned_project.as_str())
+            };
             run_memory_reembed(
-                &store_path,
-                project.as_deref(),
+                store,
+                scope,
                 model.as_deref(),
                 base_url.as_deref(),
                 batch,
@@ -7441,7 +10622,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             base_url,
             store,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let (store, project, _, _) =
+                open_cli_memory(admin, store.as_deref(), project.as_deref())?;
             let body = read_body_or_stdin(body)?;
             let p = build_provider(provider, base_url, &model)?;
             let summariser = LlmSummariser::new(p, model);
@@ -7461,7 +10643,8 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
             base_url,
             store,
         } => {
-            let store = MemoryStore::open(&store)?;
+            let (store, project, _, _) =
+                open_cli_memory(admin, store.as_deref(), project.as_deref())?;
             let p = build_provider(provider, base_url, &model)?;
             let summariser = LlmSummariser::new(p, model);
             match store.compress_project(&project, &summariser, keep).await? {
@@ -7469,7 +10652,243 @@ async fn run_memory(cmd: MemoryCmd) -> Result<()> {
                 None => println!("nothing to compress (have ≤ {keep} entries)"),
             }
         }
+        MemoryCmd::LegacyIsolate {
+            source,
+            apply,
+            claim_basename,
+            accept_mixed_history,
+        } => run_legacy_isolation_migration(&source, apply, claim_basename, accept_mixed_history)?,
     }
+    Ok(())
+}
+
+fn import_project_jsonl(
+    store: &MemoryStore,
+    identity: &ProjectIdentity,
+    project: &str,
+    mut input: Box<dyn BufRead>,
+) -> Result<usize> {
+    let mut normalized = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut value: serde_json::Value = serde_json::from_str(line.trim())?;
+        let asserted = value
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .context("jsonl: missing `project` assertion")?;
+        if !project_claim_matches(identity, asserted) {
+            bail!("foreign project assertion rejected in JSONL: {asserted:?}");
+        }
+        value["project"] = serde_json::Value::String(project.to_string());
+        writeln!(&mut normalized, "{}", value)?;
+    }
+    store
+        .import_jsonl(std::io::BufReader::new(normalized.as_slice()))
+        .map_err(anyhow::Error::from)
+}
+
+#[derive(Debug)]
+struct LegacyIsolationReport {
+    total: usize,
+    proven: usize,
+    ambiguous: usize,
+    copied: usize,
+    already_copied: usize,
+    skipped_unattributed: usize,
+    quarantined_embeddings: usize,
+    quarantined_relations: usize,
+}
+
+fn run_legacy_isolation_migration(
+    source: &Path,
+    apply: bool,
+    claim_basename: bool,
+    accept_mixed_history: bool,
+) -> Result<()> {
+    if claim_basename && !accept_mixed_history {
+        bail!("--claim-basename requires --accept-mixed-history");
+    }
+    let identity = current_project_identity()?;
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("canonicalize legacy source {}", source.display()))?;
+    let destination = rtrt_core::project_memory_db_path(&identity)?;
+    anyhow::ensure!(
+        source != destination,
+        "legacy source is already current project destination"
+    );
+
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let source_db = rusqlite::Connection::open_with_flags(&source, flags)
+        .with_context(|| format!("open legacy source read-only: {}", source.display()))?;
+    let total: usize =
+        source_db.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+    let proven: usize = source_db.query_row(
+        "SELECT COUNT(*) FROM memories WHERE project IN (?1, ?2, ?3)",
+        rusqlite::params![
+            identity.slug(),
+            identity.fingerprint(),
+            identity.memory_root().to_string_lossy()
+        ],
+        |row| row.get(0),
+    )?;
+    let ambiguous: usize = source_db.query_row(
+        "SELECT COUNT(*) FROM memories WHERE project = ?1",
+        [identity.label()],
+        |row| row.get(0),
+    )?;
+    let selected_sql = if claim_basename {
+        "project IN (?1, ?2, ?3, ?4)"
+    } else {
+        "project IN (?1, ?2, ?3)"
+    };
+    let selected_ids_sql = format!("SELECT id FROM memories WHERE {selected_sql}");
+    let selected_params: Vec<String> = [
+        identity.slug().to_string(),
+        identity.fingerprint().to_string(),
+        identity.memory_root().to_string_lossy().into_owned(),
+    ]
+    .into_iter()
+    .chain(claim_basename.then(|| identity.label().to_string()))
+    .collect();
+    let selected_count = proven + if claim_basename { ambiguous } else { 0 };
+    let skipped_unattributed = total.saturating_sub(selected_count);
+    let embedding_sql =
+        format!("SELECT COUNT(*) FROM embeddings WHERE memory_id IN ({selected_ids_sql})");
+    let relation_sql = format!(
+        "SELECT COUNT(*) FROM edges WHERE src_id IN ({selected_ids_sql}) OR dst_id IN ({selected_ids_sql})"
+    );
+    let refs = selected_params
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let quarantined_embeddings: usize = source_db.query_row(
+        &embedding_sql,
+        rusqlite::params_from_iter(refs.iter().copied()),
+        |row| row.get(0),
+    )?;
+    let quarantined_relations: usize = source_db.query_row(
+        &relation_sql,
+        rusqlite::params_from_iter(refs.iter().copied()),
+        |row| row.get(0),
+    )?;
+
+    let mut report = LegacyIsolationReport {
+        total,
+        proven,
+        ambiguous,
+        copied: 0,
+        already_copied: 0,
+        skipped_unattributed,
+        quarantined_embeddings,
+        quarantined_relations,
+    };
+    if apply && selected_count > 0 {
+        // Creates and identity-binds only current project's destination.
+        let _destination_guard = MemoryStore::open_project(&identity)?;
+        let mut destination_db = rusqlite::Connection::open_with_flags(
+            &destination,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        let tx = destination_db.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_isolation_imports (
+                source_path TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                destination_id INTEGER NOT NULL,
+                PRIMARY KEY(source_path, source_id)
+             );",
+        )?;
+        let select_sql = format!(
+            "SELECT id, kind, body, created_at, scope, metadata, session_id, body_sha, body_full
+               FROM memories WHERE {selected_sql} ORDER BY id"
+        );
+        let mut select = source_db.prepare(&select_sql)?;
+        let rows = select.query_map(rusqlite::params_from_iter(refs.iter().copied()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        for row in rows {
+            let (
+                source_id,
+                kind,
+                body,
+                created_at,
+                scope,
+                metadata,
+                session_id,
+                body_sha,
+                body_full,
+            ) = row?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_isolation_imports WHERE source_path=?1 AND source_id=?2)",
+                rusqlite::params![source.to_string_lossy(), source_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                report.already_copied += 1;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO memories(project,kind,body,created_at,scope,metadata,session_id,body_sha,body_full)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![identity.slug(), kind, body, created_at, scope, metadata, session_id, body_sha, body_full],
+            )?;
+            let destination_id = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO memories_fts(rowid,body) VALUES (?1,?2)",
+                rusqlite::params![destination_id, body],
+            )?;
+            tx.execute(
+                "INSERT INTO legacy_isolation_imports(source_path,source_id,destination_id) VALUES (?1,?2,?3)",
+                rusqlite::params![source.to_string_lossy(), source_id, destination_id],
+            )?;
+            report.copied += 1;
+        }
+        tx.commit()?;
+    }
+    println!(
+        "legacy isolation {}: source={} destination={} total={} proven={} ambiguous_basename={} copied={} already_copied={} skipped_unattributed={} quarantined_embeddings={} quarantined_relations={}",
+        if apply { "apply" } else { "dry-run" },
+        source.display(),
+        destination.display(),
+        report.total,
+        report.proven,
+        report.ambiguous,
+        report.copied,
+        report.already_copied,
+        report.skipped_unattributed,
+        report.quarantined_embeddings,
+        report.quarantined_relations,
+    );
+    if report.ambiguous > 0 && !claim_basename {
+        println!(
+            "ambiguous basename rows were not attributed; pass --claim-basename --accept-mixed-history to claim them"
+        );
+    }
+    if claim_basename {
+        println!("accepted warning: historical basename mixing cannot be disentangled");
+    }
+    println!("legacy source remains untouched and is the migration backup");
     Ok(())
 }
 
@@ -7551,7 +10970,7 @@ fn store_reembedded_vector(
 /// filter.
 #[allow(clippy::too_many_arguments)]
 fn run_memory_reembed(
-    store_path: &std::path::Path,
+    store: MemoryStore,
     project: Option<&str>,
     model_override: Option<&str>,
     base_url_override: Option<&str>,
@@ -7578,7 +10997,6 @@ fn run_memory_reembed(
         "embedding model must not be empty"
     );
 
-    let store = MemoryStore::open(store_path)?;
     let persisted_dimension = store.embedding_dimension_for_model(&model)?;
     let pending_total = store.reembed_pending_count(&model, project)?;
     if pending_total == 0 {
@@ -8062,6 +11480,24 @@ mod team_tests {
     }
 
     #[test]
+    fn parses_team_preset_apply() {
+        let cli =
+            Cli::try_parse_from(["rtrt", "team", "preset", "opencode-lead", "--apply"]).unwrap();
+
+        let Some(Cmd::Team {
+            cmd:
+                TeamCmd::Preset {
+                    roster: TeamPresetArg::OpencodeLead,
+                    apply,
+                },
+        }) = cli.command
+        else {
+            panic!("expected team preset");
+        };
+        assert!(apply);
+    }
+
+    #[test]
     fn team_dispatch_allows_stdin_prompt() {
         let cli = Cli::try_parse_from(["rtrt", "team", "dispatch"]).unwrap();
         let Some(Cmd::Team {
@@ -8208,7 +11644,8 @@ mod hook_recall_tests {
             .unwrap();
         drop(memory);
 
-        let hits = recall_hits_for_hook("proj", &store_path, prompt, 5).expect("expected hits");
+        let hits =
+            recall_hits_for_hook(None, "proj", &store_path, prompt, 5).expect("expected hits");
         assert!(
             hits.iter().all(|h| h.body.trim() != prompt.trim()),
             "self-recall row must be excluded: {hits:?}"
@@ -8245,6 +11682,7 @@ mod hook_recall_tests {
 
         // Unrelated small talk: no term overlaps this project's corpus at all.
         let unrelated = recall_hits_for_hook(
+            None,
             "proj",
             &store_path,
             "what should we eat for lunch today pasta kimchi stew",
@@ -8254,6 +11692,7 @@ mod hook_recall_tests {
 
         // Topical query naming the rare technical term.
         let topical = recall_hits_for_hook(
+            None,
             "proj",
             &store_path,
             "how does the gateway router headroom failover work",
@@ -8301,6 +11740,7 @@ mod hook_recall_tests {
         drop(memory);
 
         let hits = recall_hits_for_hook(
+            None,
             "proj",
             &store_path,
             "gateway router headroom failover status update",
@@ -8336,7 +11776,7 @@ mod hook_recall_tests {
         }
         drop(memory);
 
-        let hits = recall_hits_for_hook("proj", &store_path, "gateway headroom failover", 10)
+        let hits = recall_hits_for_hook(None, "proj", &store_path, "gateway headroom failover", 10)
             .expect("expected hits");
         let repeated = hits
             .iter()
@@ -8385,14 +11825,16 @@ mod hook_recall_tests {
         }
         drop(memory);
 
-        let unrelated = recall_hits_for_hook("proj", &store_path, "volcano eruption cause", 5);
+        let unrelated =
+            recall_hits_for_hook(None, "proj", &store_path, "volcano eruption cause", 5);
         assert!(
             unrelated.is_none(),
             "a word this project only saw in one captured conversation is not signal: {unrelated:?}"
         );
 
-        let topical = recall_hits_for_hook("proj", &store_path, "how is headroom budgeted", 5)
-            .expect("project vocabulary must still recall");
+        let topical =
+            recall_hits_for_hook(None, "proj", &store_path, "how is headroom budgeted", 5)
+                .expect("project vocabulary must still recall");
         assert!(
             topical.iter().all(|h| h.body.contains("headroom")),
             "{topical:?}"
@@ -8424,6 +11866,7 @@ mod hook_recall_tests {
         drop(memory);
 
         let hits = recall_hits_for_hook(
+            None,
             "proj",
             &store_path,
             "how does the gateway router headroom failover work",
@@ -8450,6 +11893,341 @@ mod statusline_tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect()
+    }
+
+    fn opencode_facts() -> OpenCodeRenderFacts {
+        OpenCodeRenderFacts {
+            rendered_at: 10_000,
+            project: "rtrt".into(),
+            style: OutputStyleLevel::Full,
+            savings: Some(OpenCodeSavings {
+                sigma_pct: 42,
+                command_pct: Some(35),
+                saved_chars: Some(42),
+                base_chars: Some(100),
+                recall_chars: Some(7),
+                cached: false,
+            }),
+            headroom: Some(OpenCodeHeadroom {
+                text: "room:opencode:73%".into(),
+                tone: "good",
+            }),
+            quota: None,
+            git: Some(OpenCodeGitSnapshot {
+                branch: "main".into(),
+                dirty: true,
+                cached: true,
+            }),
+            session: Some("abc123".into()),
+            model: Some("gpt-5.4".into()),
+            memory: Some(OpenCodeMemoryAggregate {
+                rows: 12,
+                original_chars: 100,
+                stored_chars: 60,
+            }),
+        }
+    }
+
+    #[test]
+    fn parses_opencode_statusline_options() {
+        let cli = Cli::try_parse_from([
+            "rtrt",
+            "statusline",
+            "--opencode",
+            "--cwd",
+            "/work/repo",
+            "--session",
+            "session-1",
+            "--model",
+            "openai/gpt-5.4",
+            "--width",
+            "88",
+            "--budget-ms",
+            "17",
+            "--no-git",
+            "--refresh",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Statusline {
+            opencode,
+            cwd,
+            session,
+            model,
+            width,
+            budget_ms,
+            no_git,
+            refresh,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected statusline command");
+        };
+        assert!(opencode);
+        assert_eq!(cwd, Some(PathBuf::from("/work/repo")));
+        assert_eq!(session.as_deref(), Some("session-1"));
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.4"));
+        assert_eq!(width, 88);
+        assert_eq!(budget_ms, 17);
+        assert!(no_git);
+        assert!(refresh);
+    }
+
+    #[test]
+    fn opencode_width_tiers_match_golden_segments() {
+        let facts = opencode_facts();
+
+        assert_eq!(
+            serde_json::Value::Array(render_opencode_segments(40, &facts)),
+            serde_json::json!([
+                {"id":"sigma","text":"Σ:42%","tone":"good","pri":100},
+                {"id":"style","text":"opt:full","tone":"accent","pri":90}
+            ])
+        );
+        assert_eq!(
+            serde_json::Value::Array(render_opencode_segments(80, &facts)),
+            serde_json::json!([
+                {"id":"project","text":"rtrt","tone":"accent","pri":100},
+                {"id":"style","text":"opt:full","tone":"accent","pri":90},
+                {"id":"savings","text":"save:42% cmd:35%","tone":"good","pri":80},
+                {"id":"headroom","text":"room:opencode:73%","tone":"good","pri":70}
+            ])
+        );
+        assert_eq!(
+            serde_json::Value::Array(render_opencode_segments(100, &facts)),
+            serde_json::json!([
+                {"id":"project","text":"rtrt","tone":"accent","pri":100},
+                {"id":"style","text":"opt:full","tone":"accent","pri":90},
+                {"id":"savings","text":"save:42% cmd:35%","tone":"good","pri":80},
+                {"id":"headroom","text":"room:opencode:73%","tone":"good","pri":70},
+                {"id":"git","text":"main*","tone":"warn","pri":65},
+                {"id":"model","text":"gpt-5.4","tone":"muted","pri":60},
+                {"id":"session","text":"sess:abc123","tone":"muted","pri":50},
+                {"id":"memory","text":"mem:12 40%","tone":"good","pri":40}
+            ])
+        );
+    }
+
+    fn rate_limit_cache_fixture(
+        captured_at: u64,
+        five_hour: Option<(f64, u64)>,
+        seven_day: Option<(f64, u64)>,
+    ) -> String {
+        let mut windows = serde_json::Map::new();
+        if let Some((used_percentage, resets_at)) = five_hour {
+            windows.insert(
+                "five_hour".into(),
+                serde_json::json!({
+                    "used_percentage": used_percentage,
+                    "resets_at": resets_at,
+                }),
+            );
+        }
+        if let Some((used_percentage, resets_at)) = seven_day {
+            windows.insert(
+                "seven_day".into(),
+                serde_json::json!({
+                    "used_percentage": used_percentage,
+                    "resets_at": resets_at,
+                }),
+            );
+        }
+        serde_json::json!({
+            "v": 1,
+            "captured_at": captured_at,
+            "windows": windows,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn claude_rate_limit_cache_accepts_partial_windows_and_filters_expired_ones() {
+        let partial = rate_limit_cache_fixture(9_900, Some((23.5, 11_800)), None);
+        let parsed = parse_claude_rate_limit_cache(&partial, 10_000, 900).unwrap();
+        assert_eq!(parsed.captured_at, 9_900);
+        assert_eq!(parsed.five_hour.unwrap().used_percentage, 23.5);
+        assert!(parsed.seven_day.is_none());
+
+        let one_expired =
+            rate_limit_cache_fixture(9_900, Some((80.0, 10_000)), Some((40.0, 20_000)));
+        let parsed = parse_claude_rate_limit_cache(&one_expired, 10_000, 900).unwrap();
+        assert!(parsed.five_hour.is_none());
+        assert_eq!(parsed.seven_day.unwrap().used_percentage, 40.0);
+
+        let expired = rate_limit_cache_fixture(9_900, Some((80.0, 9_999)), None);
+        assert!(parse_claude_rate_limit_cache(&expired, 10_000, 900).is_none());
+    }
+
+    #[test]
+    fn claude_rate_limit_cache_rejects_malformed_stale_and_future_observations() {
+        let fresh = rate_limit_cache_fixture(9_100, Some((20.0, 11_000)), None);
+        assert!(parse_claude_rate_limit_cache(&fresh, 10_000, 900).is_some());
+        assert!(parse_claude_rate_limit_cache(&fresh, 10_001, 900).is_none());
+
+        let future = rate_limit_cache_fixture(10_001, Some((20.0, 11_000)), None);
+        assert!(parse_claude_rate_limit_cache(&future, 10_000, 900).is_none());
+
+        let extra_field = r#"{"v":1,"captured_at":9900,"windows":{"five_hour":{"used_percentage":20,"resets_at":11000}},"session_id":"secret"}"#;
+        assert!(parse_claude_rate_limit_cache(extra_field, 10_000, 900).is_none());
+
+        let invalid_number = rate_limit_cache_fixture(9_900, Some((100.1, 11_000)), None);
+        assert!(parse_claude_rate_limit_cache(&invalid_number, 10_000, 900).is_none());
+
+        let control = format!(
+            "{}\n",
+            rate_limit_cache_fixture(9_900, Some((20.0, 11_000)), None)
+        );
+        assert!(parse_claude_rate_limit_cache(&control, 10_000, 900).is_none());
+    }
+
+    #[test]
+    fn claude_rate_limit_max_age_override_is_bounded() {
+        assert_eq!(bounded_claude_rate_limit_max_age(None), 15 * 60);
+        assert_eq!(bounded_claude_rate_limit_max_age(Some("1")), 1);
+        assert_eq!(bounded_claude_rate_limit_max_age(Some("3600")), 3_600);
+        assert_eq!(bounded_claude_rate_limit_max_age(Some("86401")), 15 * 60);
+        assert_eq!(
+            bounded_claude_rate_limit_max_age(Some("not-a-number")),
+            15 * 60
+        );
+    }
+
+    #[test]
+    fn opencode_quota_segments_have_deterministic_reset_text_and_tones() {
+        let good = opencode_quota_segment(
+            "limit_5h",
+            "5h",
+            &ClaudeRateLimitWindow {
+                used_percentage: 69.4,
+                resets_at: 13_660,
+            },
+            10_000,
+            30,
+            75,
+        );
+        assert_eq!(good["text"], "5h:69% ↻1h1m");
+        assert_eq!(good["tone"], "good");
+        assert_eq!(good["source"], "claude_statusline");
+        assert_eq!(good["freshness_sec"], 30);
+
+        let rounded_warn = opencode_quota_segment(
+            "limit_5h",
+            "5h",
+            &ClaudeRateLimitWindow {
+                used_percentage: 69.5,
+                resets_at: 13_660,
+            },
+            10_000,
+            30,
+            75,
+        );
+        assert_eq!(rounded_warn["text"], "5h:70% ↻1h1m");
+        assert_eq!(rounded_warn["tone"], "warn");
+
+        let warn = opencode_quota_segment(
+            "limit_week",
+            "wk",
+            &ClaudeRateLimitWindow {
+                used_percentage: 70.0,
+                resets_at: 183_700,
+            },
+            10_000,
+            30,
+            74,
+        );
+        assert_eq!(warn["text"], "wk:70% ↻2d0h");
+        assert_eq!(warn["tone"], "warn");
+
+        let bad = opencode_quota_segment(
+            "limit_week",
+            "wk",
+            &ClaudeRateLimitWindow {
+                used_percentage: 90.0,
+                resets_at: 10_060,
+            },
+            10_000,
+            30,
+            74,
+        );
+        assert_eq!(bad["tone"], "bad");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_rate_limit_cache_is_private_and_never_follows_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path().join("private");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = parent.join("claude-rate-limits.json");
+        let victim = fixture.path().join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        symlink(&victim, &cache).unwrap();
+        let limits = ClaudeRateLimits {
+            captured_at: 10_000,
+            five_hour: Some(ClaudeRateLimitWindow {
+                used_percentage: 20.0,
+                resets_at: 11_000,
+            }),
+            seven_day: None,
+        };
+
+        write_claude_rate_limit_cache(&cache, &limits).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
+        let cache_metadata = std::fs::symlink_metadata(&cache).unwrap();
+        assert!(cache_metadata.is_file());
+        assert!(!cache_metadata.file_type().is_symlink());
+        assert_eq!(cache_metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            std::fs::symlink_metadata(&parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        let raw = read_private_rate_limit_cache(
+            &cache,
+            CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES,
+            RateLimitCacheParentPolicy::Private,
+        )
+        .unwrap();
+        assert!(parse_claude_rate_limit_cache(&raw, 10_000, 900).is_some());
+
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_private_rate_limit_cache(
+                &cache,
+                CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES,
+                RateLimitCacheParentPolicy::Private,
+            )
+            .is_none()
+        );
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            read_private_rate_limit_cache(
+                &cache,
+                CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES,
+                RateLimitCacheParentPolicy::Private,
+            )
+            .is_none()
+        );
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_file(&cache).unwrap();
+        symlink(&victim, &cache).unwrap();
+        assert!(
+            read_private_rate_limit_cache(
+                &cache,
+                CLAUDE_RATE_LIMIT_CACHE_MAX_BYTES,
+                RateLimitCacheParentPolicy::Private,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -8539,6 +12317,44 @@ mod statusline_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(format_agents_segment(&names, 24), "🤖 claude·codex·+2");
+    }
+
+    #[test]
+    fn agents_cache_is_located_in_runtime_scratch_directory() {
+        let runtime_tmp = Path::new("project").join(".rtrt").join("tmp");
+
+        assert_eq!(
+            agents_status_cache_path_in(&runtime_tmp, 0x2a),
+            runtime_tmp.join("rtrt-agents-status-000000000000002a.cache")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_cache_write_replaces_symlink_without_following_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let runtime_tmp = fixture.path().join("runtime");
+        std::fs::create_dir(&runtime_tmp).unwrap();
+        std::fs::set_permissions(&runtime_tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = fixture.path().join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        let cache = agents_status_cache_path_in(&runtime_tmp, 0x2a);
+        symlink(&victim, &cache).unwrap();
+
+        write_agents_status_cache_in(&runtime_tmp, 0x2a, "agents").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
+        let metadata = std::fs::symlink_metadata(&cache).unwrap();
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(
+            metadata.uid(),
+            std::fs::symlink_metadata(&runtime_tmp).unwrap().uid()
+        );
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "agents");
     }
 }
 

@@ -21,6 +21,7 @@ rtrt-providers.workspace = true
 rtrt-templates.workspace = true
 rtrt-security.workspace = true
 clap.workspace = true
+fs2 = "0.4"
 futures-util = { workspace = true }
 tokio.workspace = true
 anyhow.workspace = true

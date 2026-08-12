@@ -308,7 +308,6 @@ pub(crate) fn write_project_config(
     repo: &std::path::Path,
     project: &rtrt_core::config::ProjectConfig,
 ) -> rtrt_core::Result<()> {
-    project.validate()?;
     let _guard = CONFIG_WRITE_LOCK
         .lock()
         .map_err(|_| rtrt_core::Error::Config("config writer lock poisoned".into()))?;

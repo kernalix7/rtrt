@@ -21,7 +21,7 @@ use rtrt_compress::{
 };
 use rtrt_core::{
     Capability, CompressionLevel, CostClass, DetectedTool, InvocationMode, OutputStyleLevel,
-    PoolKey, ProjectIdentity, RosterPreset, ToolKind,
+    PoolKey, ProjectIdentity, ToolKind,
 };
 use rtrt_memory::{
     Embedder, InvocationProvenance, LlmSummariser, MemoryStore, OllamaEmbedder,
@@ -691,19 +691,6 @@ enum ConfigCmd {
     },
     /// Print the resolved config path and whether it exists.
     Path,
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum TeamPresetArg {
-    OpencodeLead,
-}
-
-impl From<TeamPresetArg> for RosterPreset {
-    fn from(preset: TeamPresetArg) -> Self {
-        match preset {
-            TeamPresetArg::OpencodeLead => RosterPreset::OpencodeLead,
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]

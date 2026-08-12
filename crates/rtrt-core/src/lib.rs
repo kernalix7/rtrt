@@ -15,12 +15,9 @@ pub mod project;
 pub mod token;
 
 pub use config::{
-    AgentsConfig, Balance, ClaudeContinuity, Config, DEFAULT_API_MAX_TOKENS,
-    DEFAULT_CLAUDE_CONTINUITY_MAX_RESUMED_TURNS, DEFAULT_CLAUDE_CONTINUITY_TTL_SECS,
-    DEFAULT_TEAM_MAX_RETRIES, Delegation, LimitsConfig, MAX_CLAUDE_CONTINUITY_RESUMED_TURNS,
-    MAX_CLAUDE_CONTINUITY_TTL_SECS, MIN_CLAUDE_CONTINUITY_TTL_SECS, PoolLimit, ProjectConfig,
-    ProjectEntry, ProvidersConfig, RosterPreset, TargetLimit, TeamConfig, TeamMember, TeamMode,
-    TeamPolicy, TierMap, default_memory_store_path, legacy_memory_store_path, repo_root_from,
+    AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, Delegation, LimitsConfig, PoolLimit,
+    ProjectConfig, ProjectEntry, ProvidersConfig, TargetLimit, default_memory_store_path,
+    legacy_memory_store_path, repo_root_from,
 };
 pub use detect::{
     Capability, CostClass, DetectedTool, InvocationMode, ToolKind, detect_tools,

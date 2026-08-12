@@ -38,19 +38,21 @@
   <span id="pill-cache" class="pill"><span class="dot"></span>Cache</span>
   <span class="spacer"></span>
   <button id="open-palette" title="Quick jump (Ctrl/Cmd + K)" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--muted);padding:0.3rem 0.7rem;border-radius:6px;font-size:0.85em;">⌘K Jump</button>
+  <button id="dashboard-token-action" type="button" title="Forget the dashboard bearer token stored for this tab">Clear API token</button>
   <button id="theme-toggle" title="Dark / Light">🌗</button>
 </div>
 
 <div class="layout">
   <aside>
-    <div class="project-picker">
+    <div class="project-picker" aria-label="Active project">
       <div class="project-picker-head">
-        <span>Project</span>
+        <label for="project-selector">Project</label>
       </div>
       <div class="project-selector-row">
-        <select id="project-selector"><option value="">Loading projects…</option></select>
-        <button id="project-add-btn" class="ghost icon-btn" type="button" title="Add / edit project">＋</button>
+        <select id="project-selector" aria-describedby="project-selector-status"><option value="">Loading projects…</option></select>
+        <button id="project-add-btn" class="ghost icon-btn" type="button" title="Project registry is read-only in dashboard mode" disabled>＋</button>
       </div>
+      <div id="project-selector-status" class="project-selector-status" role="status" aria-live="polite">Loading availability…</div>
     </div>
     <!-- ── PROJECT MODE nav (per-project work) ──────────────────────────────
          Overview · Memory · Output Optimizer · Command Optimizer · Settings
@@ -144,6 +146,11 @@
           <button type="button" data-window="30d">30d</button>
           <button type="button" data-window="all">All</button>
         </div>
+      </div>
+      <div id="global-project-overview" class="card" hidden>
+        <div class="head"><h2>All projects</h2><span id="global-project-summary" class="hint">Loading…</span></div>
+        <p class="lede">Select an available project to enable project pages and actions.</p>
+        <table><thead><tr><th>Project</th><th>Canonical slug</th><th>Memories</th><th>Status</th></tr></thead><tbody id="global-project-overview-body"></tbody></table>
       </div>
       <!-- Pillar-led savings model: Σ agent-token saved % + three pillar cards -->
       <div class="card savings-hero">
@@ -1178,6 +1185,16 @@
       <div class="card">
         <div class="head"><h2>Configuration</h2><span class="hint">Loaded from GET /api/config</span></div>
         <form id="settings-form">
+          <div class="settings-section">
+            <h3>Dashboard <span class="badge warn">restart required</span></h3>
+            <div class="field-row">
+              <label class="field-label"><span>configured bind (next restart)</span><input type="text" id="cfg-dashboard-bind" placeholder="127.0.0.1:7311"></label>
+              <label class="field-label"><span>effective bind</span><input type="text" id="cfg-dashboard-effective-bind" readonly></label>
+              <label class="field-label"><span>configured provider API max output tokens</span><input type="number" id="cfg-provider-max-tokens" min="1"></label>
+              <label class="field-label"><span>effective API max output tokens</span><input type="text" id="cfg-provider-effective-max-tokens" readonly></label>
+            </div>
+            <div id="cfg-dashboard-provenance" class="note"></div>
+          </div>
           <!-- Capture -->
           <div class="settings-section">
             <h3>Capture</h3>
@@ -1194,6 +1211,7 @@
                 <span>dedup_window_sec</span>
                 <input type="number" id="cfg-capture-dedup" min="0" value="60">
               </div>
+              <label class="field-label"><span>project identity (derived/read-only)</span><input type="text" id="cfg-capture-project" readonly></label>
             </div>
           </div>
           <!-- Auto-compress -->
@@ -1212,8 +1230,12 @@
                 <span>base_url</span>
                 <input type="url" id="cfg-ac-base-url" placeholder="https://api.anthropic.com">
               </div>
+              <label class="field-label"><span>compatible endpoint runtime/provider</span><input type="text" id="cfg-ac-provider" placeholder="ollama or openai-compat"></label>
+              <label class="field-label"><span>effective runtime/provider</span><input type="text" id="cfg-provider-runtime" readonly></label>
+              <label class="field-label"><span>effective transport</span><input type="text" id="cfg-provider-transport" readonly></label>
             </div>
             <div class="field-row" style="margin-top:0.5rem;">
+              <div class="field-label"><span>interval_sec (daemon sweep)</span><input type="number" id="cfg-ac-interval" min="1"></div>
               <div class="field-label">
                 <span>age_sec (minimum elapsed seconds)</span>
                 <input type="number" id="cfg-ac-age-sec" min="0" value="3600">
@@ -1241,6 +1263,7 @@
               <input type="checkbox" id="cfg-emb-enabled">
               <label for="cfg-emb-enabled">Enable embeddings</label>
             </div>
+            <div class="toggle-row"><input type="checkbox" id="cfg-emb-auto"><label for="cfg-emb-auto">Auto-embed newly captured rows</label></div>
             <div class="field-row" style="margin-top:0.5rem;">
               <div class="field-label">
                 <span>model</span>
@@ -1251,6 +1274,10 @@
                 <span>base_url</span>
                 <input type="url" id="cfg-emb-base-url" placeholder="http://localhost:11434">
               </div>
+            </div>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label"><span>auto_interval_sec</span><input type="number" id="cfg-emb-interval" min="1"></label>
+              <label class="field-label"><span>auto_batch</span><input type="number" id="cfg-emb-batch" min="1"></label>
             </div>
             <div class="field-label" style="margin-top:0.5rem;">
               <span>Generate (current project)</span>
@@ -1297,27 +1324,24 @@
         </div>
         <div id="compress-now-result" class="compress-now-result out-meta"></div>
       </div>
-      <!-- Memory settings (global [memory]: store path + embed model) -->
+      <!-- Strict-isolation status: memory path is derived and never editable. -->
       <div class="card" style="margin-top:1rem;">
-        <div class="head"><h2>Memory settings</h2><span class="hint" id="memory-settings-hint">~/.rtrt/config.toml [memory]</span></div>
-        <p class="lede">Global memory store location and the embedding model name recorded in <code>[memory]</code>.</p>
+        <div class="head"><h2>Sandbox &amp; memory isolation</h2><span class="badge ok">strict isolation</span></div>
+        <p class="lede">Physical memory store is derived from current project identity. Global/user recall and arbitrary path edits are unavailable.</p>
         <div class="settings-section">
           <div class="field-row">
+            <label class="field-label"><span>project identity</span><input type="text" id="memory-settings-identity" readonly></label>
             <label class="field-label" for="memory-settings-path">
               <span>path (memory store)</span>
-              <input type="text" id="memory-settings-path" placeholder=".rtrt/memory.sqlite">
+              <input type="text" id="memory-settings-path" readonly>
             </label>
             <label class="field-label" for="memory-settings-embed-model">
-              <span>embed_model</span>
-              <input type="text" id="memory-settings-embed-model" placeholder="all-MiniLM-L6-v2">
+              <span>embedding model (source: [embeddings].model)</span>
+              <input type="text" id="memory-settings-embed-model" readonly>
             </label>
           </div>
-          <div class="note" style="margin-top:0.5rem;">
-            <strong>Changing the path points the dashboard and CLI at a different store.</strong>
-            Existing memories are not moved; the new path takes effect after a server restart.
-          </div>
+          <div id="memory-settings-provenance" class="note" style="margin-top:0.5rem;"></div>
           <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.6rem;flex-wrap:wrap;">
-            <button id="memory-settings-save-btn" class="primary" type="button">Save memory settings</button>
             <span id="memory-settings-result" class="out-meta"></span>
           </div>
         </div>
@@ -1339,7 +1363,7 @@
         <p class="lede">Optional daily ceilings per provider/target. Leave a field blank for no limit on that axis.</p>
         <div class="env-table-wrap">
           <table id="limits-tbl">
-            <thead><tr><th>Target</th><th>daily_tokens</th><th>daily_requests</th><th></th></tr></thead>
+            <thead><tr><th>Target / pool</th><th>daily_tokens</th><th>daily_requests</th><th></th></tr></thead>
             <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
           </table>
         </div>
@@ -1410,6 +1434,7 @@
             <span>Orchestration enabled — rtrt may delegate to the lanes below</span>
           </label>
           <div class="orch-grid">
+            <label class="field-label"><span>roster preset</span><select id="orch-roster"><option value="classic">classic</option><option value="opencode-lead">opencode-lead</option></select></label>
             <label class="field-label">
               <span>manager provider</span>
               <input type="text" id="orch-manager-provider" list="orch-targets" autocomplete="off">
@@ -1486,11 +1511,16 @@
               <span>default tier</span>
               <select id="orch-default-tier"></select>
             </label>
+            <label class="field-label"><span>explore tier</span><select id="orch-explore-tier"></select></label>
+            <label class="field-label"><span>review tier</span><select id="orch-review-tier"></select></label>
+            <label class="field-label"><span>balance</span><select id="orch-balance"><option value="order">configured order</option><option value="room">pool room</option></select></label>
+            <label class="field-label"><span>worker summary max lines</span><input type="number" id="orch-summary-lines" min="1" max="255"></label>
           </div>
           <div class="orch-row" style="margin-top:0.7rem;">
             <label class="segment-toggle"><input type="checkbox" id="orch-redo"><span>Redo work on fallback</span></label>
             <label class="segment-toggle"><input type="checkbox" id="orch-sibling"><span>Prefer sibling pool on quota</span></label>
             <label class="segment-toggle"><input type="checkbox" id="orch-provenance"><span>Record provenance</span></label>
+            <label class="segment-toggle"><input type="checkbox" id="orch-isolate-conflicting"><span>Isolate conflicting writes</span></label>
           </div>
           <div class="settings-section" style="margin-top:1.1rem;margin-bottom:0;">
             <h3>Design-only tiers</h3>
@@ -1671,7 +1701,7 @@
           <div id="security-project-meta" class="out-meta scope-status"></div>
           <div class="security-scan-row">
             <select id="security-profile-select"><option value="">Loading…</option></select>
-            <button id="security-apply-profile-btn" class="ghost" type="button">Apply to this project</button>
+            <button id="security-apply-profile-btn" class="ghost" type="button" title="Project registry is read-only in dashboard mode" disabled>Apply to this project</button>
             <button id="security-scan-btn" class="primary" type="button">Scan</button>
             <button id="security-view-profile-btn" class="ghost" type="button">View profile</button>
           </div>

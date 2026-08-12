@@ -577,3 +577,16 @@
     .savings-total { font-size: 2.4rem; }
     .security-profile-tools { grid-template-columns: 1fr; }
   }
+.project-picker {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
+}
+.project-selector-status {
+  margin-top: .35rem;
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.3;
+}
+#project-selector option:disabled { color: var(--err); }

@@ -1,12 +1,12 @@
-// Live activity stream via /api/stream. Each broadcast event nudges the
-// overview cards + appends a feed line. Falls back to 5s polling only if
-// the EventSource handshake fails (older browsers, proxies stripping SSE).
+// Authenticated live activity stream via fetch: EventSource cannot attach the
+// mandatory bearer header. Falls back to 5s polling if streaming is unavailable.
+let DASHBOARD_STREAM_CONTROLLER = null;
 function subscribeStream() {
-  if (typeof EventSource === 'undefined') {
-    startOverviewPolling();
-    return;
-  }
-  let es;
+  if (DASHBOARD_STREAM_CONTROLLER) DASHBOARD_STREAM_CONTROLLER.abort();
+  DASHBOARD_STREAM_CONTROLLER = null;
+  if (!currentProject()) return;
+  const streamController = new AbortController();
+  DASHBOARD_STREAM_CONTROLLER = streamController;
   let pollTimer = null;
   const startPolling = () => {
     if (pollTimer) return;
@@ -19,44 +19,60 @@ function subscribeStream() {
     clearInterval(pollTimer);
     pollTimer = null;
   };
-  const connect = () => {
-    es = new EventSource('/api/stream');
-    es.onopen = () => {
+  const receive = raw => {
+    try {
+      const d = JSON.parse(raw);
+      if (d.type === 'memory.save') {
+        pushActivity(`memory.save · ${d.kind || '?'} · ${d.project || '?'} (#${d.id})`);
+        if (activePage() === 'overview') loadOverview();
+      } else if (d.type === 'memory.delete') {
+        pushActivity(`memory.delete · #${d.id}`);
+        const project = currentProject();
+        if (project) loadHistory(project, HISTORY_OFFSET);
+      } else if (d.type === 'memory.delete_batch') {
+        pushActivity(`memory.delete_batch · ${d.deleted} deleted`);
+        const project = currentProject();
+        if (project) loadHistory(project, HISTORY_OFFSET);
+      } else if (d.type !== 'heartbeat') {
+        pushActivity(`stream · ${d.type || 'event'}`);
+      }
+    } catch (e) {
+      pushActivity(`stream parse: ${e.message || e}`);
+    }
+  };
+  const connect = async () => {
+    try {
+      const response = await fetch('/api/stream', { headers: { Accept: 'text/event-stream' }, signal: streamController.signal });
+      if (!response.ok || !response.body) throw new Error(`stream HTTP ${response.status}`);
       stopPolling();
       pushActivity('SSE connected · live capture streaming');
-    };
-    es.onmessage = (ev) => {
-      try {
-        const d = JSON.parse(ev.data);
-        if (d.type === 'memory.save') {
-          pushActivity(`memory.save · ${d.kind || '?'} · ${d.project || '?'} (#${d.id})`);
-          if (activePage() === 'overview') loadOverview();
-        } else if (d.type === 'memory.delete') {
-          pushActivity(`memory.delete · #${d.id}`);
-          // Reload history if the deleted item belongs to the open project.
-          const project = currentProject();
-          if (project) loadHistory(project, HISTORY_OFFSET);
-        } else if (d.type === 'memory.delete_batch') {
-          pushActivity(`memory.delete_batch · ${d.deleted} deleted`);
-          const project = currentProject();
-          if (project) loadHistory(project, HISTORY_OFFSET);
-        } else if (d.type === 'heartbeat') {
-          // keep-alive; ignore
-        } else {
-          pushActivity(`stream · ${d.type || 'event'}`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error('stream closed');
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let boundary;
+        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+          const event = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = event.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+            .join('\n');
+          if (data) receive(data);
         }
-      } catch (e) {
-        pushActivity(`stream parse: ${e.message || e}`);
       }
-    };
-    es.onerror = () => {
+    } catch (_) {
+      if (streamController.signal.aborted || DASHBOARD_STREAM_CONTROLLER !== streamController) return;
       startPolling();
-      try { es.close(); } catch (_) { /* noop */ }
       setTimeout(connect, 5000);
-    };
+    }
   };
   connect();
 }
+window.dashboardResetProjectStream = subscribeStream;
 
 // ── Local LLM page (Ollama) ──────────────────────────────────────────────────
 
@@ -289,6 +305,7 @@ function normalizeSecurityProfile(data, fallbackName) {
     severity_threshold: (profile && profile.severity_threshold) || 'low',
     exclude: (profile && profile.exclude) || [],
     rules,
+    raw_toml: data && typeof data.toml === 'string' ? data.toml : '',
   };
 }
 
@@ -537,22 +554,21 @@ function tomlString(value) {
 function tomlValue(value) {
   if (Array.isArray(value)) return `[${value.map(tomlValue).join(', ')}]`;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value && typeof value === 'object') return `{ ${Object.entries(value).map(([k, v]) => `${k} = ${tomlValue(v)}`).join(', ')} }`;
   return tomlString(value);
 }
 
 function securityProfileToToml(profile, newName) {
   const lines = [
-    '[profile]',
     `name = ${tomlString(newName || profile.name)}`,
     `description = ${tomlString(profile.description || '')}`,
     `severity_threshold = ${tomlString(profile.severity_threshold || 'low')}`,
   ];
   if (profile.exclude && profile.exclude.length) lines.push(`exclude = ${tomlValue(profile.exclude)}`);
-  const ruleFields = ['id', 'rule_id', 'name', 'title', 'description', 'severity', 'engine', 'source', 'pattern', 'path', 'message', 'fix_hint'];
   profile.rules.forEach(rule => {
     lines.push('', '[[rules]]');
-    ruleFields.forEach(key => {
-      if (rule[key] !== undefined && rule[key] !== null && rule[key] !== '') lines.push(`${key} = ${tomlValue(rule[key])}`);
+    Object.entries(rule).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') lines.push(`${key} = ${tomlValue(value)}`);
     });
   });
   return lines.join('\n') + '\n';
@@ -563,7 +579,10 @@ function cloneSecurityProfileToml() {
   const nameInput = document.getElementById('security-profile-new-name');
   const newName = nameInput.value.trim() || `${ACTIVE_SECURITY_PROFILE.name}-copy`;
   nameInput.value = newName;
-  document.getElementById('security-profile-toml').value = securityProfileToToml(ACTIVE_SECURITY_PROFILE, newName);
+  const raw = ACTIVE_SECURITY_PROFILE.raw_toml || '';
+  document.getElementById('security-profile-toml').value = raw && /^name\s*=/m.test(raw)
+    ? raw.replace(/^name\s*=.*$/m, `name = ${tomlString(newName)}`)
+    : securityProfileToToml(ACTIVE_SECURITY_PROFILE, newName);
 }
 
 async function saveSecurityProfileToml() {
@@ -921,26 +940,25 @@ const INITIAL_MODE = atRoot
   : (PAGE_MODE[INITIAL_ROUTE.page] || savedMode());
 // Seed the project keys loadProjects() reads from, so a ?project= in the URL
 // wins over localStorage and the selector lands on the shared project.
-if (INITIAL_ROUTE.project) {
-  localStorage.setItem('rtrt.project', INITIAL_ROUTE.project);
-  localStorage.setItem('rtrt-project', INITIAL_ROUTE.project);
-}
+if (INITIAL_ROUTE.project) sessionStorage.setItem('rtrt.project', INITIAL_ROUTE.project);
 // Sync the mode chrome only (no navigate) — the URL drives the final page below.
 setMode(INITIAL_MODE, false);
 
-// Init
-syncOverviewWindowButtons();
-// loadProjects() populates the selector (honouring the seeded ?project=); once it
-// settles, route from the URL so the deep page/sub is restored. Suppress URL
-// pushes during this async window so loadProjects()'s own navigate() (global
-// scope) can't stack intermediate history entries — routeFromLocation(false)
-// then reflects the real URL with replaceState and clears the flag.
-SUPPRESS_URL_PUSH = true;
-Promise.resolve(loadProjects()).finally(() => routeFromLocation(false));
-startOverviewPolling();
-loadTemplates();
-loadPrompts();
-loadModels();  // populates model <select>s throughout the UI
-subscribeStream();
-document.getElementById('open-palette').onclick = openPalette;
-pushActivity('Dashboard ready. Press ⌘K or Ctrl+K to jump anywhere.');
+// Init only after api.js has consumed (and removed) any bootstrap fragment.
+window.dashboardAuthReady.then(() => {
+  syncOverviewWindowButtons();
+  // loadProjects() populates the selector (honouring the seeded ?project=); once it
+  // settles, route from the URL so the deep page/sub is restored. Suppress URL
+  // pushes during this async window so loadProjects()'s own navigate() (global
+  // scope) can't stack intermediate history entries — routeFromLocation(false)
+  // then reflects the real URL with replaceState and clears the flag.
+  SUPPRESS_URL_PUSH = true;
+  Promise.resolve(loadProjects()).finally(() => routeFromLocation(false));
+  startOverviewPolling();
+  loadTemplates();
+  loadPrompts();
+  loadModels();  // populates model <select>s throughout the UI
+  subscribeStream();
+  document.getElementById('open-palette').onclick = openPalette;
+  pushActivity('Dashboard ready. Press ⌘K or Ctrl+K to jump anywhere.');
+});

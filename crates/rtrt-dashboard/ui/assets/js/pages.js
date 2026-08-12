@@ -246,6 +246,11 @@ function renderProjectSavings(payload) {
 }
 
 async function loadOverview() {
+  if (isGlobalScope()) {
+    await loadGlobalProjectsOverview();
+    return;
+  }
+  setGlobalOverviewMode(false);
   if (overviewLoading) return;
   overviewLoading = true;
   const overviewParams = new URLSearchParams();
@@ -339,6 +344,69 @@ async function loadOverview() {
     for (const c of (byParent.get(h.id) || [])) rows.push(row(c, 1));
   }
   document.querySelector('#recent-tbl tbody').innerHTML = rows.join('') || '<tr><td colspan="7" class="empty">No calls yet. Send one from the Chat playground (Tools › Chat) or <code>rtrt provider chat</code>.</td></tr>';
+}
+
+function setGlobalOverviewMode(global) {
+  const page = document.getElementById('page-overview');
+  const card = document.getElementById('global-project-overview');
+  if (!page || !card) return;
+  Array.from(page.children).forEach(child => {
+    if (child !== page.firstElementChild && child !== card) child.hidden = global;
+  });
+  card.hidden = !global;
+  const title = page.querySelector('.section-title h1');
+  const lede = page.querySelector('.section-title .lede');
+  if (title) title.textContent = global ? 'All Projects Overview' : 'Token Savings Overview';
+  if (lede) lede.textContent = global
+    ? 'Global availability and memory counts. No project is selected.'
+    : 'Combined savings from Memory, Output Optimizer, and Command Optimizer.';
+  const windows = document.getElementById('overview-window-selector');
+  if (windows) windows.hidden = global;
+}
+
+async function loadGlobalProjectsOverview() {
+  if (overviewLoading) return;
+  overviewLoading = true;
+  setGlobalOverviewMode(true);
+  const body = document.getElementById('global-project-overview-body');
+  const summary = document.getElementById('global-project-summary');
+  try {
+    const response = await fetch('/api/projects/overview');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const projects = Array.isArray(data.projects) ? data.projects : [];
+    if (summary) summary.textContent = `${data.available_projects || 0} available · ${data.unavailable_projects || 0} unavailable · ${Number(data.total_memories || 0).toLocaleString()} memories${data.partial ? ' · partial' : ''}`;
+    if (body) body.innerHTML = projects.length ? projects.map(project => `<tr>
+      <td>${escapeHtml(project.label || project.slug)}</td><td><code>${escapeHtml(project.slug)}</code></td>
+      <td>${project.memory_count == null ? 'unavailable' : Number(project.memory_count).toLocaleString()}</td>
+      <td><span class="badge ${project.available ? 'ok' : 'err'}">${project.available ? 'available' : 'unavailable'}</span></td>
+    </tr>`).join('') : '<tr><td colspan="4" class="empty">No projects discovered.</td></tr>';
+  } catch (error) {
+    if (summary) summary.textContent = 'Unavailable';
+    if (body) body.innerHTML = `<tr><td colspan="4" class="empty">${escapeHtml(error.message || String(error))}</td></tr>`;
+  } finally {
+    overviewLoading = false;
+  }
+}
+
+function resetProjectUiState() {
+  HISTORY_OFFSET = 0;
+  HISTORY_TOTAL = 0;
+  SELECTED_IDS.clear();
+  memmapStopLayout();
+  if (memmapCy) { memmapCy.destroy(); memmapCy = null; }
+  memmapOverview = null;
+  memmapProject = '';
+  memmapStack = [];
+  brainGraph = null;
+  brainProject = '';
+  brainConcept = null;
+  brainCommunity = null;
+  brainStack = [];
+  const sessionBody = document.getElementById('sessions-body');
+  if (sessionBody) sessionBody.innerHTML = '';
+  const blockBody = document.getElementById('blocks-body');
+  if (blockBody) blockBody.innerHTML = '';
 }
 
 // The gateway-inactive empty state links straight to the Chat playground.
@@ -1057,7 +1125,7 @@ async function startEmbedAndPoll(project, statusFn) {
     const pct = c.total ? Math.round(100 * c.embedded / c.total) : 0;
     if (statusFn) statusFn(`Embeddings ${c.embedded.toLocaleString()}/${c.total.toLocaleString()} (${pct}%)${c.running ? ' · Generating…' : ' · done'}`);
     // keep the project cache fresh so the map basis badge updates
-    const p = (PROJECTS_CACHE || []).find(x => x.name === project);
+    const p = (PROJECTS_CACHE || []).find(x => x.slug === project);
     if (p && !c.running && c.embedded > 0) p.embeddings_enabled = p.embeddings_enabled; // no-op, coverage drives basis
     if (c.running) { setTimeout(poll, 3000); return; }
     EMBED_POLLING.delete(project);
@@ -1148,13 +1216,24 @@ document.getElementById('blocks-set-form').onsubmit = async (ev) => {
   const d = await r.json();
   out.innerHTML = `<span class="badge ok">✓ Save id=${d.id}</span>`;
 };
-document.getElementById('export-form').onsubmit = (ev) => {
+document.getElementById('export-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const project = currentProject();
   if (isGlobalScope()) { showToast(GLOBAL_SCOPE_MESSAGE, 'err'); return; }
   if (!project) { showToast('Select or add a project', 'err'); return; }
-  window.location.href = `/api/memory/export?project=${encodeURIComponent(project)}`;
-  pushActivity(`export ${project}`);
+  try {
+    const response = await fetch(`/api/memory/export?project=${encodeURIComponent(project)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    const href = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = href;
+    link.download = `${project}-memory.jsonl`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(href), 0);
+    pushActivity(`export ${project}`);
+  } catch (error) {
+    showToast(`Export failed: ${error.message || error}`, 'err');
+  }
 };
 
 // ── Memory Sessions — GET /api/memory/sessions ──────────────────────────────
@@ -4264,12 +4343,44 @@ async function loadPrompts() {
 
 // Models — fetched once at boot; drives every model <select> in the UI.
 let MODELS_CACHE = [];
+function normalizeProviderId(provider) {
+  const normalized = String(provider || '').trim().toLowerCase();
+  if (['openai-compatible', 'openai_compatible', 'openai-compat'].includes(normalized)) return 'openai-compat';
+  if (['lmstudio', 'lm_studio', 'lms', 'lm-studio'].includes(normalized)) return 'lm-studio';
+  if (['llama', 'llamacpp', 'llama_cpp', 'llama-cpp', 'llama.cpp'].includes(normalized)) return 'llama.cpp';
+  return normalized;
+}
+function normalizeModelEntry(model) {
+  if (!model || typeof model.id !== 'string' || !model.id) return null;
+  const id = model.id;
+  const split = id.indexOf('/');
+  const provider = normalizeProviderId(typeof model.provider === 'string'
+    ? model.provider
+    : (split > 0 ? id.slice(0, split) : ''));
+  const upstream = typeof model.upstream_id === 'string'
+    ? model.upstream_id
+    : (split > 0 ? id.slice(split + 1) : id);
+  // Legacy `{id,source}` payloads remain usable; new payloads supply an honest
+  // display label and canonical id directly.
+  const label = typeof model.label === 'string' && model.label
+    ? model.label
+    : `${id}${model.source ? ` (${model.source})` : ''}`;
+  return {
+    id: split > 0 && provider ? `${provider}/${upstream}` : id,
+    upstream_id: upstream,
+    provider,
+    transport: typeof model.transport === 'string' ? model.transport : '',
+    source: typeof model.source === 'string' ? model.source : '',
+    available: model.available !== false,
+    label,
+  };
+}
 async function loadModels() {
   try {
     const r = await fetch('/api/models');
     if (!r.ok) return;
     const d = await r.json();
-    MODELS_CACHE = Array.isArray(d.models) ? d.models : [];
+    MODELS_CACHE = Array.isArray(d.models) ? d.models.map(normalizeModelEntry).filter(Boolean) : [];
   } catch (_) { /* backend not yet available — leave cache empty */ }
   populateModelSelects();
 }
@@ -4277,12 +4388,11 @@ async function loadModels() {
 // Populate every model <select> that is already in the DOM.
 // Called after fetch and again whenever the settings page is opened.
 function populateModelSelects() {
-  const opts = buildModelOptions('');
   ['cfg-ac-model', 'compress-now-model', 'compress-llm-model'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel) return;
-    const current = sel.value;
-    sel.innerHTML = opts;
+    const current = canonicalModelValue(sel.value);
+    sel.innerHTML = buildModelOptions(current);
     // Restore previously selected value if it still exists.
     if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
   });
@@ -4298,9 +4408,9 @@ function populateModelSelects() {
 function populateRequiredModelSelect(id) {
   const sel = document.getElementById(id);
   if (!sel) return;
-  const current = sel.value;
+  const current = canonicalModelValue(sel.value);
   sel.innerHTML = '<option value="">Select a model…</option>' + MODELS_CACHE.map(m =>
-    `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)} (${escapeHtml(m.source)})</option>`
+    `<option value="${escapeAttr(m.id)}">${escapeHtml(m.label)}${m.available === false ? ' · unavailable' : ''}</option>`
   ).join('');
   if (current && sel.querySelector(`option[value="${CSS.escape(current)}"]`)) sel.value = current;
 }
@@ -4519,16 +4629,30 @@ async function loadConfig() {
   const cap = d.capture || {};
   const ac = d.auto_compress || {};
   const emb = d.embeddings || {};
+  const dashboard = d.dashboard || {};
+  const dashboardEffective = d.dashboard_effective || {};
+  const providers = d.providers || {};
+  const providerRuntime = d.provider_runtime || {};
   const securityDefaultProfile = d.security?.default_profile;
   if (securityDefaultProfile && String(securityDefaultProfile).trim()) {
     GLOBAL_DEFAULT_PROFILE = String(securityDefaultProfile).trim();
   }
   const bool = (v) => !!v;
+  document.getElementById('cfg-dashboard-bind').value = dashboard.bind || '';
+  document.getElementById('cfg-dashboard-effective-bind').value = dashboardEffective.bind || '';
+  document.getElementById('cfg-dashboard-provenance').textContent = `Effective source: ${dashboardEffective.source || 'unknown'} · saving configured bind requires restart${dashboardEffective.bind !== dashboard.bind ? ' and is currently overridden' : ''}.`;
+  document.getElementById('cfg-provider-max-tokens').value = providers.api_max_tokens ?? 4096;
+  document.getElementById('cfg-provider-effective-max-tokens').value = `${providerRuntime.api_max_tokens ?? 4096} (${providerRuntime.api_max_tokens_source || 'default'})`;
   document.getElementById('cfg-capture-enabled').checked = bool(cap.enabled);
   document.getElementById('cfg-capture-redact').checked = bool(cap.redact);
   document.getElementById('cfg-capture-dedup').value = cap.dedup_window_sec ?? 60;
+  document.getElementById('cfg-capture-project').value = cap.project || (isGlobalProjectValue(currentProject()) ? 'derived per request/project' : currentProject());
   document.getElementById('cfg-ac-enabled').checked = bool(ac.enabled);
   document.getElementById('cfg-ac-base-url').value = ac.base_url || '';
+  document.getElementById('cfg-ac-provider').value = ac.provider || '';
+  document.getElementById('cfg-provider-runtime').value = providerRuntime.provider || '';
+  document.getElementById('cfg-provider-transport').value = providerRuntime.transport || '';
+  document.getElementById('cfg-ac-interval').value = ac.interval_sec ?? 1800;
   document.getElementById('cfg-ac-age-sec').value = ac.age_sec ?? 3600;
   document.getElementById('cfg-ac-min-chars').value = ac.min_chars ?? 200;
   document.getElementById('cfg-ac-batch').value = ac.batch ?? 20;
@@ -4540,6 +4664,9 @@ async function loadConfig() {
   }
   // Embeddings section — fields are present only when the backend includes the key.
   document.getElementById('cfg-emb-enabled').checked = bool(emb.enabled);
+  document.getElementById('cfg-emb-auto').checked = emb.auto !== false;
+  document.getElementById('cfg-emb-interval').value = emb.auto_interval_sec ?? 120;
+  document.getElementById('cfg-emb-batch').value = emb.auto_batch ?? 64;
   populateEmbModelSelect(emb.model || '');
   document.getElementById('cfg-emb-base-url').value = emb.base_url || '';
   await populateSecurityProfileSelect('setting-default-security-profile', GLOBAL_DEFAULT_PROFILE);
@@ -4551,6 +4678,8 @@ async function loadConfig() {
 document.getElementById('settings-form').onsubmit = async (ev) => {
   ev.preventDefault();
   const body = {
+    dashboard: { bind: document.getElementById('cfg-dashboard-bind').value.trim() },
+    providers: { api_max_tokens: Number(document.getElementById('cfg-provider-max-tokens').value) },
     capture: {
       enabled: document.getElementById('cfg-capture-enabled').checked,
       redact: document.getElementById('cfg-capture-redact').checked,
@@ -4560,6 +4689,8 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       enabled: document.getElementById('cfg-ac-enabled').checked,
       model: document.getElementById('cfg-ac-model').value || null,
       base_url: document.getElementById('cfg-ac-base-url').value || null,
+      provider: document.getElementById('cfg-ac-provider').value || null,
+      interval_sec: Number(document.getElementById('cfg-ac-interval').value),
       age_sec: Number(document.getElementById('cfg-ac-age-sec').value),
       min_chars: Number(document.getElementById('cfg-ac-min-chars').value),
       batch: Number(document.getElementById('cfg-ac-batch').value),
@@ -4569,6 +4700,9 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
       enabled: document.getElementById('cfg-emb-enabled').checked,
       model: document.getElementById('cfg-emb-model').value || null,
       base_url: document.getElementById('cfg-emb-base-url').value || null,
+      auto: document.getElementById('cfg-emb-auto').checked,
+      auto_interval_sec: Number(document.getElementById('cfg-emb-interval').value),
+      auto_batch: Number(document.getElementById('cfg-emb-batch').value),
     },
     security: {
       default_profile: document.getElementById('setting-default-security-profile').value,
@@ -4585,7 +4719,7 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
     result.innerHTML = `<span style="color:var(--err);">${r.status}: ${await r.text()}</span>`;
     return;
   }
-  result.innerHTML = '<span class="badge ok">✓ Saved</span>';
+    result.innerHTML = '<span class="badge ok">✓ Saved</span> <span class="badge warn">restart required for bind/model/endpoint changes</span>';
   GLOBAL_DEFAULT_PROFILE = body.security.default_profile || GLOBAL_DEFAULT_PROFILE;
   pushActivity('Settings saved');
   showToast('Settings saved', 'ok');
@@ -4597,42 +4731,25 @@ document.getElementById('settings-form').onsubmit = async (ev) => {
 // ===========================================================================
 async function loadMemorySettings() {
   try {
-    const r = await fetch('/api/memory/settings');
+    const project = currentProject();
+    const query = project && !isGlobalProjectValue(project) ? `?project=${encodeURIComponent(project)}` : '';
+    const r = await fetch(`/api/memory/settings${query}`);
     if (!r.ok) return;
     const d = await r.json();
     const pathEl = document.getElementById('memory-settings-path');
     const modelEl = document.getElementById('memory-settings-embed-model');
+    const identityEl = document.getElementById('memory-settings-identity');
     if (pathEl) pathEl.value = d.path || '';
-    if (modelEl) modelEl.value = d.embed_model || '';
+    if (modelEl) modelEl.value = d.model || '';
+    if (identityEl) identityEl.value = d.project_identity || 'unavailable';
+    const captureIdentity = document.getElementById('cfg-capture-project');
+    if (captureIdentity && d.project_identity) captureIdentity.value = d.project_identity;
+    const provenance = document.getElementById('memory-settings-provenance');
+    if (provenance) provenance.textContent = `Status: ${d.status || 'unknown'} · provenance: ${d.provenance || 'unknown'} · owner: current operator · restart required: ${d.restart_required ? 'yes' : 'no'}.`;
     const hint = document.getElementById('memory-settings-hint');
     if (hint && d.config_path) hint.textContent = `${d.config_path} [memory]`;
   } catch (_) { /* ignore */ }
 }
-
-async function saveMemorySettings() {
-  const result = document.getElementById('memory-settings-result');
-  const path = document.getElementById('memory-settings-path').value.trim();
-  const embed_model = document.getElementById('memory-settings-embed-model').value.trim();
-  if (result) result.textContent = 'Saving…';
-  try {
-    const r = await fetch('/api/memory/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, embed_model }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || `${r.status}`);
-    if (result) result.innerHTML = '<span class="badge ok">✓ Saved · restart to apply path change</span>';
-    pushActivity('Memory settings saved');
-    showToast('Memory settings saved', 'ok');
-  } catch (e) {
-    if (result) result.innerHTML = `<span style="color:var(--err);">${escapeHtml(e.message || String(e))}</span>`;
-    showToast(`Memory settings error: ${e.message || e}`, 'err');
-  }
-}
-
-const memorySettingsSaveBtn = document.getElementById('memory-settings-save-btn');
-if (memorySettingsSaveBtn) memorySettingsSaveBtn.onclick = saveMemorySettings;
 
 // ===========================================================================
 // Daily usage limits (global [limits.<target>]). Plain global setting — a
@@ -4653,8 +4770,13 @@ function renderLimitsTable() {
       <td>${escapeHtml(row.target)}</td>
       <td><input type="number" min="0" data-limit-idx="${i}" data-limit-field="daily_tokens" value="${row.daily_tokens ?? ''}" placeholder="—" style="width:120px;"></td>
       <td><input type="number" min="0" data-limit-idx="${i}" data-limit-field="daily_requests" value="${row.daily_requests ?? ''}" placeholder="—" style="width:120px;"></td>
-      <td><button class="ghost" type="button" data-limit-remove="${i}">Remove</button></td>
-    </tr>`).join('');
+      <td><button class="ghost" type="button" data-pool-add="${i}">Add pool</button> <button class="ghost" type="button" data-limit-remove="${i}">Remove</button></td>
+    </tr>${(row.pools || []).map((pool, p) => `<tr>
+      <td>↳ <input type="text" data-pool-idx="${i}" data-pool-row="${p}" data-pool-field="pool" value="${escapeAttr(pool.pool || '')}" placeholder="pool prefix"></td>
+      <td><input type="number" min="0" data-pool-idx="${i}" data-pool-row="${p}" data-pool-field="daily_tokens" value="${pool.daily_tokens ?? ''}" placeholder="—" style="width:120px;"></td>
+      <td><input type="number" min="0" data-pool-idx="${i}" data-pool-row="${p}" data-pool-field="daily_requests" value="${pool.daily_requests ?? ''}" placeholder="—" style="width:120px;"></td>
+      <td><button class="ghost" type="button" data-pool-remove="${i}:${p}">Remove pool</button></td>
+    </tr>`).join('')}`).join('');
   tbody.querySelectorAll('input[data-limit-idx]').forEach(inp => {
     inp.onchange = () => {
       const idx = Number(inp.dataset.limitIdx);
@@ -4669,6 +4791,20 @@ function renderLimitsTable() {
       renderLimitsTable();
     };
   });
+  tbody.querySelectorAll('[data-pool-add]').forEach(btn => { btn.onclick = () => {
+    const row = LIMITS_STATE[Number(btn.dataset.poolAdd)];
+    row.pools = row.pools || [];
+    row.pools.push({ pool: '', daily_tokens: null, daily_requests: null });
+    renderLimitsTable();
+  }; });
+  tbody.querySelectorAll('[data-pool-field]').forEach(inp => { inp.onchange = () => {
+    const pool = LIMITS_STATE[Number(inp.dataset.poolIdx)].pools[Number(inp.dataset.poolRow)];
+    pool[inp.dataset.poolField] = inp.dataset.poolField === 'pool' ? inp.value.trim() : (inp.value.trim() === '' ? null : Number(inp.value));
+  }; });
+  tbody.querySelectorAll('[data-pool-remove]').forEach(btn => { btn.onclick = () => {
+    const [target, pool] = btn.dataset.poolRemove.split(':').map(Number);
+    LIMITS_STATE[target].pools.splice(pool, 1); renderLimitsTable();
+  }; });
 }
 
 async function loadLimitsConfig() {
@@ -4680,6 +4816,7 @@ async function loadLimitsConfig() {
       target: t.target,
       daily_tokens: t.daily_tokens ?? null,
       daily_requests: t.daily_requests ?? null,
+      pools: Array.isArray(t.pools) ? t.pools : [],
     })) : [];
     const hint = document.getElementById('limits-config-hint');
     if (hint && d.path) hint.textContent = `${d.path} [limits]`;
@@ -4697,6 +4834,7 @@ function addLimitTarget() {
     target,
     daily_tokens: tokVal === '' ? null : Number(tokVal),
     daily_requests: reqVal === '' ? null : Number(reqVal),
+    pools: [],
   });
   document.getElementById('limits-add-target').value = '';
   document.getElementById('limits-add-tokens').value = '';
@@ -4709,11 +4847,14 @@ async function saveLimitsConfig() {
   if (result) result.textContent = 'Saving…';
   // Drop rows that pin neither axis so an empty target isn't persisted.
   const targets = LIMITS_STATE
-    .filter(r => r.target && (r.daily_tokens != null || r.daily_requests != null))
+    .filter(r => r.target && (r.daily_tokens != null || r.daily_requests != null || (r.pools || []).some(p => p.pool && (p.daily_tokens != null || p.daily_requests != null))))
     .map(r => ({
       target: r.target,
       daily_tokens: r.daily_tokens == null ? null : Number(r.daily_tokens),
       daily_requests: r.daily_requests == null ? null : Number(r.daily_requests),
+      pools: (r.pools || []).filter(p => p.pool && (p.daily_tokens != null || p.daily_requests != null)).map(p => ({
+        pool: p.pool, daily_tokens: p.daily_tokens == null ? null : Number(p.daily_tokens), daily_requests: p.daily_requests == null ? null : Number(p.daily_requests),
+      })),
     }));
   try {
     const r = await fetch('/api/limits/config', {
@@ -4727,6 +4868,7 @@ async function saveLimitsConfig() {
       target: t.target,
       daily_tokens: t.daily_tokens ?? null,
       daily_requests: t.daily_requests ?? null,
+      pools: Array.isArray(t.pools) ? t.pools : [],
     })) : [];
     renderLimitsTable();
     if (result) result.innerHTML = '<span class="badge ok">✓ Saved</span>';
@@ -5074,4 +5216,3 @@ document.getElementById('chat-clear').onclick = () => {
   const status = document.getElementById('chat-status');
   if (status) status.textContent = '';
 };
-

@@ -1,3 +1,180 @@
+(function installDashboardAuthFetch() {
+  const TOKEN_KEY = 'rtrt.dashboard.token';
+  const nativeFetch = window.fetch.bind(window);
+  const GLOBAL_GET_ROUTES = new Set([
+    '/api/projects', '/api/projects/overview', '/api/templates', '/api/prompts',
+    '/api/metrics', '/api/budget', '/api/models', '/api/ollama/models',
+    '/api/ollama/ps', '/api/security/profiles',
+  ]);
+  const scopedRequests = new Set();
+  let projectGeneration = 0;
+  let promptInFlight = null;
+  let prompted = false;
+  const bootstrapPrefix = '#bootstrap=';
+  const hadBootstrapFragment = window.location.hash.startsWith(bootstrapPrefix);
+
+  const bootstrapPromise = (async function exchangeBootstrapFragment() {
+    if (!hadBootstrapFragment) return true;
+    const credential = window.location.hash.slice(bootstrapPrefix.length);
+    // Clear credential before validation, network activity, or any other app code.
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (!/^[A-Za-z0-9_-]{87}$/.test(credential)) return false;
+    try {
+      const response = await nativeFetch('/api/auth/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential }),
+        cache: 'no-store',
+        credentials: 'omit',
+      });
+      if (!response.ok) return false;
+      const payload = await response.json();
+      if (!payload || typeof payload.token !== 'string' || !payload.token) return false;
+      sessionStorage.setItem(TOKEN_KEY, payload.token);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  })();
+  // App initialization may do non-fetch work as well. Give app.js one explicit
+  // gate so bootstrap always completes before the application starts.
+  window.dashboardAuthReady = bootstrapPromise;
+
+  function isDashboardApi(input) {
+    const raw = input instanceof Request ? input.url : String(input);
+    const url = new URL(raw, window.location.href);
+    return url.origin === window.location.origin && (url.pathname === '/api' || url.pathname.startsWith('/api/'));
+  }
+
+  function isGlobalApi(method, pathname) {
+    if (method !== 'GET') return pathname === '/api/auth/bootstrap';
+    return GLOBAL_GET_ROUTES.has(pathname)
+      || pathname.startsWith('/api/templates/')
+      || pathname.startsWith('/api/prompts/')
+      || pathname.startsWith('/api/security/profile/');
+  }
+
+  function scopedRequest(input, init) {
+    const request = input instanceof Request ? input : null;
+    const method = String((init && init.method) || (request && request.method) || 'GET').toUpperCase();
+    const url = new URL(request ? request.url : String(input), window.location.href);
+    if (isGlobalApi(method, url.pathname)) return { input, init, scoped: false };
+    const project = typeof window.dashboardSelectedProject === 'function'
+      ? window.dashboardSelectedProject()
+      : '';
+    if (!project) return { error: new Response('project selection required', { status: 428 }) };
+    const asserted = url.searchParams.getAll('project');
+    if (asserted.length > 1 || (asserted.length === 1 && asserted[0] !== project)) {
+      return { error: new Response('project selector is not canonical', { status: 400 }) };
+    }
+    const options = { ...(init || {}) };
+    const headers = new Headers(request ? request.headers : options.headers);
+    headers.set('X-RTRT-Project', project);
+    options.headers = headers;
+    if (typeof options.body === 'string' && /application\/json/i.test(headers.get('Content-Type') || '')) {
+      try {
+        const body = JSON.parse(options.body);
+        if (body && Object.prototype.hasOwnProperty.call(body, 'project') && body.project !== project) {
+          return { error: new Response('body project assertion is not canonical', { status: 400 }) };
+        }
+      } catch (_) { /* backend owns malformed JSON diagnostics */ }
+    }
+    const controller = new AbortController();
+    const sourceSignal = options.signal || (request && request.signal);
+    if (sourceSignal) {
+      if (sourceSignal.aborted) controller.abort(sourceSignal.reason);
+      else sourceSignal.addEventListener('abort', () => controller.abort(sourceSignal.reason), { once: true });
+    }
+    options.signal = controller.signal;
+    return { input, init: options, scoped: true, controller, generation: projectGeneration };
+  }
+
+  function invalidateScopedRequests() {
+    projectGeneration += 1;
+    scopedRequests.forEach(controller => controller.abort('project changed'));
+    scopedRequests.clear();
+  }
+  window.dashboardInvalidateProjectRequests = invalidateScopedRequests;
+
+  function requestWithToken(input, init, token) {
+    const options = { ...(init || {}) };
+    const headers = new Headers(options.headers || (input instanceof Request ? input.headers : undefined));
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    options.headers = headers;
+    return nativeFetch(input instanceof Request ? input.clone() : input, options);
+  }
+
+  async function requestTokenOnce() {
+    if (promptInFlight) return promptInFlight;
+    if (prompted) return null;
+    prompted = true;
+    promptInFlight = Promise.resolve(window.prompt('Dashboard API token:'))
+      .then(value => {
+        const token = (value || '').trim();
+        if (token) sessionStorage.setItem(TOKEN_KEY, token);
+        return token || null;
+      })
+      .finally(() => { promptInFlight = null; });
+    return promptInFlight;
+  }
+
+  window.fetch = async function dashboardFetch(input, init) {
+    if (!isDashboardApi(input)) return nativeFetch(input, init);
+    await bootstrapPromise;
+    const scoped = scopedRequest(input, init);
+    if (scoped.error) return scoped.error;
+    if (scoped.controller) scopedRequests.add(scoped.controller);
+    let response;
+    try {
+      response = await requestWithToken(scoped.input, scoped.init, sessionStorage.getItem(TOKEN_KEY));
+    } finally {
+      if (scoped.controller) scopedRequests.delete(scoped.controller);
+    }
+    if (scoped.scoped && scoped.generation !== projectGeneration) throw new DOMException('Stale project response', 'AbortError');
+    if (scoped.scoped && (response.status === 400 || response.status === 404)) {
+      const detail = await response.clone().text().catch(() => '');
+      if (/project selector|project selectors|unknown project/i.test(detail)) {
+        if (typeof window.dashboardClearProjectSelection === 'function') window.dashboardClearProjectSelection('Project is unavailable or no longer recognized.');
+        return response;
+      }
+    }
+    if (response.status !== 401) return response;
+    // A fragment is a one-shot login attempt. Never turn its rejection into an
+    // unrelated manual credential prompt; direct visits retain that fallback.
+    if (hadBootstrapFragment) {
+      const action = document.getElementById('dashboard-token-action');
+      if (action) action.textContent = 'Bootstrap rejected';
+      return response;
+    }
+    const token = await requestTokenOnce();
+    if (!token) {
+      const action = document.getElementById('dashboard-token-action');
+      if (action) action.textContent = 'Set API token';
+      return response;
+    }
+    if (scoped.scoped && scoped.generation !== projectGeneration) throw new DOMException('Stale project response', 'AbortError');
+    response = await requestWithToken(scoped.input, scoped.init, token); // exactly one retry
+    if (scoped.scoped && scoped.generation !== projectGeneration) throw new DOMException('Stale project response', 'AbortError');
+    if (response.status === 401) {
+      sessionStorage.removeItem(TOKEN_KEY);
+      const action = document.getElementById('dashboard-token-action');
+      if (action) action.textContent = 'Token rejected — clear';
+    }
+    return response;
+  };
+
+  window.addEventListener('DOMContentLoaded', () => {
+    const action = document.getElementById('dashboard-token-action');
+    if (!action) return;
+    action.onclick = () => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      prompted = false;
+      action.textContent = 'API token cleared';
+    };
+  });
+  window.dashboardApiTestHooks = Object.freeze({ isGlobalApi });
+})();
+
 (function initTheme() {
   const saved = localStorage.getItem('rtrt-theme');
   const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -44,8 +221,10 @@ function currentProject() {
   return document.getElementById('project-selector').value;
 }
 
+window.dashboardSelectedProject = currentProject;
+
 function isGlobalScope() {
-  return document.getElementById('project-selector').value === GLOBAL_PROJECT_VALUE;
+  return !currentProject();
 }
 
 function isGlobalProjectValue(value) {
@@ -57,8 +236,8 @@ function escapeAttr(s) {
 }
 
 function selectedProject() {
-  const name = currentProject();
-  return PROJECTS_CACHE.find(p => p.name === name) || null;
+  const slug = currentProject();
+  return PROJECTS_CACHE.find(p => p.slug === slug) || null;
 }
 
 function projectPath() {
@@ -155,52 +334,105 @@ async function populateSecurityProfileSelect(selectId, selected) {
 
 async function loadProjects() {
   const select = document.getElementById('project-selector');
-  const saved = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project') || '';
-  const previous = currentProject() || saved || GLOBAL_PROJECT_VALUE;
-  const globalOption = `<option value="${GLOBAL_PROJECT_VALUE}">🌐 Global · default</option>`;
+  const linked = new URL(window.location.href).searchParams.get('project') || '';
+  const saved = sessionStorage.getItem('rtrt.project') || '';
+  const previous = linked || currentProject() || saved;
   try {
     const r = await fetch('/api/projects');
     if (!r.ok) {
       showToast(await securityErrorMessage(r, 'Failed to load projects'), 'err');
-      select.innerHTML = globalOption + '<option value="">Failed to load projects</option>';
-      select.value = GLOBAL_PROJECT_VALUE;
+      select.innerHTML = '<option value="">Global overview · projects unavailable</option>';
+      select.value = '';
       PROJECTS_CACHE = [];
       HIDDEN_CAPTURE_BUCKETS_COUNT = 0;
       HIDDEN_CAPTURE_BUCKET_ROWS = 0;
       refreshOrphanBuckets();
       syncProjectInputs('');
       refreshProjectScopePage();
-      navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
+      updateProjectSelectorStatus();
       return;
     }
-    const data = await r.json();
-    PROJECTS_CACHE = Array.isArray(data.projects) ? data.projects : [];
-    HIDDEN_CAPTURE_BUCKETS_COUNT = data.hidden_capture_buckets || 0;
-    HIDDEN_CAPTURE_BUCKET_ROWS = data.hidden_capture_bucket_rows || 0;
-    const projectOptions = PROJECTS_CACHE.length ? PROJECTS_CACHE.map(p =>
-      `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}${p.mem_count ? ` · ${p.mem_count}` : ''}</option>`
-    ).join('') : '<option value="">No projects</option>';
-    select.innerHTML = globalOption + projectOptions;
-    select.value = previous === GLOBAL_PROJECT_VALUE || PROJECTS_CACHE.some(p => p.name === previous) ? previous : GLOBAL_PROJECT_VALUE;
-    syncProjectInputs(isGlobalScope() ? '' : select.value);
-    localStorage.setItem('rtrt.project', select.value);
-    localStorage.setItem('rtrt-project', select.value);
+    const data = normalizeProjectsResponse(await r.json());
+    PROJECTS_CACHE = data.projects;
+    HIDDEN_CAPTURE_BUCKETS_COUNT = data.hidden_capture_buckets;
+    HIDDEN_CAPTURE_BUCKET_ROWS = data.hidden_capture_bucket_rows;
+    const projectOptions = PROJECTS_CACHE.map(p => {
+      const label = p.label || p.name || p.slug;
+      const path = p.path || p.memory_root || 'path unavailable';
+      const count = Number.isSafeInteger(p.mem_count) ? `${p.mem_count} memories` : 'count unavailable';
+      const diagnostic = p.available === false ? ` · unavailable${p.diagnostic ? ` (${p.diagnostic})` : ''}` : '';
+      return `<option value="${escapeAttr(p.slug)}"${p.available === false ? ' disabled' : ''}>${escapeHtml(label)} · ${escapeHtml(path)} · ${escapeHtml(p.slug)} · ${count}${escapeHtml(diagnostic)}</option>`;
+    }).join('');
+    select.innerHTML = `<option value="">Global overview · no project selected</option>${projectOptions}`;
+    const desired = PROJECTS_CACHE.find(p => p.slug === previous && p.available !== false);
+    select.value = desired ? desired.slug : '';
+    syncProjectInputs(select.value);
+    if (select.value) sessionStorage.setItem('rtrt.project', select.value);
+    else sessionStorage.removeItem('rtrt.project');
     refreshProjectScopePage();
     refreshOrphanBuckets();
-    if (isGlobalScope()) navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
+    updateProjectSelectorStatus();
+    if (data.warning) showToast(data.warning, 'err');
   } catch (e) {
     showToast(`Project load error: ${e.message || e}`, 'err');
-    select.innerHTML = globalOption + '<option value="">Failed to load projects</option>';
-    select.value = GLOBAL_PROJECT_VALUE;
+    select.innerHTML = '<option value="">Global overview · projects unavailable</option>';
+    select.value = '';
     PROJECTS_CACHE = [];
     HIDDEN_CAPTURE_BUCKETS_COUNT = 0;
     HIDDEN_CAPTURE_BUCKET_ROWS = 0;
     refreshOrphanBuckets();
     syncProjectInputs('');
     refreshProjectScopePage();
-    navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
+    updateProjectSelectorStatus();
   }
 }
+
+// `/api/projects` historically returned a bare ProjectView array. Normalize
+// that legacy shape and the current envelope, but do not accept the distinct
+// `/api/memory/projects` `{project,count,latest_ts}` wire format as equivalent.
+function normalizeProjectsResponse(data) {
+  const rawProjects = Array.isArray(data)
+    ? data
+    : (data && Array.isArray(data.projects) ? data.projects : []);
+  const projects = rawProjects.filter(project =>
+    project && typeof project.slug === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(project.slug)
+  );
+  const boundedCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return {
+    projects,
+    hidden_capture_buckets: Array.isArray(data) ? 0 : boundedCount(data && data.hidden_capture_buckets),
+    hidden_capture_bucket_rows: Array.isArray(data) ? 0 : boundedCount(data && data.hidden_capture_bucket_rows),
+    warning: Array.isArray(data) || typeof (data && data.warning) !== 'string'
+      ? ''
+      : data.warning.slice(0, 320),
+  };
+}
+window.dashboardProjectTestHooks = Object.freeze({ normalizeProjectsResponse });
+
+function updateProjectSelectorStatus() {
+  const status = document.getElementById('project-selector-status');
+  if (!status) return;
+  const available = PROJECTS_CACHE.filter(project => project.available !== false).length;
+  const unavailable = PROJECTS_CACHE.length - available;
+  const selected = selectedProject();
+  status.textContent = selected
+    ? `${selected.label || selected.name || selected.slug} · ${selected.mem_count ?? 'unknown'} memories · available`
+    : `${available} available · ${unavailable} unavailable · global overview`;
+}
+
+function clearProjectSelection(message) {
+  if (typeof window.dashboardInvalidateProjectRequests === 'function') window.dashboardInvalidateProjectRequests();
+  const select = document.getElementById('project-selector');
+  if (select) select.value = '';
+  sessionStorage.removeItem('rtrt.project');
+  syncProjectInputs('');
+  if (typeof resetProjectUiState === 'function') resetProjectUiState();
+  if (typeof window.dashboardResetProjectStream === 'function') window.dashboardResetProjectStream();
+  updateProjectSelectorStatus();
+  if (typeof syncUrlProject === 'function') syncUrlProject();
+  if (message) showToast(message, 'err');
+}
+window.dashboardClearProjectSelection = clearProjectSelection;
 
 /// Populate the "orphaned capture buckets" note + reassign picker inside the
 /// project modal from the counts `loadProjects()` just read off `GET
@@ -232,9 +464,9 @@ async function refreshOrphanBuckets() {
   bucketSelect.innerHTML = HIDDEN_BUCKETS_CACHE.length
     ? HIDDEN_BUCKETS_CACHE.map(b => `<option value="${escapeAttr(b.name)}">${escapeHtml(b.name)} · ${b.mem_count}</option>`).join('')
     : '<option value="">No hidden buckets</option>';
-  const targets = PROJECTS_CACHE.filter(p => !isGlobalProjectValue(p.name));
+  const targets = PROJECTS_CACHE.filter(p => p.available !== false);
   targetSelect.innerHTML = targets.length
-    ? targets.map(p => `<option value="${escapeAttr(p.name)}">${escapeHtml(p.name)}</option>`).join('')
+    ? targets.map(p => `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.label || p.name || p.slug)} · ${escapeHtml(p.slug)}</option>`).join('')
     : '<option value="">No projects to fold into</option>';
 }
 
@@ -263,6 +495,9 @@ function closeProjectModal() {
 }
 
 async function openProjectModal(forceNew) {
+  showToast('Project registry changes are unavailable in dashboard mode.', 'err');
+  return;
+  /* istanbul ignore next -- retained markup for compatibility with older servers */
   const project = forceNew ? null : selectedProject();
   document.getElementById('project-name-input').value = project ? project.name : '';
   document.getElementById('project-path-input').value = project && project.path ? project.path : '';
@@ -282,19 +517,19 @@ document.getElementById('project-modal-close').onclick = closeProjectModal;
 document.getElementById('project-modal').onclick = (ev) => { if (ev.target.id === 'project-modal') closeProjectModal(); };
 document.getElementById('project-selector').onchange = () => {
   const name = currentProject();
-  localStorage.setItem('rtrt.project', name);
-  localStorage.setItem('rtrt-project', name);
+  if (typeof window.dashboardInvalidateProjectRequests === 'function') window.dashboardInvalidateProjectRequests();
+  if (name) sessionStorage.setItem('rtrt.project', name);
+  else sessionStorage.removeItem('rtrt.project');
+  if (typeof resetProjectUiState === 'function') resetProjectUiState();
+  if (typeof window.dashboardResetProjectStream === 'function') window.dashboardResetProjectStream();
   syncProjectInputs(isGlobalScope() ? '' : name);
   updateGlobalScopeIndicators();
+  updateProjectSelectorStatus();
   // Keep the shareable ?project= in the address bar current (replaceState — a
   // project switch is not a new history entry). Defined in app.js.
   if (typeof syncUrlProject === 'function') syncUrlProject();
-  if (isGlobalScope()) {
-    navigate(typeof globalScopeLandingPage === 'function' ? globalScopeLandingPage() : 'settings');
-    return;
-  }
   refreshProjectScopePage();
-  if (activePage() === 'overview') loadOverview();
+  if (isGlobalScope() || activePage() === 'overview') navigate('overview');
 };
 document.getElementById('project-form').onsubmit = async (ev) => {
   ev.preventDefault();
@@ -318,7 +553,7 @@ document.getElementById('project-form').onsubmit = async (ev) => {
     }
     await r.json().catch(() => ({}));
     closeProjectModal();
-    localStorage.setItem('rtrt.project', name);
+    sessionStorage.setItem('rtrt.project', name);
     document.getElementById('project-selector').value = name;
     await loadProjects();
     document.getElementById('project-selector').value = name;

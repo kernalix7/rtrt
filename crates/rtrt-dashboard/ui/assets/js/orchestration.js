@@ -13,6 +13,10 @@
 // The one fixed vocabulary on this page: `TeamMode` is an enum in the config
 // schema, not a user-extensible list, so its three values are the schema's.
 const ORCH_MODES = ['cli', 'api', 'auto'];
+const ORCH_DELEGATIONS = [
+  { value: 'native', label: 'Native Task' },
+  { value: 'cli', label: 'CLI (claude -p)' },
+];
 
 // Working copy of the config. Edits mutate this; only Save sends it.
 let ORCH_TEAM = null;      // team config as returned by GET /api/team/config
@@ -96,6 +100,63 @@ function orchOptions(values, selected, placeholder) {
   return head + values.map(v =>
     `<option value="${escapeAttr(v)}"${v === selected ? ' selected' : ''}>${escapeHtml(v)}</option>`
   ).join('');
+}
+
+function orchDelegationOptions(selected) {
+  return ORCH_DELEGATIONS.map(({ value, label }) =>
+    `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`
+  ).join('');
+}
+
+const ORCH_PERMISSION_ACTIONS = ['allow', 'ask', 'deny'];
+
+function orchPermissions(value) {
+  if (!value || typeof value !== 'object') return null;
+  const edit = ['allow', 'ask', 'deny'].includes(value.edit) ? value.edit : null;
+  const bash = {};
+  Object.entries(value.bash || {}).forEach(([pattern, action]) => {
+    if (pattern.trim() && ORCH_PERMISSION_ACTIONS.includes(action)) bash[pattern] = action;
+  });
+  return { edit, bash };
+}
+
+function orchPermissionActionOptions(selected) {
+  return orchOptions(ORCH_PERMISSION_ACTIONS, selected, null);
+}
+
+function orchRenderPermissions(lane, index) {
+  const permissions = orchPermissions(lane.permissions);
+  const bash = permissions ? permissions.bash : {};
+  return `<div class="settings-section orch-permissions-section">
+    <h3>Native worker permissions</h3>
+    <div class="orch-note">Used by Native Task workers. CLI delegation keeps these values but does not apply them here.</div>
+    <label class="field-label"><span>edit</span>
+      <select data-permission-edit ${lane.delegation === 'cli' ? 'disabled' : ''}>
+        <option value=""${!permissions || permissions.edit == null ? ' selected' : ''}>inherit</option>
+        ${ORCH_PERMISSION_ACTIONS.map(action => `<option value="${action}"${permissions && permissions.edit === action ? ' selected' : ''}>${action}</option>`).join('')}
+      </select>
+    </label>
+    <div class="orch-permission-rules" data-permission-rules>
+      ${Object.entries(bash).map(([pattern, action], row) => `<div class="orch-permission-row">
+        <input type="text" data-permission-pattern="${row}" value="${escapeAttr(pattern)}" placeholder="bash pattern" autocomplete="off" ${lane.delegation === 'cli' ? 'disabled' : ''}>
+        <select data-permission-action="${row}" ${lane.delegation === 'cli' ? 'disabled' : ''}>${orchPermissionActionOptions(action)}</select>
+        <button type="button" class="ghost orch-mini orch-danger" data-permission-remove="${row}" ${lane.delegation === 'cli' ? 'disabled' : ''}>×</button>
+      </div>`).join('')}
+    </div>
+    <button type="button" class="ghost orch-mini" data-permission-add ${lane.delegation === 'cli' ? 'disabled' : ''}>＋ Add bash rule</button>
+  </div>`;
+}
+
+function orchCommitPermissions(card, lane) {
+  const edit = card.querySelector('[data-permission-edit]');
+  const bash = {};
+  card.querySelectorAll('.orch-permission-row').forEach(row => {
+    const pattern = row.querySelector('[data-permission-pattern]').value.trim();
+    const action = row.querySelector('[data-permission-action]').value;
+    if (pattern && ORCH_PERMISSION_ACTIONS.includes(action)) bash[pattern] = action;
+  });
+  const hasEdit = edit && edit.value;
+  lane.permissions = hasEdit || Object.keys(bash).length ? { edit: hasEdit || null, bash } : null;
 }
 
 // Reset the validation banner. Called before every save attempt so a stale
@@ -200,6 +261,7 @@ function renderOrchManager() {
   const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value == null ? '' : value; };
   const check = (id, value) => { const el = document.getElementById(id); if (el) el.checked = !!value; };
   check('orch-enabled', ORCH_TEAM.enabled);
+  set('orch-roster', ORCH_TEAM.roster || 'classic');
   set('orch-manager-provider', ORCH_TEAM.manager_provider);
   set('orch-manager-model', ORCH_TEAM.manager_model);
   set('orch-manager-base-url', ORCH_TEAM.manager_base_url);
@@ -288,6 +350,12 @@ function renderOrchLanes() {
         <label class="field-label"><span>invocation mode</span>
           <select data-lane-field="mode">${orchOptions(ORCH_MODES, lane.mode, null)}</select>
         </label>
+        <label class="field-label"><span>delegation</span>
+          <select data-lane-field="delegation">${orchDelegationOptions(lane.delegation || 'native')}</select>
+        </label>
+        <label class="field-label"><span>host agent</span>
+          <input type="text" data-lane-field="host_agent" value="${escapeAttr(lane.host_agent || '')}" placeholder="optional" autocomplete="off">
+        </label>
         <label class="field-label"><span>logical model</span>
           <input type="text" data-lane-field="logical" value="${escapeAttr(lane.logical || '')}" placeholder="unset" autocomplete="off">
         </label>
@@ -307,6 +375,7 @@ function renderOrchLanes() {
       <div class="orch-row">
         <label class="segment-toggle"><input type="checkbox" data-lane-field="allow_impl" ${lane.allow_impl ? 'checked' : ''}><span>May implement (write code)</span></label>
       </div>
+      ${orchRenderPermissions(lane, i)}
       <div class="settings-section orch-flags-section">
         <h3>Invocation flags</h3>
         <div class="orch-note">Passed through verbatim by whoever invokes this lane. rtrt stores and renders them; it does not interpret them.</div>
@@ -342,7 +411,7 @@ function wireOrchLanes(host) {
       }
       const commit = () => {
         if (field === 'roles' || field === 'fallback') lane[field] = orchSplitList(input.value);
-        else if (field === 'mode') lane[field] = input.value;
+        else if (field === 'mode' || field === 'delegation') lane[field] = input.value;
         else if (field === 'name' || field === 'target') lane[field] = input.value.trim();
         else lane[field] = orchBlankToNull(input.value);
       };
@@ -350,9 +419,34 @@ function wireOrchLanes(host) {
       input.onchange = () => {
         commit();
         if (field === 'name') { renderOrchestration(); return; }
-        if (field === 'target' || field === 'mode' || field === 'sibling') renderOrchLanes();
+        if (field === 'target' || field === 'mode' || field === 'delegation' || field === 'sibling') renderOrchLanes();
       };
     });
+
+    const permissionEdit = card.querySelector('[data-permission-edit]');
+    if (permissionEdit) permissionEdit.onchange = () => { orchCommitPermissions(card, lane); };
+    card.querySelectorAll('[data-permission-pattern], [data-permission-action]').forEach(input => {
+      input.oninput = () => orchCommitPermissions(card, lane);
+      input.onchange = () => orchCommitPermissions(card, lane);
+    });
+    card.querySelectorAll('[data-permission-remove]').forEach(btn => {
+      btn.onclick = () => {
+        orchCommitPermissions(card, lane);
+        const keys = Object.keys(lane.permissions ? lane.permissions.bash : {});
+        if (lane.permissions) delete lane.permissions.bash[keys[Number(btn.dataset.permissionRemove)]];
+        if (lane.permissions && !lane.permissions.edit && !Object.keys(lane.permissions.bash).length) lane.permissions = null;
+        renderOrchLanes();
+      };
+    });
+    const addPermission = card.querySelector('[data-permission-add]');
+    if (addPermission) addPermission.onclick = () => {
+      orchCommitPermissions(card, lane);
+      lane.permissions = lane.permissions || { edit: null, bash: {} };
+      let n = Object.keys(lane.permissions.bash).length + 1;
+      while (lane.permissions.bash[`rule-${n}`] !== undefined) n += 1;
+      lane.permissions.bash[`rule-${n}`] = 'ask';
+      renderOrchLanes();
+    };
 
     card.querySelectorAll('[data-flag-key], [data-flag-value]').forEach(input => {
       input.onchange = () => {
@@ -417,12 +511,15 @@ function addOrchLane() {
     model: null,
     mode: ORCH_MODES[0],
     roles: [],
+    delegation: 'native',
+    host_agent: null,
     logical: null,
     sibling: null,
     tier: null,
     fallback: [],
     allow_impl: true,
     flags: {},
+    permissions: null,
   });
   renderOrchestration();
 }
@@ -550,6 +647,9 @@ function renderOrchPolicy() {
   check('orch-redo', policy.redo_on_fallback);
   check('orch-sibling', policy.prefer_sibling_on_quota);
   check('orch-provenance', policy.record_provenance);
+  check('orch-isolate-conflicting', policy.isolate_conflicting !== false);
+  set('orch-summary-lines', policy.worker_summary_max_lines ?? 3);
+  set('orch-balance', policy.balance || 'order');
 
   // The depth placeholder shows the value rtrt would derive, so "auto" is a
   // number the user can see rather than a mystery.
@@ -565,6 +665,12 @@ function renderOrchPolicy() {
     defaultSel.innerHTML = orchOptions(tierNames, policy.default_tier || '', auto);
     defaultSel.value = policy.default_tier || '';
   }
+  ['explore', 'review'].forEach(kind => {
+    const sel = document.getElementById(`orch-${kind}-tier`);
+    if (!sel) return;
+    sel.innerHTML = orchOptions(tierNames, policy[`${kind}_tier`] || '', 'unset');
+    sel.value = policy[`${kind}_tier`] || '';
+  });
 
   // Design-only tiers: `null` follows the shipped default, an explicit list
   // pins it. The checkbox distinguishes the two; while following the default
@@ -651,6 +757,7 @@ function orchTeamBody() {
   const policy = ORCH_TEAM.policy || {};
   return {
     enabled: checked('orch-enabled'),
+    roster: val('orch-roster') || ORCH_TEAM.roster || 'classic',
     manager_provider: val('orch-manager-provider'),
     manager_model: val('orch-manager-model'),
     manager_base_url: val('orch-manager-base-url'),
@@ -661,12 +768,15 @@ function orchTeamBody() {
       model: orchBlankToNull(lane.model),
       mode: ORCH_MODES.includes(lane.mode) ? lane.mode : ORCH_MODES[0],
       roles: lane.roles || [],
+      delegation: ORCH_DELEGATIONS.some(({ value }) => value === lane.delegation) ? lane.delegation : 'native',
+      host_agent: orchBlankToNull(lane.host_agent),
       logical: orchBlankToNull(lane.logical),
       sibling: orchBlankToNull(lane.sibling),
       tier: orchBlankToNull(lane.tier),
       fallback: lane.fallback || [],
       allow_impl: lane.allow_impl !== false,
       flags: lane.flags || {},
+      permissions: orchPermissions(lane.permissions),
     })),
     tiers: (ORCH_TEAM.tiers || []).map(rung => ({
       tier: rung.tier || '',
@@ -679,6 +789,11 @@ function orchTeamBody() {
       record_provenance: checked('orch-provenance'),
       max_fallback_depth: orchNumOrNull(val('orch-max-depth')),
       default_tier: orchBlankToNull(val('orch-default-tier')),
+      explore_tier: orchBlankToNull(val('orch-explore-tier')),
+      review_tier: orchBlankToNull(val('orch-review-tier')),
+      balance: val('orch-balance') || policy.balance || 'order',
+      worker_summary_max_lines: orchNumOrNull(val('orch-summary-lines')) ?? policy.worker_summary_max_lines ?? 3,
+      isolate_conflicting: checked('orch-isolate-conflicting'),
       // `null` = follow the shipped default; a list pins it explicitly.
       design_only_tiers: followDesignDefault ? null : (policy.design_only_tiers || []),
     },

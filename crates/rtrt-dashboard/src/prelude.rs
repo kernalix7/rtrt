@@ -27,6 +27,9 @@ pub(crate) use crate::handlers::config::{
     ModelsResponse, SetMemorySettingsRequest, get_config, get_memory_settings, get_models,
     post_config, post_memory_settings,
 };
+pub(crate) use crate::handlers::failover::{
+    SetFailoverRequest, get_failover_config, post_failover_config,
+};
 pub(crate) use crate::handlers::limits::{
     LimitTargetView, LimitsConfigResponse, SetLimitsRequest, get_limits_config, post_limits_config,
 };
@@ -95,10 +98,6 @@ pub(crate) use crate::handlers::statusline::{
     get_statusline_config, parse_config_toml, post_statusline_config,
     read_global_statusline_config, run_statusline_preview, statusline_config_path,
     statusline_preview, upgrade_legacy_statusline_config, validate_statusline_segments,
-};
-pub(crate) use crate::handlers::team::{
-    SetFailoverRequest, SetTeamRequest, TeamMemberView, TeamPolicyView, TierView,
-    get_failover_config, get_team_config, post_failover_config, post_team_config,
 };
 pub(crate) use crate::handlers::templates::{
     ScaffoldPreviewFile, ScaffoldPreviewResponse, ScaffoldRequest, ScaffoldResponse,

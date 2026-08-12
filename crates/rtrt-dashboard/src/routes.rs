@@ -102,11 +102,7 @@ fn router_with_origins(
             "/api/limits/config",
             get(get_limits_config).post(post_limits_config),
         )
-        // Orchestration: the editable `[team]` roster + `[failover]` markers.
-        .route(
-            "/api/team/config",
-            get(get_team_config).post(post_team_config),
-        )
+        // Provider failover markers.
         .route(
             "/api/failover/config",
             get(get_failover_config).post(post_failover_config),

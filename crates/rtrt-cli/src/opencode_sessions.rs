@@ -2802,13 +2802,13 @@ fn write_manifest(
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+fn sync_directory(#[cfg_attr(not(unix), allow(unused_variables))] path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
-fn set_private_file(path: &Path) -> Result<()> {
+fn set_private_file(#[cfg_attr(not(unix), allow(unused_variables))] path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

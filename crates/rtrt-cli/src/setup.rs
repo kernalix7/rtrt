@@ -1203,6 +1203,15 @@ fn disable_opencode_sandbox_at_registry_locked(
     Ok(())
 }
 
+// The strict sandbox can only ever have been installed on Linux, so removing it
+// anywhere else is nothing to do rather than a failure the uninstall reports.
+#[cfg(not(target_os = "linux"))]
+fn disable_opencode_sandbox_global(_apply: bool) -> Result<()> {
+    println!("OpenCode sandbox: not available on this platform");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn disable_opencode_sandbox_global(apply: bool) -> Result<()> {
     let registry_path = crate::sandbox::registry_path()?;
     if !registry_path.exists() {
@@ -1213,6 +1222,7 @@ fn disable_opencode_sandbox_global(apply: bool) -> Result<()> {
     disable_opencode_sandbox_global_at(apply, &registry_path, &executable)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn disable_opencode_sandbox_global_at(
     apply: bool,
     registry_path: &Path,
@@ -2955,7 +2965,9 @@ fn install_terse_rules(agent: AgentKind, apply: bool) -> Result<()> {
     Ok(())
 }
 
-fn set_private_file_mode(path: &Path) -> Result<()> {
+fn set_private_file_mode(
+    #[cfg_attr(not(unix), allow(unused_variables))] path: &Path,
+) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

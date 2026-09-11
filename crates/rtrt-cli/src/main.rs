@@ -7291,6 +7291,7 @@ fn default_claude_rate_limit_cache_paths(create_state: bool) -> Option<(PathBuf,
     match std::fs::symlink_metadata(&state) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_state => {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             {

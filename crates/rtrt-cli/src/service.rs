@@ -8,6 +8,11 @@
 //!
 //! Default behaviour is **dry-run**: print the unit + the commands that would
 //! run. Pass `--apply` to write the file and enable the service.
+//!
+//! Because every manager this module drives is Unix-only, its helpers lose
+//! their callers on Windows and go unreferenced there. That is the intended
+//! shape, so the module states it once rather than per item.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

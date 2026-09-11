@@ -2382,7 +2382,7 @@ fn resolve_opencode_config_root_from(
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| profile.filter(|path| !path.as_os_str().is_empty()))
     {
-        return Ok(root.join(".config/opencode"));
+        return Ok(root.join(".config").join("opencode"));
     }
     bail!("cannot resolve OpenCode config root: no nonempty config or home environment is set")
 }

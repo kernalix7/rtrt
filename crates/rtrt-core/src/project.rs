@@ -941,6 +941,21 @@ mod tests {
     /// A unique, self-cleaning temp directory rooted in the system temp dir.
     /// Avoids pulling in an external `tempfile` dependency while staying
     /// deterministic (unique per test via pid + monotonic counter).
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, which breaks comparisons against canonical paths.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+    /// production code rejects, so the plain temp path is the correct fixture there.
+    fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(path).expect("canonicalize temp path")
+        }
+        #[cfg(not(unix))]
+        {
+            path.to_path_buf()
+        }
+    }
+
     struct TmpDir(PathBuf);
 
     impl TmpDir {
@@ -958,7 +973,7 @@ mod tests {
             // macOS reaches the temp dir through `/var -> /private/var`, and the
             // functions under test return canonical paths, so the fixture has to
             // start canonical for the comparison to mean anything.
-            let base = std::fs::canonicalize(&base).expect("canonicalize temp dir");
+            let base = canonical_for_tests(&base);
             Self(base)
         }
 

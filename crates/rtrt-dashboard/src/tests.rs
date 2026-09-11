@@ -102,6 +102,21 @@ impl Drop for EnvGuard {
 /// Build a minimal `AppState` backed by a fresh SQLite store at
 /// `<tmp_home>/memory.sqlite`. No embedder / no auto-capture / no daemons, so
 /// the router is exercised in isolation.
+/// Canonical only where it matters. macOS reaches the temp dir through
+/// `/var -> /private/var`, which breaks comparisons against canonical paths.
+/// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+/// production code rejects, so the plain temp path is the correct fixture there.
+fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(path).expect("canonicalize temp path")
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// A temp dir whose path is canonical.
 ///
 /// macOS reaches the system temp dir through `/var -> /private/var`, and project
@@ -115,7 +130,7 @@ struct CanonicalTempDir {
 impl CanonicalTempDir {
     fn new() -> Self {
         let guard = tempfile::tempdir().unwrap();
-        let path = std::fs::canonicalize(guard.path()).unwrap();
+        let path = canonical_for_tests(guard.path());
         Self {
             _guard: guard,
             path,

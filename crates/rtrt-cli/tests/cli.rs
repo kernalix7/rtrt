@@ -9,6 +9,21 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 /// A `rtrt` command with HOME isolated to `home`.
+/// Canonical only where it matters. macOS reaches the temp dir through
+/// `/var -> /private/var`, which breaks comparisons against canonical paths.
+/// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+/// production code rejects, so the plain temp path is the correct fixture there.
+fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(path).expect("canonicalize temp path")
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// A temp HOME whose path is canonical.
 ///
 /// macOS reaches the system temp dir through `/var -> /private/var`, and the
@@ -22,7 +37,7 @@ struct CanonicalHome {
 impl CanonicalHome {
     fn new() -> Self {
         let guard = tempfile::tempdir().unwrap();
-        let path = std::fs::canonicalize(guard.path()).unwrap();
+        let path = canonical_for_tests(guard.path());
         Self {
             _guard: guard,
             path,
@@ -1791,7 +1806,9 @@ fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
 
-    let first = cached_statusline_command(home.path(), &runtime)
+    // Establishing the cache is setup, not the thing being timed; only the second
+    // call below runs under the budget this test asserts against.
+    let first = cached_statusline_command_with_budget(home.path(), &runtime, "5000")
         .output()
         .unwrap();
     assert!(
@@ -1820,8 +1837,14 @@ fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
         "wall={wall:?}"
     );
     let value = parse_statusline_json(&second.stdout);
-    assert_eq!(value["data"]["savings"]["cached"], true);
-    assert_eq!(value["data"]["git"]["cached"], true);
+    assert_eq!(
+        value["data"]["savings"]["cached"], true,
+        "second run did not reuse the savings cache: {value}"
+    );
+    assert_eq!(
+        value["data"]["git"]["cached"], true,
+        "second run did not reuse the Git cache: {value}"
+    );
     assert!(value["took_ms"].as_u64().unwrap() < 500);
 }
 

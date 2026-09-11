@@ -2825,12 +2825,27 @@ fn quote(identifier: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, which breaks comparisons against canonical paths.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+    /// production code rejects, so the plain temp path is the correct fixture there.
+    fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(path).expect("canonicalize temp path")
+        }
+        #[cfg(not(unix))]
+        {
+            path.to_path_buf()
+        }
+    }
+
     /// macOS resolves the system temp dir through `/var -> /private/var`, and the
     /// migration deliberately refuses to open a database reached through a
     /// symlink. Tests therefore need a canonical root, not the raw handle path.
     fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
         let handle = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(handle.path()).unwrap();
+        let root = canonical_for_tests(handle.path());
         (handle, root)
     }
 

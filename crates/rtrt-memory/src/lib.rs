@@ -6968,6 +6968,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, which breaks comparisons against canonical paths.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+    /// production code rejects, so the plain temp path is the correct fixture there.
+    fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(path).expect("canonicalize temp path")
+        }
+        #[cfg(not(unix))]
+        {
+            path.to_path_buf()
+        }
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -6982,7 +6997,7 @@ mod tests {
             // macOS reaches the temp dir through `/var -> /private/var`, and the
             // store derives identity from canonical paths, so the fixture has to
             // start canonical for those comparisons to line up.
-            let path = fs::canonicalize(&path).unwrap();
+            let path = canonical_for_tests(&path);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

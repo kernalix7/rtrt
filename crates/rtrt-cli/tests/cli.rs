@@ -1800,6 +1800,25 @@ fn cached_statusline_command_with_budget(
     command
 }
 
+/// A private directory holding a Git stand-in the statusline probe will trust.
+///
+/// The probe rejects any Git whose path is not private, which the Git shipped on
+/// some runners is not, so priming through the real one is not reproducible. The
+/// stand-in emits the single porcelain line the probe reads.
+#[cfg(unix)]
+fn trusted_git_bin(home: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = home.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let git = bin.join("git");
+    std::fs::write(&git, "#!/bin/sh\nprintf '# branch.head main\\n'\n").unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
 #[test]
 fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
     let home = CanonicalHome::new();
@@ -1809,6 +1828,7 @@ fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
     // Establishing the cache is setup, not the thing being timed; only the second
     // call below runs under the budget this test asserts against.
     let first = cached_statusline_command_with_budget(home.path(), &runtime, "5000")
+        .env("PATH", trusted_git_bin(home.path()))
         .output()
         .unwrap();
     assert!(
@@ -1857,15 +1877,7 @@ fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
 
-    // The probe only trusts a Git binary whose whole path is private, which the
-    // Git shipped on some runners is not. Priming through a fixture we own makes
-    // the cache this test then ages deterministic on every platform.
-    let bin = home.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let prime_git = bin.join("git");
-    std::fs::write(&prime_git, "#!/bin/sh\nprintf '# branch.head main\\n'\n").unwrap();
-    std::fs::set_permissions(&prime_git, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bin = trusted_git_bin(home.path());
 
     let prime = cached_statusline_command_with_budget(home.path(), &runtime, "5000")
         .env("PATH", &bin)

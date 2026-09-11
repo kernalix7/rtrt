@@ -322,6 +322,7 @@ mod tests {
     /// `/var -> /private/var`, which breaks comparisons against canonical paths.
     /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
     /// production code rejects, so the plain temp path is the correct fixture there.
+    #[cfg(unix)]
     fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
         #[cfg(unix)]
         {

@@ -44,4 +44,4 @@ async-trait.workspace = true
 # the router can be exercised directly without binding a TCP listener.
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
-tempfile = "3"
+tempfile.workspace = true

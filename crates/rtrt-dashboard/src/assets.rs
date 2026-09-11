@@ -131,9 +131,9 @@ pub(crate) async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str)
     asset_response(ASSET_JS_PAGES, "text/javascript; charset=utf-8")
 }
 
-pub(crate) async fn asset_js_orchestration()
+pub(crate) async fn asset_js_failover()
 -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
-    asset_response(ASSET_JS_ORCHESTRATION, "text/javascript; charset=utf-8")
+    asset_response(ASSET_JS_FAILOVER, "text/javascript; charset=utf-8")
 }
 
 pub(crate) async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
@@ -154,7 +154,7 @@ pub(crate) const ASSET_JS_COMPONENTS: &str = include_str!("../ui/assets/js/compo
 
 pub(crate) const ASSET_JS_PAGES: &str = include_str!("../ui/assets/js/pages.js");
 
-pub(crate) const ASSET_JS_ORCHESTRATION: &str = include_str!("../ui/assets/js/orchestration.js");
+pub(crate) const ASSET_JS_FAILOVER: &str = include_str!("../ui/assets/js/failover.js");
 
 pub(crate) const ASSET_JS_APP: &str = include_str!("../ui/assets/js/app.js");
 

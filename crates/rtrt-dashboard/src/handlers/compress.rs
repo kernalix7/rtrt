@@ -264,6 +264,50 @@ pub(crate) struct SetupRequest {
     binary: Option<String>,
 }
 
+fn render_setup_snippet(
+    agent: &str,
+    binary: &str,
+    memory: &str,
+) -> std::result::Result<(String, String), (StatusCode, String)> {
+    match agent {
+        "claude-code" => Ok((
+            "~/.claude/mcp.json".to_string(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "rtrt": {
+                        "command": binary,
+                        "args": ["--admin", "--memory", memory]
+                    }
+                }
+            }))
+            .unwrap_or_default(),
+        )),
+        "cursor" => Ok((
+            "~/.cursor/mcp.json".to_string(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "rtrt": {
+                        "command": binary,
+                        "args": ["--admin", "--memory", memory]
+                    }
+                }
+            }))
+            .unwrap_or_default(),
+        )),
+        "codex" => Ok((
+            "~/.codex/config.toml".to_string(),
+            format!(
+                "[mcp.rtrt]\ncommand = \"{}\"\nargs = [\"--admin\", \"--memory\", \"{}\"]\n",
+                binary, memory
+            ),
+        )),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent: {other} (try claude-code / cursor / codex)"),
+        )),
+    }
+}
+
 pub(crate) async fn setup_snippet(
     axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<SetupRequest>,
@@ -276,45 +320,7 @@ pub(crate) async fn setup_snippet(
         ));
     }
     let memory = state.memory_path.to_string_lossy().into_owned();
-    let (target_path, snippet) = match req.agent.as_str() {
-        "claude-code" => (
-            "~/.claude/mcp.json".to_string(),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mcpServers": {
-                    "rtrt": {
-                        "command": binary,
-                        "args": ["--memory", memory]
-                    }
-                }
-            }))
-            .unwrap(),
-        ),
-        "cursor" => (
-            "~/.cursor/mcp.json".to_string(),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "mcpServers": {
-                    "rtrt": {
-                        "command": binary,
-                        "args": ["--memory", memory]
-                    }
-                }
-            }))
-            .unwrap(),
-        ),
-        "codex" => (
-            "~/.codex/config.toml".to_string(),
-            format!(
-                "[mcp.rtrt]\ncommand = \"{}\"\nargs = [\"--memory\", \"{}\"]\n",
-                binary, memory
-            ),
-        ),
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown agent: {other} (try claude-code / cursor / codex)"),
-            ));
-        }
-    };
+    let (target_path, snippet) = render_setup_snippet(&req.agent, &binary, &memory)?;
     Ok(Json(serde_json::json!({
         "agent": req.agent,
         "target_path": target_path,
@@ -478,5 +484,46 @@ pub(crate) async fn compress(
                 "saved_pct": saved_pct,
             })))
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn json_setup_snippets_enable_admin_for_explicit_memory() {
+        // Given: the JSON-based dashboard setup targets and an explicit memory path.
+        for agent in ["claude-code", "cursor"] {
+            // When: the setup snippet is rendered and parsed.
+            let (_, snippet) =
+                render_setup_snippet(agent, "rtrt-mcp", "/stores/admin.sqlite").unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&snippet).unwrap();
+
+            // Then: its structured argv selects admin mode before the memory path.
+            assert_eq!(
+                parsed["mcpServers"]["rtrt"]["args"],
+                serde_json::json!(["--admin", "--memory", "/stores/admin.sqlite"])
+            );
+        }
+    }
+
+    #[test]
+    fn codex_setup_snippet_enables_admin_for_explicit_memory() {
+        // Given: the Codex dashboard setup target and an explicit memory path.
+        // When: the setup snippet is rendered and parsed.
+        let (_, snippet) =
+            render_setup_snippet("codex", "rtrt-mcp", "/stores/admin.sqlite").unwrap();
+        let parsed: toml::Value = toml::from_str(&snippet).unwrap();
+
+        // Then: its structured argv selects admin mode before the memory path.
+        assert_eq!(
+            parsed["mcp"]["rtrt"]["args"],
+            toml::Value::Array(vec![
+                toml::Value::String("--admin".into()),
+                toml::Value::String("--memory".into()),
+                toml::Value::String("/stores/admin.sqlite".into()),
+            ])
+        );
     }
 }

@@ -54,6 +54,10 @@
       || pathname.startsWith('/api/security/profile/');
   }
 
+  function isUnscopedFailoverConfig(pathname, project) {
+    return !project && pathname === '/api/failover/config';
+  }
+
   function scopedRequest(input, init) {
     const request = input instanceof Request ? input : null;
     const method = String((init && init.method) || (request && request.method) || 'GET').toUpperCase();
@@ -62,6 +66,7 @@
     const project = typeof window.dashboardSelectedProject === 'function'
       ? window.dashboardSelectedProject()
       : '';
+    if (isUnscopedFailoverConfig(url.pathname, project)) return { input, init, scoped: false };
     if (!project) return { error: new Response('project selection required', { status: 428 }) };
     const asserted = url.searchParams.getAll('project');
     if (asserted.length > 1 || (asserted.length === 1 && asserted[0] !== project)) {
@@ -209,7 +214,7 @@ let SECURITY_PROFILES_CACHE = [];
 let GLOBAL_DEFAULT_PROFILE = 'ai-default';
 const GLOBAL_PROJECT_VALUE = '__global__';
 const GLOBAL_SCOPE_MESSAGE = 'Global mode — select an individual project';
-// Mirror of the Rust STATUSLINE_SEGMENTS const. `agents` is the orchestration
+// Mirror of the Rust STATUSLINE_SEGMENTS const. `agents` is the detected-agent
 // segment (labelled "Agents"); `codex` is kept as a backward-compat alias.
 const STATUSLINE_SEGMENTS = ['project', 'branch', 'wip', 'sess', 'ctx', 'cache', 'opt', 'model', 'usage', 'agents', 'savings'];
 // Human-friendly labels for the segment toggles (key -> label).

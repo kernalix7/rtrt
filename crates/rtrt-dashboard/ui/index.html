@@ -26,7 +26,7 @@
 <div class="topbar">
   <div class="brand"><span class="logo">RT</span> RTRT</div>
   <!-- Top-level MODE switch: Project (per-project work) vs Tools (multi-provider /
-       orchestration). Each mode owns its own sidebar nav set (see aside [data-mode]).
+       routing). Each mode owns its own sidebar nav set (see aside [data-mode]).
        setMode() in app.js toggles the visible sidebar, persists to localStorage,
        and navigates to the mode's default page. -->
   <div id="mode-switch" class="mode-switch" role="tablist" aria-label="Top-level mode">
@@ -103,7 +103,7 @@
       </details>
     </nav>
 
-    <!-- ── TOOLS MODE nav (multi-AI-provider / orchestration) ────────────────
+    <!-- ── TOOLS MODE nav (multi-AI-provider / routing) ──────────────────────
          Providers · Chat · Limits · Environment · Router · Setup. Default page
          = providers (the dedicated provider settings). Structured into groups
          so the load-balancing router has room to grow. -->
@@ -115,12 +115,12 @@
         <a class="nav" data-page="chat"><span class="icon">✎</span><span class="nav-copy"><span class="nav-label">Chat</span><span class="nav-sub">gateway playground</span></span></a>
         <a class="nav" data-page="limits"><span class="icon">⛽</span><span class="nav-copy"><span class="nav-label">Limits</span><span class="nav-sub">daily usage ceilings</span></span></a>
       </details>
-      <div class="nav-divider">Orchestrate</div>
+      <div class="nav-divider">Routing</div>
       <details class="nav-group" open>
         <summary class="group">🔀 Routing</summary>
         <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
         <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · preview</span></span></a>
-          <a class="nav" data-page="orchestration"><span class="icon">⋔</span><span class="nav-copy"><span class="nav-label">Orchestration</span><span class="nav-sub">failover policy</span></span></a>
+          <a class="nav" data-page="failover"><span class="icon">⋔</span><span class="nav-copy"><span class="nav-label">Failover</span><span class="nav-sub">failure policy</span></span></a>
       </details>
       <div class="nav-divider">Connect</div>
       <details class="nav-group" open>
@@ -1389,69 +1389,69 @@
       </div>
     </section>
 
-    <section id="page-orchestration" class="page" hidden>
+    <section id="page-failover" class="page" hidden>
       <div class="section-head">
         <div class="section-title">
-          <h1>Orchestration</h1>
+          <h1>Failover</h1>
           <div class="lede">The failure policy rtrt follows when a provider call fails.</div>
         </div>
       </div>
 
       <div class="card">
         <div class="head"><h2>Failure policy scope</h2><span class="hint">[failover]</span></div>
-        <div class="settings-section" id="team-scope-section" hidden>
+        <div class="settings-section" id="failover-scope-section" hidden>
           <h3>Scope</h3>
-          <div class="scope-toggle" role="radiogroup" aria-label="Orchestration scope">
+          <div class="scope-toggle" role="radiogroup" aria-label="Failover scope">
             <label class="segment-toggle">
-              <input type="radio" name="team-scope" id="team-scope-global" value="global" checked>
+              <input type="radio" name="failover-scope" id="failover-scope-global" value="global" checked>
               <span>Follow global</span>
             </label>
             <label class="segment-toggle">
-              <input type="radio" name="team-scope" id="team-scope-custom" value="custom">
+              <input type="radio" name="failover-scope" id="failover-scope-custom" value="custom">
               <span>Custom (this project)</span>
             </label>
           </div>
-          <small class="placeholder-hint" id="team-scope-hint"></small>
+          <small class="placeholder-hint" id="failover-scope-hint"></small>
         </div>
       </div>
 
-      <div id="orch-editors">
+      <div id="failover-fields">
         <!-- Failover markers -->
         <div class="card">
           <div class="head"><h2>Failure classification</h2><span class="hint" id="failover-config-hint">[failover]</span></div>
           <p class="lede">Extra error markers, one per line, layered on top of the built-in classification. A marker listed here is matched first, so putting a built-in marker under a different class reclassifies it.</p>
-          <div class="orch-grid">
+          <div class="failover-grid">
             <label class="field-label">
               <span>fatal — stop the walk, no retry, no failover</span>
-              <textarea id="orch-fail-fatal" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-fatal" rows="4" spellcheck="false"></textarea>
             </label>
             <label class="field-label">
               <span>quota — fail over immediately, no retry</span>
-              <textarea id="orch-fail-quota" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-quota" rows="4" spellcheck="false"></textarea>
             </label>
             <label class="field-label">
               <span>transient — earn a backed-off retry</span>
-              <textarea id="orch-fail-transient" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-transient" rows="4" spellcheck="false"></textarea>
             </label>
           </div>
-          <div class="orch-grid" style="margin-top:0.7rem;">
+          <div class="failover-grid" style="margin-top:0.7rem;">
             <label class="field-label">
               <span>transient retries</span>
-              <input type="number" id="orch-fail-retries" min="0" step="1" placeholder="built-in">
+              <input type="number" id="failover-retries" min="0" step="1" placeholder="built-in">
             </label>
             <label class="field-label">
               <span>backoff divisor (of the call timeout)</span>
-              <input type="number" id="orch-fail-divisor" min="1" step="1" placeholder="built-in">
+              <input type="number" id="failover-divisor" min="1" step="1" placeholder="built-in">
             </label>
             <label class="field-label">
               <span>fixed backoff (ms)</span>
-              <input type="number" id="orch-fail-backoff" min="0" step="1" placeholder="derived from timeout">
+              <input type="number" id="failover-backoff" min="0" step="1" placeholder="derived from timeout">
             </label>
           </div>
-          <div class="orch-row">
-            <button id="orch-fail-save-btn" class="primary" type="button">Save failure policy</button>
-            <button id="orch-reload-btn" class="ghost" type="button">Discard changes</button>
-            <span id="orch-fail-save-result" class="out-meta"></span>
+          <div class="failover-row">
+            <button id="failover-save-btn" class="primary" type="button">Save failure policy</button>
+            <button id="failover-reload-btn" class="ghost" type="button">Discard changes</button>
+            <span id="failover-save-result" class="out-meta"></span>
           </div>
         </div>
       </div>
@@ -1704,9 +1704,9 @@
 <script src="/assets/js/api.js"></script>
 <script src="/assets/js/components.js"></script>
 <script src="/assets/js/pages.js"></script>
-<!-- Tools › Orchestration. After pages.js (it reuses the shared scope helpers)
+<!-- Tools › Failover. After pages.js (it reuses the shared scope helpers)
      and before app.js, which routes to the initial page on load. -->
-<script src="/assets/js/orchestration.js"></script>
+<script src="/assets/js/failover.js"></script>
 <script src="/assets/js/app.js"></script>
 </body>
 </html>

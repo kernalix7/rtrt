@@ -1605,17 +1605,11 @@ async fn recall_role_filter_restricts_hits() {
 }
 
 // ---------------------------------------------------------------------------
-// Orchestration config — `[team]` roster + `[failover]` markers.
-//
-// The roster the binary ships is only a DEFAULT, so these tests assert the
-// SHAPE of the exchange (shipped default is served, an invalid roster never
-// reaches disk, a custom roster round-trips) without pinning any lane, tier,
-// target or model name — those are config, and a config change must not be a
-// test change.
+// Failover config — `[failover]` markers. Native team/roster endpoints are gone.
 // ---------------------------------------------------------------------------
 
 /// A POST with no body — the "Follow global" clear path every scoped endpoint
-/// exposes.
+/// exposes. Does **not** inject a project selector.
 fn post_empty(uri: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -1626,168 +1620,117 @@ fn post_empty(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// Register `demo` as an on-disk project rooted at `<tmp>/repo` and return it.
-async fn register_demo_project(
-    state: crate::state::AppState,
-    tmp: &std::path::Path,
-) -> std::path::PathBuf {
-    let repo = tmp.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let resp = call(
-        router(state, None),
-        json(
-            Method::PUT,
-            "/api/projects",
-            &format!(
-                r#"{{"name":"demo","path":"{}"}}"#,
-                repo.to_string_lossy().replace('\\', "\\\\")
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    repo
+fn test_slug() -> String {
+    TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-#[tokio::test]
-#[ignore = "legacy project-registry mutation removed by project isolation"]
-async fn a_project_roster_that_would_be_invalid_is_rejected_and_not_written() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-    let repo = register_demo_project(state.clone(), tmp.path()).await;
+fn unselected(mut state: AppState) -> AppState {
+    state.selected = false;
+    state
+}
 
-    // A ladder rung naming a lane this roster does not define — the effective
-    // roster would be invalid, so the write must not happen at all.
-    let body = r#"{
-        "enabled": true,
-        "leader_order": ["kept"],
-        "members": [
-            {"name":"kept","target":"one","model":null,"mode":"cli",
-             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-             "fallback":[],"allow_impl":true,"flags":{}}
-        ],
-        "tiers": [{"tier":"rung","members":["dropped"]}],
-        "policy": null
-    }"#;
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(Method::POST, "/api/team/config?project=demo", body),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = json_body(resp).await;
-    let message = v["error"].as_str().expect("error message");
-    // The validator's own message, not a paraphrase.
-    assert!(
-        message.contains("dropped") && message.contains("unknown member"),
-        "expected the validator's message, got: {message}"
+/// GET without the `X-RTRT-Project` header `get()` always injects.
+fn bare_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// JSON POST/PUT without the `X-RTRT-Project` header `json()` always injects.
+fn bare_json(method: Method, uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost:7311")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn with_project_header(mut req: Request<Body>, slug: &str) -> Request<Body> {
+    req.headers_mut().insert(
+        "X-RTRT-Project",
+        axum::http::HeaderValue::from_str(slug).expect("slug is a valid header value"),
     );
+    req
+}
 
-    // Nothing reached disk: no project override file, and the project still
-    // inherits the global roster.
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
+async fn failover_handler_get(state: AppState) -> axum::response::Response {
+    crate::handlers::failover::get_failover_config(
+        axum::Extension(state),
+        axum::extract::Query(crate::handlers::scope::ProjectQuery::default()),
+    )
+    .await
+}
+
+async fn failover_handler_post(
+    state: AppState,
+    scope: Option<&str>,
+    body: Option<&str>,
+) -> axum::response::Response {
+    let q = crate::handlers::scope::ProjectQuery {
+        project: None,
+        scope: scope.map(str::to_string),
+    };
+    let parsed = body.map(|raw| {
+        axum::Json(
+            serde_json::from_str::<crate::handlers::failover::SetFailoverRequest>(raw)
+                .expect("test failover body"),
+        )
+    });
+    crate::handlers::failover::post_failover_config(
+        axum::Extension(state),
+        axum::extract::Query(q),
+        parsed,
+    )
+    .await
 }
 
 #[tokio::test]
-#[ignore = "legacy project-registry mutation removed by project isolation"]
-async fn failover_config_scope_matches_the_team_endpoint() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-    let repo = register_demo_project(state.clone(), tmp.path()).await;
-
-    // A global policy the project will shadow.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config",
-            r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Before any project write, the project inherits it.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["inherited"], true);
-    assert_eq!(v["fatal"][0], "global marker");
-
-    // The project pins its own policy: whole-section replacement, so the
-    // global marker and retry count are gone rather than merged in.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config?project=demo",
-            r#"{"fatal":["project marker"],"quota":[],"transient":[],"transient_retries":null}"#,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
-    assert_eq!(v["fatal"][0], "project marker");
-    assert!(v["transient_retries"].is_null());
-
-    // The global policy is untouched by the project write.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["fatal"][0], "global marker");
-    assert_eq!(v["transient_retries"], 3);
-
-    // Clearing returns the project to the global policy and removes the now
-    // empty override file, keeping the repo clean.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        post_empty("/api/failover/config?project=demo&scope=global"),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["fatal"][0], "global marker");
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-}
-
-#[tokio::test]
-async fn failover_config_get_post_roundtrip() {
+async fn team_config_api_is_unavailable() {
     let tmp = tempfile::tempdir().unwrap();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
-    // Defaults: no marker overrides at all.
     let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
+    let resp = call(app, get("/api/team/config")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let app = router(state, None);
+    let resp = call(
+        app,
+        json(Method::POST, "/api/team/config", r#"{"enabled":true}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn failover_global_get_post_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let repo = state.project.memory_root().to_path_buf();
+    let app = router(unselected(state.clone()), None);
+
+    let resp = call(app, bare_get("/api/failover/config")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], false);
     assert!(v["fatal"].as_array().expect("fatal").is_empty());
     assert!(v["transient_retries"].is_null());
-    assert_eq!(v["scope"], "global");
 
-    let app = router(state.clone(), None);
+    let app = router(unselected(state.clone()), None);
     let resp = call(
         app,
-        json(
+        bare_json(
             Method::POST,
             "/api/failover/config",
             r#"{"fatal":["contract expired"," "],"quota":["seat limit reached"],
@@ -1796,35 +1739,319 @@ async fn failover_config_get_post_roundtrip() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
     let v = json_body(resp).await;
-    // The blank marker a form leaves behind is dropped, not persisted.
-    assert_eq!(
-        v["fatal"].as_array().expect("fatal").len(),
-        1,
-        "blank markers should be dropped"
-    );
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
     assert_eq!(v["fatal"][0], "contract expired");
     assert_eq!(v["quota"][0], "seat limit reached");
     assert_eq!(v["transient_retries"], 1);
     assert_eq!(v["backoff_divisor"], 60);
     assert!(v["backoff_ms"].is_null());
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+
+    let app = router(unselected(state), None);
+    let resp = call(app, bare_get("/api/failover/config")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "contract expired");
+    assert_eq!(v["transient_retries"], 1);
 }
 
 #[tokio::test]
-async fn failover_config_rejects_a_zero_backoff_divisor() {
+async fn failover_inherited_project_get_shows_global_policy() {
     let tmp = tempfile::tempdir().unwrap();
     let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config",
-            r#"{"fatal":[],"quota":[],"transient":[],"backoff_divisor":0}"#,
+        router(state, None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_custom_write_preserves_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(
+                Method::POST,
+                "/api/failover/config?scope=custom",
+                r#"{"fatal":["project marker"],"quota":[],"transient":[],"transient_retries":null}"#,
+            ),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["custom"], true);
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"][0], "project marker");
+    assert!(v["transient_retries"].is_null());
+    assert!(repo.join(".rtrt").join("config.toml").exists());
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
+    assert_eq!(v["fatal"][0], "project marker");
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_follow_global_preserves_unrelated_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let project = rtrt_core::config::ProjectConfig {
+        output_level: Some("ultra".into()),
+        failover: Some(rtrt_core::config::FailoverConfig {
+            fatal: vec!["project marker".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::util::write_project_config(&repo, &project).unwrap();
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(post_empty("/api/failover/config?scope=global"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+
+    let remaining = rtrt_core::Config::load_project(&repo).unwrap();
+    assert!(remaining.failover.is_none());
+    assert_eq!(remaining.output_level.as_deref(), Some("ultra"));
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_post_rejects_missing_and_invalid_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+    let body = r#"{"fatal":["should not persist"],"quota":[],"transient":[]}"#;
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_json(Method::POST, "/api/failover/config", body), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("scope=custom or scope=global")
+    );
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(Method::POST, "/api/failover/config?scope=nope", body),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("invalid failover scope")
+    );
+
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn failover_numeric_fields_reject_values_above_u32_max() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    let at_max = format!(
+        r#"{{"fatal":[],"quota":[],"transient":[],"transient_retries":{},"backoff_divisor":{}}}"#,
+        u32::MAX,
+        u32::MAX
+    );
+    let resp = call(
+        router(unselected(state.clone()), None),
+        bare_json(Method::POST, "/api/failover/config", &at_max),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["transient_retries"], u32::MAX);
+    assert_eq!(v["backoff_divisor"], u32::MAX);
+
+    let over_max = format!(
+        r#"{{"fatal":[],"quota":[],"transient":[],"transient_retries":{}}}"#,
+        u64::from(u32::MAX) + 1
+    );
+    let resp = call(
+        router(unselected(state.clone()), None),
+        bare_json(Method::POST, "/api/failover/config", &over_max),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("failover.transient_retries")
+    );
+
+    let resp = call(
+        router(unselected(state), None),
+        bare_get("/api/failover/config"),
+    )
+    .await;
+    let v = json_body(resp).await;
+    assert_eq!(v["transient_retries"], u32::MAX);
+}
+
+#[tokio::test]
+async fn failover_header_only_project_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(
+                Method::POST,
+                "/api/failover/config?scope=custom",
+                r#"{"fatal":["header project"],"quota":[],"transient":[]}"#,
+            ),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["fatal"][0], "header project");
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "global marker");
+}
+
+#[tokio::test]
+async fn failover_rejects_zero_backoff_divisor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+    let body = r#"{"fatal":[],"quota":[],"transient":[],"backoff_divisor":0}"#;
+
+    let resp = failover_handler_post(unselected(state.clone()), None, Some(body)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error message")
+            .contains("backoff_divisor")
+    );
+    assert!(!config_file(tmp.path()).exists());
+
+    let resp = call(
+        router(state, None),
+        with_project_header(
+            bare_json(Method::POST, "/api/failover/config?scope=custom", body),
+            &slug,
         ),
     )
     .await;
@@ -1836,7 +2063,7 @@ async fn failover_config_rejects_a_zero_backoff_divisor() {
             .expect("error message")
             .contains("backoff_divisor")
     );
-    assert!(!config_file(tmp.path()).exists());
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
 }
 
 #[tokio::test]
@@ -2101,7 +2328,7 @@ async fn config_writer_rejects_symlink_target_without_touching_destination() {
 }
 
 #[tokio::test]
-async fn orchestration_page_assets_are_served_and_deep_linkable() {
+async fn failover_page_assets_are_served_and_deep_linkable() {
     let tmp = tempfile::tempdir().unwrap();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
@@ -2109,7 +2336,7 @@ async fn orchestration_page_assets_are_served_and_deep_linkable() {
     // The page's script is embedded in the binary and served like the other
     // app assets: `no-store`, so auth/bootstrap code is never restored stale.
     let app = router(state.clone(), None);
-    let resp = call(app, get("/assets/js/orchestration.js")).await;
+    let resp = call(app, get("/assets/js/failover.js")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
@@ -2118,19 +2345,19 @@ async fn orchestration_page_assets_are_served_and_deep_linkable() {
         Some("no-store")
     );
     let script = body_text(resp).await;
-    assert!(script.contains("loadOrchestration"));
+    assert!(script.contains("loadFailover"));
 
     // The shell loads it, and the page + nav entry exist in the markup.
     let app = router(state.clone(), None);
     let html = body_text(call(app, get("/")).await).await;
-    assert!(html.contains("/assets/js/orchestration.js"));
-    assert!(html.contains("id=\"page-orchestration\""));
-    assert!(html.contains("data-page=\"orchestration\""));
+    assert!(html.contains("/assets/js/failover.js"));
+    assert!(html.contains("id=\"page-failover\""));
+    assert!(html.contains("data-page=\"failover\""));
 
-    // Deep link: /orchestration falls through to the SPA shell so a refresh
+    // Deep link: /failover falls through to the SPA shell so a refresh
     // (or a shared URL) restores the page instead of 404ing.
     let app = router(state, None);
-    let resp = call(app, get("/orchestration")).await;
+    let resp = call(app, get("/failover")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
         resp.headers()
@@ -2139,4 +2366,13 @@ async fn orchestration_page_assets_are_served_and_deep_linkable() {
             .unwrap_or_default()
             .starts_with("text/html")
     );
+}
+
+#[tokio::test]
+async fn retired_orchestration_asset_is_not_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let resp = call(app, get("/assets/js/orchestration.js")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

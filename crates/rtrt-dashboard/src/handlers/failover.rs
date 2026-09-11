@@ -1,11 +1,18 @@
 //! `[failover]` policy config — the retry/fallback markers behind
 //! `rtrt route --failover` and `rtrt call --failover`.
 //!
-//! Endpoint: `GET/POST /api/failover/config`. Takes the same `?project=` /
-//! `?scope=` selector as every other config endpoint (see `handlers::scope`)
-//! and answers with the same `scope` / `custom` / `inherited` triple.
+//! Endpoint: `GET/POST /api/failover/config`.
+//!
+//! Mutation is explicit:
+//! - unselected (`AppState.selected == false`) GET/POST read and write the
+//!   global policy only;
+//! - a selected project GET shows the effective policy (`custom` / `inherited`);
+//! - a selected project POST requires `scope=custom` to write an override, or
+//!   a no-body `scope=global` to drop only `[failover]`;
+//! - any other project POST is rejected so a project-selected request can never
+//!   silently mutate the global policy.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use rtrt_core::config::FailoverConfig;
@@ -21,8 +28,12 @@ fn clean_list(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Drop unnamed invocation flags. A flag's VALUE may legitimately be empty (a
-/// valueless switch), so only the key is required.
+fn selected_repo(state: &AppState) -> Option<PathBuf> {
+    state
+        .selected
+        .then(|| state.project.memory_root().to_path_buf())
+}
+
 fn config_path_string(repo: Option<&Path>, custom: bool) -> String {
     match repo.filter(|_| custom) {
         Some(path) => rtrt_core::Config::project_config_path(path)
@@ -66,7 +77,6 @@ fn scope_fields(repo: Option<&Path>, custom: bool) -> serde_json::Value {
     })
 }
 
-/// Merge the scope triple into a response object.
 fn with_scope(
     mut value: serde_json::Value,
     repo: Option<&Path>,
@@ -86,9 +96,6 @@ fn with_scope(
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
-// ---------------------------------------------------------------------------
-// GET/POST /api/failover/config
-// ---------------------------------------------------------------------------
 
 fn failover_json(
     failover: &FailoverConfig,
@@ -106,22 +113,30 @@ fn failover_json(
     })
 }
 
+fn respond_failover(
+    failover: &FailoverConfig,
+    repo: Option<&Path>,
+    custom: bool,
+) -> axum::response::Response {
+    Json(with_scope(
+        failover_json(failover, repo, custom),
+        repo,
+        custom,
+    ))
+    .into_response()
+}
+
 pub(crate) async fn get_failover_config(
     axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> axum::response::Response {
-    let repo = Some(state.project.memory_root().to_path_buf());
+    let repo = selected_repo(&state);
     let custom = project_overrides(repo.as_deref()).failover;
     let cfg = match rtrt_core::Config::load_effective(repo.as_deref()) {
         Ok(cfg) => cfg,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    Json(with_scope(
-        failover_json(&cfg.failover, repo.as_deref(), custom),
-        repo.as_deref(),
-        custom,
-    ))
-    .into_response()
+    respond_failover(&cfg.failover, repo.as_deref(), custom)
 }
 
 /// Full-replace write. An omitted marker list clears that class; the numeric
@@ -142,21 +157,44 @@ pub(crate) struct SetFailoverRequest {
     backoff_ms: crate::util::JsonPatch<u64>,
 }
 
+enum FailoverWrite {
+    SaveGlobal,
+    SaveProject,
+    FollowGlobal,
+}
+
+fn write_intent(selected: bool, scope: Option<&str>) -> Result<FailoverWrite, &'static str> {
+    let scope = scope.map(str::trim).filter(|s| !s.is_empty());
+    match (selected, scope) {
+        (false, None) => Ok(FailoverWrite::SaveGlobal),
+        (false, Some(s)) if s.eq_ignore_ascii_case("global") => Ok(FailoverWrite::SaveGlobal),
+        (true, Some(s)) if s.eq_ignore_ascii_case("custom") => Ok(FailoverWrite::SaveProject),
+        (true, Some(s)) if s.eq_ignore_ascii_case("global") => Ok(FailoverWrite::FollowGlobal),
+        (true, None) => Err("project failover writes require scope=custom or scope=global"),
+        _ => Err("invalid failover scope"),
+    }
+}
+
 pub(crate) async fn post_failover_config(
     axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     body: Option<Json<SetFailoverRequest>>,
 ) -> axum::response::Response {
-    let repo = Some(state.project.memory_root().to_path_buf());
-    let follow_global = q
-        .scope
-        .as_deref()
-        .is_some_and(|s| s.eq_ignore_ascii_case("global"));
+    let repo = selected_repo(&state);
+    let intent = match write_intent(state.selected, q.scope.as_deref()) {
+        Ok(intent) => intent,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
 
     // "Follow global": clear only this project's `[failover]` override; a
-    // coexisting `[team]` override (or any other) in the same file survives.
-    if follow_global && repo.is_some() {
-        let path = repo.as_deref().expect("repo is some");
+    // coexisting `[compression]` / `[statusline]` / other override survives.
+    if matches!(intent, FailoverWrite::FollowGlobal) {
+        let Some(path) = repo.as_deref() else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "project failover writes require scope=custom or scope=global",
+            );
+        };
         let mut project = match rtrt_core::Config::load_project(path) {
             Ok(p) => p,
             Err(e) => return clear_field_error(e),
@@ -169,28 +207,16 @@ pub(crate) async fn post_failover_config(
             Ok(cfg) => cfg,
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        return Json(with_scope(
-            failover_json(&cfg.failover, Some(path), false),
-            Some(path),
-            false,
-        ))
-        .into_response();
+        return respond_failover(&cfg.failover, Some(path), false);
     }
 
     let Some(Json(req)) = body else {
-        // `?scope=global` in the global scope has nothing to clear and carries
-        // no body; report the global policy rather than erroring.
-        if follow_global {
+        if matches!(intent, FailoverWrite::SaveGlobal) {
             let cfg = match rtrt_core::Config::load() {
                 Ok(cfg) => cfg,
                 Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             };
-            return Json(with_scope(
-                failover_json(&cfg.failover, None, false),
-                None,
-                false,
-            ))
-            .into_response();
+            return respond_failover(&cfg.failover, None, false);
         }
         return error_response(StatusCode::BAD_REQUEST, "missing body");
     };
@@ -202,13 +228,17 @@ pub(crate) async fn post_failover_config(
     let transient_retries = match patch_unsigned(
         req.transient_retries,
         current.transient_retries.map(u64::from),
-    ) {
-        Ok(v) => v.map(|v| v as u32),
+    )
+    .and_then(|v| narrow_u32(v, "failover.transient_retries"))
+    {
+        Ok(v) => v,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
     };
     let backoff_divisor =
-        match patch_unsigned(req.backoff_divisor, current.backoff_divisor.map(u64::from)) {
-            Ok(v) => v.map(|v| v as u32),
+        match patch_unsigned(req.backoff_divisor, current.backoff_divisor.map(u64::from))
+            .and_then(|v| narrow_u32(v, "failover.backoff_divisor"))
+        {
+            Ok(v) => v,
             Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
         };
     let backoff_ms = match patch_unsigned(req.backoff_ms, current.backoff_ms) {
@@ -236,8 +266,13 @@ pub(crate) async fn post_failover_config(
         backoff_ms,
     };
 
-    // Per-project write.
-    if let Some(path) = repo.as_deref() {
+    if matches!(intent, FailoverWrite::SaveProject) {
+        let Some(path) = repo.as_deref() else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "project failover writes require scope=custom or scope=global",
+            );
+        };
         let mut project = match rtrt_core::Config::load_project(path) {
             Ok(p) => p,
             Err(e) => return clear_field_error(e),
@@ -246,15 +281,9 @@ pub(crate) async fn post_failover_config(
         if let Err(e) = crate::util::write_project_config(path, &project) {
             return clear_field_error(e);
         }
-        return Json(with_scope(
-            failover_json(&failover, Some(path), true),
-            Some(path),
-            true,
-        ))
-        .into_response();
+        return respond_failover(&failover, Some(path), true);
     }
 
-    // Global write.
     let (cfg, _) = match crate::util::update_config_file(|cfg| {
         cfg.failover = failover;
         Ok(())
@@ -262,13 +291,9 @@ pub(crate) async fn post_failover_config(
         Ok(result) => result,
         Err((status, msg)) => return error_response(status, msg),
     };
-    Json(with_scope(
-        failover_json(&cfg.failover, None, false),
-        None,
-        false,
-    ))
-    .into_response()
+    respond_failover(&cfg.failover, None, false)
 }
+
 fn patch_unsigned(
     value: crate::util::JsonPatch<u64>,
     existing: Option<u64>,
@@ -278,4 +303,10 @@ fn patch_unsigned(
         crate::util::JsonPatch::Null => Ok(None),
         crate::util::JsonPatch::Value(value) => Ok(Some(value)),
     }
+}
+
+fn narrow_u32(value: Option<u64>, field: &str) -> Result<Option<u32>, String> {
+    value
+        .map(|v| u32::try_from(v).map_err(|_| format!("{field} must be at most {}", u32::MAX)))
+        .transpose()
 }

@@ -383,9 +383,10 @@ pub(crate) async fn run_statusline_preview<P>(binary: P) -> Option<Vec<String>>
 where
     P: AsRef<std::ffi::OsStr>,
 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let sample = serde_json::json!({
         "model": { "display_name": "Opus 4.8" },
-        "cwd": "/home/kernalix7/Desktop/00_Personal_Project/00G_rtrt",
+        "cwd": cwd.to_string_lossy(),
         "transcript": [],
     });
     let sample = serde_json::to_vec(&sample).ok()?;

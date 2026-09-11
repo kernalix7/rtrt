@@ -542,9 +542,9 @@ const PALETTE_ITEMS = [
   { label: 'Providers · Active & models', hint: 'providers / local models', run: () => navigate('llm') },
   { label: 'Providers · Chat playground', hint: 'gateway chat / POST /api/chat', run: () => navigate('chat') },
   { label: 'Providers · Limits', hint: 'daily usage ceilings', run: () => navigate('limits') },
-  { label: 'Orchestrate · Environment', hint: 'detected tools', run: () => navigate('environment') },
-  { label: 'Orchestrate · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
-  { label: 'Orchestrate · Orchestration', hint: 'lanes / tier ladder / policy / failover', run: () => navigate('orchestration') },
+  { label: 'Routing · Environment', hint: 'detected tools', run: () => navigate('environment') },
+  { label: 'Routing · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
+  { label: 'Routing · Failover', hint: 'failure classes / retries / backoff', run: () => navigate('failover') },
   { label: 'Connect · Setup', hint: 'client snippets', run: () => navigate('connect') },
   // ── Actions ──
   { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
@@ -584,9 +584,9 @@ function refreshProjectScopePage() {
   // Providers (active + enabled) and Agents enable/disable are per-project too.
   if (page === 'llm') loadProvidersConfig();
   if (page === 'environment') loadAgentsConfig();
-  // Orchestration reads through the same ?project= selector, so the scope hint
+  // Failover reads through the same ?project= selector, so the scope hint
   // it shows has to follow the selector too.
-  if (page === 'orchestration') loadOrchestration();
+  if (page === 'failover') loadFailover();
 }
 function setCompressEngine(engine, level) {
   if (!engine) return;
@@ -614,7 +614,7 @@ function focusOptimizerLevel() {
 }
 
 function navigate(page, opts = {}) {
-  if (isGlobalScope() && page !== 'overview') {
+  if (isGlobalScope() && page !== 'overview' && page !== 'failover') {
     page = 'overview';
     opts = {};
     showToast('Select an available project to use project pages and actions.', 'err');
@@ -674,9 +674,9 @@ function navigate(page, opts = {}) {
     // Tools › Limits — daily usage ceilings (moved out of Capture/Config).
     loadLimitsConfig();
   }
-  if (page === 'orchestration') {
-    // Tools › Orchestration — the editable [team] roster + [failover] policy.
-    loadOrchestration();
+  if (page === 'failover') {
+    // Tools › Failover — the editable [failover] policy.
+    loadFailover();
   }
   if (page === 'usage') {
     // Tools › Router — provider usage + headroom + load-balancing decision.

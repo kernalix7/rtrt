@@ -50,7 +50,7 @@ fn router_with_origins(
         .route("/assets/js/api.js", get(asset_js_api))
         .route("/assets/js/components.js", get(asset_js_components))
         .route("/assets/js/pages.js", get(asset_js_pages))
-        .route("/assets/js/orchestration.js", get(asset_js_orchestration))
+        .route("/assets/js/failover.js", get(asset_js_failover))
         .route("/assets/js/app.js", get(asset_js_app))
         .route("/vendor/{file}", get(vendor_asset))
         .route("/healthz", get(healthz))
@@ -189,9 +189,16 @@ fn router_with_origins(
                         req.extensions_mut().insert(state);
                         return next.run(req).await;
                     }
-                    let slug = match selected_slug(&req) {
-                        Ok(slug) => slug,
+                    let selection = match project_selection(&req) {
+                        Ok(selection) => selection,
                         Err(response) => return response.into_response(),
+                    };
+                    let ProjectSelection::Selected(slug) = selection else {
+                        if is_global_failover_route(req.method(), req.uri().path()) {
+                            req.extensions_mut().insert(state);
+                            return next.run(req).await;
+                        }
+                        return (StatusCode::BAD_REQUEST, "project selector required").into_response();
                     };
                     let mut context = state.catalog.get(&slug);
                     if context.is_none() {
@@ -246,7 +253,14 @@ fn is_global_route(method: &Method, path: &str) -> bool {
                 || path.starts_with("/api/security/profile/")))
 }
 
-fn selected_slug(request: &axum::extract::Request) -> Result<String, (StatusCode, &'static str)> {
+enum ProjectSelection {
+    Absent,
+    Selected(String),
+}
+
+fn project_selection(
+    request: &axum::extract::Request,
+) -> Result<ProjectSelection, (StatusCode, &'static str)> {
     let header_slug = match request.headers().get("X-RTRT-Project") {
         Some(value) => match value.to_str() {
             Ok(value) if crate::project_catalog::valid_slug(value) => Some(value.to_string()),
@@ -267,9 +281,14 @@ fn selected_slug(request: &axum::extract::Request) -> Result<String, (StatusCode
     {
         return Err((StatusCode::BAD_REQUEST, "project selectors do not match"));
     }
-    header_slug
-        .or(query_slug)
-        .ok_or((StatusCode::BAD_REQUEST, "project selector required"))
+    Ok(match header_slug.or(query_slug) {
+        Some(slug) => ProjectSelection::Selected(slug),
+        None => ProjectSelection::Absent,
+    })
+}
+
+fn is_global_failover_route(method: &Method, path: &str) -> bool {
+    path == "/api/failover/config" && matches!(*method, Method::GET | Method::POST)
 }
 
 fn query_project(query: Option<&str>) -> Result<Option<String>, ()> {

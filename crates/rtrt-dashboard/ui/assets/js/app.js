@@ -757,7 +757,7 @@ document.getElementById('llm-models-refresh').onclick = () => loadLlmModels();
 document.getElementById('llm-ps-refresh').onclick = () => loadLlmPs();
 
 // ── Top-level MODE switch (Project | Tools) ──────────────────────────────────
-// Project mode = per-project work; Tools mode = multi-provider / orchestration.
+// Project mode = per-project work; Tools mode = multi-provider / routing.
 // Each mode owns its own sidebar nav set (<nav class="mode-nav" data-mode="…">).
 // MODE_PAGES maps each mode to the page-* ids that live under it, and the default
 // page shown when the mode is entered. PAGE_MODE inverts it so navigate() can keep
@@ -770,7 +770,7 @@ const MODE_PAGES = {
   },
   tools: {
     default: 'llm',
-    pages: ['llm', 'chat', 'limits', 'environment', 'usage', 'orchestration', 'connect'],
+    pages: ['llm', 'chat', 'limits', 'environment', 'usage', 'failover', 'connect'],
   },
 };
 const PAGE_MODE = {};
@@ -906,7 +906,11 @@ function setMode(mode, navigateTo = true) {
     btn.classList.toggle('active', on);
     btn.setAttribute('aria-selected', on ? 'true' : 'false');
   });
-  if (navigateTo) navigate(MODE_PAGES[mode].default);
+  if (navigateTo) navigate(mode === 'tools' ? toolsModeDefaultPage() : MODE_PAGES[mode].default);
+}
+
+function toolsModeDefaultPage() {
+  return isGlobalScope() ? 'failover' : MODE_PAGES.tools.default;
 }
 
 // Keep the mode chrome in sync when a page is shown programmatically.
@@ -916,11 +920,11 @@ function syncModeForPage(page) {
 }
 
 // Where to land when the global ("🌐 Global") scope is selected. Project mode
-// lands on Capture/Config (where global defaults are edited); Tools mode stays
-// on its own default page so switching the project doesn't yank the user out of
-// Tools. api.js calls this via a typeof guard (it loads before app.js).
+// lands on Capture/Config (where global defaults are edited); Tools mode uses
+// the same no-project default as setMode (Failover). api.js calls this via a
+// typeof guard (it loads before app.js).
 function globalScopeLandingPage() {
-  return CURRENT_MODE === 'tools' ? MODE_PAGES.tools.default : 'settings';
+  return CURRENT_MODE === 'tools' ? toolsModeDefaultPage() : 'settings';
 }
 
 document.querySelectorAll('#mode-switch .mode-seg').forEach(btn => {

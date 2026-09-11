@@ -2037,13 +2037,22 @@ fn http_token_from_env(transport: Transport) -> Result<Option<String>> {
     Ok(token)
 }
 
-/// Decide whether a request's `Origin` header may proceed. An absent header is
-/// a native (non-browser) client and is always allowed; an empty allowlist
-/// admits no browser origin at all, so the default configuration cannot be
-/// reached from a page.
-fn origin_is_allowed(allowlist: &[String], origin: Option<&str>) -> bool {
-    let Some(origin) = origin else {
+/// Decide whether a request's `Origin` may proceed. Only a genuinely absent
+/// header is treated as a native (non-browser) client; a header that is present
+/// but unreadable, or repeated, is rejected rather than silently read as absent,
+/// since either lets a caller pick which value the guard inspects. An empty
+/// allowlist admits no browser origin at all, so the default configuration
+/// cannot be reached from a page.
+fn origin_is_allowed(allowlist: &[String], headers: &axum::http::HeaderMap) -> bool {
+    let mut values = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(origin) = values.next() else {
         return true;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(origin) = origin.to_str() else {
+        return false;
     };
     allowlist.iter().any(|allowed| allowed == origin)
 }
@@ -2053,9 +2062,7 @@ async fn origin_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::http::header::ORIGIN;
-    let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
-    if origin_is_allowed(&allowlist, origin) {
+    if origin_is_allowed(&allowlist, req.headers()) {
         return next.run(req).await;
     }
     forbidden_origin_response()
@@ -2638,30 +2645,80 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn origin_headers(values: &[&[u8]]) -> axum::http::HeaderMap {
+        use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                ORIGIN,
+                HeaderValue::from_bytes(value).expect("header value"),
+            );
+        }
+        headers
+    }
+
     #[test]
     fn empty_origin_allowlist_admits_native_clients_and_no_browser_origin() {
-        assert!(origin_is_allowed(&[], None));
-        assert!(!origin_is_allowed(&[], Some("http://localhost:7311")));
-        assert!(!origin_is_allowed(&[], Some("https://evil.example")));
-        assert!(!origin_is_allowed(&[], Some("null")));
+        assert!(origin_is_allowed(&[], &origin_headers(&[])));
+        assert!(!origin_is_allowed(
+            &[],
+            &origin_headers(&[b"http://localhost:7311"])
+        ));
+        assert!(!origin_is_allowed(
+            &[],
+            &origin_headers(&[b"https://evil.example"])
+        ));
+        assert!(!origin_is_allowed(&[], &origin_headers(&[b"null"])));
     }
 
     #[test]
     fn configured_origin_allowlist_admits_only_exact_matches() {
         let allowlist = vec!["http://localhost:7311".to_string()];
-        assert!(origin_is_allowed(&allowlist, None));
-        assert!(origin_is_allowed(&allowlist, Some("http://localhost:7311")));
-        assert!(!origin_is_allowed(
+        assert!(origin_is_allowed(&allowlist, &origin_headers(&[])));
+        assert!(origin_is_allowed(
             &allowlist,
-            Some("http://localhost:7312")
+            &origin_headers(&[b"http://localhost:7311"])
         ));
         assert!(!origin_is_allowed(
             &allowlist,
-            Some("http://localhost:7311.evil.example")
+            &origin_headers(&[b"http://localhost:7312"])
         ));
         assert!(!origin_is_allowed(
             &allowlist,
-            Some("HTTP://LOCALHOST:7311")
+            &origin_headers(&[b"http://localhost:7311.evil.example"])
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"http://localhost:7311/"])
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"HTTP://LOCALHOST:7311"])
+        ));
+    }
+
+    #[test]
+    fn unreadable_or_repeated_origin_is_rejected_rather_than_read_as_absent() {
+        let allowlist = vec!["http://localhost:7311".to_string()];
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"http://localhost:\xff\xfe"])
+        ));
+        assert!(!origin_is_allowed(
+            &[],
+            &origin_headers(&[b"http://localhost:\xff\xfe"])
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"http://localhost:7311", b"https://evil.example"])
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"https://evil.example", b"http://localhost:7311"])
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            &origin_headers(&[b"http://localhost:7311", b"http://localhost:7311"])
         ));
     }
 

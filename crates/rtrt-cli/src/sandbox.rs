@@ -1,4 +1,10 @@
 //! Strict Linux shell wrapper used by OpenCode's built-in ShellTool.
+//!
+//! Everything that actually enters the sandbox is Linux-only. Other targets
+//! keep the shared types and the entry points that report the feature as
+//! unavailable, which leaves the rest of the module legitimately unreferenced
+//! rather than tempting a per-item `cfg` that drifts out of sync.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;

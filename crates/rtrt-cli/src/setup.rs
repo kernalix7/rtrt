@@ -891,6 +891,7 @@ pub(crate) fn resolve_opencode_config_path() -> Result<PathBuf> {
 
 /// Read-only validation used by `rtrt opencode`. Launcher authorization must
 /// never reconcile or rewrite global OpenCode configuration.
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_opencode_sandbox_shell(path: &Path, executable: &Path) -> Result<()> {
     reject_symlink(path, "OpenCode config")?;
     let (_, root) = read_opencode_config(path)?;

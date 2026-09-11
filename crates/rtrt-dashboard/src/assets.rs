@@ -35,11 +35,11 @@ use tokio::sync::broadcast;
 
 use crate::prelude::*;
 
-/// Serve the SPA shell with `no-cache` so a redeployed UI shows up on the next
-/// load instead of being pinned to a browser-cached copy.
+/// Never retain the bootstrap shell. It can arrive with a one-time credential
+/// in the URL fragment, and every load must execute the current auth bootstrap.
 fn index_response() -> axum::response::Response {
     (
-        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
         Html(INDEX_HTML),
     )
         .into_response()
@@ -96,10 +96,8 @@ pub(crate) async fn vendor_asset(
 /// Serve a front-end asset (split out of index.html) with an explicit
 /// Content-Type. Embedded via include_str! so the binary stays self-contained.
 ///
-/// These assets have no content hash in their URL, so a long cache would pin
-/// the browser to a stale UI for up to a day after every redeploy (the "my
-/// UI/UX changes aren't showing up" trap). `no-cache` makes the browser
-/// revalidate on each load, so a rebuilt binary's UI appears immediately.
+/// These assets have no content hash in their URL. `no-store` ensures the auth
+/// bootstrap and the app loading it can never be restored from a stale cache.
 /// (The large, never-changing vendor libs keep their long cache instead.)
 pub(crate) fn asset_response(
     body: &'static str,
@@ -108,7 +106,7 @@ pub(crate) fn asset_response(
     (
         [
             (axum::http::header::CONTENT_TYPE, content_type),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
         ],
         body,
     )
@@ -133,9 +131,9 @@ pub(crate) async fn asset_js_pages() -> ([(axum::http::HeaderName, &'static str)
     asset_response(ASSET_JS_PAGES, "text/javascript; charset=utf-8")
 }
 
-pub(crate) async fn asset_js_orchestration()
+pub(crate) async fn asset_js_failover()
 -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
-    asset_response(ASSET_JS_ORCHESTRATION, "text/javascript; charset=utf-8")
+    asset_response(ASSET_JS_FAILOVER, "text/javascript; charset=utf-8")
 }
 
 pub(crate) async fn asset_js_app() -> ([(axum::http::HeaderName, &'static str); 2], &'static str) {
@@ -156,7 +154,7 @@ pub(crate) const ASSET_JS_COMPONENTS: &str = include_str!("../ui/assets/js/compo
 
 pub(crate) const ASSET_JS_PAGES: &str = include_str!("../ui/assets/js/pages.js");
 
-pub(crate) const ASSET_JS_ORCHESTRATION: &str = include_str!("../ui/assets/js/orchestration.js");
+pub(crate) const ASSET_JS_FAILOVER: &str = include_str!("../ui/assets/js/failover.js");
 
 pub(crate) const ASSET_JS_APP: &str = include_str!("../ui/assets/js/app.js");
 

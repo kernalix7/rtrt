@@ -6,11 +6,12 @@
 //! (local, offline after first download) and are only required when calling the
 //! vector / hybrid paths.
 
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rtrt_core::{Error, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rtrt_core::{Error, ProjectIdentity, Result, project_memory_db_path_in};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
@@ -42,6 +43,446 @@ pub use summarise::Summariser;
 pub struct MemoryStore {
     pub(crate) conn: Connection,
     embedder: Option<Arc<dyn Embedder>>,
+    project_pin: Option<ProjectStorePin>,
+}
+
+/// Verified project binding carried by a strictly opened store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStorePin {
+    pub slug: String,
+}
+
+const STORE_IDENTITY_SCHEMA_VERSION: i64 = 1;
+const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 8;
+
+/// Identity and compatibility metadata read from an existing project store.
+///
+/// Inspection is read-only: it never creates a database, runs migrations, or
+/// resolves the identity-controlled `memory_root` on the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectStoreInspection {
+    pub database_path: PathBuf,
+    pub slug: String,
+    pub fingerprint: String,
+    pub memory_root: PathBuf,
+    pub label: String,
+    pub identity_schema_version: i64,
+    pub database_schema_version: i64,
+    pub database_schema_compatible: bool,
+    pub integrity_ok: bool,
+}
+
+/// Inspect one exact direct child of a trusted project catalog root.
+///
+/// `candidate` may name either `<slug>` or `<slug>/memory.sqlite`. The catalog
+/// root, project directory, and database must already exist and be private,
+/// real filesystem objects. No path is created, no migration is attempted, and
+/// the stored `memory_root` is treated as data rather than followed.
+pub fn inspect_project_store_in(
+    projects_root: &Path,
+    candidate: &Path,
+) -> Result<ProjectStoreInspection> {
+    inspect_project_store_inner(projects_root, candidate, None)
+}
+
+/// As [`inspect_project_store_in`], additionally requiring the database to be
+/// bound to `identity`. Use this before opening a discovered store writable.
+pub fn inspect_project_store_for_identity_in(
+    projects_root: &Path,
+    candidate: &Path,
+    identity: &ProjectIdentity,
+) -> Result<ProjectStoreInspection> {
+    inspect_project_store_inner(projects_root, candidate, Some(identity))
+}
+
+fn inspect_project_store_inner(
+    projects_root: &Path,
+    candidate: &Path,
+    expected: Option<&ProjectIdentity>,
+) -> Result<ProjectStoreInspection> {
+    let root_metadata = fs::symlink_metadata(projects_root).map_err(Error::Io)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(unsafe_store_path(
+            "project catalog root is not a real directory",
+            projects_root,
+        ));
+    }
+    verify_private_owner_mode(projects_root, &root_metadata, 0o700)?;
+    let root = fs::canonicalize(projects_root).map_err(Error::Io)?;
+
+    let candidate_db = candidate
+        .file_name()
+        .is_some_and(|name| name == "memory.sqlite");
+    let store_dir = if candidate_db {
+        candidate.parent().ok_or_else(|| {
+            unsafe_store_path("project database has no store directory", candidate)
+        })?
+    } else {
+        candidate
+    };
+    let slug = store_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| unsafe_store_path("project store has an invalid slug", store_dir))?;
+    if store_dir.parent() != Some(projects_root) {
+        return Err(unsafe_store_path(
+            "project store is not a direct catalog child",
+            candidate,
+        ));
+    }
+
+    let expected_dir = root.join(slug);
+    let dir_metadata = fs::symlink_metadata(&expected_dir).map_err(Error::Io)?;
+    if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
+        return Err(unsafe_store_path(
+            "project store is not a real directory",
+            &expected_dir,
+        ));
+    }
+    verify_private_owner_mode(&expected_dir, &dir_metadata, 0o700)?;
+    let canonical_dir = fs::canonicalize(&expected_dir).map_err(Error::Io)?;
+    if canonical_dir.parent() != Some(root.as_path()) {
+        return Err(unsafe_store_path(
+            "project store escaped catalog root",
+            &expected_dir,
+        ));
+    }
+
+    let database_path = canonical_dir.join("memory.sqlite");
+    verify_private_db_file(&database_path)?;
+    let database_uri = immutable_sqlite_uri(&database_path)?;
+    let conn = Connection::open_with_flags(
+        database_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| Error::Memory(format!("inspect project store: {e}")))?;
+
+    let identity_rows: i64 = conn
+        .query_row("SELECT count(*) FROM store_identity", [], |row| row.get(0))
+        .map_err(|e| Error::Memory(format!("read project store identity: {e}")))?;
+    if identity_rows != 1 {
+        return Err(Error::Memory(format!(
+            "malformed project store identity: expected one row, found {identity_rows}"
+        )));
+    }
+    let stored: (i64, String, String, String) = conn
+        .query_row(
+            "SELECT schema_version, fingerprint, memory_root, label
+               FROM store_identity WHERE singleton = ?1",
+            [1_i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| Error::Memory(format!("read project store identity: {e}")))?;
+    let memory_root = PathBuf::from(&stored.2);
+    if stored.0 != STORE_IDENTITY_SCHEMA_VERSION
+        || !valid_store_fingerprint(&stored.1)
+        || stored.3.is_empty()
+        || !normalized_absolute_path(&memory_root)
+        || catalog_slug(&stored.3, &stored.1) != slug
+    {
+        return Err(Error::Memory(
+            "malformed project store identity".to_string(),
+        ));
+    }
+    if let Some(identity) = expected
+        && (identity.slug() != slug
+            || identity.fingerprint() != stored.1
+            || identity.memory_root() != memory_root
+            || identity.label() != stored.3)
+    {
+        return Err(Error::Memory(format!(
+            "project store identity mismatch for {}",
+            identity.slug()
+        )));
+    }
+
+    let database_schema_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| Error::Memory(format!("read project store schema: {e}")))?;
+    let integrity: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(|e| Error::Memory(format!("check project store integrity: {e}")))?;
+    if integrity != "ok" {
+        return Err(Error::Memory(format!(
+            "project store integrity check failed: {integrity}"
+        )));
+    }
+
+    Ok(ProjectStoreInspection {
+        database_path,
+        slug: slug.to_string(),
+        fingerprint: stored.1,
+        memory_root,
+        label: stored.3,
+        identity_schema_version: stored.0,
+        database_schema_version,
+        database_schema_compatible: (0..=CURRENT_DATABASE_SCHEMA_VERSION)
+            .contains(&database_schema_version),
+        integrity_ok: true,
+    })
+}
+
+fn valid_store_fingerprint(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn immutable_sqlite_uri(path: &Path) -> Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| unsafe_store_path("project database path is not valid Unicode", path))?;
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}")
+                .map_err(|error| Error::Memory(format!("encode project database URI: {error}")))?;
+        }
+    }
+    Ok(format!("file:{encoded}?mode=ro&immutable=1"))
+}
+
+fn normalized_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::Normal(_)
+            )
+        })
+}
+
+fn catalog_slug(label: &str, fingerprint: &str) -> String {
+    const MAX_LEN: usize = 96;
+    let label_limit = MAX_LEN.saturating_sub(2 + fingerprint.len());
+    let mut sanitized = String::with_capacity(label_limit);
+    let mut separator = false;
+    for character in label.chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_alphanumeric() {
+            if separator && !sanitized.is_empty() && sanitized.len() < label_limit {
+                sanitized.push('-');
+            }
+            separator = false;
+            if sanitized.len() < label_limit {
+                sanitized.push(character);
+            }
+        } else {
+            separator = true;
+        }
+        if sanitized.len() >= label_limit {
+            break;
+        }
+    }
+    while sanitized.ends_with('-') {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        sanitized.push_str("project");
+    }
+    format!("{sanitized}--{fingerprint}")
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn prepare_project_store(identity: &ProjectIdentity, home: &Path) -> Result<PathBuf> {
+    let home_metadata = fs::symlink_metadata(home).map_err(Error::Io)?;
+    if home_metadata.file_type().is_symlink() || !home_metadata.is_dir() {
+        return Err(unsafe_store_path(
+            "operator home is not a real directory",
+            home,
+        ));
+    }
+    verify_owner_and_safe_parent_mode(home, &home_metadata)?;
+    let home = fs::canonicalize(home).map_err(Error::Io)?;
+    let mut parent = home.clone();
+    for component in [".rtrt", "projects", identity.slug()] {
+        parent = ensure_private_store_directory(&parent, component)?;
+    }
+    let expected = project_memory_db_path_in(&home, identity);
+    if parent.join("memory.sqlite") != expected || !parent.starts_with(&home) {
+        return Err(unsafe_store_path(
+            "project store escaped operator home",
+            &parent,
+        ));
+    }
+    Ok(expected)
+}
+
+fn ensure_private_store_directory(parent: &Path, component: &str) -> Result<PathBuf> {
+    if component.is_empty()
+        || Path::new(component)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(unsafe_store_path(
+            "invalid project store path component",
+            &parent.join(component),
+        ));
+    }
+    let path = parent.join(component);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&path).map_err(Error::Io)?;
+        }
+        Err(error) => return Err(Error::Io(error)),
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(Error::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(unsafe_store_path(
+            "project store component is not a real directory",
+            &path,
+        ));
+    }
+    verify_private_owner_mode(&path, &metadata, 0o700)?;
+    let canonical = fs::canonicalize(&path).map_err(Error::Io)?;
+    if canonical.parent() != Some(parent) {
+        return Err(unsafe_store_path(
+            "project store component escaped its parent",
+            &path,
+        ));
+    }
+    Ok(canonical)
+}
+
+fn prepare_private_db_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => verify_private_db_metadata(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            #[cfg_attr(not(unix), allow(unused_variables))]
+            let file = options.open(path).map_err(Error::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(Error::Io)?;
+            }
+            verify_private_db_file(path)
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn verify_private_db_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(Error::Io)?;
+    verify_private_db_metadata(path, &metadata)
+}
+
+fn verify_private_db_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(unsafe_store_path(
+            "project memory DB is not a real file",
+            path,
+        ));
+    }
+    verify_private_owner_mode(path, metadata, 0o600)
+}
+
+#[cfg(unix)]
+fn verify_owner_and_safe_parent_mode(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = current_uid()?;
+    if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err(unsafe_store_path(
+            "operator home has wrong owner or writable group/world mode",
+            path,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_owner_and_safe_parent_mode(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_owner_mode(path: &Path, metadata: &fs::Metadata, mode: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !private_owner_mode_valid(metadata.uid(), metadata.mode(), current_uid()?, mode) {
+        return Err(unsafe_store_path(
+            "project store path has wrong owner or mode",
+            path,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_owner_mode_valid(
+    actual_uid: u32,
+    actual_mode: u32,
+    expected_uid: u32,
+    mode: u32,
+) -> bool {
+    actual_uid == expected_uid && actual_mode & 0o7777 == mode
+}
+
+#[cfg(not(unix))]
+fn verify_private_owner_mode(_path: &Path, _metadata: &fs::Metadata, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_uid() -> Result<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let status = fs::read_to_string("/proc/self/status").map_err(Error::Io)?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|ids| ids.split_whitespace().nth(1))
+            .and_then(|uid| uid.parse().ok())
+            .ok_or_else(|| Error::Memory("cannot determine effective user ID".to_string()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map_err(Error::Io)?;
+        if !output.status.success() {
+            return Err(Error::Memory(
+                "cannot determine effective user ID".to_string(),
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .ok_or_else(|| Error::Memory("cannot determine effective user ID".to_string()))
+    }
+}
+
+fn unsafe_store_path(message: &str, path: &Path) -> Error {
+    Error::Memory(format!("{message}: {}", path.display()))
 }
 
 /// Memory tier. Higher tiers persist longer; lower tiers belong to a
@@ -528,8 +969,36 @@ pub struct ConceptHierarchy {
 }
 
 /// One row from [`MemoryStore::reattribution_candidates`]:
-/// `(id, transcript_file, current_project, source_kind)`.
-pub type ReattributionRow = (i64, String, String, Option<String>);
+/// `(id, transcript_file, current_project, source_kind, session_id,
+/// parent_session_id)`.
+pub type ReattributionRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Persistent parent/child identity for an externally launched agent session.
+///
+/// OpenCode injects the parent fields into the shell environment. The child
+/// Claude `SessionStart` hook supplies `child_session_id`, producing a durable
+/// join that remains valid after temporary worktrees and transcripts vanish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationProvenance {
+    pub child_session_id: String,
+    pub invocation_id: String,
+    pub parent_project: String,
+    pub parent_session_id: Option<String>,
+    pub parent_call_id: Option<String>,
+    pub caller_agent: Option<String>,
+    pub parent_cwd: Option<String>,
+    pub parent_worktree: Option<String>,
+    pub target: Option<String>,
+    pub model: Option<String>,
+    pub created_at: i64,
+}
 
 /// A clusterable row: a [`MemNode`] paired with its salient-[`token_set`].
 /// The unit consumed by [`MemoryStore::cluster_rows`] /
@@ -1195,6 +1664,43 @@ impl UnionFind {
 }
 
 impl MemoryStore {
+    /// Open the DB bound to `identity` under the operator-owned project store.
+    pub fn open_project(identity: &ProjectIdentity) -> Result<Self> {
+        let home = dirs_home().ok_or_else(|| {
+            Error::Memory("cannot determine operator home directory for project store".to_string())
+        })?;
+        Self::open_project_in(identity, &home)
+    }
+
+    /// Open below an explicitly resolved operator home. This remains strict;
+    /// unlike [`Self::open`], `identity` cannot be omitted or overridden.
+    pub fn open_project_in(identity: &ProjectIdentity, home: &Path) -> Result<Self> {
+        let path = prepare_project_store(identity, home)?;
+        prepare_private_db_file(&path)?;
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|e| Error::Memory(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;",
+        )
+        .map_err(|e| Error::Memory(e.to_string()))?;
+        let store = Self {
+            conn,
+            embedder: None,
+            project_pin: Some(ProjectStorePin {
+                slug: identity.slug().to_string(),
+            }),
+        };
+        store.migrate()?;
+        store.bind_store_identity(identity)?;
+        verify_private_db_file(&path)?;
+        Ok(store)
+    }
+
+    /// Explicit legacy/admin/migration open. This never infers or applies a
+    /// project identity and remains compatible with existing arbitrary paths.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
             if !parent.as_os_str().is_empty() {
@@ -1213,6 +1719,7 @@ impl MemoryStore {
         let store = Self {
             conn,
             embedder: None,
+            project_pin: None,
         };
         store.migrate()?;
         Ok(store)
@@ -1223,6 +1730,7 @@ impl MemoryStore {
         let store = Self {
             conn,
             embedder: None,
+            project_pin: None,
         };
         store.migrate()?;
         Ok(store)
@@ -1236,12 +1744,93 @@ impl MemoryStore {
         self
     }
 
+    /// Verified strict-project pin, absent for legacy/admin and in-memory DBs.
+    pub fn project_pin(&self) -> Option<&ProjectStorePin> {
+        self.project_pin.as_ref()
+    }
+
+    pub fn project_slug(&self) -> Option<&str> {
+        self.project_pin.as_ref().map(|pin| pin.slug.as_str())
+    }
+
+    /// Fail closed when an alias does not name this strictly bound project.
+    pub fn assert_project_alias(&self, requested: &str) -> Result<()> {
+        match self.project_slug() {
+            Some(bound) if bound == requested => Ok(()),
+            Some(bound) => Err(Error::Memory(format!(
+                "project alias mismatch: requested {requested}, store is bound to {bound}"
+            ))),
+            None => Err(Error::Memory(
+                "project alias assertion requires a project-bound store".to_string(),
+            )),
+        }
+    }
+
+    fn bind_store_identity(&self, identity: &ProjectIdentity) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO store_identity
+                    (singleton, schema_version, fingerprint, memory_root, label)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    STORE_IDENTITY_SCHEMA_VERSION,
+                    identity.fingerprint(),
+                    identity.memory_root().to_string_lossy(),
+                    identity.label(),
+                ],
+            )
+            .map_err(|e| Error::Memory(format!("bind project store identity: {e}")))?;
+        let stored: (i64, String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT schema_version, fingerprint, memory_root, label
+                   FROM store_identity WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| Error::Memory(format!("read project store identity: {e}")))?;
+        let expected_root = identity.memory_root().to_string_lossy();
+        if stored.0 != STORE_IDENTITY_SCHEMA_VERSION
+            || stored.1 != identity.fingerprint()
+            || stored.2 != expected_root
+            || stored.3 != identity.label()
+        {
+            return Err(Error::Memory(format!(
+                "project store identity mismatch for {}",
+                identity.slug()
+            )));
+        }
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         // Enable FK enforcement for this connection. Must run before any DML.
         // SQLite only cascades when this pragma is ON; without it, ON DELETE
         // CASCADE on embeddings/edges is silently ignored.
         self.conn
             .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS store_identity (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    schema_version INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    memory_root TEXT NOT NULL,
+                    label TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS store_identity_immutable_update
+                BEFORE UPDATE ON store_identity BEGIN
+                    SELECT RAISE(ABORT, 'store_identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS store_identity_immutable_delete
+                BEFORE DELETE ON store_identity BEGIN
+                    SELECT RAISE(ABORT, 'store_identity is immutable');
+                END;
+                "#,
+            )
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         // Bootstrap v1 schema.
@@ -1400,6 +1989,36 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v8: durable provenance for external agent sessions. A child session
+        // is the stable join key shared by Claude hooks and transcript rows;
+        // invocation ids are not unique because one shell call may launch
+        // several children in parallel.
+        if v < 8 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS invocation_provenance (
+                        child_session_id TEXT PRIMARY KEY,
+                        invocation_id TEXT NOT NULL,
+                        parent_project TEXT NOT NULL,
+                        parent_session_id TEXT,
+                        parent_call_id TEXT,
+                        caller_agent TEXT,
+                        parent_cwd TEXT,
+                        parent_worktree TEXT,
+                        target TEXT,
+                        model TEXT,
+                        created_at INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_invocation_provenance_parent
+                        ON invocation_provenance(parent_session_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_invocation_provenance_invocation
+                        ON invocation_provenance(invocation_id);
+                    PRAGMA user_version = 8;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1448,22 +2067,51 @@ impl MemoryStore {
     /// index mirrors only the body, so changing `project` needs no FTS sync.
     /// One UPDATE via `json_set` so a row is never left half-migrated.
     pub fn reattribute(&self, id: i64, source_kind: &str, project: Option<&str>) -> Result<()> {
-        match project {
-            Some(p) => self.conn.execute(
-                "UPDATE memories \
-                    SET project = ?3, \
-                        metadata = json_set(COALESCE(metadata, '{}'), '$.source_kind', ?2) \
-                  WHERE id = ?1",
-                rusqlite::params![id, source_kind, p],
-            ),
-            None => self.conn.execute(
-                "UPDATE memories \
-                    SET metadata = json_set(COALESCE(metadata, '{}'), '$.source_kind', ?2) \
-                  WHERE id = ?1",
-                rusqlite::params![id, source_kind],
-            ),
+        self.reattribute_with_provenance(id, source_kind, project, None)?;
+        Ok(())
+    }
+
+    /// Reattribute a transcript row and merge its durable invocation metadata
+    /// in one statement, so readers never observe a moved row without its
+    /// parent call identity (or vice versa).
+    pub fn reattribute_with_provenance(
+        &self,
+        id: i64,
+        source_kind: &str,
+        project: Option<&str>,
+        provenance: Option<&InvocationProvenance>,
+    ) -> Result<()> {
+        let mut patch = std::collections::BTreeMap::new();
+        patch.insert("source_kind".to_string(), source_kind.to_string());
+        if let Some(value) = provenance {
+            patch.insert("invocation_id".to_string(), value.invocation_id.clone());
+            if let Some(parent) = &value.parent_session_id {
+                patch.insert("parent_session_id".to_string(), parent.clone());
+            }
+            if let Some(call) = &value.parent_call_id {
+                patch.insert("parent_call_id".to_string(), call.clone());
+            }
+            if let Some(agent) = &value.caller_agent {
+                patch.insert("caller_agent".to_string(), agent.clone());
+            }
+            if let Some(target) = &value.target {
+                patch.insert("child_target".to_string(), target.clone());
+            }
+            if let Some(model) = &value.model {
+                patch.insert("child_model".to_string(), model.clone());
+            }
         }
-        .map_err(|e| Error::Memory(e.to_string()))?;
+        let patch = serde_json::to_string(&patch)
+            .map_err(|e| Error::Memory(format!("provenance metadata encode: {e}")))?;
+        self.conn
+            .execute(
+                "UPDATE memories \
+                    SET project = COALESCE(?3, project), \
+                        metadata = json_patch(COALESCE(NULLIF(metadata, ''), '{}'), json(?2)) \
+                  WHERE id = ?1",
+                rusqlite::params![id, patch, project],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
         Ok(())
     }
 
@@ -1487,18 +2135,82 @@ impl MemoryStore {
         Ok(moved)
     }
 
+    /// Register the first durable parent identity for one child agent session.
+    /// A resumed historical session may fire under a different caller, so a
+    /// conflicting child id must never transfer ownership to the later call.
+    pub fn upsert_invocation_provenance(&self, value: &InvocationProvenance) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO invocation_provenance (
+                    child_session_id, invocation_id, parent_project,
+                    parent_session_id, parent_call_id, caller_agent,
+                    parent_cwd, parent_worktree, target, model, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(child_session_id) DO NOTHING",
+                rusqlite::params![
+                    value.child_session_id,
+                    value.invocation_id,
+                    value.parent_project,
+                    value.parent_session_id,
+                    value.parent_call_id,
+                    value.caller_agent,
+                    value.parent_cwd,
+                    value.parent_worktree,
+                    value.target,
+                    value.model,
+                    value.created_at,
+                ],
+            )
+            .map_err(|e| Error::Memory(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn invocation_provenance(
+        &self,
+        child_session_id: &str,
+    ) -> Result<Option<InvocationProvenance>> {
+        self.conn
+            .query_row(
+                "SELECT child_session_id, invocation_id, parent_project,
+                        parent_session_id, parent_call_id, caller_agent,
+                        parent_cwd, parent_worktree, target, model, created_at
+                   FROM invocation_provenance
+                  WHERE child_session_id = ?1",
+                [child_session_id],
+                |row| {
+                    Ok(InvocationProvenance {
+                        child_session_id: row.get(0)?,
+                        invocation_id: row.get(1)?,
+                        parent_project: row.get(2)?,
+                        parent_session_id: row.get(3)?,
+                        parent_call_id: row.get(4)?,
+                        caller_agent: row.get(5)?,
+                        parent_cwd: row.get(6)?,
+                        parent_worktree: row.get(7)?,
+                        target: row.get(8)?,
+                        model: row.get(9)?,
+                        created_at: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| Error::Memory(e.to_string()))
+    }
+
     /// Transcript-captured rows that may need (re)attribution — purely by
     /// PROVENANCE, no project-name pattern matching. Returns every
     /// `source = "transcript"` row as `(id, transcript_file, current_project,
-    /// source_kind)`; the caller re-resolves the project from the file's encoded
-    /// dir and only writes when the project differs or the row is unclassified,
-    /// so it's idempotent and cheap once everything has settled.
+    /// source_kind, session_id, stored parent session)`; the caller first checks
+    /// durable invocation provenance for the child and parent, then falls back
+    /// to the file's encoded dir.
     pub fn reattribution_candidates(&self) -> Result<Vec<ReattributionRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT m.id, json_extract(m.metadata, '$.transcript_file') AS tf, m.project, \
-                        json_extract(m.metadata, '$.source_kind') AS sk \
+                        json_extract(m.metadata, '$.source_kind') AS sk, m.session_id, \
+                        COALESCE(json_extract(m.metadata, '$.parent_session'), \
+                                 json_extract(m.metadata, '$.parent_session_id')) AS ps \
                    FROM memories m \
                   WHERE json_extract(m.metadata, '$.source') = 'transcript' \
                     AND tf IS NOT NULL",
@@ -1511,6 +2223,8 @@ impl MemoryStore {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|e| Error::Memory(e.to_string()))?;
@@ -6246,6 +6960,373 @@ fn community_subgraph(graph: &ConceptGraph, community_id: i64) -> ConceptGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, which breaks comparisons against canonical paths.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+    /// production code rejects, so the plain temp path is the correct fixture there.
+    fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(path).expect("canonicalize temp path")
+        }
+        #[cfg(not(unix))]
+        {
+            path.to_path_buf()
+        }
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rtrt-memory-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            // macOS reaches the temp dir through `/var -> /private/var`, and the
+            // store derives identity from canonical paths, so the fixture has to
+            // start canonical for those comparisons to line up.
+            let path = canonical_for_tests(&path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn project_identity(base: &Path, name: &str) -> ProjectIdentity {
+        let repo = base.join(name);
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        ProjectIdentity::derive(repo).unwrap()
+    }
+
+    fn private_home(base: &Path) -> PathBuf {
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        home
+    }
+
+    fn set_private_file_mode(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    fn directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut snapshot = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = if entry.file_type().unwrap().is_file() {
+                    fs::read(entry.path()).unwrap()
+                } else {
+                    Vec::new()
+                };
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
+    }
+
+    #[test]
+    fn project_store_inspection_reads_valid_identity_without_mutation() {
+        let temp = TestDir::new("inspect-valid");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let projects_root = home.join(".rtrt/projects");
+        let store_dir = projects_root.join(identity.slug());
+        let before = directory_snapshot(&store_dir);
+
+        let inspected = inspect_project_store_for_identity_in(
+            &projects_root,
+            &store_dir.join("memory.sqlite"),
+            &identity,
+        )
+        .unwrap();
+
+        assert_eq!(inspected.slug, identity.slug());
+        assert_eq!(inspected.fingerprint, identity.fingerprint());
+        assert_eq!(inspected.memory_root, identity.memory_root());
+        assert_eq!(inspected.label, identity.label());
+        assert_eq!(inspected.identity_schema_version, 1);
+        assert_eq!(inspected.database_schema_version, 8);
+        assert!(inspected.database_schema_compatible);
+        assert!(inspected.integrity_ok);
+        assert_eq!(directory_snapshot(&store_dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_store_inspection_accepts_equivalent_catalog_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("inspect-equivalent-root");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let alias = temp.path().join("home-alias");
+        symlink(&home, &alias).unwrap();
+        let projects_root = alias.join(".rtrt").join("projects");
+        let database = projects_root.join(identity.slug()).join("memory.sqlite");
+
+        let inspected =
+            inspect_project_store_for_identity_in(&projects_root, &database, &identity).unwrap();
+
+        assert_eq!(inspected.slug, identity.slug());
+    }
+
+    #[test]
+    fn project_store_inspection_rejects_missing_identity_and_creates_nothing() {
+        let temp = TestDir::new("inspect-missing");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let projects_root = home.join(".rtrt/projects");
+        let missing = projects_root.join("missing--00000000000000000000000000000000");
+        let before = directory_snapshot(&projects_root);
+        assert!(inspect_project_store_in(&projects_root, &missing).is_err());
+        assert_eq!(directory_snapshot(&projects_root), before);
+
+        let store_dir = projects_root.join(identity.slug());
+        let db = store_dir.join("memory.sqlite");
+        fs::remove_file(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE unrelated (value TEXT)", [])
+            .unwrap();
+        drop(conn);
+        set_private_file_mode(&db);
+        let before = directory_snapshot(&store_dir);
+        let error = inspect_project_store_in(&projects_root, &store_dir).unwrap_err();
+        assert!(error.to_string().contains("read project store identity"));
+        assert_eq!(directory_snapshot(&store_dir), before);
+    }
+
+    #[test]
+    fn project_store_inspection_rejects_malformed_identity() {
+        let temp = TestDir::new("inspect-malformed");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let projects_root = home.join(".rtrt/projects");
+        let store_dir = projects_root.join(identity.slug());
+        let db = store_dir.join("memory.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER store_identity_immutable_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE store_identity SET fingerprint = ?1 WHERE singleton = ?2",
+            rusqlite::params!["not-a-fingerprint", 1_i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = inspect_project_store_in(&projects_root, &store_dir).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed project store identity")
+        );
+    }
+
+    #[test]
+    fn project_store_inspection_rejects_identity_mismatch_and_tamper() {
+        let temp = TestDir::new("inspect-mismatch");
+        let first = project_identity(temp.path(), "first");
+        let second = project_identity(temp.path(), "second");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&first, &home).unwrap());
+        let projects_root = home.join(".rtrt/projects");
+        let first_dir = projects_root.join(first.slug());
+
+        let mismatch =
+            inspect_project_store_for_identity_in(&projects_root, &first_dir, &second).unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("project store identity mismatch")
+        );
+
+        let db = first_dir.join("memory.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TRIGGER store_identity_immutable_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE store_identity SET memory_root = ?1 WHERE singleton = ?2",
+            rusqlite::params![second.memory_root().to_string_lossy(), 1_i64],
+        )
+        .unwrap();
+        drop(conn);
+        let tamper =
+            inspect_project_store_for_identity_in(&projects_root, &first_dir, &first).unwrap_err();
+        assert!(
+            tamper
+                .to_string()
+                .contains("project store identity mismatch")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_store_inspection_rejects_symlink_non_file_and_unsafe_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDir::new("inspect-unsafe");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let projects_root = home.join(".rtrt/projects");
+        let store_dir = projects_root.join(identity.slug());
+        let db = store_dir.join("memory.sqlite");
+        let backup = store_dir.join("memory.backup");
+        fs::rename(&db, &backup).unwrap();
+        symlink(&backup, &db).unwrap();
+        assert!(inspect_project_store_in(&projects_root, &store_dir).is_err());
+
+        fs::remove_file(&db).unwrap();
+        fs::create_dir(&db).unwrap();
+        assert!(inspect_project_store_in(&projects_root, &store_dir).is_err());
+
+        fs::remove_dir(&db).unwrap();
+        fs::rename(&backup, &db).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(inspect_project_store_in(&projects_root, &store_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_open_rejects_symlink_and_insecure_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TestDir::new("unsafe-paths");
+        let identity = project_identity(temp.path(), "repo");
+        let home_symlink = temp.path().join("home-symlink");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&home_symlink).unwrap();
+        fs::set_permissions(&home_symlink, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, home_symlink.join(".rtrt")).unwrap();
+        assert!(MemoryStore::open_project_in(&identity, &home_symlink).is_err());
+
+        let home_mode = temp.path().join("home-mode");
+        fs::create_dir(&home_mode).unwrap();
+        fs::set_permissions(&home_mode, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(home_mode.join(".rtrt")).unwrap();
+        fs::set_permissions(home_mode.join(".rtrt"), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(MemoryStore::open_project_in(&identity, &home_mode).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_open_sets_private_modes_and_pin() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TestDir::new("private-modes");
+        let identity = project_identity(temp.path(), "repo");
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let store = MemoryStore::open_project_in(&identity, &home).unwrap();
+        assert_eq!(store.project_slug(), Some(identity.slug()));
+        store.assert_project_alias(identity.slug()).unwrap();
+        assert!(store.assert_project_alias("wrong-alias").is_err());
+        assert!(
+            store
+                .conn
+                .execute("UPDATE store_identity SET label = 'changed'", [])
+                .is_err()
+        );
+        let db = project_memory_db_path_in(&home, &identity);
+        assert_eq!(fs::metadata(&db).unwrap().mode() & 0o7777, 0o600);
+        let uid = current_uid().unwrap();
+        assert_eq!(fs::metadata(&db).unwrap().uid(), uid);
+        for directory in [
+            home.join(".rtrt"),
+            home.join(".rtrt/projects"),
+            db.parent().unwrap().into(),
+        ] {
+            let metadata = fs::metadata(directory).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o700);
+            assert_eq!(metadata.uid(), uid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_owner_validation_rejects_wrong_owner() {
+        assert!(!private_owner_mode_valid(1001, 0o100600, 1000, 0o600));
+        assert!(private_owner_mode_valid(1000, 0o100600, 1000, 0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_project_database_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("identity-swap");
+        let first = project_identity(temp.path(), "first");
+        let second = project_identity(temp.path(), "second");
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(MemoryStore::open_project_in(&first, &home).unwrap());
+        drop(MemoryStore::open_project_in(&second, &home).unwrap());
+        let first_db = project_memory_db_path_in(&home, &first);
+        let second_db = project_memory_db_path_in(&home, &second);
+        fs::remove_file(&second_db).unwrap();
+        fs::copy(&first_db, &second_db).unwrap();
+        fs::set_permissions(&second_db, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = match MemoryStore::open_project_in(&second, &home) {
+            Ok(_) => panic!("swapped project DB unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("project store identity mismatch")
+        );
+    }
+
+    #[test]
+    fn legacy_open_remains_unpinned_and_compatible() {
+        let temp = TestDir::new("legacy-open");
+        let path = temp.path().join("arbitrary").join("legacy.sqlite");
+        let store = MemoryStore::open(&path).unwrap();
+        assert_eq!(store.project_slug(), None);
+        assert!(store.assert_project_alias("anything").is_err());
+        store.save("legacy", "note", "still works").unwrap();
+        assert_eq!(store.list_by_project("legacy", 1).unwrap().len(), 1);
+    }
 
     #[test]
     fn save_and_recall_bm25() {
@@ -6259,6 +7340,91 @@ mod tests {
         let hits = store.recall_bm25("p1", "rust", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].body.contains("rust"));
+    }
+
+    #[test]
+    fn invocation_provenance_preserves_first_durable_owner() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let provenance = InvocationProvenance {
+            child_session_id: "child-1".into(),
+            invocation_id: "opencode:parent-1:call-1".into(),
+            parent_project: "00G_rtrt".into(),
+            parent_session_id: Some("parent-1".into()),
+            parent_call_id: Some("call-1".into()),
+            caller_agent: None,
+            parent_cwd: Some("/tmp/lane".into()),
+            parent_worktree: Some("/repo/00G_rtrt".into()),
+            target: Some("claude".into()),
+            model: None,
+            created_at: 20,
+        };
+        store.upsert_invocation_provenance(&provenance).unwrap();
+
+        let conflicting = InvocationProvenance {
+            child_session_id: "child-1".into(),
+            invocation_id: "other-invocation".into(),
+            parent_project: "other-project".into(),
+            parent_session_id: Some("other-parent".into()),
+            parent_call_id: Some("other-call".into()),
+            caller_agent: Some("explore".into()),
+            parent_cwd: Some("/other/cwd".into()),
+            parent_worktree: Some("/other/worktree".into()),
+            target: Some("other-target".into()),
+            model: Some("opus".into()),
+            created_at: 30,
+        };
+        store.upsert_invocation_provenance(&conflicting).unwrap();
+
+        let stored = store.invocation_provenance("child-1").unwrap().unwrap();
+        assert_eq!(stored, provenance);
+        assert!(store.invocation_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn reattribution_persists_complete_provenance_metadata_atomically() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("source".into(), "transcript".into());
+        metadata.insert("transcript_file".into(), "/tmp/child.jsonl".into());
+        let id = store
+            .save_with_metadata("temporary", "assistant-turn", "result", &metadata)
+            .unwrap();
+        let provenance = InvocationProvenance {
+            child_session_id: "child-1".into(),
+            invocation_id: "invocation-1".into(),
+            parent_project: "real-project".into(),
+            parent_session_id: Some("parent-1".into()),
+            parent_call_id: Some("call-1".into()),
+            caller_agent: Some("build".into()),
+            parent_cwd: None,
+            parent_worktree: None,
+            target: Some("claude".into()),
+            model: Some("sonnet".into()),
+            created_at: 1,
+        };
+
+        store
+            .reattribute_with_provenance(id, "main", Some("real-project"), Some(&provenance))
+            .unwrap();
+
+        assert!(store.list_by_project("temporary", 10).unwrap().is_empty());
+        assert_eq!(store.list_by_project("real-project", 10).unwrap().len(), 1);
+        let metadata = store.get_metadata(id).unwrap();
+        for (key, expected) in [
+            ("source_kind", "main"),
+            ("invocation_id", "invocation-1"),
+            ("parent_session_id", "parent-1"),
+            ("parent_call_id", "call-1"),
+            ("caller_agent", "build"),
+            ("child_target", "claude"),
+            ("child_model", "sonnet"),
+        ] {
+            assert_eq!(metadata.get(key).map(String::as_str), Some(expected));
+        }
+        assert_eq!(
+            metadata.get("transcript_file").map(String::as_str),
+            Some("/tmp/child.jsonl")
+        );
     }
 
     /// `reassign_project` folds every row of an orphan bucket into a target

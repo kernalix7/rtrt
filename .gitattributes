@@ -1,0 +1,21 @@
+# Assets embedded with include_str! are matched byte-for-byte at runtime, and
+# fixtures encode exact line endings on purpose. A checkout that rewrites them
+# to CRLF breaks those comparisons, so pin every tracked text file to LF and let
+# the few genuinely binary or CRLF-bearing files opt out below.
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.sqlite binary
+*.woff binary
+*.woff2 binary
+
+# Exercises CRLF handling, so its bytes must survive checkout unchanged.
+crates/rtrt-proxy/tests/fixtures/git_diff_crlf.txt -text
+
+# Vendored upstream files keep the bytes they were published with.
+crates/rtrt-dashboard/ui/vendor/** -text

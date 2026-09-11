@@ -8,234 +8,43 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-10
+
+### Highlights
+
+**RTRT 0.1.1은 로컬 우선 툴킷 릴리스를 완성하며, 멀티 에이전트 오케스트레이션은 호스트 런타임이 담당합니다.**
+
+- 제품 바이너리 3개, 옵트인 `rtrt-eval`, MCP 도구 23개, 빌트인 템플릿 `dev`, `design`, `plan`, `standardization` 4종을 갖춘 11개 크레이트 워크스페이스입니다.
+- OpenCode 통합은 정확한 `rtrt-agent@0.1.1` npm 패키지를 등록하며 OMO와 호환됩니다.
+- 쌍 태그와 의존성 순서를 따르는 자동화가 하나의 버전 릴리스에서 Rust 크레이트와 npm 패키지를 릴리스합니다.
+- Setup 강화로 관리 OpenCode 상태에 엄격한 사전 점검, 심볼릭 링크 보호, 원자적 쓰기를 적용합니다.
+
 ### 추가
 
-- **OpenCode 팀 오케스트레이터**: `rtrt setup --agent opencode --team --apply`가 재현 가능하고 반복 실행에 안전한 전체 팀 설정을 설치합니다. 커스터마이즈 가능한 로컬 manager(기본 `ollama/granite4:350m`), 순서 기반 leader failover, 역할 기반 worker, 생성형 OpenCode agents, Claude MCP 등록, 소형 모델의 prompt 복사에 의존하지 않고 사용자 원문을 한 번 전달하는 exact-relay plugin을 포함합니다. 새 `rtrt team show`, `check-manager`, `dispatch` 명령과 MCP `team_dispatch`를 제공합니다. Claude leader는 `claude -p --model opus|sonnet` 구독 CLI 경로를 사용하며, 재시도 가능한 quota·rate-limit·server·timeout 실패에서 다음 leader로 넘어갑니다. MCP 자동 캡처는 linked worktree를 main 저장소로 귀속하며, 공유 HTTP dispatch는 명시적 project가 없으면 stray project 생성 대신 캡처를 건너뜁니다.
-
-### Highlights — 대시보드 URL 라우팅 / 딥링크
-
-**대시보드의 모든 페이지가 진짜 URL이 됩니다.**
-
-- History-API 라우팅: 각 페이지(및 서브탭)가 경로에 매핑되어 새로고침 · 앞뒤 이동 · 딥링크가 올바른 화면에 도착; 미지의 경로는 SPA 셸로 폴백 (#56).
-- 메모리 페이지의 이중 내비게이션(사이드바 항목 + 페이지 내 서브탭)을 단일 내비게이션 모델로 정리 (#55).
-
-### Highlights — 사용량 인지 프로바이더 라우팅: 원장 → 헤드룸 → 페일오버
-
-**라우터가 각 프로바이더의 사용량과 잔여 쿼터를 알고, 헤드룸 있는 타깃을 선호하며, 소진/오류 타깃에서 자동으로 넘어갑니다.**
-
-- **프로바이더 사용량 원장** (#52): 모든 프로바이더 호출이 `epoch_ts / target / model / input_tokens / output_tokens / est / ok`를 `~/.rtrt/provider-usage.tsv`에 기록(`RTRT_PROVIDER_USAGE_PATH` 재정의; 최근 5000행 상한; best-effort 기록이라 호출을 실패시키지 않음). CLI 셸-아웃은 실제 사용량을 보고하지 않으므로 토큰 수는 ~chars/4 추정치이며 끝까지 `est`로 표시.
-- 타깃별 롤링 **5h / 24h / 7d 윈도우**; 새 `rtrt usage`가 타깃별 표 출력(추정 행은 `~` 표시). 헤드룸 = 24h 사용량 vs `~/.rtrt/config.toml`의 `[limits.<target>] daily_tokens / daily_requests` 상한; `[limits]` 항목 없는 타깃은 상한 없음 보고 — 지어내지 않음.
-- **헤드룸 가중 선택** (#53): 로컬-무료 → 구독-정액 → API-종량 비용 순서 안에서, 가장 빠듯한 차원이 ~15% 미만 남은 후보는 같은 계층 내 감점, 완전 소진 타깃은 계층 무관 최후 폴백으로 강등; 동률은 잔여 헤드룸 비율이 큰 쪽 승리. `rtrt route --explain`이 결정 · 랭크 대안 · 판단 근거 헤드룸 출력.
-- **자동 페일오버** (#53): `rtrt route --failover` / `rtrt call --failover`가 랭크 후보를 순회 — 재시도 가능 실패(rate-limit / quota / 429 / 5xx / 타임아웃)는 다음 타깃으로, 종결성 오류는 중단; 결과에 어떤 타깃이 왜 넘어갔는지 요약.
-- **대시보드 게이지 + 라우팅 프리뷰** (#54): `GET /api/usage`(타깃별 윈도우 사용량 + 헤드룸) + `GET /api/route/preview`(프롬프트 없이 *다음* 요청의 로드밸런싱 결정)가 Tools 쪽 사용량/헤드룸 게이지와 라우팅 프리뷰를 지탱.
-
-### Highlights — 2단 설정: 글로벌 베이스 커널 + 프로젝트별 오버라이드
-
-**글로벌 베이스(훅 / MCP / 스테이터스라인 배선, `~/.rtrt/config.toml`, `rtrt setup` 관리) + 얇은 프로젝트별 커스터마이즈 파일. 유효 설정 = 글로벌 ⊕ 프로젝트.**
-
-- `<repo>/.rtrt/config.toml`의 `ProjectConfig` (#34, #44): 출력 레벨(`off`/`lite`/`full`/`ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인 — 모두 옵션 오버라이드. 비어 있는 필드는 글로벌 상속; 전부 기본값이면 파일 삭제로 저장소 청결 유지. `Config::load_effective(repo)`가 오버레이 적용.
-- 대시보드: 프로젝트별 설정 표면마다 **글로벌 따름 / 커스텀** 스코프 토글 — 스테이터스라인 (#42), Output Optimizer 레벨 (#43), 프로바이더 / 압축 / 에이전트 (#45).
-- `rtrt migrate`(기본 dry-run; `--apply`로 기록)가 기존 저장소를 rtrt 프로젝트 표준으로 이관; `rtrt project refresh`는 원커맨드 별칭(컨트랙트 렌더 → 표준 설정 활성화 → 전체 일관성 감사). 둘 다 프로젝트 레벨 rtrt 소유 키 섀도(예: 프로젝트 `.claude/settings.json`의 `statusLine` 재선언)를 감지해 `.bak` 백업과 함께 제거 — 프로젝트가 글로벌 베이스 커널을 따르게 함 (#34).
-- `rtrt project status / health / repair`가 표준화 컨트랙트를 점검/복구; 팀 에이전트 동반 설치 (#32).
-
-### Highlights — 스테이터스라인 필러별 절감 모델
-
-**리치 스테이터스라인 3행이 프로젝트별 · 필러별 절감을 각자 정직한 단위로 보고 — 혼합 · 조작된 퍼센트 없음.**
-
-- `📝opt:<level>` — Output Optimizer는 활성 terse 레벨로 표시(프롬프트 주입이라 전/후 측정 불가 — 퍼센트 없음); `🧠mem:X%` — 메모리 저장 축소(원본 vs 저장 본문; 내부 효율, 자체 필러); `⚡cmd:Y%` — Command Optimizer 유효(EFFECTIVE) 절감률(실제 필터링된 실행만, 패스스루 제외로 희석 방지); `💯Σ:Z%` — 에이전트-토큰 절감: 모델 컨텍스트 밖으로 지켜낸 토큰(명령 필터링 + 리콜 재사용; 저장 압축과 terse 모드는 제외) (#37, #38, #39).
-- ctx% 보정 + 실제 5h / 주간 rate-limit 윈도우 (#36); rtrt 네이티브 라벨 (#41); 프로젝트별 스테이터스라인 상속/오버라이드, 기본은 글로벌 따름 (#42).
-
-### Highlights — 대시보드 재구성 (Project / Tools)
-
-- 상단 바를 **Project / Tools** 모드로 분리 (#51); Overview / Environment / Route 페이지를 데이터 모델 중심으로 재구성 (#49); Overview Σ가 혼합 합계 대신 에이전트-토큰 모델 사용 (#50).
-- 남은 설정 전부 웹 UI에서 편집 가능 (#48).
-- 프런트엔드를 HTML 셸 + `styles.css` + 클래식-JS 모듈로 분리 (#46); 백엔드 `main.rs`를 state / routes / handlers 모듈 트리로 분리 (#47); 기능 그룹 IA + 통합 페이지로 UI 개편 (#40); 대시보드 v2: 6-섹션 IA, 시간 윈도우, 유효%/커버리지, 정확한 Output Optimizer 보고 (#28, #29).
-
-### Highlights — 오케스트레이터: detect → invoke → route
-
-- `rtrt detect`가 로컬 AI CLI / API / 서버를 스캔해 가용 상태를 보고, 대시보드 Environment 탭에서 도구별 opt-in/out (#19, #22).
-- `rtrt call <target>` 크로스-툴 호출 브리지: 감지된 에이전트/프로바이더를 `--mode` cli / api / auto로 하나의 프롬프트 인터페이스에서 실행; MCP `agent_call` 도구로도 노출 (#21, #24).
-- `rtrt route` 비용 인지 라우트 선택: 능력 기준 가장 저렴하고 쓸모 있는 타깃(로컬-무료 → 구독 → API-종량), `--explain` / `--dry-run`; MCP `agent_route` 도구; 대시보드 Orchestration 뷰 (#23, #24, #26).
-- 리치 커스텀 스테이터스라인 `rtrt statusline --rich`(모델 / ctx% / rate-limit 윈도우 / 프로젝트별 절감), 웹 UI에서 커스터마이즈 (#25, #27).
-
-### Highlights — 템플릿 · 프로젝트 라이프사이클 · 표준화
-
-- 대시보드 비주얼 템플릿 에디터 + 커스텀 템플릿 CRUD (#30); 템플릿 페이지 개편 — 그룹화된 라이브러리 + 다듬은 에디터 (#33).
-- 새 표준화 템플릿 + `rtrt init` 프로젝트 부트스트랩 (#31); `rtrt project` 라이프사이클(status / health / repair) + 팀 에이전트 (#32).
-
-### Highlights — Output Optimizer + Command Optimizer
-
-- **Output Optimizer** (#10): 일회성 압축 호출 대신 레벨(`off` / `lite` / `full` / `ultra`)을 갖는 영구 terse 모드; 다국어 룰 + 보조 스킬 (#12); 압축-출력 crew 서브에이전트 (#13); 사용자 레벨 디렉터리에서 스킬/에이전트 로드 + 에이전트별 terse 룰 (#14); 웹 UI 레벨 토글 (#15).
-- **Command Optimizer** (#17): 광범위 명령 출력 필터(git / cargo / 파일시스템 / 검색 / HTTP / GitHub / 컨테이너 / Kubernetes / Python / Go / Node / TypeScript / 린터); `rtrt proxy-run <cmd>`가 명령을 실행하고 종료 코드를 보존하며 출력 필터링; 투명한 Claude Code `PreToolUse` 훅(`rtrt hook proxy-rewrite`)이 축소 가능 명령을 자동 재작성; `~/.rtrt/proxy-stats.sqlite` 기반 `rtrt gain` 절감 분석 (#20); `rtrt discover`가 Claude Code transcript에서 축소 가능 명령 스캔.
-- 대시보드에서 3개 옵티마이저 전체의 실시간 프로젝트별 토큰 절감 (#18); 퍼센트-절감 헤드라인 + Environment 탭 (#22).
-- rtrt를 **Retort** — "AI 에이전트 컨텍스트를 증류" — 로 리브랜딩 (#16).
-
-### Fixed — 6월 스윕 이후
-
-- 메모리 캡처를 cwd basename이 아닌 git 저장소 루트로 귀속 (#9).
-- 대시보드: 스테이터스라인에서 서드파티 에이전트 이름 제거; 기본값을 에이전트에 동기화 (#41); Output Optimizer를 오해 소지 있는 % 대신 레벨로 표시 (#28).
-- CI: clippy 1.96 `sort_by_key` + Windows unused-path 수정 (#35).
-- 릴리스 파이프라인: `release.yml`의 crates.io 게시 루프가 워크스페이스 크레이트 11개 전부를 의존성 순서로 커버하고 실제 게시 오류에는 즉시 실패(기존엔 9개만 나열 — `rtrt-security` / `rtrt-eval` 누락 — 하고 모든 실패를 삼킴); 이미-게시됨 스킵(멱등)은 유지. `coverage.yml`이 라인 커버리지 하한(`--fail-under-lines 35`) 강제; CI `cargo audit` 차단화.
-
-### Highlights — 인터랙티브 메모리 그래프 (기본: 무-LLM 유사도)
-
-**메모리 그래프가 흩뿌린 점에서 탐색 맵으로. 기본 모드는 엔티티 추출도 생성 LLM도 불필요.**
-
-- **유사도 모드(기본)**: `graph_similarity`가 각 메모리를 가장 유사한 이웃과 가중 엣지로 연결 — 이미 저장된 임베딩 코사인(추론 호출 0) 또는 임베딩 없으면 FTS5 BM25 어휘 유사도(완전 무모델). `GET /api/memory/graph` → `{ mode:"similarity", basis:"vector"|"bm25", nodes, edges:[{src,dst,weight}] }`. UI 기본값 — 추출 단계 없이 그래프 즉시 표시.
-- **엔티티 모드(옵션, `mode=entity`)**: 이분 메모리↔엔티티 그래프(엔티티 1급 노드), 개념 수준 구조 원하는 사용자용 LLM 엔티티 추출.
-- UI: 유사도/엔티티 모드 토글; 유사도 엣지는 weight 비례, basis 캡션; 엔티티 추출 버튼은 엔티티 모드에만.
-
-- `rtrt-memory` 스키마 v7에 `entities(project, name)` + `memory_entities(memory_id, entity_id)` 추가 — 추출된 엔티티가 1급 노드(기존 메모리↔메모리 `edges` 경로는 유지, 가산적). 새 `upsert_entity`, `link_memory_entity`, `link_extracted_bipartite`, `graph_bipartite`(메모리 노드 + degree 있는 엔티티 노드 + memory→entity 링크 반환, 각 메모리의 `source_kind` 포함).
-- `GET /api/memory/graph`가 이분 `{nodes, edges}` 반환(메모리 노드 `m<id>` + kind·source_kind, 엔티티 노드 `e<id>` + degree); `POST /api/memory/entities`가 이제 이분 그래프 구축.
-- UI: 엔티티는 큰 녹색 노드(degree 비례 반경), 메모리는 작은 노드(메인 파랑/서브 보라); force-directed 레이아웃에 노드 드래그/고정·휠 줌·팬; 노드 클릭 시 상세 패널 + 이웃 하이라이트; 메모리/엔티티 + 메인/서브 필터 + 검색; 빈 그래프는 엔티티 추출 CTA 표시.
-
-### Highlights — 팀원/서브에이전트 작업 캡처 + 부모 프로젝트로 그룹핑
-
-**대시보드가 Claude Code transcript를 tail해서 메인 에이전트 transcript에 안 들어오는 팀원(FleetView)·서브에이전트(Task 도구) 작업을 캡처하고, 실제 프로젝트 하위로 묶고, 모든 행을 메인/서브로 분류.**
-
-- `rtrt-dashboard`에 transcript 워처: `~/.claude/projects/**/*.jsonl`(메인 세션 + 중첩 `<session>/subagents/agent-*.jsonl`) tail, 각 assistant 턴을 `body_sha` 디덥과 함께 저장.
-- 서브에이전트 행은 **부모 세션 프로젝트**로 귀속 — 부모 transcript의 cwd로 도출해 서브에이전트가 git worktree(자기 cwd basename은 `p18-gap` 같은 브랜치명)에서 돌아도 안정. 각 행에 `source_kind = main | subagent` 태그.
-- `rtrt-memory`: `reattribute(id, source_kind, project?)`(단일 `json_set` UPDATE) + `reattribution_candidates()`; 부팅 1회 마이그레이션이 기존 stray 서브에이전트/worktree 버킷을 부모로 접고 메인/서브 분류(idempotent).
-- `/api/projects`가 stray 버킷(`agent-*` / `p<n>-*` / hex 세션 해시)을 셀렉터에서 숨김(등록 프로젝트는 항상 표시); 셀렉터 105 → 실제 프로젝트만.
-- 타임라인 API가 `source_kind` 노출; 메모리 페이지에 🧠 메인 / 🤖 서브 배지 + 전체/메인/서브 필터.
-
-### Highlights — 프로젝트 중심 대시보드 + 프로젝트별 보안
-
-**대시보드를 flat 13개 메뉴 대신 프로젝트 컨텍스트 중심으로 재구성하고, 보안을 프로젝트 인식형으로 전환.**
-
-- `rtrt-core`에 프로젝트 레지스트리: `ProjectEntry { name, path, security_profile }` + `Config.projects` (`project()` / `upsert_project()` 헬퍼). `~/.rtrt/config.toml`에 `[[projects]]`로 저장.
-- 대시보드 API: `GET /api/projects`(config 레지스트리 ∪ 메모리 버킷 → 이름/경로/바인딩 프로파일/mem_count), `PUT /api/projects`(upsert + config 기록), `POST /api/security/profile`(검증 + 커스텀 프로파일을 `~/.rtrt/security/profiles/`에 저장).
-- UI: 사이드바에 전역 프로젝트 셀렉터(localStorage 기억) + 프로젝트 추가/편집 모달; nav를 **프로젝트** 스코프 그룹(개요/메모리/보안/코드맵/진단)과 **도구** 그룹(압축/로컬 LLM/프롬프트/템플릿/연결/설정)으로 분리. 스코프 페이지는 페이지별 프로젝트 선택기 대신 단일 `currentProject()` 사용.
-- 보안 페이지 프로젝트 인식: 선택 프로젝트 경로를 스캔, 바인딩된 프로파일 기본 선택, "이 프로젝트에 적용"으로 프로파일 바인딩, "프로파일 설정" 서브탭에서 프로파일 목록/보기(룰+표준)/복제/저장.
-
-### Highlights — AI 산출물 보안 & 라이선스 프로파일
-
-**새 `rtrt-security` 크레이트(11번째 워크스페이스 크레이트): RHEL/OpenSCAP 보안 프로파일을 본뜬 프로파일 기반 보안+라이선스 스캔. 빌트인 프로파일 6개가 모든 룰을 산업 표준(CWE / OWASP Top 10 + ASVS / NIST 800-53 + 800-218 SSDF / CIS Controls v8 / SLSA / EU AI Act)에 매핑하고, 5개 플러그인 엔진이 실행하며, CLI·대시보드·MCP로 노출.**
-
-- 스캔 엔진 5개: `secrets`(빌트인 패턴셋 + Shannon 엔트로피 게이트 + 마스킹), `licenses`(SPDX 매니페스트 정책, allow/forbid, 헤더 검사 옵션, 워크스페이스 상속 인식), `deps`(Cargo.lock / package-lock 위생 — git/wildcard/yanked — + 오프라인 RustSec advisory 매칭 옵션), `patterns`(lang·path 필터 정규식 소스 스캐너), `ai`(AI 산출물 특화: hallucinated-import/슬롭스쿼팅, base64-blob, eval-usage, todo-secret, unsafe-block — 각 소스 파일을 가장 가까운 crate 매니페스트 기준으로 판정해 모노레포 멤버 오탐 방지).
-- 빌트인 프로파일 6개: `ai-default`(권장 baseline, 10룰), `ai-strict`(16), `owasp-top-10`(15), `asvs-l2`(13), `cis-baseline`(13), `nist-ssdf`(12). 선언적 TOML — 사용자는 `~/.rtrt/security/profiles/`에 자기 것 넣어 빌트인 오버라이드/추가. 모든 룰이 `standards` 매핑 보유해 finding이 강제하는 통제 항목을 인용.
-- CLI: `rtrt security scan --profile <name> [--path] [--json]`, `profile list`, `profile show <name>`, `gate`(프로파일 임계치 이상이면 non-zero 종료 — CI 게이트), `init`(빌트인을 사용자 디렉터리로 복사).
-- 대시보드: 보안 페이지(프로파일 선택, 스캔, 심각도별 finding + 표준 칩, 실행/스킵 엔진) — `GET /api/security/profiles`, `GET /api/security/profile/{name}`, `POST /api/security/scan` 기반.
-- MCP: `security_scan(profile, path?)`가 전체 ScanReport 반환 — 에이전트가 커밋 전 자기 산출물 자가 검사 가능.
-
-### Highlights — 대시보드 백그라운드 서비스 자동 시작
-
-**설치 시 `rtrt-dashboard`를 백그라운드 OS 서비스로 띄워, 직접 실행 안 해도 <http://127.0.0.1:7311> 웹 UI가 항상 떠 있음 — 크래시 시 재시작, 로그인 시 자동 기동.**
-
-- 새 `rtrt service install|uninstall|status` 서브커맨드: Linux는 systemd **user** 유닛(`~/.config/systemd/user/rtrt-dashboard.service`), macOS는 launchd LaunchAgent(`~/Library/LaunchAgents/io.kodenet.rtrt-dashboard.plist`). 기본 dry-run, `--apply`로 실행. 유닛이 `RTRT_MEMORY_PATH=~/.rtrt/memory.sqlite`를 고정해 CLI/MCP/훅과 동일 스토어 사용.
-- `install.sh` / `install.ps1`이 기본으로 서비스 시작(Windows는 `rtrt-dashboard` 로그온 예약 작업 등록); `--no-service` / `-NoService` / `RTRT_NO_SERVICE=1`로 옵트아웃. `uninstall.sh` / `uninstall.ps1`은 바이너리 삭제 전에 서비스 중지+제거.
-- `docs/INSTALL.md` + `docs/INSTALL.ko.md`에 서비스, 옵트아웃 플래그, 수동 관리 문서화.
-
-### Highlights — 절감률 % 일관 표시 · 로컬 LLM 관리 페이지
-
-**대시보드가 압축 절감률을 어디서나 퍼센트로 표시하고, 로컬 Ollama 모델을 끝까지 관리하는 새 페이지가 추가됐습니다.**
-
-- 모든 압축 표면이 `saved_pct`(소수 1자리)를 반환: `POST /api/compress`, `POST /api/proxy`, `POST /api/memory/compress`, 그리고 `GET /api/memory/stats`(압축된 행 집계 `saved_pct`)와 타임라인 행(행별 `saved_pct`, 미압축 시 null). UI는 압축/프록시 결과, 통계 KPI 타일, 행별 배지에 퍼센트 표시.
-- 새 **로컬 LLM** 페이지 — `GET /api/ollama/models`, `GET /api/ollama/ps`, `POST /api/ollama/pull`, `DELETE /api/ollama/models` 기반: 설치된 모델 크기와 함께 목록, 현재 로드된 모델 확인, 새 모델 pull(블로킹), 삭제(확인 후), 그리고 원클릭으로 압축/임베딩 기본 모델 지정. Ollama base URL은 config에서 해석(`embeddings` → `auto_compress` → localhost, 끝의 `/v1` 제거).
-
-### Highlights — 밀집 벡터 시맨틱 recall · 엔티티 연결 · SessionStart 주입
-
-**메모리 recall이 로컬 Ollama 임베더 기반의 진짜 밀집 벡터 경로를 얻고, 대시보드는 임베딩 백필 + 엔티티 추출을 원클릭으로 노출하며, SessionStart 훅이 첫 턴부터 프로젝트 지식을 주입합니다.**
-
-- `rtrt-memory::OllamaEmbedder` (`ollama-embed` feature)가 `{base_url}/api/embeddings` 호출; 기본 모델 `bge-m3` (1024차원). `recall_hybrid`에 연결돼 임베더가 있으면 `mode=hybrid` recall이 BM25 + 코사인을 reciprocal-rank fusion으로 융합하고, 없으면 그래프 혼합 BM25로 graceful degrade.
-- 새 `[embeddings]` 설정 섹션(`enabled` / `model` / `base_url`) + `RTRT_EMBED_ENABLED` / `RTRT_EMBED_MODEL` / `RTRT_EMBED_BASE_URL` env 오버라이드; `GET`/`POST /api/config`와 대시보드 설정 페이지에서 읽기·쓰기 노출.
-- 대시보드: `POST /api/memory/embed`로 프로젝트의 미임베딩 행 백필, `POST /api/memory/entities`로 LLM 엔티티 추출 후 동시 언급 메모리 연결. 검색 서브탭에 벡터 히트 시맨틱 배지 + 임베딩 백필 버튼, 그래프 서브탭에 엔티티 추출 버튼 + 타입별(엔티티/블록/메모리) 노드 색상.
-- `MemoryStore::add_edge`가 새 엣지 생성 여부를 반환; 엔티티 연결을 async `link_entities`와 동기 `link_extracted`로 분리해 `!Sync` 스토어 borrow를 `.await` 넘겨 잡지 않고 `Send` axum 핸들러에서 실행.
-- 새 `rtrt hook session-inject`(`SessionStart`에 등록)가 프로젝트 상위 메모리를 컨텍스트 블록으로 출력해 첫 프롬프트 전에 배경 지식 확보.
-
-### Highlights — 로컬 LLM 압축 모델 비교
-
-- `docs/PERF.md` + `docs/PERF.ko.md`에 LLM 자동 압축 경로의 로컬 Ollama 모델 길이별 비교 게시 (티어당 현실 캡처 20개 × 6티어, XS ~16자 ~ XXL ~6000자). 결론: 압축률은 모델보다 입력 길이가 좌우 — 짧은 행은 거의 안 줄어 `RTRT_AUTO_COMPRESS_MIN_CHARS=512`가 올바르게 스킵, dense 중간 길이 ~25-30%, 긴 장황한 캡처 40%+.
-- 로컬 권장 기본 `gemma3:4b`: 전 길이 견고(XXL 42%), 4.3GB로 GPU 100% 적재, 짧은 행 안전 스킵. `granite4.1:8b`는 초장문 부적합(6000자 전부 미압축), `llama3.1:8b`는 사실 조작, `qwen3.5:9b`(thinking)는 verbatim 반환.
-- `docs/USAGE.md` + `docs/USAGE.ko.md`에 `RTRT_AUTO_COMPRESS_MODEL=gemma3:4b` 로컬 오버라이드 명시; 코드 기본값은 클라우드 키 사용자 위해 `claude-haiku-4-5` 유지.
-
-### Highlights — MCP Prompts/Resources + ONNX 백엔드 + BERTScore
-
-**남은 로드맵 3개 항목 한 묶음에 착륙. MCP 서버는 핸들러 트라이어드 (tools / prompts / resources) 완전 노출; 휴리스틱 `MlCompressor`는 옵션 실 ONNX-runtime 백엔드 (LLMLingua-2 계약 일치)로 졸업; `rtrt-eval`은 동일 인코더 로딩 머신을 공유하는 BERTScore 평가기 추가. 신규 코드 전부 피처 게이트, 모델 파일은 무동봉.**
-
-- `rtrt-mcp`가 `enable_prompts()` + `enable_resources()` 선언, 4개 핸들러 구현. `prompts/list`는 로컬 `PromptRegistry`의 모든 이름 (기본 `~/.rtrt/prompts/`, `RTRT_PROMPTS_DIR`로 오버라이드); `prompts/get`은 handlebars 인자 치환과 함께 최신 버전 반환. `resources/list`는 프로젝트당 `memory://<project>/timeline` 1개 + Letta 블록당 `memory://<project>/block/<name>` 1개씩 노출; `resources/read`는 JSONL 타임라인 row 또는 블록 본문 반환. 에러는 `McpError::invalid_params` / `internal_error`로 매핑, 서버는 절대 크래시 안 함.
-- `rtrt-templates::render::render_str` 신설로 handlebars 렌더러 공개 — MCP와 다른 컨슈머가 스캐폴더와 동일 `{{var}}` 엔진 공유.
-- `rtrt-compress::OnnxImportance` — 옵트인 `onnx` 피처가 `ort = 2.0.0-rc.12` (`load-dynamic`), HuggingFace `tokenizers`, `ndarray` 픽업. `MlCompressor::onnx(model, tokenizer)`가 세션 구성, 사용자 제공 모델을 `input_ids` + `attention_mask`로 실행, per-subword keep-probability를 tokenizer의 offsets 통해 whitespace 토큰에 매핑. 기본 빌드는 `ort` 링크 안 함 — 룰 엔진만 쓰는 사용자의 워크스페이스 사이즈 동일.
-- 신규 CLI 배선: `rtrt compress --ml --onnx-model <path> --onnx-tokenizer <path>` (`rtrt-cli --features onnx`로 게이트, `rtrt-compress/onnx`에 포워드). env 변수 (`RTRT_ONNX_MODEL` / `RTRT_ONNX_TOKENIZER`) 둘 다 수용.
-- `rtrt-eval::bertscore` — 옵트인 `bertscore` 피처. `BertScoreScorer::new(encoder.onnx, tokenizer.json)`이 L2-normalised per-subword 임베더 구성; `score(reference, hypothesis)`가 greedy-aligned `(P, R, F1)` 반환; `evaluate_fixture(fixture, level)`이 compressor 실행 후 per-sample + mean 점수 보고. CLI: `rtrt-eval bertscore --model ... --tokenizer ... [--level full]`.
-- `docs/USAGE.md` + `docs/USAGE.ko.md`에 ONNX 모델 계약, BERTScore 워크플로, 두 표면의 env 변수 / 피처 플래그 문서화. README 로드맵 (EN + KO) 3 항목 done으로 전환, deferred 멀티 에이전트 라인 별도 불릿 유지.
-
-### Highlights — rtrt-eval 옵션 하니스
-
-**10번째 워크스페이스 크레이트 `rtrt-eval` 도입. 두 표면 (recall 정확도 + 압축 ratio) JSON fixture를 단일 숫자로 환원 → 대시보드 게시 가능. 내장 smoke fixture는 의도적으로 작음 — 동일 스키마 외부 fixture 받음, LongMemEval-S / 인하우스 코퍼스 드랍 시 코드 변경 없이 적용. Smoke 코퍼스에서 R@5 = 0.857 + MRR = 0.857, 내장 floor 테스트로 강제.**
-
-- 신규 크레이트 `crates/rtrt-eval/`: 라이브러리 + `rtrt-eval` 바이너리. 서브커맨드 `recall` / `compress`, JSON 또는 사람 표 출력, `--fixture <path>`로 내장 smoke 셋 덮어쓰기.
-- 라이브러리 API: `RecallFixture`, `CompressFixture`, `evaluate_recall(&fixture, k) -> RecallReport`, `evaluate_compression(&fixture, level) -> CompressReport`. 내장 fixture는 `RECALL_SMOKE` / `COMPRESS_SMOKE` const로 노출.
-- Smoke fixture: `crates/rtrt-eval/fixtures/recall_smoke.json` (12 docs, 7 라벨 query) + `compress_smoke.json` (3 prose 샘플). BM25가 R@5 ≥ 0.80 floor 클리어하도록 손-튜닝; floor 미달 시 `recall_at_5_on_smoke_fixture_clears_floor` 테스트가 머지 차단.
-- `docs/PERF.md` + `docs/PERF.ko.md`에 smoke fixture 첫 측정값 게시. 명시적으로 smoke (경쟁 벤치 아님) — 실수치는 실제 라벨링 코퍼스 필요.
-- README 로드맵 (EN + KO): rtrt-eval + smoke 스크립트는 done으로 전환; BERTScore 수치 / ONNX 백엔드 / 정식 태그는 open 유지.
-
-### Highlights — LLM 자동 압축 + 라이브 키 스모크 게이트
-
-- `rtrt-dashboard`에 옵트인 LLM 압축 데몬. `RTRT_AUTO_COMPRESS_LLM=1` 설정 시 백그라운드 tokio 태스크가 `RTRT_AUTO_COMPRESS_AGE_SEC`보다 오래되고 `RTRT_AUTO_COMPRESS_MIN_CHARS`보다 긴 body row를 스윕, 게이트웨이 모델 (`RTRT_AUTO_COMPRESS_MODEL`, 기본 `claude-haiku-4-5`)에 의미 보존 압축 요청 후 본문 덮어쓰기. 재작성된 row는 `metadata.compressed_at` / `compressed_model` / `compressed_from_chars` / `compressed_to_chars`로 태깅 — 다음 스윕은 스킵. 모델 출력이 비었거나 원본보다 짧지 않으면 `compressed_skip=no-shrink`만 기록하고 본문은 유지.
-- `MemoryStore::set_body` (외부 콘텐츠 FTS5의 `'delete' + insert` 패턴으로 인덱스 동기화) + `MemoryStore::compress_candidates` (age / min-chars / not-yet-compressed 필터) — 데몬의 토대. `auto_compress_primitives` 회귀 테스트로 커버.
-- `scripts/smoke.sh` — 라이브 키 스모크 하니스. `rtrt --version` / `compress` / `proxy` / `templates` / `new` / `repo-map`은 무조건 실행; Anthropic / OpenAI / OpenAI-compat 채팅은 환경 변수 있을 때만 (없으면 SKIP); 루프백 포트에 `rtrt-dashboard` + `rtrt-mcp` 띄워서 `/healthz` / `/api/templates` / `/api/stats` + MCP HTTP 응답성 + 베어러 가드 401 검증. 실제 실행된 검사가 실패한 경우에만 non-zero. `0.1.0` 정식 태그 승격 전 게이트.
-- `docs/USAGE.md` + `docs/USAGE.ko.md`에 `RTRT_AUTO_COMPRESS_*` 환경 변수 7개와 데몬이 기록하는 메타데이터 필드 문서화.
-
-### Highlights — 대시보드 / 문서 / 회귀 커버리지
-
-- 대시보드 활동 피드가 `EventSource`로 `/api/stream` 구독. SSE 미지원 환경에서만 5초 폴링 폴백. 캡처가 새로고침 없이 실시간 표시.
-- `docs/USAGE.md` + `docs/USAGE.ko.md`에 MCP 18개 도구 전부 문서화 (`memory_timeline` / `memory_profile` / `memory_relations` / `memory_smart_search` / `memory_export` / `memory_consolidate` / `memory_sessions` / `repo_map` 표 추가) + MCP가 인식하는 `RTRT_AUTO_*` 환경 변수 4개. 한국어 USAGE는 영문에만 있던 대시보드 자동 캡처 파이프라인 섹션도 보강.
-- `rtrt-memory` 회귀 테스트 `auto_capture_pipeline_primitives` — 대시보드 / MCP가 공통 사용하는 빌딩 블록 검증: 결정론적 `body_sha`, `body_seen_at` dedup 윈도우 (프로젝트별 스코핑), `tag_row` 세션 + sha 기록, `sessions` / `session_records` 그룹화, `archive_overflow_no_llm` 최신 N 유지.
-
-### Highlights — 방향성 정리 후속
-
-**스키마 v5가 타임라인 페이저용 커버링 인덱스 추가 (`recent_paged` 100K rows p50 71ms → ~32µs, 2200× 가속). Claude Code 플러그인 훅 6 → 12개. MCP에 7번째 메모리 도구 (`memory_sessions`) 추가 — v4 `session_id` 컬럼 노출. MCP `compress` / `compress_ml` / `proxy` / `provider_chat` 핸들러 4개가 대시보드와 동일한 자동 캡처 파이프라인 통과. PR 시점 perf 게이트 (`.github/workflows/perf.yml` + `scripts/perf-gate.sh`)가 베이스라인 대비 10% 이상 회귀 거부. 한국어 README가 Unix-toolkit 포지셔닝으로 재정렬.**
-
-- `rtrt-memory` 스키마 v5: `idx_memories_timeline` 커버링 인덱스 `(project, created_at DESC, id DESC)`. 신규 `sessions()` + `session_records()` 헬퍼 — `session_id` 기준 그룹화로 리플레이/익스포트 가능. `recent_paged` p50 모든 크기에서 sub-50 µs.
-- `rtrt-mcp`에 `memory_sessions` (프로젝트별 세션 요약 또는 세션 행 리스트) 추가, 총 18개 도구. `RtrtState`에 `auto_capture()` 헬퍼 — 대시보드와 동일 파이프라인 (`redact_secrets` → SHA-256 dedup → save → 세션 태그). `compress` / `compress_ml` / `proxy` / `provider_chat` 성공 시마다 실행. 환경 변수: `RTRT_AUTO_CAPTURE` / `RTRT_AUTO_REDACT` / `RTRT_AUTO_DEDUP_WINDOW_SEC` / `RTRT_DEFAULT_PROJECT` (대시보드와 동일).
-- Claude Code 플러그인 (`plugins/claude-code/rtrt/`) 훅 12개: PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd.
-- `.github/workflows/perf.yml` — PR base ref 기준 `--save-baseline` / `--baseline`로 `rtrt-memory` 벤치, `scripts/perf-gate.sh`가 criterion `estimates.json` 파싱 후 10% 이상 p50 회귀 시 exit 1. `docs/PERF.ko.md` 정책 자동화.
-- `docs/PERF.md` + `docs/PERF.ko.md`에 v5 인덱스 적용 후 측정값 갱신.
-- `docs/README.ko.md` 재작성 — Unix-toolkit 포지셔닝, 3 기둥 블록, DESIGN/PERF 링크, 18 MCP 도구 반영.
-
-### Highlights — 방향성 정리
-
-**RTRT는 Unix 도구 모음 방향으로 정식 commit. 최상위 `DESIGN.md`가 10개 원칙 문서화, `docs/PERF.md`가 SLO 표 + 첫 측정값 게시. 자동 캡처는 옵션이 아닌 기본 동작 — 모든 dashboard `/api/*` 호출과 모든 Claude Code 훅 발화가 SHA-256 dedup + privacy 필터 + 세션 태깅 파이프라인을 거쳐 SQLite에 도달. 시간당 콘솔리데이션 데몬이 프로젝트별 row 캡 유지. 새 메모리 MCP 도구 6개 (timeline / profile / relations / smart_search / export / consolidate) + SSE 라이브 스트림 + 토큰 집계 엔드포인트로 표면 보강.**
-
-- 신규 `DESIGN.md` + `docs/DESIGN.ko.md`: 10개 원칙 — 프레임워크 아닌 도구, 안정된 substrate, 3 기둥만, 자동 캡처 기본, 옵션 크레이트로 확장, 측정값 성능, 로컬 우선, 발행 인터페이스 영원, 작게 천천히 깊게.
-- 신규 `docs/PERF.md` + `docs/PERF.ko.md`: SLO 표 + `recall_bench` 첫 측정값. 10% 이상 회귀는 릴리스 차단.
-- `rtrt-memory` v4 스키마: `session_id` + `body_sha` 컬럼 + 인덱스. `body_sha()` / `body_seen_at()` / `tag_row()` / `archive_overflow_no_llm()` 헬퍼.
-- `rtrt-dashboard` 자동 캡처 파이프라인: `/api/{chat,compress,diagnose,proxy}` 성공마다 `redact_secrets` → SHA-256 dedup (기본 5분) → 저장 → 세션 태깅. 환경 변수: `RTRT_AUTO_CAPTURE` / `RTRT_AUTO_REDACT` / `RTRT_AUTO_DEDUP_WINDOW_SEC` / `RTRT_DEFAULT_PROJECT`. 저장마다 `/api/stream` (SSE) JSON 이벤트 브로드캐스트.
-- 시간당 콘솔리데이션 데몬 — `archive_overflow_no_llm`로 프로젝트별 `RTRT_CONSOLIDATE_KEEP` (기본 1000) 최신 row 유지. 주기 `RTRT_CONSOLIDATE_INTERVAL_SEC` (기본 3600, 0 비활성).
-- `GET /api/memory/projects` + `GET /api/memory/timeline?project=X&limit=N&offset=M` — 대시보드 프로젝트 픽커 + 페이지네이션 히스토리.
-- `GET /api/tokens/summary` — 게이트웨이 요청 이력 시간/일 단위 집계.
-- `GET /api/stream` SSE + 256-슬롯 tokio broadcast — 캡처마다 `{type, id, kind, project, session}` 이벤트.
-- 새 MCP 메모리 도구 6개: `memory_timeline` / `memory_profile` / `memory_relations` / `memory_smart_search` / `memory_export` / `memory_consolidate`. MCP 서버 총 17개 도구.
-- `plugins/claude-code/rtrt/` — Claude Code 플러그인 스캐폴드, 훅 스크립트 6개. `rtrt` CLI 우선, `POST /api/memory/save` 폴백. Best-effort: 캡처 실패해도 에이전트 안 멈춤.
-- `crates/rtrt-memory/benches/recall_bench.rs` — criterion 벤치 (1K / 10K / 100K). 첫 측정값 `docs/PERF.md`.
-- 워크스페이스 의존성: `sha2` (dedup), `uuid` (세션), `tokio-stream` (SSE).
-
-### Highlights — 같은 브랜치 이전 묶음
-
-- `rtrt-mcp`: rmcp Streamable HTTP 전송 + axum 라우터. 새 도구 `compress_ml`, `proxy`, `memory_set_block/get_block/list_blocks`. `memory_recall`에 qdrant DSL 필터 파라미터. `--http-token` 상수-시간 베어러 가드, `--allowed-origins` RFC 6454.
-- `rtrt-memory`: v3 마이그레이션 `metadata` 컬럼, `PayloadFilter` DSL (`source=claude,topic~^auth`), `recall_bm25_with_filter`, `save_with_metadata`, `export_jsonl` / `import_jsonl`.
-- `rtrt-providers`: `Gateway::with_cache(cap)` Helicone 응답 캐시 — 키 `(model, messages, max_tokens, temperature)`, 히트는 재시도/메트릭/예산 우회.
-- `rtrt-compress`: `MlCompressor` + `TokenImportance` 트레이트 + 휴리스틱 백엔드 (ONNX 백엔드 deferred), `compress_to(Plain/Markdown/Xml/Json)`, tree-sitter Python + TypeScript 그래머.
-- `rtrt-templates`: `agent-role` 빌트인 (crewAI role/goal/backstory 트리아드).
-- `rtrt-dashboard`: 10탭 (Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup), SVG 스파크라인, parent_id 그룹 트레이스, 다크/라이트 토글, 캐시 KPI. 신규 라우트 `/api/{prompts*, budget, memory/{recall,save,blocks,blocks/{name}}, compress, proxy, diagnose, repo-map, setup}`. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어.
-- `rtrt-cli`: `rtrt diagnose`, `rtrt mcp`, `rtrt benchmark`, `rtrt memory export/import`, `rtrt memory blocks {set,get,list}`. 기존 확장: `compress {--ml --ratio --format}`, `memory recall --filter`, `memory save --meta key=val`, `signatures --lang python|typescript`, `repo-map` 다중 언어 자동 감지.
-
-자세한 항목은 [영문 CHANGELOG](../CHANGELOG.md#unreleased) 참고.
-
----
-
-**첫 번째 스윕 (트레이서빌리티용 유지) — INSPIRATION 백로그 HIGH 12개:**
-
-- `rtrt-providers`: `Gateway` + `Budget` + `RequestMetric { id, parent_id, cost_usd, … }`; `Context7Client`.
-- `rtrt-memory`: `MemoryScope`, `add_edge` + `recall_via_graph`, `with_embedder` 자동 임베드, `archive_overflow`, `hnsw` 피처.
-- `rtrt-compress`: `Extreme` 레벨, 헤지/담화/메타 표현 규칙, `redact_secrets`, `LlmCompressor`, Rust 시그니처 추출기.
-- `rtrt-templates`: handlebars 렌더링, `PromptRegistry`.
-- `rtrt-cli`: `compress --llm` / `memory {extract,compress}` / `prompt {save,get,list,versions}` / `signatures` / `repo-map` / `discover` / `docs` / `setup --agent`.
-- `rtrt-mcp`: 6번째 도구 `provider_chat`.
+- 단수 루트 `plugin` 키와 정확한 `rtrt-agent@0.1.1` 등록을 사용하는 OpenCode npm 플러그인 통합을 추가했습니다. Setup 관리 스테이터스라인은 npm 패키지에 포함되지 않습니다.
+- 프로젝트 전용 OpenCode 세션 마이그레이션과 launcher, setup 소유 Linux shell sandbox를 추가했습니다.
+
+### 변경
+
+- 프로바이더 라우팅과 페일오버는 툴킷 기능으로 유지합니다. 네이티브 오케스트레이션, team, scheduler, roster, `team_dispatch`는 제거하고 호스트 런타임에 위임합니다.
+- 대시보드 Orchestration 페이지를 Failover로 변경했습니다. 경로는 `/failover`, 백엔드는 `/api/failover/config`이며, `/orchestration`은 overview로 이동하고 `assets/js/orchestration.js`는 더 이상 존재하지 않습니다.
+- 프로젝트를 선택하지 않아도 페일오버 정책을 편집할 수 있습니다. 셀렉터가 없으면 전역 `[failover]` 정책을 읽고 쓰며, 선택한 프로젝트는 이를 읽기 전용으로 상속합니다. **Custom**은 `<repo>/.rtrt/config.toml`에 기록하고, **Follow global**은 그 override만 제거합니다.
+- OpenCode setup은 Rules, TUI, MCP를 쓰기 전에 엄격한 legacy 정리를 검증하고, 마지막에 인식 가능한 항목을 정리합니다. 그 이전 단계가 실패하면 legacy runtime을 보존합니다.
+- 통합 릴리스 워크플로는 쌍 태그와 의존성 순서를 따라 하나의 versioned release에서 Rust/npm 릴리스를 자동화합니다. 각 크레이트는 패키징, 게시, 레지스트리 노출 확인을 마친 뒤에야 다음 의존 크레이트를 게시합니다.
+
+### 수정
+
+- Setup, provenance, permission, filesystem, HTTP MCP 경계를 강화하고 보안 수정을 위해 `h2`를 0.4.16으로 업데이트했습니다.
+- 레거시 프로젝트 파일을 정리할 때 배타적 생성으로 백업하고, 대상이 바이트와 소유권이 그대로인 일반 파일인지 확인하며, 해당 파일을 변경하기 직전에 다시 검증합니다. 교체 내용은 같은 디렉터리의 임시 파일에 쓴 뒤 rename으로 옮기므로, 마지막 순간에 끼워 넣은 심볼릭 링크는 따라가지 않고 대체됩니다.
+- `<repo>/.rtrt`를 생성 후 권한을 좁히는 대신 처음부터 `0700`으로 만듭니다. 뒤따르는 권한 변경이 다른 디렉터리로 유도될 수 있는 창을 없앴습니다.
+- `--allowed-origins` 없이 실행한 `rtrt-mcp --transport http`는 이제 모든 origin을 허용하지 않고, `Origin` 헤더를 포함한 요청을 전부 거부합니다. `Origin`을 보내지 않는 네이티브 클라이언트는 영향이 없습니다.
+- OpenCode 플러그인은 경로를 인자로 받는 shell 명령을 더 이상 자동 승인하지 않습니다. 권한 판정 시점과 shell 실행 시점의 경로 해석이 달라, 승인된 파일이 그 사이에 심볼릭 링크로 교체될 수 있기 때문입니다. `cat`, `ls`, `head`, `tail`, `wc`, `stat`은 일반 확인 절차로 돌아가며 `pwd`만 자동 승인됩니다.
+- `rtrt-core`가 Windows에서 다시 빌드됩니다. 동일 파일 검사가 아직 불안정한 `volume_serial_number`/`file_index`를 사용해 nightly에서만 컴파일됐습니다. 이제 Windows에서는 안정 속성 전부를 비교하며, 이는 교체를 탐지하지만 진정한 파일 신원 확인이 아닌 변조 검사입니다.
+- 대시보드 페일오버 편집기는 `transient_retries`와 `backoff_divisor`가 `u32::MAX`를 넘으면 조용히 잘라내지 않고 400으로 거부합니다. 정책 로드가 실패하면 폼을 비우고 잠가, 이전 프로젝트 값이 전역 정책으로 저장되는 일이 없습니다.
+- Setup 멱등성, 프로젝트 전용 세션 migration과 catch-up, sandbox 검증, uninstall 순서, 외부 설정 보존을 개선했습니다.
 
 <!--
-릴리스 절단 시 이 스탠자를 복사해 새 버전 섹션을 만드세요.
+새 버전 섹션을 만들 때 이 블록을 복사합니다.
 `### Highlights`를 항상 섹션 최상단에 두는 것이 중요합니다 — 릴리스 페이지에서
 사용자가 가장 먼저 보는 영역이며, 릴리스 워크플로우가 이 섹션을 그대로 추출합니다.
 

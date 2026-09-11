@@ -314,8 +314,8 @@ impl UsageSnapshot {
             add_usage(&mut self.usage_by_target, model, total);
             add_usage(&mut self.requests_by_target, model, 1);
             if let Some(provider) = provider_for_model(model) {
-                add_usage(&mut self.usage_by_target, provider, total);
-                add_usage(&mut self.requests_by_target, provider, 1);
+                add_usage(&mut self.usage_by_target, &provider, total);
+                add_usage(&mut self.requests_by_target, &provider, 1);
             }
         }
         self.sources.push(format!(
@@ -495,15 +495,21 @@ fn parse_nonnegative_u64(value: Option<&str>, field: &str) -> Result<u64, String
         .map_err(|err| format!("sqlite3 invalid {field}: {err}"))
 }
 
-fn provider_for_model(model: &str) -> Option<&'static str> {
-    let normalized = model.to_ascii_lowercase();
+fn provider_for_model(model: &str) -> Option<String> {
+    if let Some((provider, upstream)) = model.trim().split_once('/')
+        && !provider.is_empty()
+        && !upstream.is_empty()
+    {
+        return Some(rtrt_core::config::normalize_provider_id(provider));
+    }
+    let normalized = model.trim().to_ascii_lowercase();
     if normalized.starts_with("claude") {
-        Some("anthropic")
+        Some("anthropic".to_string())
     } else if normalized.starts_with("gpt")
         || normalized.starts_with("o1")
         || normalized.starts_with("o3")
     {
-        Some("openai")
+        Some("openai".to_string())
     } else {
         None
     }
@@ -640,5 +646,20 @@ mod tests {
         assert!(snapshot.limits_by_pool.is_empty());
         let headroom = snapshot.headroom("openai").expect("headroom");
         assert_eq!(headroom.remaining, 850);
+    }
+
+    #[test]
+    fn canonical_model_provider_wins_over_model_name_heuristics() {
+        for (model, expected) in [
+            ("Anthropic/claude-sonnet-4-6", Some("anthropic")),
+            ("ollama/gpt-oss:20b", Some("ollama")),
+            ("openai-compatible/vendor/model", Some("openai-compat")),
+            ("Azure-West/deployment/family:model", Some("azure-west")),
+            ("gpt-5.4-mini", Some("openai")),
+            ("claude-haiku-4-5", Some("anthropic")),
+            ("gemma3:4b", None),
+        ] {
+            assert_eq!(provider_for_model(model).as_deref(), expected, "{model}");
+        }
     }
 }

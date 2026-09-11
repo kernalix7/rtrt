@@ -41,10 +41,23 @@ pub(crate) async fn security_profiles() -> Json<Vec<String>> {
 
 pub(crate) async fn security_profile(
     AxPath(name): AxPath<String>,
-) -> std::result::Result<Json<Profile>, (StatusCode, String)> {
-    rtrt_security::load_profile(&name)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !valid_profile_name(&name) {
+        return Err((StatusCode::BAD_REQUEST, "invalid profile name".into()));
+    }
+    let profile =
+        rtrt_security::load_profile(&name).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    if profile.name != name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "request name, filename, and profile.name must match".into(),
+        ));
+    }
+    let toml = toml::to_string_pretty(&profile)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "profile": profile, "toml": toml }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,12 +68,14 @@ pub(crate) struct SecurityScanRequest {
 }
 
 pub(crate) async fn security_scan(
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<SecurityScanRequest>,
 ) -> std::result::Result<Json<ScanReport>, (StatusCode, String)> {
     let profile = rtrt_security::load_profile(&req.profile)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let path = req.path.unwrap_or_else(|| ".".to_string());
-    rtrt_security::run(&profile, std::path::Path::new(&path))
+    let requested = req.path.unwrap_or_else(|| ".".to_string());
+    let path = state.contained_path(std::path::Path::new(&requested))?;
+    rtrt_security::run(&profile, &path)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -76,25 +91,45 @@ pub(crate) struct ProfileSaveReq {
 pub(crate) async fn security_profile_save(
     Json(req): Json<ProfileSaveReq>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Validate the TOML by parsing it into a Profile first.
-    Profile::from_toml(&req.toml).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !valid_profile_name(&req.name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "profile name may contain only ASCII letters, digits, '-' and '_'".into(),
+        ));
+    }
+    let profile =
+        Profile::from_toml(&req.toml).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if profile.name != req.name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "request name, filename, and profile.name must match".into(),
+        ));
+    }
 
     let dir = rtrt_security::user_profile_dir().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "cannot determine profile directory".to_string(),
     ))?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
+    crate::util::ensure_safe_dir(&dir).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("create dir {}: {e}", dir.display()),
         )
     })?;
     let path = dir.join(format!("{}.toml", req.name));
-    std::fs::write(&path, &req.toml).map_err(|e| {
+    crate::util::atomic_write(&path, req.toml.as_bytes()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("write {}: {e}", path.display()),
         )
     })?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 96
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }

@@ -34,6 +34,7 @@ id_ed25519*
 # Build / dist
 /dist/
 /release/
+node_modules/
 
 # AI config (kept out of git history per repo policy)
 # See CONTRIBUTING.md "No AI tool co-author trailers".
@@ -67,4 +68,8 @@ demo.png
 .rtrt/*.sqlite-journal
 .rtrt/*.sqlite-wal
 .rtrt/*.sqlite-shm
+# Crate-local .rtrt/ is test residue (model-cache tempdirs), never source.
+crates/**/.rtrt/
+# Local agent session state.
+/.omo/
 .claude/settings.local.json

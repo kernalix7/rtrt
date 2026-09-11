@@ -17,7 +17,8 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +39,11 @@ const CACHE_MODE_ENV_VAR: &str = "RTRT_MODEL_CACHE";
 const CACHE_OFF_VALUES: &[&str] = &["0", "off", "false", "no"];
 const CACHE_REFRESH_VALUES: &[&str] = &["refresh", "force", "reprobe"];
 const STATE_DIR_NAME: &str = ".rtrt";
+/// Derived model metadata is deliberately small; refuse larger files before
+/// allocating or asking serde to construct attacker-controlled collections.
+const MAX_CACHE_BYTES: u64 = 1024 * 1024;
+const MAX_CACHED_MODELS: usize = 4096;
+const MAX_MODEL_ID_BYTES: usize = 512;
 
 /// How the cache behaves for one lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +92,19 @@ impl ProbeIdentity {
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(epoch_secs),
         }
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.binary == current.binary
+            && self.args == current.args
+            && self.binary_len == current.binary_len
+            && self.binary_mtime_epoch == current.binary_mtime_epoch
+            // A failed version probe provides no evidence that the binary
+            // changed. Metadata remains the hard identity in that case.
+            && match (&self.version, &current.version) {
+                (Some(cached), Some(current)) => cached == current,
+                _ => true,
+            }
     }
 }
 
@@ -167,6 +186,9 @@ impl Store {
         let started = Instant::now();
         let models = probe();
         let probe_cost = started.elapsed();
+        if !models_are_bounded(&models) {
+            return Vec::new();
+        }
 
         // A probe that produced nothing is not an answer, it is a failure (not
         // logged in, tool mid-upgrade, list command changed). Storing it would
@@ -188,7 +210,10 @@ impl Store {
 
     fn fresh_models(&self, tool: &str, identity: &ProbeIdentity, now: u64) -> Option<Vec<String>> {
         let entry = load(&self.path)?.entries.remove(tool)?;
-        if &entry.identity != identity || entry.models.is_empty() || !is_fresh(&entry, now) {
+        if !entry.identity.matches(identity)
+            || !models_are_bounded(&entry.models)
+            || !is_fresh(&entry, now)
+        {
             return None;
         }
         Some(entry.models)
@@ -244,7 +269,47 @@ fn is_fresh(entry: &CacheEntry, now: u64) -> bool {
 /// Read the whole cache file. Missing, unreadable and malformed all collapse to
 /// `None` — the caller treats every one of them as "no usable entry".
 fn load(path: &Path) -> Option<CacheFile> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    let expected = fs::symlink_metadata(path).ok()?;
+    if expected.file_type().is_symlink() || !expected.is_file() || expected.len() > MAX_CACHE_BYTES
+    {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CACHE_BYTES || !same_file(&expected, &metadata) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn models_are_bounded(models: &[String]) -> bool {
+    !models.is_empty()
+        && models.len() <= MAX_CACHED_MODELS
+        && models.iter().all(|model| {
+            !model.is_empty()
+                && model.len() <= MAX_MODEL_ID_BYTES
+                && model.contains('/')
+                && model.split('/').all(|segment| {
+                    segment
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                })
+                && model
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/-_.:@+".contains(&byte))
+        })
+        && models
+            .iter()
+            .try_fold(0_u64, |total, model| total.checked_add(model.len() as u64))
+            .is_some_and(|total| total <= MAX_CACHE_BYTES)
 }
 
 /// Insert one entry and swap the file into place atomically.
@@ -266,12 +331,53 @@ fn write_entry(path: &Path, tool: &str, entry: &CacheEntry) -> std::io::Result<(
     let mut file = load(path).unwrap_or_default();
     file.entries.insert(tool.to_string(), entry.clone());
     let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
+    if json.len() as u64 > MAX_CACHE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "model cache exceeds size limit",
+        ));
+    }
 
     let temp = temp_sibling(path);
-    fs::write(&temp, json.as_bytes())?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp_file = options.open(&temp)?;
+    if let Err(error) = temp_file
+        .write_all(json.as_bytes())
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(temp_file);
     fs::rename(&temp, path).inspect_err(|_| {
         let _ = fs::remove_file(&temp);
-    })
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(path, {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o600)
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.file_type() == right.file_type()
 }
 
 /// A per-process, per-call scratch name in the destination directory, so the
@@ -360,14 +466,17 @@ mod tests {
     }
 
     fn temp_store_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rtrt-model-cache-{tag}-{}-{}/cli-models.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|since| since.as_nanos())
-                .unwrap_or_default()
-        ))
+        std::env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp")
+            .join(format!(
+                "rtrt-model-cache-{tag}-{}-{}/cli-models.json",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or_default()
+            ))
     }
 
     fn identity(binary: &str, version: Option<&str>) -> ProbeIdentity {
@@ -422,10 +531,76 @@ mod tests {
     }
 
     #[test]
-    fn upgraded_or_moved_binary_invalidates_the_entry() {
+    fn unavailable_current_version_keeps_a_known_version_cache_hit() {
+        let stored_identity = identity("/usr/bin/opencode", Some("1.0.0"));
+        let current_identity = identity("/usr/bin/opencode", None);
+        let store = seeded_store(
+            "version-unavailable",
+            "opencode",
+            &stored_identity,
+            &["cached/model"],
+        );
+        let probe = CountingProbe::new(&["never/used"]);
+
+        let models = store.models_or_probe_at(1_001, "opencode", &current_identity, || probe.run());
+
+        assert_eq!(probe.calls(), 0, "an unavailable version is not a mismatch");
+        assert_eq!(models, vec!["cached/model"]);
+    }
+
+    #[test]
+    fn known_version_mismatch_invalidates_the_entry() {
+        let stored_identity = identity("/usr/bin/opencode", Some("1.0.0"));
+        let current_identity = identity("/usr/bin/opencode", Some("1.1.0"));
+        let store = seeded_store(
+            "version-mismatch",
+            "opencode",
+            &stored_identity,
+            &["stale/model"],
+        );
+        let probe = CountingProbe::new(&["fresh/model"]);
+
+        let models = store.models_or_probe_at(1_001, "opencode", &current_identity, || probe.run());
+
+        assert_eq!(probe.calls(), 1, "a known version change must re-probe");
+        assert_eq!(models, vec!["fresh/model"]);
+        assert_eq!(
+            load(&store.path).expect("rewritten").entries["opencode"].identity,
+            current_identity
+        );
+    }
+
+    #[test]
+    fn binary_metadata_mismatch_invalidates_the_entry() {
+        let mut stored_identity = identity("/usr/bin/opencode", Some("1.0.0"));
+        stored_identity.binary_len = Some(10);
+        stored_identity.binary_mtime_epoch = Some(100);
+
+        let mut changed_len = stored_identity.clone();
+        changed_len.binary_len = Some(11);
+        let mut changed_mtime = stored_identity.clone();
+        changed_mtime.binary_mtime_epoch = Some(101);
+
+        for changed in [changed_len, changed_mtime] {
+            let store = seeded_store(
+                "metadata-mismatch",
+                "opencode",
+                &stored_identity,
+                &["stale/model"],
+            );
+            let probe = CountingProbe::new(&["fresh/model"]);
+
+            let models = store.models_or_probe_at(1_001, "opencode", &changed, || probe.run());
+
+            assert_eq!(probe.calls(), 1, "changed metadata must re-probe");
+            assert_eq!(models, vec!["fresh/model"]);
+        }
+    }
+
+    #[test]
+    fn moved_binary_or_changed_args_invalidates_the_entry() {
         let stored_identity = identity("/usr/bin/opencode", Some("1.0.0"));
         for changed in [
-            identity("/usr/bin/opencode", Some("1.1.0")),
             identity("/opt/opencode/bin/opencode", Some("1.0.0")),
             ProbeIdentity::new(
                 Path::new("/usr/bin/opencode"),
@@ -496,6 +671,47 @@ mod tests {
             assert_eq!(models, vec!["opencode-go/glm-5.2"]);
             let repaired = load(&store.path).expect("corrupt file replaced by a valid one");
             assert_eq!(repaired.entries["opencode"].models, models);
+        }
+    }
+
+    #[test]
+    fn oversized_cache_is_rejected_before_parsing() {
+        let path = temp_store_path("oversized");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_CACHE_BYTES + 1)
+            .unwrap();
+        assert!(load(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cache_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_store_path("symlink");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = path.with_file_name("target.json");
+        fs::write(&target, r#"{"entries":{}}"#).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(load(&path).is_none());
+    }
+
+    #[test]
+    fn malformed_or_oversized_probe_result_is_never_cached() {
+        for models in [
+            vec!["not-a-provider-model".to_string()],
+            vec![format!("provider/{}", "x".repeat(MAX_MODEL_ID_BYTES))],
+        ] {
+            let store = Store::at(temp_store_path("invalid-probe"), CacheMode::Use);
+            let identity = identity("/usr/bin/opencode", Some("1.0.0"));
+            assert!(
+                store
+                    .models_or_probe_at(1_000, "opencode", &identity, || models)
+                    .is_empty()
+            );
+            assert!(!store.path.exists());
         }
     }
 

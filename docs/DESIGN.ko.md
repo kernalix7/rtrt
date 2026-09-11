@@ -106,12 +106,13 @@ event fires
 - `rtrt-memory[embeddings]` — fastembed ONNX 런타임.
 - `rtrt-memory[hnsw]` — `instant-distance` ANN.
 - `rtrt-memory[llm]` — `LlmSummariser`.
+- `rtrt-eval` — 옵트인 회수 및 압축 평가 하니스.
 
 코어 밖 후보:
 
-- `rtrt-orchestrator` — 멀티-에이전트 코디네이션 (액션 / 신호 / 리스 / 메시 / 센티넬). 진화 중 아이디어를 SQLite 스키마에 묶으면 비싸짐. 자체 크레이트 + 옵트인.
 - `rtrt-snapshot` — git 버전 메모리 스냅샷.
-- `rtrt-eval` — 라벨링된 데이터셋 대비 회수 정확도 벤치.
+
+멀티 에이전트 코디네이션은 이 워크스페이스 밖의 외부 에이전트 런타임이 담당합니다. RTRT는 scheduler, team protocol 또는 orchestration 크레이트를 제공하지 않습니다.
 
 기본 설치는 가벼움 유지.
 
@@ -151,8 +152,8 @@ event fires
 
 ## 이건 안 한다
 
-- **53 도구 MCP 표면.** 더 큰 메모리 플랫폼과 도구 수 경쟁 안 함. 10-15개 잘 다듬어진 도구로 멈춤.
-- **코어에 멀티-에이전트 코디네이션.** 신호 · 리스 · 메시 · 센티넬 — 18개월 더 검증되면 `rtrt-orchestrator` 옵션 크레이트로.
+- **도구 수 경쟁.** 더 큰 메모리 플랫폼과 기능 수 경쟁을 하지 않고 MCP 표면을 좁고 검토 가능한 범위로 유지합니다.
+- **RTRT 내부 멀티 에이전트 코디네이션.** 신호, 리스, 메시 동기화, scheduler 및 worker protocol은 외부 에이전트 런타임에 둡니다.
 - **클라우드 전용 / 유료 전용 기능.** 모든 것이 노트북에서 오프라인 동작.
 - **프레임워크 위 프레임워크.** 에이전트 런타임 · 오케스트레이션 DSL · 플러그인 마켓플레이스 없음.
 

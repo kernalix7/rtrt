@@ -17,13 +17,19 @@ use rtrt_providers::Gateway;
 use tokio::sync::{Mutex, broadcast};
 use tower::ServiceExt;
 
-use crate::routes::router;
 use crate::state::AppState;
+
+const TEST_TOKEN: &str = "dashboard-test-token";
+
+fn router(state: AppState, token: Option<String>) -> axum::Router {
+    crate::routes::router(state, Some(token.unwrap_or_else(|| TEST_TOKEN.to_string())))
+}
 
 /// Serializes env-mutating tests so parallel test threads never race on
 /// `HOME` / `RTRT_*` overrides. Acquired by [`EnvGuard::new`] for the whole
 /// test body; the guard restores the originals on drop before releasing.
 static ENV_MUTEX: StdMutex<()> = StdMutex::new(());
+static TEST_SLUG: StdMutex<String> = StdMutex::new(String::new());
 
 /// The sandboxed config file for a test's temp home. [`EnvGuard`] pins
 /// `RTRT_CONFIG` to exactly this path, so it is where the config endpoints
@@ -52,10 +58,15 @@ impl EnvGuard {
         std::fs::create_dir_all(tmp_home).ok();
         let mem = tmp_home.join("memory.sqlite");
         let cfg = config_file(tmp_home);
-        let overrides: [(&'static str, Option<std::ffi::OsString>); 3] = [
+        let overrides: [(&'static str, Option<std::ffi::OsString>); 8] = [
             ("HOME", Some(tmp_home.as_os_str().to_owned())),
             ("RTRT_MEMORY_PATH", Some(mem.into_os_string())),
             ("RTRT_CONFIG", Some(cfg.into_os_string())),
+            ("RTRT_OPENAI_COMPAT_URL", None),
+            ("RTRT_PROVIDER_BASE_URL", None),
+            ("RTRT_OPENAI_COMPAT_PROVIDER", None),
+            ("OPENAI_API_KEY", None),
+            ("RTRT_DASHBOARD_TOKEN", None),
         ];
         let mut saved = Vec::with_capacity(overrides.len());
         for (key, new_val) in overrides {
@@ -91,17 +102,79 @@ impl Drop for EnvGuard {
 /// Build a minimal `AppState` backed by a fresh SQLite store at
 /// `<tmp_home>/memory.sqlite`. No embedder / no auto-capture / no daemons, so
 /// the router is exercised in isolation.
+/// Canonical only where it matters. macOS reaches the temp dir through
+/// `/var -> /private/var`, which breaks comparisons against canonical paths.
+/// Windows canonicalization instead yields a `\\?\` verbatim path, which the
+/// production code rejects, so the plain temp path is the correct fixture there.
+fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(path).expect("canonicalize temp path")
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// A temp dir whose path is canonical.
+///
+/// macOS reaches the system temp dir through `/var -> /private/var`, and project
+/// identity derives from the canonical path, so a raw handle path makes every
+/// derived slug disagree with the home the catalog was built from.
+struct CanonicalTempDir {
+    _guard: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl CanonicalTempDir {
+    fn new() -> Self {
+        let guard = tempfile::tempdir().unwrap();
+        let path = canonical_for_tests(guard.path());
+        Self {
+            _guard: guard,
+            path,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 fn test_state(tmp_home: &std::path::Path) -> AppState {
-    let mem_path = tmp_home.join("memory.sqlite");
-    let memory = MemoryStore::open(&mem_path).expect("open memory store");
+    let root = tmp_home.join("demo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(tmp_home.join(".rtrt")) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(tmp_home.join(".rtrt"), permissions).unwrap();
+    }
+    let project = Arc::new(rtrt_core::ProjectIdentity::derive(&root).unwrap());
+    *TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()) = project.slug().to_string();
+    let mem_path = rtrt_core::project_memory_db_path_in(tmp_home, &project);
+    let memory = Arc::new(Mutex::new(
+        MemoryStore::open_project_in(&project, tmp_home).expect("open memory store"),
+    ));
+    let context = Arc::new(crate::state::ProjectContext::new(
+        project.clone(),
+        memory.clone(),
+        mem_path.clone(),
+    ));
+    let catalog = Arc::new(crate::project_catalog::ProjectCatalog::from_context(
+        tmp_home.to_path_buf(),
+        context,
+    ));
     let (events, _) = broadcast::channel::<String>(256);
     AppState {
         gateway: Arc::new(Gateway::from_env()),
         prompts: None,
-        memory: Some(Arc::new(Mutex::new(memory))),
+        memory: Some(memory),
         auto_capture: false,
         auto_redact: false,
-        default_project: "default".to_string(),
+        project: project.clone(),
         session_id: "test-session".to_string(),
         dedup_window_sec: 0,
         events,
@@ -111,6 +184,9 @@ fn test_state(tmp_home: &std::path::Path) -> AppState {
         level_tokens: Arc::new(Mutex::new(HashMap::new())),
         memory_path: mem_path,
         embedding_jobs: Arc::new(StdMutex::new(HashSet::new())),
+        catalog,
+        selected: true,
+        daemon_projects: Arc::new(StdMutex::new(HashSet::from([project.slug().to_string()]))),
     }
 }
 
@@ -122,19 +198,30 @@ async fn call(app: axum::Router, req: Request<Body>) -> axum::response::Response
 }
 
 fn get(uri: &str) -> Request<Body> {
+    let slug = TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let uri = uri.replace("project=demo", &format!("project={slug}"));
     Request::builder()
         .method(Method::GET)
         .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .header("X-RTRT-Project", slug)
         .body(Body::empty())
         .unwrap()
 }
 
 fn json(method: Method, uri: &str, body: &str) -> Request<Body> {
+    let slug = TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let uri = uri.replace("project=demo", &format!("project={slug}"));
+    let body = body.replace(r#""project":"demo""#, &format!(r#""project":"{slug}""#));
     Request::builder()
         .method(method)
         .uri(uri)
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost:7311")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
+        .header("X-RTRT-Project", slug)
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -147,9 +234,189 @@ async fn json_body(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_str(&body_text(resp).await).unwrap()
 }
 
+#[test]
+fn admin_scope_without_token_fails_closed() {
+    let error = crate::validate_scope("admin", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires nonempty RTRT_DASHBOARD_TOKEN"));
+    assert!(crate::validate_scope("admin", Some("secret")).is_err());
+}
+
+#[test]
+fn startup_without_token_fails_closed() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    assert!(
+        crate::dashboard_token()
+            .unwrap_err()
+            .to_string()
+            .contains("requires nonempty RTRT_DASHBOARD_TOKEN")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn machine_startup_requires_exact_private_state_and_redacts_token() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state_dir = tmp.path().join(".rtrt/dashboard");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::set_permissions(
+        tmp.path().join(".rtrt"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let env_file = state_dir.join("dashboard.env");
+    std::fs::write(&env_file, "RTRT_DASHBOARD_TOKEN=machine-secret\n").unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let startup = crate::MachineStartup::parse([
+        "--machine".into(),
+        "--state-dir".into(),
+        state_dir.clone().into_os_string(),
+    ])
+    .unwrap();
+    assert_eq!(startup.token, "machine-secret");
+
+    let error = crate::MachineStartup::parse([
+        "--machine".into(),
+        "--state-dir".into(),
+        tmp.path().join("other").into_os_string(),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(!error.contains("machine-secret"));
+}
+
+#[tokio::test]
+async fn project_bound_route_never_falls_back_without_selector() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let request = Request::builder()
+        .uri("/api/memory/timeline")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        call(router(state, None), request).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn production_dashboard_sources_do_not_mutate_environment() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("rs")
+            || entry.path().file_name().and_then(|value| value.to_str()) == Some("tests.rs")
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !source.contains("env::set_var"),
+            "{}",
+            entry.path().display()
+        );
+        assert!(
+            !source.contains("env::remove_var"),
+            "{}",
+            entry.path().display()
+        );
+    }
+}
+
+#[test]
+fn ui_auth_uses_session_storage_and_one_retry() {
+    let source = include_str!("../ui/assets/js/api.js");
+    assert!(source.contains("sessionStorage.setItem(TOKEN_KEY"));
+    assert!(source.contains("exactly one retry"));
+    assert!(!source.contains("localStorage.setItem(TOKEN_KEY"));
+    assert!(!source.contains("URLSearchParams"));
+}
+
+#[tokio::test]
+async fn foreign_project_and_global_routes_are_denied() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    assert_eq!(
+        call(app.clone(), get("/api/memory/timeline?project=foreign"))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            get("/api/memory/graph?project=__global__&mode=brain")
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(app, get("/api/projects/hidden")).await.status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn bearer_api_mutation_without_origin_is_accepted() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/memory/save")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            "X-RTRT-Project",
+            TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
+        .body(Body::from(r#"{"body":"x"}"#))
+        .unwrap();
+    assert_eq!(
+        call(router(state, None), request).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repo_map_rejects_outside_and_symlink_escape() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let outside = CanonicalTempDir::new();
+    std::os::unix::fs::symlink(outside.path(), state.project.checkout_root().join("escape"))
+        .unwrap();
+    for root in [
+        outside.path().to_string_lossy().into_owned(),
+        "escape".into(),
+    ] {
+        let response = call(
+            router(state.clone(), None),
+            json(
+                Method::POST,
+                "/api/repo-map",
+                &serde_json::json!({"root": root}).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/healthz")).await;
@@ -158,8 +425,132 @@ async fn healthz_returns_ok() {
 }
 
 #[tokio::test]
+async fn models_contract_preserves_unavailable_configured_compatible_model() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let path = config_file(tmp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"[auto_compress]
+model = "gemma3:4b-it-qat"
+base_url = "http://127.0.0.1:9/v1"
+"#,
+    )
+    .unwrap();
+    let response = call(router(test_state(tmp.path()), None), get("/api/models")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let configured = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["source"] == "configured")
+        .unwrap();
+    assert_eq!(configured["id"], "openai-compat/gemma3:4b-it-qat");
+    assert_eq!(configured["upstream_id"], "gemma3:4b-it-qat");
+    assert_eq!(configured["provider"], "openai-compat");
+    assert_eq!(configured["transport"], "openai-compatible");
+    assert_eq!(configured["available"], false);
+    assert_eq!(
+        configured["label"],
+        "gemma3:4b-it-qat — OpenAI-compatible endpoint"
+    );
+}
+
+#[test]
+fn ollama_model_dto_uses_canonical_id_and_honest_label() {
+    let value = serde_json::to_value(crate::handlers::config::model_entry(
+        "ollama",
+        "gemma3:4b-it-qat",
+        "local",
+        true,
+    ))
+    .unwrap();
+    assert_eq!(value["id"], "ollama/gemma3:4b-it-qat");
+    assert_eq!(value["upstream_id"], "gemma3:4b-it-qat");
+    assert_eq!(value["provider"], "ollama");
+    assert_eq!(value["transport"], "openai-compatible");
+    assert_eq!(value["source"], "local");
+    assert_eq!(value["available"], true);
+    assert_eq!(
+        value["label"],
+        "gemma3:4b-it-qat — Ollama (OpenAI-compatible)"
+    );
+}
+
+#[test]
+fn model_dto_normalizes_provider_aliases_without_losing_nested_model_ids() {
+    for (provider, upstream, id, normalized, label) in [
+        (
+            "OLLAMA",
+            "Ollama/org/model:tag",
+            "ollama/org/model:tag",
+            "ollama",
+            "org/model:tag — Ollama (OpenAI-compatible)",
+        ),
+        (
+            "openai-compatible",
+            "vendor/model:1",
+            "openai-compat/vendor/model:1",
+            "openai-compat",
+            "vendor/model:1 — OpenAI-compatible endpoint",
+        ),
+        (
+            "LMStudio",
+            "publisher/model",
+            "lm-studio/publisher/model",
+            "lm-studio",
+            "publisher/model — LM Studio (OpenAI-compatible)",
+        ),
+        (
+            "vLLM",
+            "model:latest",
+            "vllm/model:latest",
+            "vllm",
+            "model:latest — vLLM (OpenAI-compatible)",
+        ),
+        (
+            "Azure-West",
+            "deployment/family:model",
+            "azure-west/deployment/family:model",
+            "azure-west",
+            "deployment/family:model — azure-west (OpenAI-compatible)",
+        ),
+    ] {
+        let value = serde_json::to_value(crate::handlers::config::model_entry_with_transport(
+            provider,
+            upstream,
+            "configured",
+            false,
+            provider == "Azure-West",
+        ))
+        .unwrap();
+        assert_eq!(value["id"], id, "{provider}");
+        assert_eq!(value["provider"], normalized, "{provider}");
+        assert_eq!(value["label"], label, "{provider}");
+        assert_eq!(value["available"], false, "{provider}");
+    }
+}
+
+#[test]
+fn unknown_provider_without_compatible_endpoint_is_not_given_a_protocol_identity() {
+    let value = serde_json::to_value(crate::handlers::config::model_entry(
+        "Google",
+        "publisher/model:tag",
+        "configured",
+        false,
+    ))
+    .unwrap();
+    assert_eq!(value["id"], "google/publisher/model:tag");
+    assert_eq!(value["provider"], "google");
+    assert_eq!(value["transport"], "unknown");
+    assert_eq!(value["label"], "publisher/model:tag — google");
+}
+
+#[tokio::test]
 async fn stats_returns_zeroed_json() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/stats")).await;
@@ -172,17 +563,17 @@ async fn stats_returns_zeroed_json() {
 
 #[tokio::test]
 async fn projects_lists_memory_buckets() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
         let store = state.memory.as_ref().unwrap().lock().await;
         let id = store
-            .save("demo", "note", "remember to ship the feature")
+            .save(state.project.slug(), "note", "remember to ship the feature")
             .unwrap();
         store.tag_row(id, Some("sess-1"), Some("sha1")).unwrap();
     }
-    let app = router(state, None);
+    let app = router(state.clone(), None);
     let resp = call(app, get("/api/projects")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
@@ -194,14 +585,162 @@ async fn projects_lists_memory_buckets() {
     assert_eq!(demo["mem_count"], 1);
     assert_eq!(v["hidden_capture_buckets"], 0);
     assert_eq!(v["hidden_capture_bucket_rows"], 0);
+    assert!(
+        v.get("warning").is_none(),
+        "healthy envelope stays compatible"
+    );
+}
+
+#[tokio::test]
+#[ignore = "legacy multi-project registry behavior removed by project isolation"]
+async fn projects_survives_invalid_unrelated_team_config() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let config = config_file(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        config,
+        r#"
+[[projects]]
+name = "registered"
+path = "/safe/project"
+
+[team]
+enabled = true
+leader_order = ["loop"]
+
+[[team.members]]
+name = "loop"
+target = "claude"
+mode = "cli"
+roles = ["lead"]
+fallback = ["loop"]
+"#,
+    )
+    .unwrap();
+    let state = test_state(tmp.path());
+    state
+        .memory
+        .as_ref()
+        .unwrap()
+        .lock()
+        .await
+        .save("memory-only", "note", "still visible")
+        .unwrap();
+
+    let resp = call(router(state, None), get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let projects = v["projects"].as_array().unwrap();
+    assert!(projects.iter().any(|p| p["name"] == "registered"));
+    assert!(projects.iter().any(|p| p["name"] == "memory-only"));
+    assert!(
+        v["warning"]
+            .as_str()
+            .unwrap()
+            .contains("Full configuration")
+    );
+    assert!(v["warning"].as_str().unwrap().len() <= 320);
+}
+
+#[tokio::test]
+#[ignore = "legacy multi-project registry behavior removed by project isolation"]
+async fn projects_filters_capture_buckets_when_registry_is_unavailable() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let config = config_file(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "not valid = [toml").unwrap();
+    let state = test_state(tmp.path());
+    let orphan = "agent-1234";
+    {
+        let store = state.memory.as_ref().unwrap().lock().await;
+        store.save(orphan, "note", "hidden capture").unwrap();
+        store.save("visible", "note", "real project").unwrap();
+    }
+
+    let resp = call(router(state, None), get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let projects = v["projects"].as_array().unwrap();
+    assert!(projects.iter().all(|p| p["name"] != orphan));
+    assert!(projects.iter().any(|p| p["name"] == "visible"));
+    assert_eq!(v["hidden_capture_buckets"], 1);
+    assert_eq!(v["hidden_capture_bucket_rows"], 1);
+    assert!(
+        v["warning"]
+            .as_str()
+            .unwrap()
+            .contains("registry unavailable")
+    );
+}
+
+#[tokio::test]
+#[ignore = "legacy multi-project registry behavior removed by project isolation"]
+async fn projects_memory_disabled_returns_config_only_with_warning() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let config = config_file(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "[[projects]]\nname = \"registered\"\n").unwrap();
+    let mut state = test_state(tmp.path());
+    state.memory = None;
+
+    let resp = call(router(state, None), get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["projects"][0]["name"], "registered");
+    assert!(v["warning"].as_str().unwrap().contains("disabled"));
+}
+
+#[tokio::test]
+#[ignore = "legacy multi-project registry behavior removed by project isolation"]
+async fn projects_memory_query_error_returns_config_only_with_warning() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let config = config_file(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "[[projects]]\nname = \"registered\"\n").unwrap();
+    let state = test_state(tmp.path());
+    rusqlite::Connection::open(tmp.path().join("memory.sqlite"))
+        .unwrap()
+        .execute("DROP TABLE memories", [])
+        .unwrap();
+
+    let resp = call(router(state, None), get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["projects"][0]["name"], "registered");
+    assert!(v["warning"].as_str().unwrap().contains("query failed"));
+}
+
+#[tokio::test]
+#[ignore = "legacy multi-project registry behavior removed by project isolation"]
+async fn projects_both_sources_failed_returns_bounded_503() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let config = config_file(tmp.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "not valid = [toml").unwrap();
+    let mut state = test_state(tmp.path());
+    state.memory = None;
+
+    let resp = call(router(state, None), get("/api/projects")).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(resp).await;
+    assert!(body.contains("configuration"));
+    assert!(body.contains("memory"));
+    assert!(body.len() <= 320);
+    assert!(!body.contains(tmp.path().to_string_lossy().as_ref()));
 }
 
 /// A bucket named like a machine-generated session-hash pair (the confirmed
 /// orphan shape: source transcript deleted, reattribution can never resolve
 /// it) must not clutter the selector — but its rows stay in the store.
 #[tokio::test]
+#[ignore = "legacy hidden-bucket enumeration removed by project isolation"]
 async fn projects_hides_orphan_capture_buckets_but_keeps_rows() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let orphan = "30877432d1026706d7e805da846a32c3-bb81e3c29b62179273c8eb5bb682575ec87a171a";
@@ -252,8 +791,9 @@ async fn projects_hides_orphan_capture_buckets_but_keeps_rows() {
 /// A registered project always shows, even if its name happens to match the
 /// capture-bucket shape (e.g. someone genuinely named a project `agent-42`).
 #[tokio::test]
+#[ignore = "legacy registry mutation removed by project isolation"]
 async fn projects_registered_entry_is_never_hidden_even_if_name_matches() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let app = router(state.clone(), None);
@@ -288,8 +828,9 @@ async fn projects_registered_entry_is_never_hidden_even_if_name_matches() {
 /// project via a parameterized bulk UPDATE — the manual fallback for when
 /// automatic reattribution can never resolve a parent.
 #[tokio::test]
+#[ignore = "legacy project reassignment removed by project isolation"]
 async fn projects_reassign_folds_orphan_rows_into_target() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let orphan = "agent-1234";
@@ -333,8 +874,9 @@ async fn projects_reassign_folds_orphan_rows_into_target() {
 /// `from` and `to` must both be present and differ — a same-name reassign is
 /// a no-op the caller almost certainly didn't intend.
 #[tokio::test]
+#[ignore = "legacy project reassignment removed by project isolation"]
 async fn projects_reassign_rejects_same_from_and_to() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let app = router(state, None);
@@ -352,7 +894,7 @@ async fn projects_reassign_rejects_same_from_and_to() {
 
 #[tokio::test]
 async fn compression_config_get_post_roundtrip() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
@@ -371,7 +913,7 @@ async fn compression_config_get_post_roundtrip() {
     let v = json_body(resp).await;
     assert_eq!(v["level"], "lite");
     assert_eq!(v["enabled"], true);
-    assert_eq!(v["scope"], "global");
+    assert_eq!(v["scope"], "custom");
 
     // GET reads the persisted global override back.
     let app = router(state.clone(), None);
@@ -380,7 +922,7 @@ async fn compression_config_get_post_roundtrip() {
     let v = json_body(resp).await;
     assert_eq!(v["level"], "lite");
     assert_eq!(v["enabled"], true);
-    assert_eq!(v["scope"], "global");
+    assert_eq!(v["scope"], "custom");
 
     // Disable via the "off" pseudo-level and confirm it sticks.
     let app = router(state.clone(), None);
@@ -405,23 +947,29 @@ async fn compression_config_get_post_roundtrip() {
 
 #[tokio::test]
 async fn memory_sessions_groups_by_session_id() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
         let store = state.memory.as_ref().unwrap().lock().await;
-        let id = store.save("demo", "note", "first row").unwrap();
+        let id = store
+            .save(state.project.slug(), "note", "first row")
+            .unwrap();
         store.tag_row(id, Some("sess-1"), Some("sha1")).unwrap();
-        let id = store.save("demo", "note", "second row").unwrap();
+        let id = store
+            .save(state.project.slug(), "note", "second row")
+            .unwrap();
         store.tag_row(id, Some("sess-1"), Some("sha2")).unwrap();
-        let id = store.save("demo", "note", "other session").unwrap();
+        let id = store
+            .save(state.project.slug(), "note", "other session")
+            .unwrap();
         store.tag_row(id, Some("sess-2"), Some("sha3")).unwrap();
     }
-    let app = router(state, None);
+    let app = router(state.clone(), None);
     let resp = call(app, get("/api/memory/sessions?project=demo")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
-    assert_eq!(v["project"], "demo");
+    assert_eq!(v["project"], state.project.slug());
     let sessions = v["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), 2);
     let s1 = sessions
@@ -433,22 +981,18 @@ async fn memory_sessions_groups_by_session_id() {
 
 #[tokio::test]
 async fn memory_sessions_empty_project_returns_empty() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/memory/sessions?project=ghost")).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["project"], "ghost");
-    assert_eq!(v["total"], 0);
-    assert!(v["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// `mode=overview` builds the whole-project LOD index and mints one drill
 /// token per bubble — the live path the Memory map actually uses.
 #[tokio::test]
 async fn memory_graph_overview_returns_bubbles_with_tokens() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -456,7 +1000,7 @@ async fn memory_graph_overview_returns_bubbles_with_tokens() {
         for i in 0..6 {
             store
                 .save(
-                    "demo",
+                    state.project.slug(),
                     "note",
                     &format!("memory row number {i} about the deploy pipeline"),
                 )
@@ -482,7 +1026,7 @@ async fn memory_graph_overview_returns_bubbles_with_tokens() {
 /// is the ONLY drill-down path the shipped frontend uses.
 #[tokio::test]
 async fn memory_graph_token_drill_returns_members() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -490,7 +1034,7 @@ async fn memory_graph_token_drill_returns_members() {
         for i in 0..6 {
             store
                 .save(
-                    "demo",
+                    state.project.slug(),
                     "note",
                     &format!("memory row number {i} about the deploy pipeline"),
                 )
@@ -530,7 +1074,7 @@ async fn memory_graph_token_drill_returns_members() {
 /// via `token` instead of rendering a bogus empty cluster.
 #[tokio::test]
 async fn memory_graph_legacy_cluster_query_returns_410() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/memory/graph?project=demo&cluster=123")).await;
@@ -544,7 +1088,7 @@ async fn memory_graph_legacy_cluster_query_returns_410() {
 
 #[tokio::test]
 async fn bearer_guard_blocks_api_without_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let resp = call(app, get("/api/stats")).await;
@@ -555,7 +1099,7 @@ async fn bearer_guard_blocks_api_without_token() {
 
 #[tokio::test]
 async fn bearer_guard_advertises_challenge() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let resp = call(app, get("/api/stats")).await;
@@ -572,7 +1116,7 @@ async fn bearer_guard_advertises_challenge() {
 
 #[tokio::test]
 async fn bearer_guard_exempt_spa_shell_and_healthz() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let token = Some("s3cr3t".to_string());
 
@@ -585,17 +1129,72 @@ async fn bearer_guard_exempt_spa_shell_and_healthz() {
     let app = router(test_state(tmp.path()), token);
     let resp = call(app, get("/healthz")).await;
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
+    let resp = call(app, get("/assets/js/api.js")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn browser_origin_cannot_follow_attacker_host() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/stats")
+        .header(header::HOST, "attacker.example")
+        .header(header::ORIGIN, "http://attacker.example")
+        .header(header::AUTHORIZATION, "Bearer s3cr3t")
+        .header(
+            "X-RTRT-Project",
+            TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        call(router(test_state(tmp.path()), Some("s3cr3t".into())), req)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn explicit_bearer_client_without_origin_is_accepted() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/stats")
+        .header(header::AUTHORIZATION, "Bearer s3cr3t")
+        .header(
+            "X-RTRT-Project",
+            TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        call(router(state, Some("s3cr3t".into())), req)
+            .await
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
 async fn bearer_guard_accepts_correct_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let req = Request::builder()
         .method(Method::GET)
         .uri("/api/stats")
         .header(header::AUTHORIZATION, "Bearer s3cr3t")
+        .header(
+            "X-RTRT-Project",
+            TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
         .body(Body::empty())
         .unwrap();
     let resp = call(app, req).await;
@@ -604,7 +1203,7 @@ async fn bearer_guard_accepts_correct_token() {
 
 #[tokio::test]
 async fn bearer_guard_rejects_wrong_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let req = Request::builder()
@@ -617,9 +1216,145 @@ async fn bearer_guard_rejects_wrong_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+const BOOTSTRAP_TEST_TOKEN: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn bootstrap_request(body: String, origin: bool) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/api/auth/bootstrap")
+        .header(header::CONTENT_TYPE, "application/json");
+    if origin {
+        builder = builder.header(header::ORIGIN, "http://127.0.0.1:7311");
+    }
+    builder.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn bootstrap_exchange_requires_origin_but_not_bearer() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let credential =
+        rtrt_core::dashboard_bootstrap::issue_with_nonce(BOOTSTRAP_TEST_TOKEN, now, 60, [9; 16])
+            .unwrap();
+    let body = serde_json::json!({ "credential": credential }).to_string();
+    let app = router(
+        test_state(tmp.path()),
+        Some(BOOTSTRAP_TEST_TOKEN.to_string()),
+    );
+    let missing_origin = call(app.clone(), bootstrap_request(body.clone(), false)).await;
+    assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+
+    let success = call(app, bootstrap_request(body, true)).await;
+    assert_eq!(success.status(), StatusCode::OK);
+    assert_eq!(success.headers()[header::CACHE_CONTROL], "no-store");
+    let payload = json_body(success).await;
+    assert_eq!(payload["token"], BOOTSTRAP_TEST_TOKEN);
+}
+
+#[tokio::test]
+async fn bootstrap_exchange_rejects_replay_malformed_and_oversized_generically() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let credential =
+        rtrt_core::dashboard_bootstrap::issue_with_nonce(BOOTSTRAP_TEST_TOKEN, now, 60, [8; 16])
+            .unwrap();
+    let body = serde_json::json!({ "credential": credential }).to_string();
+    let app = router(
+        test_state(tmp.path()),
+        Some(BOOTSTRAP_TEST_TOKEN.to_string()),
+    );
+    assert_eq!(
+        call(app.clone(), bootstrap_request(body.clone(), true))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let replay = call(app.clone(), bootstrap_request(body, true)).await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(replay.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(body_text(replay).await, "bootstrap rejected");
+
+    let malformed = call(app.clone(), bootstrap_request("{}".into(), true)).await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(malformed.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(body_text(malformed).await, "bootstrap rejected");
+    let oversized = call(
+        app,
+        bootstrap_request(
+            serde_json::json!({ "credential": "A".repeat(300) }).to_string(),
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_text(oversized).await, "bootstrap rejected");
+}
+
+#[test]
+fn dashboard_js_clears_fragment_before_exchange_and_uses_session_storage_only() {
+    let source = crate::assets::ASSET_JS_API;
+    let clear = source.find("window.history.replaceState").unwrap();
+    let exchange = source.find("nativeFetch('/api/auth/bootstrap'").unwrap();
+    assert!(clear < exchange);
+    assert!(source.contains("sessionStorage.setItem(TOKEN_KEY, payload.token)"));
+    assert!(source.contains("sessionStorage.removeItem(TOKEN_KEY)"));
+    let fragment_rejection = source.find("if (hadBootstrapFragment)").unwrap();
+    let manual_fallback = source
+        .find("const token = await requestTokenOnce()")
+        .unwrap();
+    assert!(fragment_rejection < manual_fallback);
+    assert!(source.contains("window.prompt('Dashboard API token:')"));
+    assert!(source.contains("window.dashboardAuthReady = bootstrapPromise"));
+    assert!(!source.contains("localStorage.setItem(TOKEN_KEY"));
+    assert!(!source.contains("document.cookie"));
+}
+
+#[test]
+fn dashboard_app_waits_for_auth_and_direct_visits_keep_manual_fallback() {
+    let auth = crate::assets::ASSET_JS_API;
+    let app = crate::assets::ASSET_JS_APP;
+    assert!(auth.contains("if (!hadBootstrapFragment) return true"));
+    assert!(auth.contains("const token = await requestTokenOnce()"));
+    let gate = app.find("window.dashboardAuthReady.then").unwrap();
+    let init = app.find("syncOverviewWindowButtons();").unwrap();
+    assert!(gate < init);
+    let html = crate::assets::INDEX_HTML;
+    assert!(html.find("/assets/js/api.js").unwrap() < html.find("/assets/js/app.js").unwrap());
+}
+
+#[tokio::test]
+async fn bootstrap_shell_and_unhashed_assets_are_never_stored() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
+    for path in [
+        "/",
+        "/memory/search",
+        "/assets/styles.css",
+        "/assets/js/api.js",
+    ] {
+        let response = call(app.clone(), get(path)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn spa_fallback_serves_deep_path_as_html() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/memory/search")).await;
@@ -637,7 +1372,7 @@ async fn spa_fallback_serves_deep_path_as_html() {
 
 #[tokio::test]
 async fn spa_fallback_404_for_bogus_api() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/bogus")).await;
@@ -663,7 +1398,7 @@ async fn spa_fallback_404_for_bogus_api() {
 /// still resolves to its members.
 #[tokio::test]
 async fn memory_graph_overview_balances_dominant_catchall_bubble() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     const TOTAL: usize = 300;
@@ -672,7 +1407,7 @@ async fn memory_graph_overview_balances_dominant_catchall_bubble() {
         let store = state.memory.as_ref().unwrap().lock().await;
         for i in 0..TOTAL {
             let body = format!("uniqueword{i}xyz alphatok{i}abc betatok{i}def gammatok{i}ghi");
-            let id = store.save("bigproj", "note", &body).unwrap();
+            let id = store.save(state.project.slug(), "note", &body).unwrap();
             let session = format!("sess-{}", i % SESSIONS);
             store.tag_row(id, Some(&session), None).unwrap();
         }
@@ -680,7 +1415,7 @@ async fn memory_graph_overview_balances_dominant_catchall_bubble() {
     let app = router(state.clone(), None);
     let resp = call(
         app,
-        get("/api/memory/graph?project=bigproj&mode=overview&group=context&basis=lexical"),
+        get("/api/memory/graph?project=demo&mode=overview&group=context&basis=lexical"),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -765,7 +1500,7 @@ async fn memory_graph_overview_balances_dominant_catchall_bubble() {
 /// item count (no pagination drift between the count and paged queries).
 #[tokio::test]
 async fn timeline_role_filter_splits_input_and_output() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let input_kinds = [
@@ -782,10 +1517,14 @@ async fn timeline_role_filter_splits_input_and_output() {
     {
         let store = state.memory.as_ref().unwrap().lock().await;
         for kind in input_kinds {
-            store.save("demo", kind, "typed by the user").unwrap();
+            store
+                .save(state.project.slug(), kind, "typed by the user")
+                .unwrap();
         }
         for kind in output_kinds {
-            store.save("demo", kind, "produced by an agent").unwrap();
+            store
+                .save(state.project.slug(), kind, "produced by an agent")
+                .unwrap();
         }
     }
 
@@ -845,19 +1584,31 @@ async fn timeline_role_filter_splits_input_and_output() {
 /// prompts or just agent output.
 #[tokio::test]
 async fn recall_role_filter_restricts_hits() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
         let store = state.memory.as_ref().unwrap().lock().await;
         store
-            .save("demo", "user-prompt-submit", "fix the parser bug")
+            .save(
+                state.project.slug(),
+                "user-prompt-submit",
+                "fix the parser bug",
+            )
             .unwrap();
         store
-            .save("demo", "assistant-turn", "fixed the parser bug")
+            .save(
+                state.project.slug(),
+                "assistant-turn",
+                "fixed the parser bug",
+            )
             .unwrap();
         store
-            .save("demo", "teammate-message", "parser bug report")
+            .save(
+                state.project.slug(),
+                "teammate-message",
+                "parser bug report",
+            )
             .unwrap();
     }
     let app = router(state.clone(), None);
@@ -894,574 +1645,132 @@ async fn recall_role_filter_restricts_hits() {
 }
 
 // ---------------------------------------------------------------------------
-// Orchestration config — `[team]` roster + `[failover]` markers.
-//
-// The roster the binary ships is only a DEFAULT, so these tests assert the
-// SHAPE of the exchange (shipped default is served, an invalid roster never
-// reaches disk, a custom roster round-trips) without pinning any lane, tier,
-// target or model name — those are config, and a config change must not be a
-// test change.
+// Failover config — `[failover]` markers. Native team/roster endpoints are gone.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn team_config_get_returns_the_shipped_default_roster() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
-
-    let resp = call(app, get("/api/team/config")).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-
-    // With no config file at all, the endpoint serves the shipped roster —
-    // compared against the core's own default rather than a literal list.
-    let shipped = rtrt_core::TeamConfig::default();
-    let names: Vec<&str> = v["members"]
-        .as_array()
-        .expect("members is a list")
-        .iter()
-        .map(|m| m["name"].as_str().expect("lane name"))
-        .collect();
-    let expected: Vec<&str> = shipped.members.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, expected);
-    assert_eq!(v["enabled"], shipped.enabled);
-    assert_eq!(v["manager_provider"], shipped.manager_provider);
-
-    // `tiers` is the CONFIGURED ladder (empty by default); `effective.tiers`
-    // is the one actually in force, so the UI can tell "unset" from "none".
-    assert!(v["tiers"].as_array().expect("tiers is a list").is_empty());
-    let effective = v["effective"]["tiers"].as_array().expect("effective tiers");
-    assert!(!effective.is_empty());
-    assert!(effective.iter().all(|t| t["tier"].is_string()));
-    // Every lane gets a resolved fallback walk.
-    assert_eq!(
-        v["effective"]["chains"]
-            .as_object()
-            .expect("chains is a map")
-            .len(),
-        shipped.members.len()
-    );
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["custom"], false);
-    assert_eq!(v["inherited"], false);
-
-    // A GET must never create the config file.
-    assert!(!config_file(tmp.path()).exists());
-}
-
-#[tokio::test]
-async fn team_config_post_with_a_fallback_cycle_is_rejected_and_not_written() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
-
-    // Two lanes that fall back to each other: the walk would never terminate.
-    let body = r#"{
-        "enabled": true,
-        "leader_order": ["first"],
-        "members": [
-            {"name":"first","target":"alpha","model":"alpha/one","mode":"cli",
-             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-             "fallback":["second"],"allow_impl":true,"flags":{}},
-            {"name":"second","target":"beta","model":"beta/one","mode":"cli",
-             "roles":["support"],"logical":null,"sibling":null,"tier":null,
-             "fallback":["first"],"allow_impl":true,"flags":{}}
-        ],
-        "tiers": [],
-        "policy": null
-    }"#;
-    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = json_body(resp).await;
-    let message = v["error"].as_str().expect("error message");
-    assert!(
-        message.contains("cycle"),
-        "validator message should name the cycle, got: {message}"
-    );
-
-    // Nothing was persisted: the invalid roster never reached the file.
-    assert!(
-        !config_file(tmp.path()).exists(),
-        "a rejected roster must not create or touch the config file"
-    );
-}
-
-#[tokio::test]
-async fn team_config_post_roundtrips_a_valid_roster() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-
-    // A fully custom roster: names, tier names and the ladder shape are all
-    // the caller's, none of them the shipped ones.
-    let body = r#"{
-        "enabled": true,
-        "manager_provider": "local-manager",
-        "manager_model": "tiny",
-        "manager_base_url": "",
-        "leader_order": ["primary", "backup"],
-        "members": [
-            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
-             "roles":["lead","review"],"logical":"one","sibling":"backup","tier":null,
-             "fallback":["backup"],"allow_impl":true,"flags":{"permission-mode":"plan"}},
-            {"name":"backup","target":"beta","model":"beta/one","mode":"api",
-             "roles":["support"],"logical":"one","sibling":"primary","tier":null,
-             "fallback":[],"allow_impl":false,"flags":{}}
-        ],
-        "tiers": [
-            {"tier":"quick","members":["primary"]},
-            {"tier":"deep","members":["primary","backup"]}
-        ],
-        "policy": {
-            "max_retries": 4,
-            "redo_on_fallback": false,
-            "prefer_sibling_on_quota": true,
-            "record_provenance": false,
-            "max_fallback_depth": 2,
-            "default_tier": "quick",
-            "design_only_tiers": ["deep"]
-        }
-    }"#;
-    let app = router(state.clone(), None);
-    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
-    assert_eq!(resp.status(), StatusCode::OK, "valid roster should persist");
-
-    // GET reads the persisted roster back, ladder order intact.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config")).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["enabled"], true);
-    assert_eq!(v["manager_provider"], "local-manager");
-    // An empty manager_base_url is stored as "unset", not as an empty string.
-    assert!(v["manager_base_url"].is_null());
-    assert_eq!(v["members"][0]["name"], "primary");
-    assert_eq!(v["members"][0]["sibling"], "backup");
-    assert_eq!(v["members"][0]["flags"]["permission-mode"], "plan");
-    assert_eq!(v["members"][1]["allow_impl"], false);
-    let tiers = v["tiers"].as_array().expect("tiers is a list");
-    assert_eq!(tiers.len(), 2);
-    assert_eq!(tiers[0]["tier"], "quick");
-    assert_eq!(tiers[1]["tier"], "deep");
-    assert_eq!(v["policy"]["max_retries"], 4);
-    assert_eq!(v["policy"]["default_tier"], "quick");
-    // The design-only rung is reported as such, and the lane that may not
-    // implement is allowed there.
-    let effective = v["effective"]["tiers"].as_array().expect("effective tiers");
-    let deep = effective
-        .iter()
-        .find(|t| t["tier"] == "deep")
-        .expect("deep rung");
-    assert_eq!(deep["design_only"], true);
-    assert_eq!(v["effective"]["chains"]["primary"][0], "backup");
-
-    // The roster really is on disk under `[team]`. Read it back from the path
-    // the ENDPOINT reports rather than a reconstructed one, so the assertion
-    // cannot quietly pass against a file the handler never wrote.
-    let reported = v["path"].as_str().expect("config path reported");
-    assert_eq!(
-        std::path::Path::new(reported),
-        config_file(tmp.path()),
-        "the endpoint must write inside the test sandbox"
-    );
-    let raw = std::fs::read_to_string(reported).expect("config written");
-    assert!(
-        raw.contains("[team]"),
-        "config should carry a [team] section"
-    );
-}
-
-#[tokio::test]
-async fn team_config_post_rejects_a_design_only_lane_in_an_implementing_tier() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
-
-    // `backup` may not implement, yet sits in a tier that is not design-only.
-    let body = r#"{
-        "enabled": true,
-        "leader_order": ["primary"],
-        "members": [
-            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
-             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-             "fallback":[],"allow_impl":true,"flags":{}},
-            {"name":"backup","target":"beta","model":"beta/one","mode":"cli",
-             "roles":["support"],"logical":null,"sibling":null,"tier":null,
-             "fallback":[],"allow_impl":false,"flags":{}}
-        ],
-        "tiers": [{"tier":"quick","members":["primary","backup"]}],
-        "policy": null
-    }"#;
-    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = json_body(resp).await;
-    let message = v["error"].as_str().expect("error message");
-    assert!(
-        message.contains("design-only"),
-        "validator message should explain the design-only conflict, got: {message}"
-    );
-    assert!(!config_file(tmp.path()).exists());
-}
-
-#[tokio::test]
-async fn team_config_post_rejects_a_cross_logical_sibling() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
-
-    // A sibling pair is one model on two pools; these are two different models.
-    let body = r#"{
-        "enabled": true,
-        "leader_order": ["primary"],
-        "members": [
-            {"name":"primary","target":"alpha","model":"alpha/one","mode":"cli",
-             "roles":["lead"],"logical":"one","sibling":"backup","tier":null,
-             "fallback":[],"allow_impl":true,"flags":{}},
-            {"name":"backup","target":"beta","model":"beta/two","mode":"cli",
-             "roles":["support"],"logical":"two","sibling":null,"tier":null,
-             "fallback":[],"allow_impl":true,"flags":{}}
-        ],
-        "tiers": [],
-        "policy": null
-    }"#;
-    let resp = call(app, json(Method::POST, "/api/team/config", body)).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = json_body(resp).await;
-    let message = v["error"].as_str().expect("error message");
-    assert!(
-        message.contains("sibling"),
-        "validator message should name the sibling, got: {message}"
-    );
-    assert!(!config_file(tmp.path()).exists());
-}
-
-#[tokio::test]
-async fn team_config_scope_toggle_matches_the_other_settings() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-
-    // Register a real on-disk project so `resolve_project_repo` resolves it,
-    // exactly as the other per-project settings require.
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::PUT,
-            "/api/projects",
-            &format!(
-                r#"{{"name":"demo","path":"{}"}}"#,
-                repo.to_string_lossy().replace('\\', "\\\\")
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // A project that pins nothing INHERITS the global roster, and says so with
-    // the same scope triple as the other seven per-project settings.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config?project=demo")).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["custom"], false);
-    assert_eq!(v["inherited"], true);
-    // Reading a project's roster must not conjure an override file for it.
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-
-    // The global scope reports nothing to inherit, same as every other endpoint.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config?project=global")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["inherited"], false);
-
-    // "Follow global" on a project that has no override is a safe no-op that
-    // re-reads the effective roster, exactly like the other clear paths.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        post_empty("/api/team/config?project=demo&scope=global"),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["inherited"], true);
-    assert!(!v["members"].as_array().expect("members").is_empty());
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-}
-
 /// A POST with no body — the "Follow global" clear path every scoped endpoint
-/// exposes.
+/// exposes. Does **not** inject a project selector.
 fn post_empty(uri: &str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
         .uri(uri)
+        .header(header::ORIGIN, "http://localhost:7311")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
         .body(Body::empty())
         .unwrap()
 }
 
-/// A roster with no lane in common with the shipped one, so "the project's own"
-/// and "the global" can never be confused for each other.
-const PROJECT_ROSTER: &str = r#"{
-    "enabled": true,
-    "manager_provider": "project-manager",
-    "manager_model": "project-model",
-    "manager_base_url": "",
-    "leader_order": ["project-lane"],
-    "members": [
-        {"name":"project-lane","target":"project-target","model":null,"mode":"cli",
-         "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-         "fallback":[],"allow_impl":true,"flags":{}}
-    ],
-    "tiers": [],
-    "policy": null
-}"#;
+fn test_slug() -> String {
+    TEST_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
-/// Register `demo` as an on-disk project rooted at `<tmp>/repo` and return it.
-async fn register_demo_project(
-    state: crate::state::AppState,
-    tmp: &std::path::Path,
-) -> std::path::PathBuf {
-    let repo = tmp.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let resp = call(
-        router(state, None),
-        json(
-            Method::PUT,
-            "/api/projects",
-            &format!(
-                r#"{{"name":"demo","path":"{}"}}"#,
-                repo.to_string_lossy().replace('\\', "\\\\")
-            ),
-        ),
+fn unselected(mut state: AppState) -> AppState {
+    state.selected = false;
+    state
+}
+
+/// GET without the `X-RTRT-Project` header `get()` always injects.
+fn bare_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// JSON POST/PUT without the `X-RTRT-Project` header `json()` always injects.
+fn bare_json(method: Method, uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost:7311")
+        .header(header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn with_project_header(mut req: Request<Body>, slug: &str) -> Request<Body> {
+    req.headers_mut().insert(
+        "X-RTRT-Project",
+        axum::http::HeaderValue::from_str(slug).expect("slug is a valid header value"),
+    );
+    req
+}
+
+async fn failover_handler_get(state: AppState) -> axum::response::Response {
+    crate::handlers::failover::get_failover_config(
+        axum::Extension(state),
+        axum::extract::Query(crate::handlers::scope::ProjectQuery::default()),
     )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    repo
+    .await
+}
+
+async fn failover_handler_post(
+    state: AppState,
+    scope: Option<&str>,
+    body: Option<&str>,
+) -> axum::response::Response {
+    let q = crate::handlers::scope::ProjectQuery {
+        project: None,
+        scope: scope.map(str::to_string),
+    };
+    let parsed = body.map(|raw| {
+        axum::Json(
+            serde_json::from_str::<crate::handlers::failover::SetFailoverRequest>(raw)
+                .expect("test failover body"),
+        )
+    });
+    crate::handlers::failover::post_failover_config(
+        axum::Extension(state),
+        axum::extract::Query(q),
+        parsed,
+    )
+    .await
 }
 
 #[tokio::test]
-async fn team_config_writes_and_clears_a_project_override() {
-    let tmp = tempfile::tempdir().unwrap();
+async fn team_config_api_is_unavailable() {
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
-    let repo = register_demo_project(state.clone(), tmp.path()).await;
-    let project_file = repo.join(".rtrt").join("config.toml");
 
-    // A coexisting override written first, so the clear below has a neighbour
-    // it must not disturb.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/compression/config?project=demo",
-            r#"{"level":"ultra"}"#,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Writing with a project selected pins THIS project's roster.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/team/config?project=demo",
-            PROJECT_ROSTER,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-    assert_eq!(v["custom"], true);
-    assert_eq!(v["inherited"], false);
-    // The reported path is the file the write actually landed in.
-    assert_eq!(v["path"], project_file.to_string_lossy().into_owned());
-
-    // GET through the project scope now reads the override back…
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-    assert_eq!(v["manager_provider"], "project-manager");
-    assert_eq!(v["members"][0]["name"], "project-lane");
-
-    // …while the GLOBAL scope still serves the shipped roster untouched.
     let app = router(state.clone(), None);
     let resp = call(app, get("/api/team/config")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    let shipped = rtrt_core::TeamConfig::default();
-    assert_eq!(v["manager_provider"], shipped.manager_provider);
-    assert_eq!(v["members"][0]["name"], shipped.members[0].name);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // `?scope=global` clears ONLY the team override; the compression override
-    // in the same file survives.
-    let app = router(state.clone(), None);
+    let app = router(state, None);
     let resp = call(
         app,
-        post_empty("/api/team/config?project=demo&scope=global"),
+        json(Method::POST, "/api/team/config", r#"{"enabled":true}"#),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["inherited"], true);
-    assert_eq!(v["manager_provider"], shipped.manager_provider);
-
-    let stored = rtrt_core::Config::load_project(&repo).unwrap();
-    assert!(stored.team.is_none(), "the team override was cleared");
-    assert!(
-        stored.compression.is_some(),
-        "clearing the roster must not touch a coexisting override"
-    );
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn a_project_roster_that_would_be_invalid_is_rejected_and_not_written() {
-    let tmp = tempfile::tempdir().unwrap();
+async fn failover_global_get_post_roundtrip() {
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
-    let repo = register_demo_project(state.clone(), tmp.path()).await;
+    let repo = state.project.memory_root().to_path_buf();
+    let app = router(unselected(state.clone()), None);
 
-    // A ladder rung naming a lane this roster does not define — the effective
-    // roster would be invalid, so the write must not happen at all.
-    let body = r#"{
-        "enabled": true,
-        "leader_order": ["kept"],
-        "members": [
-            {"name":"kept","target":"one","model":null,"mode":"cli",
-             "roles":["lead"],"logical":null,"sibling":null,"tier":null,
-             "fallback":[],"allow_impl":true,"flags":{}}
-        ],
-        "tiers": [{"tier":"rung","members":["dropped"]}],
-        "policy": null
-    }"#;
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(Method::POST, "/api/team/config?project=demo", body),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let v = json_body(resp).await;
-    let message = v["error"].as_str().expect("error message");
-    // The validator's own message, not a paraphrase.
-    assert!(
-        message.contains("dropped") && message.contains("unknown member"),
-        "expected the validator's message, got: {message}"
-    );
-
-    // Nothing reached disk: no project override file, and the project still
-    // inherits the global roster.
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/team/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-}
-
-#[tokio::test]
-async fn failover_config_scope_matches_the_team_endpoint() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-    let repo = register_demo_project(state.clone(), tmp.path()).await;
-
-    // A global policy the project will shadow.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config",
-            r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Before any project write, the project inherits it.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "global");
-    assert_eq!(v["inherited"], true);
-    assert_eq!(v["fatal"][0], "global marker");
-
-    // The project pins its own policy: whole-section replacement, so the
-    // global marker and retry count are gone rather than merged in.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config?project=demo",
-            r#"{"fatal":["project marker"],"quota":[],"transient":[],"transient_retries":null}"#,
-        ),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config?project=demo")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["scope"], "custom");
-    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
-    assert_eq!(v["fatal"][0], "project marker");
-    assert!(v["transient_retries"].is_null());
-
-    // The global policy is untouched by the project write.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
-    let v = json_body(resp).await;
-    assert_eq!(v["fatal"][0], "global marker");
-    assert_eq!(v["transient_retries"], 3);
-
-    // Clearing returns the project to the global policy and removes the now
-    // empty override file, keeping the repo clean.
-    let app = router(state.clone(), None);
-    let resp = call(
-        app,
-        post_empty("/api/failover/config?project=demo&scope=global"),
-    )
-    .await;
+    let resp = call(app, bare_get("/api/failover/config")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     assert_eq!(v["scope"], "global");
-    assert_eq!(v["fatal"][0], "global marker");
-    assert!(!repo.join(".rtrt").join("config.toml").exists());
-}
-
-#[tokio::test]
-async fn failover_config_get_post_roundtrip() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _g = EnvGuard::new(tmp.path());
-    let state = test_state(tmp.path());
-
-    // Defaults: no marker overrides at all.
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = json_body(resp).await;
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], false);
     assert!(v["fatal"].as_array().expect("fatal").is_empty());
     assert!(v["transient_retries"].is_null());
-    assert_eq!(v["scope"], "global");
 
-    let app = router(state.clone(), None);
+    let app = router(unselected(state.clone()), None);
     let resp = call(
         app,
-        json(
+        bare_json(
             Method::POST,
             "/api/failover/config",
             r#"{"fatal":["contract expired"," "],"quota":["seat limit reached"],
@@ -1470,35 +1779,319 @@ async fn failover_config_get_post_roundtrip() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-
-    let app = router(state.clone(), None);
-    let resp = call(app, get("/api/failover/config")).await;
     let v = json_body(resp).await;
-    // The blank marker a form leaves behind is dropped, not persisted.
-    assert_eq!(
-        v["fatal"].as_array().expect("fatal").len(),
-        1,
-        "blank markers should be dropped"
-    );
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
     assert_eq!(v["fatal"][0], "contract expired");
     assert_eq!(v["quota"][0], "seat limit reached");
     assert_eq!(v["transient_retries"], 1);
     assert_eq!(v["backoff_divisor"], 60);
     assert!(v["backoff_ms"].is_null());
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+
+    let app = router(unselected(state), None);
+    let resp = call(app, bare_get("/api/failover/config")).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "contract expired");
+    assert_eq!(v["transient_retries"], 1);
 }
 
 #[tokio::test]
-async fn failover_config_rejects_a_zero_backoff_divisor() {
-    let tmp = tempfile::tempdir().unwrap();
+async fn failover_inherited_project_get_shows_global_policy() {
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
-    let app = router(test_state(tmp.path()), None);
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = call(
-        app,
-        json(
-            Method::POST,
-            "/api/failover/config",
-            r#"{"fatal":[],"quota":[],"transient":[],"backoff_divisor":0}"#,
+        router(state, None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_custom_write_preserves_global() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(
+                Method::POST,
+                "/api/failover/config?scope=custom",
+                r#"{"fatal":["project marker"],"quota":[],"transient":[],"transient_retries":null}"#,
+            ),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["custom"], true);
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"][0], "project marker");
+    assert!(v["transient_retries"].is_null());
+    assert!(repo.join(".rtrt").join("config.toml").exists());
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["fatal"].as_array().expect("fatal").len(), 1);
+    assert_eq!(v["fatal"][0], "project marker");
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], false);
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_follow_global_preserves_unrelated_overrides() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let project = rtrt_core::config::ProjectConfig {
+        output_level: Some("ultra".into()),
+        failover: Some(rtrt_core::config::FailoverConfig {
+            fatal: vec!["project marker".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::util::write_project_config(&repo, &project).unwrap();
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(post_empty("/api/failover/config?scope=global"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "global");
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+
+    let remaining = rtrt_core::Config::load_project(&repo).unwrap();
+    assert!(remaining.failover.is_none());
+    assert_eq!(remaining.output_level.as_deref(), Some("ultra"));
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "global marker");
+    assert_eq!(v["transient_retries"], 3);
+}
+
+#[tokio::test]
+async fn failover_project_post_rejects_missing_and_invalid_scope() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+    let body = r#"{"fatal":["should not persist"],"quota":[],"transient":[]}"#;
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_json(Method::POST, "/api/failover/config", body), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("scope=custom or scope=global")
+    );
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(Method::POST, "/api/failover/config?scope=nope", body),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("invalid failover scope")
+    );
+
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
+    assert!(!config_file(tmp.path()).exists());
+}
+
+#[tokio::test]
+async fn failover_numeric_fields_reject_values_above_u32_max() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+
+    let at_max = format!(
+        r#"{{"fatal":[],"quota":[],"transient":[],"transient_retries":{},"backoff_divisor":{}}}"#,
+        u32::MAX,
+        u32::MAX
+    );
+    let resp = call(
+        router(unselected(state.clone()), None),
+        bare_json(Method::POST, "/api/failover/config", &at_max),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["transient_retries"], u32::MAX);
+    assert_eq!(v["backoff_divisor"], u32::MAX);
+
+    let over_max = format!(
+        r#"{{"fatal":[],"quota":[],"transient":[],"transient_retries":{}}}"#,
+        u64::from(u32::MAX) + 1
+    );
+    let resp = call(
+        router(unselected(state.clone()), None),
+        bare_json(Method::POST, "/api/failover/config", &over_max),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error")
+            .contains("failover.transient_retries")
+    );
+
+    let resp = call(
+        router(unselected(state), None),
+        bare_get("/api/failover/config"),
+    )
+    .await;
+    let v = json_body(resp).await;
+    assert_eq!(v["transient_retries"], u32::MAX);
+}
+
+#[tokio::test]
+async fn failover_header_only_project_selection() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+
+    let resp = failover_handler_post(
+        unselected(state.clone()),
+        None,
+        Some(r#"{"fatal":["global marker"],"quota":[],"transient":[],"transient_retries":3}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(bare_get("/api/failover/config"), &slug),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["inherited"], true);
+    assert_eq!(v["fatal"][0], "global marker");
+
+    let resp = call(
+        router(state.clone(), None),
+        with_project_header(
+            bare_json(
+                Method::POST,
+                "/api/failover/config?scope=custom",
+                r#"{"fatal":["header project"],"quota":[],"transient":[]}"#,
+            ),
+            &slug,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["scope"], "custom");
+    assert_eq!(v["fatal"][0], "header project");
+
+    let resp = failover_handler_get(unselected(state)).await;
+    let v = json_body(resp).await;
+    assert_eq!(v["fatal"][0], "global marker");
+}
+
+#[tokio::test]
+async fn failover_rejects_zero_backoff_divisor() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let state = test_state(tmp.path());
+    let slug = test_slug();
+    let repo = state.project.memory_root().to_path_buf();
+    let body = r#"{"fatal":[],"quota":[],"transient":[],"backoff_divisor":0}"#;
+
+    let resp = failover_handler_post(unselected(state.clone()), None, Some(body)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = json_body(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .expect("error message")
+            .contains("backoff_divisor")
+    );
+    assert!(!config_file(tmp.path()).exists());
+
+    let resp = call(
+        router(state, None),
+        with_project_header(
+            bare_json(Method::POST, "/api/failover/config?scope=custom", body),
+            &slug,
         ),
     )
     .await;
@@ -1510,40 +2103,301 @@ async fn failover_config_rejects_a_zero_backoff_divisor() {
             .expect("error message")
             .contains("backoff_divisor")
     );
-    assert!(!config_file(tmp.path()).exists());
+    assert!(!repo.join(".rtrt").join("config.toml").exists());
 }
 
 #[tokio::test]
-async fn orchestration_page_assets_are_served_and_deep_linkable() {
-    let tmp = tempfile::tempdir().unwrap();
+async fn config_patch_omissions_preserve_every_hidden_setting() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    std::fs::create_dir_all(config_file(tmp.path()).parent().unwrap()).unwrap();
+    std::fs::write(
+        config_file(tmp.path()),
+        r#"
+[dashboard]
+bind = "0.0.0.0:9000"
+[providers]
+api_max_tokens = 777
+[capture]
+enabled = false
+redact = false
+dedup_window_sec = 987
+project = "pinned"
+[auto_compress]
+enabled = true
+model = "kept/model"
+base_url = "http://kept"
+provider = "kept-runtime"
+interval_sec = 91
+age_sec = 92
+min_chars = 93
+batch = 94
+max_tokens = 95
+[embeddings]
+enabled = true
+model = "kept-embed"
+base_url = "http://embed"
+auto = false
+auto_interval_sec = 96
+auto_batch = 97
+"#,
+    )
+    .unwrap();
+    let app = router(test_state(tmp.path()), None);
+    let response = call(app, json(Method::POST, "/api/config", r#"{"capture":{"enabled":true},"auto_compress":{"age_sec":100},"embeddings":{"enabled":false}}"#)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cfg = rtrt_core::Config::load().unwrap();
+    assert!(cfg.capture.enabled);
+    assert!(!cfg.capture.redact);
+    assert_eq!(cfg.capture.dedup_window_sec, 987);
+    assert_eq!(cfg.capture.project.as_deref(), Some("pinned"));
+    assert_eq!(cfg.auto_compress.interval_sec, 91);
+    assert_eq!(cfg.auto_compress.age_sec, 100);
+    assert_eq!(cfg.auto_compress.min_chars, 93);
+    assert_eq!(cfg.auto_compress.batch, 94);
+    assert_eq!(cfg.auto_compress.max_tokens, 95);
+    assert_eq!(cfg.auto_compress.provider.as_deref(), Some("kept-runtime"));
+    assert!(!cfg.embeddings.enabled);
+    assert!(!cfg.embeddings.auto);
+    assert_eq!(cfg.embeddings.model, "kept-embed");
+    assert_eq!(cfg.embeddings.auto_interval_sec, 96);
+    assert_eq!(cfg.embeddings.auto_batch, 97);
+    assert_eq!(cfg.dashboard.bind, "0.0.0.0:9000");
+    assert_eq!(cfg.providers.api_max_tokens, Some(777));
+}
+
+#[tokio::test]
+#[ignore = "legacy project-registry mutation removed by project isolation"]
+async fn project_patch_omissions_preserve_path_security_and_embedding() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let first = r#"{"name":"demo","path":"/kept/path","security_profile":"ai-strict","embeddings_mode":"off"}"#;
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::PUT, "/api/projects", first)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::PUT, "/api/projects", r#"{"name":"demo"}"#)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let p = rtrt_core::Config::load()
+        .unwrap()
+        .project("demo")
+        .unwrap()
+        .clone();
+    assert_eq!(p.path.as_deref(), Some("/kept/path"));
+    assert_eq!(p.security_profile.as_deref(), Some("ai-strict"));
+    assert_eq!(p.embeddings_enabled, Some(false));
+
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(
+                Method::PUT,
+                "/api/projects",
+                r#"{"name":"demo","path":null}"#,
+            )
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let p = rtrt_core::Config::load()
+        .unwrap()
+        .project("demo")
+        .unwrap()
+        .clone();
+    assert_eq!(p.path, None);
+    assert_eq!(p.security_profile.as_deref(), Some("ai-strict"));
+    assert_eq!(p.embeddings_enabled, Some(false));
+}
+
+#[tokio::test]
+async fn limits_patch_omissions_preserve_axes_and_pool_only_limits() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let initial = r#"{"targets":[{"target":"api","daily_tokens":10,"daily_requests":20,"pools":[{"pool":"paid","daily_tokens":30}]}]}"#;
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::POST, "/api/limits/config", initial)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let patch = r#"{"targets":[{"target":"api","daily_tokens":11}]}"#;
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::POST, "/api/limits/config", patch)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let limit = rtrt_core::Config::load()
+        .unwrap()
+        .limits
+        .target("api")
+        .unwrap()
+        .clone();
+    assert_eq!(limit.daily_tokens, Some(11));
+    assert_eq!(limit.daily_requests, Some(20));
+    assert_eq!(limit.pools["paid"].daily_tokens, Some(30));
+
+    let clear = r#"{"targets":[{"target":"api","daily_requests":null}]}"#;
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::POST, "/api/limits/config", clear)
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let limit = rtrt_core::Config::load()
+        .unwrap()
+        .limits
+        .target("api")
+        .unwrap()
+        .clone();
+    assert_eq!(limit.daily_tokens, Some(11));
+    assert_eq!(limit.daily_requests, None);
+    assert_eq!(limit.pools["paid"].daily_tokens, Some(30));
+}
+
+#[tokio::test]
+async fn security_profile_clone_payload_preserves_full_schema() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let toml = r#"name = "complete"
+description = "all fields"
+severity_threshold = "medium"
+exclude = ["vendor/"]
+
+[[rules]]
+id = "pattern.complete"
+engine = "patterns"
+severity = "high"
+description = "kept"
+enabled = false
+standards = { cwe = ["CWE-78"], eu_ai_act = ["Art.15"] }
+match = "danger"
+langs = ["rs", "js"]
+"#;
+    let body = serde_json::json!({"name": "complete", "toml": toml}).to_string();
+    let response = call(
+        router(test_state(tmp.path()), None),
+        json(Method::POST, "/api/security/profile", &body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = call(
+        router(test_state(tmp.path()), None),
+        get("/api/security/profile/complete"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    assert_eq!(value["profile"]["rules"][0]["enabled"], false);
+    assert_eq!(
+        value["profile"]["rules"][0]["standards"]["cwe"][0],
+        "CWE-78"
+    );
+    assert_eq!(value["profile"]["rules"][0]["match"], "danger");
+    assert!(value["toml"].as_str().unwrap().contains("eu_ai_act"));
+}
+
+#[tokio::test]
+async fn security_profile_rejects_traversal_and_name_mismatch() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let bad = r#"{"name":"../escape","toml":"name = 'escape'\n"}"#;
+    assert_eq!(
+        call(app, json(Method::POST, "/api/security/profile", bad))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mismatch = r#"{"name":"safe","toml":"name = 'other'\n"}"#;
+    assert_eq!(
+        call(
+            router(test_state(tmp.path()), None),
+            json(Method::POST, "/api/security/profile", mismatch)
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_writer_rejects_symlink_target_without_touching_destination() {
+    use std::os::unix::fs::symlink;
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    std::fs::create_dir_all(config_file(tmp.path()).parent().unwrap()).unwrap();
+    let destination = tmp.path().join("victim");
+    std::fs::write(&destination, "keep").unwrap();
+    symlink(&destination, config_file(tmp.path())).unwrap();
+    let response = call(
+        router(test_state(tmp.path()), None),
+        json(
+            Method::POST,
+            "/api/config",
+            r#"{"capture":{"enabled":false}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(std::fs::read_to_string(destination).unwrap(), "keep");
+}
+
+#[tokio::test]
+async fn failover_page_assets_are_served_and_deep_linkable() {
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
     // The page's script is embedded in the binary and served like the other
-    // app assets: `no-cache`, so a rebuilt UI shows up on the next load.
+    // app assets: `no-store`, so auth/bootstrap code is never restored stale.
     let app = router(state.clone(), None);
-    let resp = call(app, get("/assets/js/orchestration.js")).await;
+    let resp = call(app, get("/assets/js/failover.js")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
             .get(header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok()),
-        Some("no-cache")
+        Some("no-store")
     );
     let script = body_text(resp).await;
-    assert!(script.contains("loadOrchestration"));
+    assert!(script.contains("loadFailover"));
 
     // The shell loads it, and the page + nav entry exist in the markup.
     let app = router(state.clone(), None);
     let html = body_text(call(app, get("/")).await).await;
-    assert!(html.contains("/assets/js/orchestration.js"));
-    assert!(html.contains("id=\"page-orchestration\""));
-    assert!(html.contains("data-page=\"orchestration\""));
+    assert!(html.contains("/assets/js/failover.js"));
+    assert!(html.contains("id=\"page-failover\""));
+    assert!(html.contains("data-page=\"failover\""));
 
-    // Deep link: /orchestration falls through to the SPA shell so a refresh
+    // Deep link: /failover falls through to the SPA shell so a refresh
     // (or a shared URL) restores the page instead of 404ing.
     let app = router(state, None);
-    let resp = call(app, get("/orchestration")).await;
+    let resp = call(app, get("/failover")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
         resp.headers()
@@ -1552,4 +2406,13 @@ async fn orchestration_page_assets_are_served_and_deep_linkable() {
             .unwrap_or_default()
             .starts_with("text/html")
     );
+}
+
+#[tokio::test]
+async fn retired_orchestration_asset_is_not_served() {
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let resp = call(app, get("/assets/js/orchestration.js")).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

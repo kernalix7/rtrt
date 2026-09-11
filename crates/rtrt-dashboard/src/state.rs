@@ -15,7 +15,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use rtrt_core::{
-    OutputStyleLevel, read_output_style_level, read_output_style_level_for,
+    OutputStyleLevel, ProjectIdentity, read_output_style_level, read_output_style_level_for,
     write_output_style_level_for,
 };
 use rtrt_memory::{
@@ -34,6 +34,39 @@ use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
 use crate::prelude::*;
+use crate::project_catalog::ProjectCatalog;
+
+#[derive(Clone)]
+pub(crate) struct ProjectContext {
+    pub(crate) project: Arc<ProjectIdentity>,
+    pub(crate) memory: Arc<Mutex<MemoryStore>>,
+    pub(crate) memory_path: PathBuf,
+    pub(crate) cluster_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ClusterIndex)>>>,
+    pub(crate) brainh_cache:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, ConceptHierarchy)>>>,
+    pub(crate) level_tokens:
+        Arc<Mutex<std::collections::HashMap<String, (std::time::Instant, TokenEntry)>>>,
+    pub(crate) embedding_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ProjectContext {
+    pub(crate) fn new(
+        project: Arc<ProjectIdentity>,
+        memory: Arc<Mutex<MemoryStore>>,
+        memory_path: PathBuf,
+    ) -> Self {
+        Self {
+            project,
+            memory,
+            memory_path,
+            cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            brainh_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -42,7 +75,8 @@ pub(crate) struct AppState {
     pub(crate) memory: Option<Arc<Mutex<MemoryStore>>>,
     pub(crate) auto_capture: bool,
     pub(crate) auto_redact: bool,
-    pub(crate) default_project: String,
+    /// Immutable identity established before any store or watcher is opened.
+    pub(crate) project: Arc<ProjectIdentity>,
     pub(crate) session_id: String,
     pub(crate) dedup_window_sec: i64,
     pub(crate) events: broadcast::Sender<String>,
@@ -81,6 +115,9 @@ pub(crate) struct AppState {
     pub(crate) memory_path: std::path::PathBuf,
     /// Projects with an embedding backfill currently running (dedup + progress).
     pub(crate) embedding_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub(crate) catalog: Arc<ProjectCatalog>,
+    pub(crate) selected: bool,
+    pub(crate) daemon_projects: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// One drill token's payload: which project it belongs to, the member ids it
@@ -180,6 +217,81 @@ impl Provider for GatewayAdapter {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn machine(
+        gateway: Arc<Gateway>,
+        prompts: Option<Arc<PromptRegistry>>,
+        auto_capture: bool,
+        auto_redact: bool,
+        session_id: String,
+        dedup_window_sec: i64,
+        events: broadcast::Sender<String>,
+        embedder: Option<Arc<dyn Embedder>>,
+        catalog: Arc<ProjectCatalog>,
+        home: PathBuf,
+    ) -> Result<Self> {
+        // Context fields are inert on global routes. Project routes always
+        // replace them through selector middleware before handler extraction.
+        let placeholder_root = home.join(".rtrt/dashboard");
+        let project = Arc::new(ProjectIdentity::derive(&placeholder_root)?);
+        Ok(Self {
+            gateway,
+            prompts,
+            memory: None,
+            auto_capture,
+            auto_redact,
+            project,
+            session_id,
+            dedup_window_sec,
+            events,
+            embedder,
+            cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            brainh_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            memory_path: placeholder_root.join("unavailable.sqlite"),
+            embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            catalog,
+            selected: false,
+            daemon_projects: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    pub(crate) fn with_context(&self, context: &ProjectContext) -> Self {
+        let mut selected = self.clone();
+        selected.project = context.project.clone();
+        selected.memory = Some(context.memory.clone());
+        selected.memory_path = context.memory_path.clone();
+        selected.cluster_cache = context.cluster_cache.clone();
+        selected.brainh_cache = context.brainh_cache.clone();
+        selected.level_tokens = context.level_tokens.clone();
+        selected.embedding_jobs = context.embedding_jobs.clone();
+        selected.selected = true;
+        selected
+    }
+
+    /// Starts each verified project's background workers at most once for this
+    /// process. Refresh can safely call this after admitting new contexts.
+    pub(crate) fn start_project_daemons(&self) {
+        for context in self.catalog.contexts() {
+            let slug = context.project.slug().to_string();
+            let should_start = self
+                .daemon_projects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(slug.clone());
+            if !should_start {
+                continue;
+            }
+            let memory = Some(context.memory.clone());
+            crate::daemons::spawn_consolidation_daemon(memory.clone(), slug.clone());
+            crate::daemons::spawn_auto_compress_daemon(memory.clone(), self.gateway.clone(), slug);
+            crate::daemons::spawn_auto_embed_daemon(context.project.clone());
+            crate::transcripts::spawn_reattribution(memory.clone(), context.project.clone());
+            crate::transcripts::spawn_transcript_watcher(memory.clone(), context.project.clone());
+            crate::opencode_transcripts::spawn_transcript_watcher(memory, context.project.clone());
+        }
+    }
+
     /// Best-effort auto-save into the memory store. Pipeline:
     /// 1. Privacy filter (`redact_secrets`) when `auto_redact` is true.
     /// 2. SHA-256 dedup against the last `dedup_window_sec` seconds.
@@ -190,7 +302,7 @@ impl AppState {
         body: &str,
         metadata: &std::collections::BTreeMap<String, String>,
     ) {
-        if !self.auto_capture {
+        if !self.selected || !self.auto_capture {
             return;
         }
         let Some(store) = &self.memory else { return };
@@ -199,7 +311,7 @@ impl AppState {
         } else {
             body.to_string()
         };
-        let project = self.default_project.clone();
+        let project = self.project.slug().to_string();
         let kind = kind.to_string();
         let metadata = metadata.clone();
         let session = self.session_id.clone();
@@ -244,29 +356,68 @@ impl AppState {
     }
 }
 
-/// Store path for every dashboard surface: `RTRT_MEMORY_PATH` override,
-/// otherwise the toolkit-wide default (`~/.rtrt/memory.sqlite`) shared with
-/// the CLI, hooks, and MCP server.
-pub(crate) fn memory_store_path() -> PathBuf {
-    std::env::var("RTRT_MEMORY_PATH")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(rtrt_core::default_memory_store_path)
-}
-
-pub(crate) fn open_memory_store() -> Option<Arc<Mutex<MemoryStore>>> {
-    let path = memory_store_path();
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match MemoryStore::open(&path) {
-        Ok(store) => Some(Arc::new(Mutex::new(store))),
-        Err(e) => {
-            tracing::warn!(?path, "memory store unavailable: {e}");
-            None
+impl AppState {
+    /// Optional client project values are assertions, never routing keys.
+    pub(crate) fn assert_project<'a>(
+        &'a self,
+        requested: Option<&str>,
+    ) -> std::result::Result<&'a str, (StatusCode, String)> {
+        if let Some(value) = requested.map(str::trim).filter(|v| !v.is_empty())
+            && value != self.project.slug()
+        {
+            return Err((StatusCode::FORBIDDEN, "foreign project".into()));
         }
+        Ok(self.project.slug())
+    }
+
+    /// Canonical, symlink-safe containment under canonical main repository.
+    pub(crate) fn contained_path(
+        &self,
+        requested: &std::path::Path,
+    ) -> std::result::Result<PathBuf, (StatusCode, String)> {
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.project.memory_root().join(requested)
+        };
+        let canonical = std::fs::canonicalize(&candidate)
+            .map_err(|_| (StatusCode::NOT_FOUND, "path not found".into()))?;
+        if !canonical.starts_with(self.project.memory_root()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "path outside selected project".into(),
+            ));
+        }
+        Ok(canonical)
+    }
+
+    pub(crate) fn contained_write_path(
+        &self,
+        requested: &std::path::Path,
+    ) -> std::result::Result<PathBuf, (StatusCode, String)> {
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.project.memory_root().join(requested)
+        };
+        if candidate.exists() {
+            return self.contained_path(&candidate);
+        }
+        let parent = candidate
+            .parent()
+            .ok_or((StatusCode::BAD_REQUEST, "target has no parent".into()))?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(|_| (StatusCode::NOT_FOUND, "target parent not found".into()))?;
+        if !canonical_parent.starts_with(self.project.memory_root()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "path outside selected project".into(),
+            ));
+        }
+        let name = candidate
+            .file_name()
+            .ok_or((StatusCode::BAD_REQUEST, "invalid target".into()))?;
+        Ok(canonical_parent.join(name))
     }
 }
 

@@ -129,12 +129,13 @@ pub(crate) struct StatuslinePreview {
 }
 
 pub(crate) async fn get_statusline_config(
-    axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
+    axum::Extension(state): axum::Extension<AppState>,
+    axum::extract::Query(_q): axum::extract::Query<ProjectQuery>,
 ) -> DashboardJsonResult<StatuslineConfigResponse> {
     // Per-project override wins: when the project carries its own `statusline`
     // value in `<repo>/.rtrt/config.toml`, return it ("Custom" scope); otherwise
     // fall through to the global statusline config ("Follow global" — inherit).
-    if let Some(repo) = resolve_project_repo(q.project.as_deref()) {
+    if let Some(repo) = Some(state.project.memory_root().to_path_buf()) {
         let project = rtrt_core::Config::load_project(&repo).map_err(|e| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -211,6 +212,7 @@ pub(crate) fn upgrade_legacy_statusline_config(mut cfg: StatuslineConfig) -> Sta
 }
 
 pub(crate) async fn post_statusline_config(
+    axum::Extension(state): axum::Extension<AppState>,
     axum::extract::Query(q): axum::extract::Query<ProjectQuery>,
     Json(req): Json<StatuslineConfig>,
 ) -> DashboardJsonResult<StatuslineOk> {
@@ -225,7 +227,7 @@ pub(crate) async fn post_statusline_config(
     // Per-project override: persist the serialized statusline config into the
     // project's `<repo>/.rtrt/config.toml` (`ProjectConfig.statusline`) instead
     // of the global file.
-    if let Some(repo) = resolve_project_repo(q.project.as_deref()) {
+    if let Some(repo) = Some(state.project.memory_root().to_path_buf()) {
         let mut project = rtrt_core::Config::load_project(&repo).map_err(|e| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -381,9 +383,10 @@ pub(crate) async fn run_statusline_preview<P>(binary: P) -> Option<Vec<String>>
 where
     P: AsRef<std::ffi::OsStr>,
 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let sample = serde_json::json!({
         "model": { "display_name": "Opus 4.8" },
-        "cwd": "/home/kernalix7/Desktop/00_Personal_Project/00G_rtrt",
+        "cwd": cwd.to_string_lossy(),
         "transcript": [],
     });
     let sample = serde_json::to_vec(&sample).ok()?;

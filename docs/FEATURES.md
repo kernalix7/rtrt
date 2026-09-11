@@ -145,7 +145,7 @@ Vector and hybrid recall require an `Embedder`. The default is `all-MiniLM-L6-v2
 
 ```toml
 [dependencies]
-rtrt-memory = { version = "0.2", features = ["embeddings"] }
+rtrt-memory = { version = "0.1.1", features = ["embeddings"] }
 ```
 
 Usage:
@@ -323,24 +323,23 @@ rtrt project status | health | repair    # inspect / verify / repair the standar
 
 ## Project scaffolds
 
-`rtrt-templates` ships six built-in templates programmatically (no external file embedding required). Each template is a `Template { name, description, source, variables, files, post_hooks }`.
+`rtrt-templates` ships four built-in templates programmatically (no external file embedding required). Each template is a `Template { name, description, source, variables, files, post_hooks }`.
 
 Built-ins:
 
 | Name | What you get |
 |------|--------------|
-| `rust-cli` | Rust binary with `clap` + `anyhow` + `tracing`; `git init` post-hook |
-| `rust-lib` | Rust library with a `add` example test |
-| `rust-axum` | Rust HTTP service with `axum` + `tokio` + `tracing-subscriber` |
-| `node-typescript` | ESM TypeScript project with `tsx`; `npm install` post-hook |
-| `python-uv` | `pyproject.toml` project laid out for `uv sync` |
-| `go-cli` | Minimal Go CLI with `go.mod`; `go mod tidy` post-hook |
+| `dev` | Development starter document chain with `README.md`, `.gitignore`, `LICENSE`, and a source stub; `git init` post-hook |
+| `design` | Design-kit document chain with a README, CSS tokens, and a home-screen wireframe |
+| `plan` | Planning document chain with a PRD, ADR template, and roadmap |
+| `standardization` | Project contract with `CLAUDE.md` and agent definitions |
 
 Shared variables:
 
 - `project_name` (required)
 - `author` (default `Unknown`)
-- `license` (default `MIT`)
+
+`standardization` also accepts `license`, `language`, `framework`, `target_platform`, and `deployment`.
 
 Variable substitution uses `{{key}}`. Paths support substitution too — `src/{{project_name}}/__init__.py` becomes `src/hello/__init__.py`.
 

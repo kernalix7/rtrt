@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 eventsource-stream = { workspace = true }
 futures-util = { workspace = true }
 axum.workspace = true

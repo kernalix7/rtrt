@@ -1,8 +1,11 @@
 # Third-Party Licenses
 
-RTRT is MIT-licensed (see [LICENSE](LICENSE)). This document lists the
-third-party Rust crates RTRT depends on at runtime or in development,
-together with their upstream licenses.
+RTRT is MIT-licensed (see [LICENSE](LICENSE)). This document lists selected
+(not exhaustive) third-party Rust crates RTRT depends on at runtime or in
+development, together with their upstream licenses. The complete resolved
+dependency graph remains authoritative for compliance. The OpenCode SDK is
+host-supplied and used by the host plugin; it is not bundled or redistributed
+by RTRT and is not a RTRT dependency entry.
 
 ## Runtime dependencies
 
@@ -26,12 +29,38 @@ Always pulled in by at least one workspace crate.
 | [toml](https://crates.io/crates/toml) | MIT OR Apache-2.0 | `rtrt-templates` manifest parsing |
 | [walkdir](https://crates.io/crates/walkdir) | MIT OR Apache-2.0 | `rtrt-templates` custom-template scan |
 | [dirs](https://crates.io/crates/dirs) | MIT OR Apache-2.0 | `rtrt-templates` `~/.rtrt/templates` lookup |
+| [hmac](https://crates.io/crates/hmac) + [sha2](https://crates.io/crates/sha2) | MIT OR Apache-2.0 | authenticated dashboard bootstrap credentials |
+| [base64](https://crates.io/crates/base64) | MIT OR Apache-2.0 | URL-fragment-safe bootstrap encoding |
+| [getrandom](https://crates.io/crates/getrandom) | MIT OR Apache-2.0 | OS CSPRNG bootstrap nonces |
 
 ## Bundled native code
 
 | Component | License | Bundled via |
 |-----------|---------|-------------|
 | [SQLite](https://www.sqlite.org/copyright.html) | public domain | `rusqlite`'s `bundled` feature (statically linked into `rtrt-memory`) |
+
+## Optional host executables
+
+### bubblewrap (`bwrap`)
+
+Eligible Linux/WSL installs automatically use an operator-installed
+`/usr/bin/bwrap` or `/bin/bwrap` for secure machine bootstrap unless setup is
+disabled with `--no-setup` / `RTRT_NO_SETUP=1`. Bubblewrap is **not bundled,
+linked, copied, downloaded, or
+auto-installed** by RTRT. RTRT searches no `PATH` entry and executes only a
+root-owned, executable, non-group/world-writable fixed candidate.
+
+The authoritative upstream [COPYING file](https://github.com/containers/bubblewrap/blob/main/COPYING)
+for `containers/bubblewrap` is GNU Library General Public License version 2
+(LGPL-2.0). This describes the operator-supplied host executable only; RTRT
+does not bundle, link, copy, download, or install it. The operator's package
+metadata remains authoritative for the installed version.
+
+### Host prerequisites
+
+`socat` may be required by Claude Code on a particular host. It is optional,
+host-supplied, never bundled or installed by RTRT, and setup does not imply
+user approval or install consent.
 
 ## TLS
 

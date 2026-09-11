@@ -7,7 +7,10 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,13 +18,287 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Config,
+    Config, Error, Result,
+    config::CLAUDE_PERMISSION_PROMPT_TOOL,
     model_cache::{ProbeIdentity, Store},
+    project::claude_runtime_tmp_dir,
 };
+
+/// Canonical argv accepted at the direct-Claude boundary.  Deliberately much
+/// narrower than Claude's CLI: callers cannot smuggle a second command or
+/// weaken either permission or sandbox policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictClaudeInvocation {
+    pub model: String,
+    pub permission_mode: String,
+    pub prompt: String,
+}
+
+impl StrictClaudeInvocation {
+    pub fn parse(argv: &[String]) -> Result<Self> {
+        if argv.len() != 11
+            || Path::new(&argv[0]).file_name().and_then(|v| v.to_str()) != Some("claude")
+            || argv[1] != "-p"
+            || argv[2] != "--model"
+            || !matches!(argv[3].as_str(), "opus" | "sonnet")
+            || argv[4] != "--output-format"
+            || argv[5] != "json"
+            || argv[6] != "--permission-mode"
+            || !matches!(argv[7].as_str(), "plan" | "acceptEdits")
+            || argv[8] != "--permission-prompt-tool"
+            || argv[9] != CLAUDE_PERMISSION_PROMPT_TOOL
+            || argv[10].is_empty()
+            || argv[10].contains('\0')
+        {
+            return Err(Error::Provider(
+                "direct Claude requires exact RTRT argv: claude -p --model opus|sonnet --output-format json --permission-mode plan|acceptEdits --permission-prompt-tool mcp__rtrt__permission_prompt <prompt>".into(),
+            ));
+        }
+        Ok(Self {
+            model: argv[3].clone(),
+            permission_mode: argv[7].clone(),
+            prompt: argv[10].clone(),
+        })
+    }
+}
+
+/// Build a direct, strict Claude process. No shell and no RTRT bubblewrap are
+/// involved; Claude Code's supported settings/MCP flags form the sandbox.
+pub fn strict_claude_command(
+    argv: &[String],
+    project_root: &Path,
+    detected_claude: Option<&Path>,
+) -> Result<Command> {
+    let invocation = StrictClaudeInvocation::parse(argv)?;
+    let root = fs::canonicalize(project_root)?;
+    let cwd = fs::canonicalize(env::current_dir()?)?;
+    if root == Path::new("/") || !cwd.starts_with(&root) {
+        return Err(Error::Provider(
+            "direct Claude requires cwd inside canonical project root".into(),
+        ));
+    }
+    let claude = trusted_executable("claude", detected_claude, &root)?;
+    let mcp = trusted_executable("rtrt-mcp", None, &root)?;
+    let rtrt = trusted_executable("rtrt", None, &root)?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| Error::Provider("cannot resolve invoking user's home".into()))?;
+    let home = fs::canonicalize(home)?;
+    let claude_tmp = claude_runtime_tmp_dir(&root)?;
+    strict_claude_command_with_paths(&invocation, &root, &home, &claude, &mcp, &rtrt, &claude_tmp)
+}
+
+fn strict_claude_command_with_paths(
+    invocation: &StrictClaudeInvocation,
+    root: &Path,
+    home: &Path,
+    claude: &Path,
+    mcp: &Path,
+    rtrt: &Path,
+    claude_tmp: &Path,
+) -> Result<Command> {
+    let credential_files = [
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".config/gcloud",
+        ".kube",
+        ".docker/config.json",
+        ".config/gh/hosts.yml",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+    ]
+    .map(|path| serde_json::json!({ "path": home.join(path), "mode": "deny" }));
+    let credential_env = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "NPM_TOKEN",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "XAI_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+    ]
+    .map(|name| serde_json::json!({ "name": name, "mode": "deny" }));
+    let settings = serde_json::json!({
+        "sandbox": {
+            "enabled": true,
+            "autoAllowBashIfSandboxed": true,
+            "allowUnsandboxedCommands": false,
+            "failIfUnavailable": true,
+            "excludedCommands": [],
+            "network": {
+                "strictAllowlist": true,
+                "allowedDomains": [],
+                "allowLocalBinding": false,
+                "allowUnixSockets": []
+            },
+            "filesystem": {
+                "allowWrite": [root],
+                "denyRead": [home],
+                "allowRead": [root],
+                "denyWrite": []
+            },
+            "credentials": { "files": credential_files, "envVars": credential_env }
+        },
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": rtrt,
+                    "args": ["hook", "provenance", "--owner", "opencode"],
+                    "timeout": 5
+                }]
+            }]
+        }
+    });
+    let mcp_config = serde_json::json!({
+        "mcpServers": { "rtrt": { "command": mcp, "args": ["--permission-only"] } }
+    });
+    let mut command = Command::new(claude);
+    command
+        .current_dir(root)
+        .args(["-p", "--model", &invocation.model])
+        .args(["--output-format", "json"])
+        .args(["--permission-mode", &invocation.permission_mode])
+        .args(["--permission-prompt-tool", CLAUDE_PERMISSION_PROMPT_TOOL])
+        .args(["--setting-sources", ""])
+        .arg("--settings")
+        .arg(settings.to_string())
+        .arg("--strict-mcp-config")
+        .arg("--mcp-config")
+        .arg(mcp_config.to_string())
+        .arg("--")
+        .arg(&invocation.prompt)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD")
+        // Claude Code's sandbox bridge uses the standard temp variables. Pin
+        // all three because OpenCode supplies a long project-scoped TMPDIR and
+        // runtimes differ in which alias they consult. Do not clear unrelated
+        // environment: Claude OAuth/API authentication must remain available.
+        .env("TMPDIR", claude_tmp)
+        .env("TMP", claude_tmp)
+        .env("TEMP", claude_tmp)
+        .env("RTRT_STRICT_CLAUDE_SANDBOX", "1")
+        .env("RTRT_PROJECT_ROOT", root);
+    Ok(command)
+}
+
+fn trusted_executable(name: &str, detected: Option<&Path>, project_root: &Path) -> Result<PathBuf> {
+    let home = dirs::home_dir();
+    let mut candidates = Vec::new();
+    if let Some(path) = detected.filter(|path| path.is_absolute()) {
+        candidates.push(path.to_path_buf());
+    }
+    if let Some(home) = &home {
+        let user_paths: &[&str] = if name == "claude" {
+            &[
+                ".local/bin",
+                ".npm-global/bin",
+                ".claude/local",
+                ".volta/bin",
+                ".nvm/versions/node",
+                ".asdf/installs/nodejs",
+            ]
+        } else {
+            &[".cargo/bin", ".local/bin"]
+        };
+        for base in user_paths {
+            let base = home.join(base);
+            if base.ends_with("node") || base.ends_with("nodejs") {
+                if let Ok(versions) = fs::read_dir(base) {
+                    candidates.extend(
+                        versions
+                            .flatten()
+                            .map(|entry| entry.path().join("bin").join(name)),
+                    );
+                }
+            } else {
+                candidates.push(base.join(name));
+            }
+        }
+    }
+    candidates.extend(
+        ["/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin"]
+            .map(|base| Path::new(base).join(name)),
+    );
+    for candidate in candidates {
+        if !candidate.is_absolute() || !candidate.is_file() {
+            continue;
+        }
+        if let Ok(path) = validate_trusted_executable(&candidate, project_root) {
+            return Ok(path);
+        }
+    }
+    Err(Error::Provider(format!(
+        "trusted executable not found in fixed user/system locations: {name}"
+    )))
+}
+
+fn validate_trusted_executable(candidate: &Path, project_root: &Path) -> Result<PathBuf> {
+    if !candidate.is_absolute() {
+        return Err(Error::Provider("untrusted relative executable".into()));
+    }
+    let canonical = fs::canonicalize(candidate)?;
+    let project_root = fs::canonicalize(project_root)?;
+    if canonical.starts_with(&project_root) {
+        return Err(Error::Provider(format!(
+            "trusted executable must be outside project: {}",
+            canonical.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(&canonical)?;
+        let uid = fs::metadata(&project_root)?.uid();
+        if !metadata.is_file()
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+        {
+            return Err(Error::Provider(format!(
+                "untrusted executable: {}",
+                canonical.display()
+            )));
+        }
+        for parent in canonical.ancestors().skip(1) {
+            let parent_metadata = fs::metadata(parent)?;
+            if !parent_metadata.is_dir() || parent_metadata.permissions().mode() & 0o022 != 0 {
+                return Err(Error::Provider(format!(
+                    "untrusted writable executable parent: {}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    Ok(canonical)
+}
 
 const PATH_ENV_VAR: &str = "PATH";
 const PATH_EXTENSION_ENV_VAR: &str = "PATHEXT";
 const VERSION_TIMEOUT: Duration = Duration::from_millis(800);
+/// Detection only needs short version strings, model identifiers, and local
+/// config. One MiB per output stream accommodates legitimate responses while
+/// making every local probe's memory ceiling explicit.
+const MAX_PROBE_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_LOCAL_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_MODEL_IDS: usize = 4096;
+const MAX_MODEL_ID_BYTES: usize = 512;
 /// How often [`run_bounded`] samples a child process — detection's own timing
 /// floor. [`crate::model_cache`] amortises probe costs against it.
 pub(crate) const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -184,9 +461,7 @@ const REGISTRY: &[ToolDescriptor] = &[
         binaries: &["claude"],
         version_args: VERSION_FLAG,
         invocation_modes: CLI_MODE,
-        cli_invocation: Some(
-            "claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call",
-        ),
+        cli_invocation: Some("claude -p {model_args} {prompt}"),
         cost_class: CostClass::SubscriptionFlat,
         capabilities: CODING_CAPS,
         config_path: Some("~/.claude.json"),
@@ -635,12 +910,13 @@ fn command_version(path: &Path, version_args: &[&str]) -> Option<String> {
     let mut command = Command::new(path);
     command.args(version_args);
     let output = run_bounded(command, VERSION_TIMEOUT)?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    if text.trim().is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-    normalize_version(&text)
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    let text = if stdout.trim().is_empty() {
+        std::str::from_utf8(&output.stderr).ok()?
+    } else {
+        stdout
+    };
+    normalize_version(text)
 }
 
 /// Run a child process to completion under a wall-clock ceiling, killing it if
@@ -654,19 +930,57 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Option<std::process::
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stdout = spawn_bounded_drain(child.stdout.take()?, Arc::clone(&overflowed));
+    let stderr = spawn_bounded_drain(child.stderr.take()?, Arc::clone(&overflowed));
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_status)) => return child.wait_with_output().ok(),
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if overflowed.load(Ordering::Acquire) || started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break None;
             }
             Ok(None) => thread::sleep(VERSION_POLL_INTERVAL),
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
+    };
+    let stdout = stdout.join().ok().flatten()?;
+    let stderr = stderr.join().ok().flatten()?;
+    if overflowed.load(Ordering::Acquire) {
+        return None;
     }
+    Some(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_bounded_drain(
+    mut pipe: impl Read + Send + 'static,
+    overflowed: Arc<AtomicBool>,
+) -> thread::JoinHandle<Option<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut retained = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = pipe.read(&mut chunk).ok()?;
+            if read == 0 {
+                return Some(retained);
+            }
+            let remaining = MAX_PROBE_OUTPUT_BYTES.saturating_sub(retained.len());
+            retained.extend_from_slice(&chunk[..read.min(remaining)]);
+            if read > remaining {
+                overflowed.store(true, Ordering::Release);
+            }
+        }
+    })
 }
 
 fn normalize_version(raw: &str) -> Option<String> {
@@ -780,7 +1094,9 @@ fn probe_cli_models(path: &Path, args: &[&str]) -> Vec<String> {
     if !output.status.success() {
         return Vec::new();
     }
-    parse_cli_model_list(&String::from_utf8_lossy(&output.stdout))
+    std::str::from_utf8(&output.stdout)
+        .map(parse_cli_model_list)
+        .unwrap_or_default()
 }
 
 /// Parse a `provider/model`-per-line listing.
@@ -790,16 +1106,22 @@ fn probe_cli_models(path: &Path, args: &[&str]) -> Vec<String> {
 /// duplicates are removed while first-seen order is preserved. Order matters —
 /// the router picks the first model a target offers.
 fn parse_cli_model_list(raw: &str) -> Vec<String> {
+    if raw.len() > MAX_PROBE_OUTPUT_BYTES {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
     for line in raw.lines() {
         let line = strip_ansi(line);
         let candidate = line.trim();
-        if !looks_like_model_id(candidate) {
+        if candidate.len() > MAX_MODEL_ID_BYTES || !looks_like_model_id(candidate) {
             continue;
         }
         if seen.insert(candidate.to_string()) {
             models.push(candidate.to_string());
+            if models.len() > MAX_MODEL_IDS {
+                return Vec::new();
+            }
         }
     }
     models
@@ -864,15 +1186,26 @@ fn probe_ollama() -> (Option<bool>, Vec<String>) {
     if stream.write_all(request.as_bytes()).is_err() {
         return (Some(true), Vec::new());
     }
-    let mut response = String::new();
-    if stream.read_to_string(&mut response).is_err() {
+    let mut response = Vec::new();
+    if stream
+        .take(MAX_PROBE_OUTPUT_BYTES as u64 + 1)
+        .read_to_end(&mut response)
+        .is_err()
+        || response.len() > MAX_PROBE_OUTPUT_BYTES
+    {
         return (Some(true), Vec::new());
     }
+    let Ok(response) = String::from_utf8(response) else {
+        return (Some(true), Vec::new());
+    };
     let models = parse_ollama_models(&response);
     (Some(response.starts_with(HTTP_OK_PREFIX)), models)
 }
 
 fn parse_ollama_models(response: &str) -> Vec<String> {
+    if response.len() > MAX_PROBE_OUTPUT_BYTES {
+        return Vec::new();
+    }
     let body = response
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
@@ -891,12 +1224,15 @@ fn parse_ollama_models(response: &str) -> Vec<String> {
     value
         .get("models")
         .and_then(|models| models.as_array())
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
-                .map(str::to_string)
-                .collect()
+        .and_then(|models| {
+            (models.len() <= MAX_MODEL_IDS).then(|| {
+                models
+                    .iter()
+                    .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
+                    .filter(|name| name.len() <= MAX_MODEL_ID_BYTES)
+                    .map(str::to_string)
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -1021,14 +1357,280 @@ impl DetectionContext {
 }
 
 fn read_home_file(home_dir: Option<&Path>, relative: &str) -> Option<String> {
-    home_dir
-        .map(|home| home.join(relative))
-        .and_then(|path| fs::read_to_string(path).ok())
+    let path = home_dir?.join(relative);
+    let expected = fs::symlink_metadata(&path).ok()?;
+    if expected.file_type().is_symlink()
+        || !expected.is_file()
+        || expected.len() > MAX_LOCAL_CONFIG_BYTES
+    {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_LOCAL_CONFIG_BYTES
+        || !same_file(&expected, &metadata)
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_LOCAL_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_LOCAL_CONFIG_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.file_type() == right.file_type()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_claude_argv_and_command_are_direct_and_closed() {
+        let valid: Vec<String> = [
+            "claude",
+            "-p",
+            "--model",
+            "opus",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "plan",
+            "--permission-prompt-tool",
+            CLAUDE_PERMISSION_PROMPT_TOOL,
+            "task; $(not executed)",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let parsed = StrictClaudeInvocation::parse(&valid).unwrap();
+        let command = strict_claude_command_with_paths(
+            &parsed,
+            Path::new("/canonical/project"),
+            Path::new("/home/tester"),
+            Path::new("/trusted/claude"),
+            Path::new("/trusted/rtrt-mcp"),
+            Path::new("/trusted/rtrt"),
+            Path::new("/tmp/rc-1-0123456789abcdef"),
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), "/trusted/claude");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|v| v.to_string_lossy().into())
+            .collect();
+        assert!(!args.iter().any(|arg| arg == "/bin/bash" || arg == "bwrap"));
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        let settings = args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .map(|i| &args[i + 1])
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(settings).unwrap();
+        assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], true);
+        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+        assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
+        assert_eq!(settings["sandbox"]["network"]["strictAllowlist"], true);
+        assert_eq!(
+            settings["sandbox"]["network"]["allowedDomains"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            serde_json::json!(["/home/tester"])
+        );
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowRead"],
+            serde_json::json!(["/canonical/project"])
+        );
+        let hooks = settings["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 1);
+        let starts = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["matcher"], "*");
+        assert_eq!(starts[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            starts[0]["hooks"][0],
+            serde_json::json!({
+                "type": "command",
+                "command": "/trusted/rtrt",
+                "args": ["hook", "provenance", "--owner", "opencode"],
+                "timeout": 5
+            })
+        );
+        let source = args
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .unwrap();
+        assert_eq!(args[source + 1], "");
+        assert_eq!(args.iter().filter(|arg| *arg == "-p").count(), 1);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "task; $(not executed)")
+                .count(),
+            1
+        );
+        let mcp_config = args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .map(|i| serde_json::from_str::<serde_json::Value>(&args[i + 1]).unwrap())
+            .unwrap();
+        assert_eq!(mcp_config["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            mcp_config["mcpServers"]["rtrt"]["args"],
+            serde_json::json!(["--permission-only"])
+        );
+        let env: Vec<_> = command.get_envs().collect();
+        assert!(
+            env.iter()
+                .any(|(key, value)| *key == "RTRT_STRICT_CLAUDE_SANDBOX" && value.is_some())
+        );
+        assert!(
+            env.iter()
+                .all(|(key, _)| *key != "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")
+        );
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(env.iter().any(|(name, value)| {
+                *name == key && *value == Some(std::ffi::OsStr::new("/tmp/rc-1-0123456789abcdef"))
+            }));
+        }
+
+        for bad in [
+            "haiku",
+            "bypassPermissions",
+            "text",
+            "mcp__evil__permission_prompt",
+            "--allowed-tools",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "--settings",
+        ] {
+            let mut rejected = valid.clone();
+            rejected.push(bad.into());
+            assert!(StrictClaudeInvocation::parse(&rejected).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_claude_proves_direct_argv_and_strict_environment() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp")
+            .join(format!("strict-claude-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        let executables = dir.join("executables");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&executables).unwrap();
+        let fake = executables.join("claude");
+        let capture = dir.join("capture");
+        fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s\\n' \"$RTRT_STRICT_CLAUDE_SANDBOX\" \"$RTRT_PROJECT_ROOT\" \"$TMPDIR\" \"$TMP\" \"$TEMP\" \"$@\" > \"$CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let invocation = StrictClaudeInvocation {
+            model: "sonnet".into(),
+            permission_mode: "acceptEdits".into(),
+            prompt: "literal; $(still literal)".into(),
+        };
+        let uid = fs::metadata(&project).unwrap().uid();
+        let claude_tmp = crate::project::claude_runtime_tmp_candidate_for_test(
+            Path::new("/tmp"),
+            "0123456789abcdef0123456789abcdef",
+            uid,
+        )
+        .unwrap();
+        let inherited = dir
+            .join("an")
+            .join("inherited")
+            .join("tmpdir")
+            .join("x".repeat(crate::project::CLAUDE_AF_UNIX_PATH_MAX_BYTES * 2));
+        let mut command = strict_claude_command_with_paths(
+            &invocation,
+            &project,
+            &dir,
+            &fake,
+            &fake,
+            &fake,
+            &claude_tmp,
+        )
+        .unwrap();
+        assert!(
+            command
+                .env("CAPTURE", &capture)
+                .env("TMPDIR", &inherited)
+                .env("TMP", &inherited)
+                .env("TEMP", &inherited)
+                // Reapply strict construction last, as production does.
+                .env("TMPDIR", &claude_tmp)
+                .env("TMP", &claude_tmp)
+                .env("TEMP", &claude_tmp)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let captured = fs::read_to_string(&capture).unwrap();
+        assert!(captured.starts_with("1\n"));
+        let lines: Vec<_> = captured.lines().collect();
+        assert_eq!(lines[2], claude_tmp.to_string_lossy());
+        assert_eq!(lines[3], claude_tmp.to_string_lossy());
+        assert_eq!(lines[4], claude_tmp.to_string_lossy());
+        assert!(!captured.contains(&inherited.to_string_lossy().into_owned()));
+        assert!(captured.contains("--strict-mcp-config\n"));
+        assert!(captured.contains("literal; $(still literal)\n"));
+        assert!(!captured.contains("/bin/bash"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_executable_rejects_relative_and_writable_parents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp/trusted-executable-project");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(validate_trusted_executable(Path::new("claude"), &root).is_err());
+        let dir = env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp/untrusted-path-parent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("claude");
+        fs::write(&fake, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_trusted_executable(&fake, &root).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let inside = root.join("rtrt");
+        fs::write(&inside, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&inside, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_trusted_executable(&inside, &root).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn registry_contains_expected_targets() {
@@ -1068,10 +1670,7 @@ mod tests {
                 .and_then(|descriptor| descriptor.cli_invocation)
         };
 
-        assert_eq!(
-            template("claude"),
-            Some("claude -p {model_args} {prompt} --allowedTools mcp__rtrt__agent_call")
-        );
+        assert_eq!(template("claude"), Some("claude -p {model_args} {prompt}"));
         assert_eq!(
             template("opencode"),
             Some("opencode run {model_args} --agent build {prompt}")
@@ -1231,6 +1830,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_model_listing_is_unavailable() {
+        let oversized = "provider/model\n".repeat(MAX_PROBE_OUTPUT_BYTES / 2);
+        assert!(oversized.len() > MAX_PROBE_OUTPUT_BYTES);
+        assert!(parse_cli_model_list(&oversized).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_capture_drains_both_pipes_and_rejects_overflow() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 12000 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\n'; printf 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\\n' >&2; i=$((i+1)); done",
+        ]);
+        assert!(run_bounded(command, Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
     fn cli_model_list_keeps_pool_distinct_ids_that_share_a_model_name() {
         // `PoolKey` is the segment before the first `/`, so the same model
         // reached through two pools must survive as two entries.
@@ -1296,7 +1913,7 @@ mod tests {
     }
 
     fn temp_store_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        env::current_dir().unwrap().join(".rtrt/tmp").join(format!(
             "rtrt-detect-cache-{tag}-{}-{}/cli-models.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1350,5 +1967,43 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"models\":[{\"name\":\"llama3.2\"},{\"name\":\"bge-m3\"}]}",
         );
         assert_eq!(models, vec!["llama3.2", "bge-m3"]);
+    }
+
+    #[test]
+    fn oversized_home_config_is_rejected_before_read() {
+        let root = env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp")
+            .join(format!("detect-config-size-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_LOCAL_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(read_home_file(Some(&root), "config.toml").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_home_config_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = env::current_dir()
+            .unwrap()
+            .join(".rtrt/tmp")
+            .join(format!("detect-config-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("target"),
+            "[mcp_servers.rtrt]\ncommand='rtrt-mcp'",
+        )
+        .unwrap();
+        symlink(root.join("target"), root.join("config.toml")).unwrap();
+        assert!(read_home_file(Some(&root), "config.toml").is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

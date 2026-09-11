@@ -4,6 +4,7 @@
 pub(crate) mod chat;
 pub(crate) mod compress;
 pub(crate) mod config;
+pub(crate) mod failover;
 pub(crate) mod limits;
 pub(crate) mod memgraph;
 pub(crate) mod memory;
@@ -15,6 +16,5 @@ pub(crate) mod savings;
 pub(crate) mod scope;
 pub(crate) mod security;
 pub(crate) mod statusline;
-pub(crate) mod team;
 pub(crate) mod templates;
 pub(crate) mod usage;

@@ -61,7 +61,7 @@ pub(crate) struct ChatHttpResponse {
 }
 
 pub(crate) async fn chat(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
     Json(req): Json<ChatHttpRequest>,
 ) -> std::result::Result<Json<ChatHttpResponse>, (StatusCode, String)> {
     let messages = req
@@ -123,7 +123,7 @@ pub(crate) struct BudgetResponse {
 }
 
 pub(crate) async fn sse_stream(
-    State(state): State<AppState>,
+    axum::Extension(state): axum::Extension<AppState>,
 ) -> axum::response::sse::Sse<
     impl futures_util::Stream<
         Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>,
@@ -143,7 +143,9 @@ pub(crate) async fn sse_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-pub(crate) async fn tokens_summary(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub(crate) async fn tokens_summary(
+    axum::Extension(state): axum::Extension<AppState>,
+) -> Json<serde_json::Value> {
     let buf = state.gateway.metrics();
     let guard = buf.lock().unwrap_or_else(|p| p.into_inner());
     use rtrt_providers::MetricsView;
@@ -186,7 +188,9 @@ pub(crate) async fn tokens_summary(State(state): State<AppState>) -> Json<serde_
     }))
 }
 
-pub(crate) async fn budget(State(state): State<AppState>) -> Json<BudgetResponse> {
+pub(crate) async fn budget(
+    axum::Extension(state): axum::Extension<AppState>,
+) -> Json<BudgetResponse> {
     let cap = state.gateway.budget_cap_usd();
     let spent = state.gateway.budget_spent_usd();
     let remaining = cap.map(|c| (c - spent).max(0.0));
@@ -198,7 +202,9 @@ pub(crate) async fn budget(State(state): State<AppState>) -> Json<BudgetResponse
     })
 }
 
-pub(crate) async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+pub(crate) async fn metrics(
+    axum::Extension(state): axum::Extension<AppState>,
+) -> Json<MetricsResponse> {
     let metrics = state.gateway.metrics();
     let guard = metrics.lock().unwrap_or_else(|p| p.into_inner());
     let view = MetricsView::new(&guard);

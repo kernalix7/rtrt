@@ -145,7 +145,7 @@ let hits = store.recall_bm25("my-project", "rust", 5)?;
 
 ```toml
 [dependencies]
-rtrt-memory = { version = "0.2", features = ["embeddings"] }
+rtrt-memory = { version = "0.1.1", features = ["embeddings"] }
 ```
 
 사용:
@@ -320,24 +320,23 @@ rtrt project status | health | repair    # 표준화 컨트랙트 점검 / 검�
 
 ## 프로젝트 스캐폴드
 
-`rtrt-templates`는 빌트인 6종을 코드 상수로 제공합니다(외부 파일 임베딩 없음). 각 템플릿은 `Template { name, description, source, variables, files, post_hooks }` 구조입니다.
+`rtrt-templates`는 빌트인 4종을 코드 상수로 제공합니다(외부 파일 임베딩 없음). 각 템플릿은 `Template { name, description, source, variables, files, post_hooks }` 구조입니다.
 
 빌트인:
 
 | 이름 | 결과 |
 |------|------|
-| `rust-cli` | `clap` + `anyhow` + `tracing` 기반 러스트 바이너리; `git init` 훅 |
-| `rust-lib` | `add` 예제 테스트가 포함된 러스트 라이브러리 |
-| `rust-axum` | `axum` + `tokio` 기반 HTTP 서비스 |
-| `node-typescript` | `tsx`를 쓰는 ESM 타입스크립트; `npm install` 훅 |
-| `python-uv` | `uv sync` 친화적 `pyproject.toml` |
-| `go-cli` | `go.mod`을 갖춘 최소 Go CLI; `go mod tidy` 훅 |
+| `dev` | `README.md`, `.gitignore`, `LICENSE`, 소스 스텁을 만드는 개발 시작 문서 체인, `git init` 훅 |
+| `design` | README, CSS 토큰, 홈 화면 와이어프레임을 만드는 디자인 키트 문서 체인 |
+| `plan` | PRD, ADR 템플릿, 로드맵을 만드는 계획 문서 체인 |
+| `standardization` | `CLAUDE.md`와 에이전트 정의를 담은 프로젝트 컨트랙트 |
 
 공용 변수:
 
 - `project_name` (필수)
 - `author` (기본 `Unknown`)
-- `license` (기본 `MIT`)
+
+`standardization`은 `license`, `language`, `framework`, `target_platform`, `deployment`도 받습니다.
 
 변수 치환은 `{{key}}`. 경로에도 치환이 적용되어 `src/{{project_name}}/__init__.py` → `src/hello/__init__.py`로 풀립니다.
 

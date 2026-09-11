@@ -43,7 +43,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{
     Json, Router,
     extract::{FromRequest, Request, State},
-    http::{HeaderValue, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderValue, StatusCode,
+        header::{AUTHORIZATION, ORIGIN},
+    },
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -84,8 +87,8 @@ pub enum ModelRoute {
     Cheapest,
     /// Full route, highest-capability (quality) tier.
     Best,
-    /// A specific model dispatched through the [`Gateway`] prefix path. `model`
-    /// is the id passed to the gateway (any `provider/` prefix stripped).
+    /// A specific model dispatched through the [`Gateway`] prefix path. A
+    /// canonical `provider/model` id remains intact until gateway selection.
     Explicit { model: String },
 }
 
@@ -93,8 +96,7 @@ impl ModelRoute {
     /// Parse the OpenAI `model` field. Empty / `auto` / `rtrt/auto` route
     /// automatically; `rtrt/cheapest` and `rtrt/best` (and their bare
     /// `cheapest` / `best` aliases) pick a tier; anything else is explicit and
-    /// its leading `provider/` segment (if any) is stripped for gateway
-    /// prefix matching.
+    /// canonical provider hint is retained for gateway matching.
     pub fn parse(model: &str) -> Self {
         let trimmed = model.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -104,15 +106,9 @@ impl ModelRoute {
             "best" | "rtrt/best" => return Self::Best,
             _ => {}
         }
-        // `provider/model` → strip the provider hint and dispatch by the
-        // model id (the gateway matches providers by model-id prefix). Split on
-        // the first slash only, so ollama tags like `library/model:tag` keep
-        // their suffix intact.
-        let model = match trimmed.split_once('/') {
-            Some((_provider, rest)) if !rest.is_empty() => rest.to_string(),
-            _ => trimmed.to_string(),
-        };
-        Self::Explicit { model }
+        Self::Explicit {
+            model: trimmed.to_string(),
+        }
     }
 
     /// The routing preference for the auto family, or `None` for explicit
@@ -440,10 +436,19 @@ impl GatewayState {
     }
 }
 
+fn configured_token(token: &Option<Arc<String>>) -> Option<Arc<String>> {
+    token
+        .as_ref()
+        .filter(|token| !token.trim().is_empty())
+        .cloned()
+}
+
 /// Build the gateway axum [`Router`] for `state`. Exposed so tests can drive it
 /// with an injected gateway.
 pub fn app(state: GatewayState) -> Router {
-    let token = state.token.clone();
+    // Embedders can still construct a state without a token, but such a router
+    // must never silently become an unauthenticated gateway.
+    let token = configured_token(&state.token);
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
@@ -455,19 +460,17 @@ pub fn app(state: GatewayState) -> Router {
         .with_state(state)
 }
 
-/// Bind and serve the gateway. Loopback by default; a non-loopback bind without
-/// a bearer token logs a warning (the endpoint would then be unauthenticated).
+/// Bind and serve the gateway. Every bind, including loopback, requires a
+/// non-blank bearer token. Validation happens before the socket is opened.
 pub async fn serve(
     host: &str,
     port: u16,
     token: Option<String>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let is_loopback =
-        host.starts_with("127.") || host == "::1" || host == "[::1]" || host == "localhost";
-    if token.is_none() && !is_loopback {
-        tracing::warn!(
-            "binding {host}:{port} without a bearer token is risky; non-loopback callers can hit the gateway unauthenticated (set RTRT_GATEWAY_TOKEN)."
+    if token.as_ref().is_none_or(|token| token.trim().is_empty()) {
+        anyhow::bail!(
+            "gateway bearer token is required (set RTRT_GATEWAY_TOKEN to a non-blank value)"
         );
     }
     let state = GatewayState::from_env(token, timeout);
@@ -637,29 +640,15 @@ fn chunk_event(chunk: &ChatCompletionChunk) -> Event {
     Event::default().data(data)
 }
 
-async fn list_models(State(_state): State<GatewayState>) -> Json<ModelsResponse> {
+async fn list_models(State(state): State<GatewayState>) -> Json<ModelsResponse> {
     let created = now_epoch_secs();
     let mut data = vec![
         model_object("rtrt/auto", "rtrt", created),
         model_object("rtrt/cheapest", "rtrt", created),
         model_object("rtrt/best", "rtrt", created),
     ];
-    let cfg = rtrt_core::Config::load_effective_for_cwd();
-    for tool in rtrt_core::detect_tools_with_config(cfg) {
-        if !tool.installed || !tool.enabled {
-            continue;
-        }
-        if tool.models.is_empty() {
-            data.push(model_object(&tool.name, &tool.name, created));
-        } else {
-            for model in &tool.models {
-                data.push(model_object(
-                    &format!("{}/{}", tool.name, model),
-                    &tool.name,
-                    created,
-                ));
-            }
-        }
+    for (id, provider, _) in state.gateway.canonical_models() {
+        data.push(model_object(&id, &provider, created));
     }
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -701,19 +690,27 @@ fn error_body(status: StatusCode, kind: &str, code: Option<&str>, message: &str)
     (status, Json(body)).into_response()
 }
 
-/// Bearer-token guard. `/healthz` is always open (liveness probes carry no
-/// auth); everything else requires `Authorization: Bearer <token>` when a
-/// token is configured. Comparison is constant-time.
+/// API-only bearer-token guard. Browser-originated requests are rejected rather
+/// than authorizing from attacker-controlled `Host`; `/healthz` alone is exempt
+/// from authentication. Missing configuration fails closed. Comparison is
+/// constant-time.
 async fn bearer_guard(
     expected: Option<Arc<String>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if req.headers().contains_key(ORIGIN) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "request_forbidden",
+            "browser Origin requests are not allowed",
+        );
+    }
     if req.uri().path() == "/healthz" {
         return next.run(req).await;
     }
     let Some(expected) = expected else {
-        return next.run(req).await;
+        return authentication_error();
     };
     let presented = req
         .headers()
@@ -727,6 +724,10 @@ async fn bearer_guard(
     if ok {
         return next.run(req).await;
     }
+    authentication_error()
+}
+
+fn authentication_error() -> Response {
     let mut resp = error_response(
         StatusCode::UNAUTHORIZED,
         "authentication_error",
@@ -783,6 +784,8 @@ mod tests {
     use rtrt_core::{CostClass, DetectedTool, InvocationMode, ToolKind};
     use tower::ServiceExt; // oneshot
 
+    const TEST_TOKEN: &str = "test-gateway-token";
+
     #[test]
     fn model_route_parses_auto_family_and_aliases() {
         assert_eq!(ModelRoute::parse(""), ModelRoute::Auto);
@@ -796,17 +799,17 @@ mod tests {
     }
 
     #[test]
-    fn model_route_strips_provider_prefix_for_explicit_models() {
+    fn model_route_retains_provider_prefix_for_explicit_models() {
         assert_eq!(
             ModelRoute::parse("anthropic/claude-haiku-4-5"),
             ModelRoute::Explicit {
-                model: "claude-haiku-4-5".to_string()
+                model: "anthropic/claude-haiku-4-5".to_string()
             }
         );
         assert_eq!(
             ModelRoute::parse("openai/gpt-5.4-mini"),
             ModelRoute::Explicit {
-                model: "gpt-5.4-mini".to_string()
+                model: "openai/gpt-5.4-mini".to_string()
             }
         );
         // Bare model id: no prefix to strip.
@@ -820,7 +823,7 @@ mod tests {
         assert_eq!(
             ModelRoute::parse("ollama/qwen2.5-coder:7b"),
             ModelRoute::Explicit {
-                model: "qwen2.5-coder:7b".to_string()
+                model: "ollama/qwen2.5-coder:7b".to_string()
             }
         );
     }
@@ -970,7 +973,7 @@ mod tests {
             "echo"
         }
         fn supported_models(&self) -> &[&'static str] {
-            &[]
+            &["echo-model"]
         }
         async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
             let last = req
@@ -1001,8 +1004,12 @@ mod tests {
         GatewayState::with_gateway(Arc::new(gateway), token, Duration::from_secs(5))
     }
 
+    fn secured_echo_state() -> GatewayState {
+        echo_state(Some(TEST_TOKEN.to_string()))
+    }
+
     #[tokio::test]
-    async fn healthz_ok() {
+    async fn healthz_is_exempt_without_token() {
         let app = app(echo_state(None));
         let resp = app
             .oneshot(
@@ -1017,10 +1024,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_without_token_fails_closed_outside_health() {
+        let resp = app(echo_state(None))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn blank_token_state_fails_closed() {
+        let resp = app(echo_state(Some(" \t".to_string())))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("authorization", "Bearer  \t")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn loopback_serve_rejects_missing_or_blank_token_before_bind() {
+        for token in [None, Some("   ".to_string())] {
+            let error = serve("127.0.0.1", 0, token, Duration::from_secs(1))
+                .await
+                .expect_err("token preflight must fail");
+            assert!(error.to_string().contains("bearer token is required"));
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_model_completes_through_gateway() {
-        let app = app(echo_state(None));
+        let app = app(secured_echo_state());
         let body = serde_json::json!({
-            "model": "openai/gpt-4o",
+            "model": "echo/gpt-4o",
             "messages": [{"role": "user", "content": "ping"}]
         });
         let resp = app
@@ -1029,6 +1075,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TEST_TOKEN}"))
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -1043,8 +1090,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertised_models_are_canonical_and_round_trip() {
+        let state = secured_echo_state();
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let listed: ModelsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            listed
+                .data
+                .iter()
+                .any(|model| model.id == "echo/echo-model")
+        );
+        assert!(!listed.data.iter().any(|model| model.id == "echo"));
+        assert!(
+            !listed
+                .data
+                .iter()
+                .any(|model| model.id.contains("echo/echo/"))
+        );
+
+        let body = serde_json::json!({
+            "model": "echo/echo-model",
+            "messages": [{"role": "user", "content": "round trip"}]
+        });
+        let (status, value) = post_raw(state, &body.to_string(), Some("application/json")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "echo: round trip"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_emits_chunks_and_done() {
-        let app = app(echo_state(None));
+        let app = app(secured_echo_state());
         let body = serde_json::json!({
             "model": "gpt-4o",
             "stream": true,
@@ -1056,6 +1144,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TEST_TOKEN}"))
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -1077,7 +1166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bearer_guard_rejects_and_accepts() {
+    async fn bearer_guard_rejects_missing_and_accepts_valid_without_origin() {
         let app = app(echo_state(Some("secret".to_string())));
         let body = serde_json::json!({
             "model": "gpt-4o",
@@ -1114,8 +1203,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_origin_is_denied_even_with_valid_bearer() {
+        let resp = app(secured_echo_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                    .header("origin", "https://attacker.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
     async fn empty_messages_is_bad_request() {
-        let app = app(echo_state(None));
+        let app = app(secured_echo_state());
         let body = serde_json::json!({ "model": "auto", "messages": [] });
         let resp = app
             .oneshot(
@@ -1123,6 +1229,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TEST_TOKEN}"))
                     .body(axum::body::Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -1135,7 +1242,11 @@ mod tests {
     /// model surfaces the gateway's "no provider registered" error.
     fn echo_state_no_default() -> GatewayState {
         let gateway = Gateway::new().register("openai", Box::new(Echo), ["gpt-"]);
-        GatewayState::with_gateway(Arc::new(gateway), None, Duration::from_secs(5))
+        GatewayState::with_gateway(
+            Arc::new(gateway),
+            Some(TEST_TOKEN.to_string()),
+            Duration::from_secs(5),
+        )
     }
 
     /// POST a raw body (optionally without a content-type) and return the
@@ -1150,6 +1261,9 @@ mod tests {
             .uri("/v1/chat/completions");
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
+        }
+        if let Some(token) = configured_token(&state.token) {
+            builder = builder.header("authorization", format!("Bearer {token}"));
         }
         let resp = app(state)
             .oneshot(
@@ -1187,7 +1301,7 @@ mod tests {
             ]
         });
         let (status, value) = post_raw(
-            echo_state(None),
+            secured_echo_state(),
             &body.to_string(),
             Some("application/json"),
         )
@@ -1203,7 +1317,7 @@ mod tests {
     async fn malformed_json_is_400_envelope() {
         // Bug #2: malformed JSON → 400 with the OpenAI error envelope.
         let (status, value) = post_raw(
-            echo_state(None),
+            secured_echo_state(),
             "{not valid json",
             Some("application/json"),
         )
@@ -1216,7 +1330,7 @@ mod tests {
     async fn missing_messages_is_400_envelope() {
         // Bug #2: a missing required field must be 400 JSON, not a plain 422.
         let (status, value) = post_raw(
-            echo_state(None),
+            secured_echo_state(),
             r#"{"model":"auto"}"#,
             Some("application/json"),
         )
@@ -1232,7 +1346,7 @@ mod tests {
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "ping"}]
         });
-        let (status, value) = post_raw(echo_state(None), &body.to_string(), None).await;
+        let (status, value) = post_raw(secured_echo_state(), &body.to_string(), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_error_envelope(&value, "invalid_request_error");
     }

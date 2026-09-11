@@ -10,7 +10,7 @@
 <strong>멀티 프로바이더 라우팅</strong> (로컬 우선; Anthropic / OpenAI / Ollama / vLLM / LM Studio).<br>
 하나의 CLI · 하나의 MCP 서버 · 하나의 웹 대시보드.</p>
 
-<pre><code># 설치 (예정)
+<pre><code># 최신 안정 릴리스 설치 (최신 릴리스를 찾을 수 없을 때만 --main으로 폴백, asset/checksum 오류는 실패)
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 
 # 소스 빌드
@@ -34,9 +34,9 @@ cargo install --path crates/rtrt-cli</code></pre>
 ---
 
 > ### 상태: 알파
-> RTRT는 초기 단계입니다. **v0.1.0**으로 머무릅니다. 워크스페이스가 컴파일되고, 출력 압축 · 명령 출력 필터링 · SQLite-FTS5 BM25 회수 · 자동 캡처 파이프라인 (`redact_secrets` → SHA-256 dedup → save → 세션 태깅) · 시간당 콘솔리데이션 데몬 · MCP 18개 도구 · 대시보드 SSE 라이브 스트림이 모두 동작합니다. 첫 정식 태그 (`v0.2.0-rc1`)는 라이브 키 + 브라우저 스모크 통과 후. 회귀 게이트는 `docs/PERF.ko.md` SLO 기반.
+> RTRT는 초기 단계입니다. 이 소스 트리에는 **v0.1.1** 릴리스 후보가 들어 있습니다. 워크스페이스가 컴파일되고, 출력 압축 · 명령 출력 필터링 · SQLite-FTS5 BM25 회수 · 자동 캡처 파이프라인 (`redact_secrets` → SHA-256 dedup → save → 세션 태깅) · 시간당 콘솔리데이션 데몬 · MCP 23개 도구 · 대시보드 SSE 라이브 스트림이 모두 동작합니다. 회귀 게이트는 `docs/PERF.ko.md` SLO 기반입니다.
 
-RTRT는 세 기둥만 합칩니다. [`DESIGN.ko.md`](DESIGN.ko.md)에 10개 원칙, [`PERF.ko.md`](PERF.ko.md)에 SLO 표 + 최신 측정값. 프레임워크가 아닌 유닉스 도구 모음 — 안정된 substrate (SQLite / Markdown / JSONL / SHA-256 / Rust / tree-sitter / MCP / SSE / 파이프) 위에 얇은 러스트 레이어. 멀티 에이전트 코디네이션은 옵션 크레이트로 분리 (scope creep 거부). 핵심 크레이트 zero-`unsafe`, edition 2024.
+RTRT는 세 기둥만 합칩니다. [`DESIGN.ko.md`](DESIGN.ko.md)에 10개 원칙, [`PERF.ko.md`](PERF.ko.md)에 SLO 표 + 최신 측정값. 프레임워크가 아닌 유닉스 도구 모음 — 안정된 substrate (SQLite / Markdown / JSONL / SHA-256 / Rust / tree-sitter / MCP / SSE / 파이프) 위에 얇은 러스트 레이어. 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 맡깁니다. 핵심 크레이트 zero-`unsafe`, edition 2024.
 
 ## 빠른 설치
 
@@ -78,8 +78,10 @@ rtrt signatures --lang rust < src/file.rs
 rtrt repo-map crates/rtrt-core
 rtrt discover
 rtrt templates
-rtrt new rust-cli ./hello --var project_name=hello
+rtrt new dev ./hello --var project_name=hello
 rtrt setup --agent claude --apply
+rtrt setup --agent opencode --apply             # OpenCode MCP 설정에 RTRT 연결
+rtrt setup --agent opencode --sandbox --machine-only --apply # 머신 셸만 허용, cwd는 승인하지 않음
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
 rtrt prompt save greet "say hi"
@@ -94,7 +96,7 @@ rtrt security scan --profile ai-default         # 프로파일 기반 보안 / �
 rtrt migrate --apply                            # 저장소를 rtrt 프로젝트 표준으로 이관
 rtrt project refresh --apply                    # 컨트랙트 렌더 + 표준 설정 + 감사
 rtrt-dashboard
-rtrt-mcp --memory ~/.rtrt/memory.sqlite
+rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 ```
 
 전체 명령은 [USAGE.ko.md](USAGE.ko.md)에 있습니다.
@@ -107,10 +109,11 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 세 기둥을 감싸는 표면:
 
-- **`rtrt-mcp`** — rmcp 1.7 stdio + Streamable HTTP. 18개 도구 (compress / compress_ml / proxy / memory_save / memory_recall / memory_timeline / memory_profile / memory_relations / memory_smart_search / memory_export / memory_consolidate / memory_sessions / memory_set_block / memory_get_block / memory_list_blocks / repo_map / templates_list / templates_scaffold / provider_chat). `--http-token` 상수-시간 베어러 가드 + RFC 6454 Origin 검증. 모든 핸들러가 자동 캡처 파이프라인 통과.
-- **`rtrt-dashboard`** — axum 10탭 (Metrics SVG 스파크라인 / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup). `/api/stream` SSE 라이브 활동, `/api/tokens/summary` 게이트웨이 시간/일 집계, `/api/memory/{projects,timeline}` 페이지네이션. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
+- **`rtrt-mcp`** — rmcp 1.x stdio + Streamable HTTP. 23개 도구 (compress / compress_ml / proxy / repo_map / memory_* / templates_* / provider_chat / agent_call / agent_route / security_scan / permission_prompt). `RTRT_MCP_HTTP_TOKEN` 환경 변수 기반 상수-시간 베어러 가드 + RFC 6454 Origin 검증. 모든 핸들러가 자동 캡처 파이프라인을 통과합니다.
+- **`rtrt-dashboard`** — axum의 Project 페이지는 Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security이고 Tools 페이지는 LLM, Chat, Limits, Environment, Usage, Failover, Connect입니다. Failover는 프로젝트를 선택하지 않았을 때만 글로벌 정책을 편집합니다. 프로젝트를 선택하면 상속 상태는 읽기 전용이며, **Custom**은 프로젝트 오버라이드를 기록하고 **Follow global**은 그 오버라이드를 제거합니다. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
 - **Claude Code 플러그인** — `plugins/claude-code/rtrt/` 훅 12종 (PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd). CLI 우선, 대시보드 POST 폴백.
 - **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/opencode/aider --apply`.
+- **Linux OpenCode 보안 부트스트랩** — eligible 설치는 machine shell과 기존 global session migration을 자동 적용하며 `--no-setup`으로 끕니다. 설치 cwd는 승인하지 않습니다.
 - **보안 & 라이선스 스캔** — `rtrt-security`: 프로파일 기반 5 엔진(secrets / licenses / deps / patterns / ai), 표준 매핑 빌트인 프로파일 6종(CWE / OWASP / NIST / CIS / SLSA / EU AI Act), `rtrt security scan | profile | gate | init` + 대시보드 보안 페이지 + MCP `security_scan`.
 - **2단 설정 & 프로젝트 라이프사이클** — 글로벌 베이스 커널(`~/.rtrt/config.toml`, `rtrt setup` 관리) + 프로젝트별 `<repo>/.rtrt/config.toml` 오버라이드(유효 설정 = 글로벌 ⊕ 프로젝트, 대시보드 글로벌 따름/커스텀 토글); `rtrt migrate` / `rtrt project refresh`(기본 dry-run, `--apply`) + `rtrt project status/health/repair`.
 - **개발자 도구** — `rtrt signatures`, `rtrt repo-map`, `rtrt discover`, `rtrt benchmark`.
@@ -119,7 +122,7 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 
 | 문서 | 내용 |
 |------|------|
-| [INSTALL.ko.md](INSTALL.ko.md) | 설치 경로 — 소스 / crates.io(예정) / 바이너리(예정) |
+| [INSTALL.ko.md](INSTALL.ko.md) | 설치 경로 — 소스 / v0.1.1 crates.io 및 사전 빌드 바이너리 릴리스 채널 / 제거 |
 | [USAGE.ko.md](USAGE.ko.md) | CLI · MCP · 대시보드 사용법 + 자동 캡처 파이프라인 |
 | [FEATURES.ko.md](FEATURES.ko.md) | 압축 규칙 / 필터 / 메모리 스키마 / 템플릿 |
 | [ARCHITECTURE.ko.md](ARCHITECTURE.ko.md) | 크레이트 경계 · 데이터 흐름 |
@@ -138,10 +141,10 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - [x] `rtrt-proxy` git / cargo 필터 (MCP 도구 노출)
 - [x] `rtrt-memory` BM25 + 벡터 + HNSW + RRF 하이브리드 + 그래프 + 메모리 스코프 + 페이로드 필터 DSL + Letta 블록 + JSONL export/import
 - [x] `rtrt-memory` v5 스키마 (`session_id` + `body_sha` + 커버링 인덱스) — 100K rows 타임라인 32µs
-- [x] `rtrt-templates` 빌트인 6종 + agent-role + handlebars + 버저닝되는 `PromptRegistry`
+- [x] `rtrt-templates` 빌트인 4종(`dev`, `design`, `plan`, `standardization`) + handlebars + 버저닝되는 `PromptRegistry`
 - [x] `rtrt-providers` Anthropic / OpenAI / OpenAI-compat HTTP + 스트리밍 + Gateway + Budget + 응답 캐시 + exponential 재시도 + Anthropic 프롬프트 캐시 휴리스틱 + Context7
-- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP, 18 도구, 베어러 가드, RFC 6454 Origin
-- [x] `rtrt-dashboard` axum 10탭 + SSE 라이브 + 토큰 집계 + 자동 캡처 파이프라인 + 시간당 콘솔리데이션 데몬
+- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP, 23개 도구, 베어러 가드, RFC 6454 Origin
+- [x] `rtrt-dashboard` axum Project/Tools 내비게이션 + 범위별 Failover 정책 편집 + SSE 라이브 + 토큰 집계 + 자동 캡처 파이프라인 + 시간당 콘솔리데이션 데몬
 - [x] Claude Code 플러그인 12개 훅 (`plugins/claude-code/rtrt/`)
 - [x] `install.sh` + `install.ps1` 원라이너 + `release.yml` 5-target 매트릭스
 - [x] `rtrt setup --agent <name>` Claude / Cursor / Codex / Windsurf / opencode 와이어업
@@ -157,8 +160,8 @@ rtrt-mcp --memory ~/.rtrt/memory.sqlite
 - [x] 프로바이더 사용량 원장 + 윈도우 헤드룸 + 헤드룸 가중 `rtrt route` + 자동 페일오버 (`rtrt usage` / `/api/usage` / `/api/route/preview`)
 - [x] `rtrt-security` 프로파일 기반 보안 & 라이선스 스캔 (엔진 5종, 표준 매핑 프로파일 6종, CI `gate`)
 - [x] 2단 설정 (글로벌 베이스 커널 + 프로젝트별 `.rtrt/config.toml` 오버라이드) + `rtrt migrate` / `rtrt project refresh`
-- [ ] 옵션 멀티 에이전트 코디네이션 크레이트 (DESIGN.md 명시 deferred)
-- [ ] 첫 정식 태그 릴리스 — 라이브 키 스모크 + 브라우저 투어 통과 후, 사용자 승인 받고 진행. 그때까지 버전 라벨은 `0.1.0` 유지
+- [x] 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 위임하고 RTRT native orchestration 표면은 제거
+- [x] v0.1.1용 쌍 태그·의존성 순서 기반 Rust/npm 릴리스 자동화
 
 ## 라이선스
 

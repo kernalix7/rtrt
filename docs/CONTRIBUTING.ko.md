@@ -77,12 +77,8 @@ chore(ci): cargo-audit 0.21로 업그레이드
 
 ### AI 도구 공동 저자 금지
 
-다음과 같은 `Co-authored-by:` 트레일러는 **추가하지 마세요**.
-
-- `Co-authored-by: Claude <noreply@anthropic.com>` (Anthropic 이메일 일체)
-- `Co-authored-by: Cursor <cursoragent@cursor.com>`
-- `Co-authored-by: Copilot <...>` (GitHub Copilot 어떤 변형이든)
-- `Co-authored-by: <기타 AI 도구/에이전트 신원>`
+AI 도구나 코딩 에이전트를 지명하는 공동 저자 트레일러는 **추가하지 마세요**.
+AI 도구를 밝히는 생성 크레딧 트레일러와 본문 표기도 금지됩니다.
 
 패치는 당신이 작성한 것이고, 인적 저작권은 당신에게 귀속됩니다. AI 도구가 얼마나 기여했든 본 저장소에서는 공동 저자 크레딧을 받지 않습니다. 트레일러가 실수로 들어가면 수정 요청을 드릴 것이며, 이미 병합된 PR의 경우 후속 PR로 히스토리 정리를 조율합니다.
 
@@ -94,10 +90,16 @@ chore(ci): cargo-audit 0.21로 업그레이드
 
 이후의 `### Added` / `### Changed` / `### Fixed`는 상세 추적용입니다.
 
+릴리스를 자르기 전에 GitHub `crates-io-publish` 환경을 만들고 해당 환경에 `CARGO_REGISTRY_TOKEN` 시크릿을 추가해야 합니다. 쌍 태그 릴리스는 Rust 크레이트를 게시하려면 이 환경과 토큰이 필요합니다.
+
+그런 다음 릴리스 태그는 병합된 `main` 커밋에 모두 만듭니다. 릴리스 워크플로우는 본문 추출에 `REL-` 마커를 사용하므로 두 태그를 한 번의 atomic push로 함께 올려야 합니다.
+
 ```bash
-git tag vX.Y.Z <commit>
-git tag REL-vX.Y.Z vX.Y.Z^{}    # 중첩 태그 경고 회피용 디리퍼런스
-git push origin vX.Y.Z REL-vX.Y.Z
+git checkout main
+git pull --ff-only origin main
+git tag vX.Y.Z HEAD
+git tag REL-vX.Y.Z HEAD
+git push --atomic origin vX.Y.Z REL-vX.Y.Z
 ```
 
 ### 외부 기여자 크레딧

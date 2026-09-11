@@ -21,6 +21,7 @@ rtrt-providers.workspace = true
 rtrt-templates.workspace = true
 rtrt-security.workspace = true
 clap.workspace = true
+fs2 = "0.4"
 futures-util = { workspace = true }
 tokio.workspace = true
 anyhow.workspace = true
@@ -29,6 +30,7 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 toml.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []
@@ -39,4 +41,3 @@ onnx = ["rtrt-compress/onnx"]
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
-tempfile = "3.27.0"

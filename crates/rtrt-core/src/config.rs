@@ -1,11 +1,20 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{CompressionLevel, Error, Result};
+
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Only permission-prompt bridge accepted for delegated Claude CLI lanes.
+pub const CLAUDE_PERMISSION_PROMPT_TOOL: &str = "mcp__rtrt__permission_prompt";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -29,878 +38,10 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
-    #[serde(default, skip_serializing_if = "TeamConfig::is_default")]
-    pub team: TeamConfig,
     #[serde(default, skip_serializing_if = "FailoverConfig::is_default")]
     pub failover: FailoverConfig,
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TeamMode {
-    Cli,
-    Api,
-    Auto,
-}
-
-/// One lane of the team: a concrete `(target, model, mode)` the leader can
-/// delegate to, plus the routing policy that decides *when* it is used.
-///
-/// Everything after `roles` is optional and defaults to "unset", so a `[team]`
-/// section written before lanes existed parses and re-serializes byte for byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TeamMember {
-    pub name: String,
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    pub mode: TeamMode,
-    pub roles: Vec<String>,
-    /// The logical model behind this lane (e.g. `glm-5.2`). Two members sharing
-    /// a `logical` are the *same* model reached through different pools — that
-    /// is what makes quota crossover between them safe, and it is the only
-    /// thing [`TeamMember::sibling`] is allowed to pair.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical: Option<String>,
-    /// Name of the sibling lane: the same [`TeamMember::logical`] model served
-    /// by another pool. Consulted before the fallback chain when this lane's
-    /// pool runs out of quota, so a quota wall costs a pool switch instead of a
-    /// model downgrade.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sibling: Option<String>,
-    /// The difficulty tier this lane serves. Purely a self-declaration: it adds
-    /// the lane to that tier's roster in [`TeamConfig::effective_tiers`], which
-    /// lets a roster be expressed member-by-member without a `[team.tiers]`
-    /// table at all. `[team.tiers]` still decides ordering within a tier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
-    /// Ordered replacement lanes, tried left to right when this one fails past
-    /// its retries. Names must resolve to other members and must not form a
-    /// cycle.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback: Vec<String>,
-    /// Whether this lane may implement (write code). A design-only lane —
-    /// typically an expensive or tightly rationed one — sets `false` and may
-    /// then only appear in tiers listed under
-    /// [`TeamPolicy::design_only_tiers`].
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub allow_impl: bool,
-    /// Free-form per-lane invocation flags, passed through verbatim by whoever
-    /// invokes the lane (e.g. `permission-mode` / `allowed-tools` for a
-    /// `claude -p` lane). rtrt stores and renders them; it does not interpret
-    /// them, so a new upstream flag needs no rtrt release.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub flags: BTreeMap<String, String>,
-}
-
-impl TeamMember {
-    /// A lane with only its identity set; every routing field takes its default
-    /// so callers opt into exactly the policy they mean.
-    pub fn new(name: impl Into<String>, target: impl Into<String>, mode: TeamMode) -> Self {
-        Self {
-            name: name.into(),
-            target: target.into(),
-            model: None,
-            mode,
-            roles: Vec::new(),
-            logical: None,
-            sibling: None,
-            tier: None,
-            fallback: Vec::new(),
-            allow_impl: true,
-            flags: BTreeMap::new(),
-        }
-    }
-
-    /// One invocation flag by key.
-    pub fn flag(&self, key: &str) -> Option<&str> {
-        self.flags.get(key).map(String::as_str)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TeamConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_team_manager_provider")]
-    pub manager_provider: String,
-    #[serde(default = "default_team_manager_model")]
-    pub manager_model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manager_base_url: Option<String>,
-    #[serde(default = "default_team_leader_order")]
-    pub leader_order: Vec<String>,
-    #[serde(default = "default_team_members")]
-    pub members: Vec<TeamMember>,
-    /// Difficulty ladder: tier name -> the lanes that serve it, most preferred
-    /// first. Empty means "use the shipped default ladder" (see
-    /// [`TeamConfig::effective_tiers`]); a non-empty table *replaces* the
-    /// default outright rather than merging with it, so a user roster is never
-    /// polluted by lanes they did not ask for.
-    #[serde(default, skip_serializing_if = "TierMap::is_empty")]
-    pub tiers: TierMap,
-    /// How the leader walks the ladder: retries, sibling crossover, fallback
-    /// depth, provenance.
-    #[serde(default, skip_serializing_if = "TeamPolicy::is_default")]
-    pub policy: TeamPolicy,
-}
-
-impl Default for TeamConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            manager_provider: default_team_manager_provider(),
-            manager_model: default_team_manager_model(),
-            manager_base_url: None,
-            leader_order: default_team_leader_order(),
-            members: default_team_members(),
-            // Empty, not the default ladder: an unset `[team.tiers]` must not
-            // be written back into anyone's config file. `effective_tiers`
-            // supplies the default at read time instead.
-            tiers: TierMap::default(),
-            policy: TeamPolicy::default(),
-        }
-    }
-}
-
-impl TeamConfig {
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        validate_team_value("manager_provider", &self.manager_provider)?;
-        validate_team_value("manager_model", &self.manager_model)?;
-        if let Some(base_url) = &self.manager_base_url {
-            validate_team_value("manager_base_url", base_url)?;
-        }
-        if !self.enabled {
-            return Ok(());
-        }
-        if self.leader_order.is_empty() {
-            return Err(Error::Config(
-                "team.leader_order must not be empty when team is enabled".to_string(),
-            ));
-        }
-        if self.members.is_empty() {
-            return Err(Error::Config(
-                "team.members must not be empty when team is enabled".to_string(),
-            ));
-        }
-
-        let mut member_names = std::collections::BTreeSet::new();
-        let mut member_targets = std::collections::BTreeSet::new();
-        for (index, member) in self.members.iter().enumerate() {
-            validate_team_value(&format!("members[{index}].name"), &member.name)?;
-            validate_team_value(&format!("members[{index}].target"), &member.target)?;
-            if let Some(model) = &member.model {
-                validate_team_value(&format!("members[{index}].model"), model)?;
-            }
-            if member.roles.is_empty() {
-                return Err(Error::Config(format!(
-                    "team.members[{index}].roles must not be empty"
-                )));
-            }
-            for (role_index, role) in member.roles.iter().enumerate() {
-                validate_team_value(&format!("members[{index}].roles[{role_index}]"), role)?;
-            }
-            if !member_names.insert(member.name.as_str()) {
-                return Err(Error::Config(format!(
-                    "duplicate team member name at index {index}: {}",
-                    member.name
-                )));
-            }
-            if !member_targets.insert((
-                member.target.as_str(),
-                member.model.as_deref(),
-                member.mode,
-            )) {
-                return Err(Error::Config(format!(
-                    "duplicate team member at index {index}: target/model/mode must be unique"
-                )));
-            }
-        }
-
-        let mut leaders = std::collections::BTreeSet::new();
-        for (index, leader) in self.leader_order.iter().enumerate() {
-            validate_team_value(&format!("leader_order[{index}]"), leader)?;
-            if !leaders.insert(leader.as_str()) {
-                return Err(Error::Config(format!(
-                    "duplicate team leader at index {index}: {leader}"
-                )));
-            }
-            if !member_names.contains(leader.as_str()) {
-                return Err(Error::Config(format!(
-                    "team.leader_order[{index}] references unknown member: {leader}"
-                )));
-            }
-        }
-
-        self.validate_lane_links(&member_names)?;
-        self.validate_tiers(&member_names)?;
-        Ok(())
-    }
-
-    /// Cross-references between lanes: siblings must be the same logical model,
-    /// fallbacks must resolve and must not loop.
-    fn validate_lane_links(&self, member_names: &BTreeSet<&str>) -> Result<()> {
-        for (index, member) in self.members.iter().enumerate() {
-            if let Some(logical) = &member.logical {
-                validate_team_value(&format!("members[{index}].logical"), logical)?;
-            }
-            if let Some(tier) = &member.tier {
-                validate_team_value(&format!("members[{index}].tier"), tier)?;
-            }
-            for (key, value) in &member.flags {
-                validate_team_value(&format!("members[{index}].flags key"), key)?;
-                validate_team_text(&format!("members[{index}].flags.{key}"), value)?;
-            }
-
-            if let Some(sibling) = &member.sibling {
-                validate_team_value(&format!("members[{index}].sibling"), sibling)?;
-                if sibling == &member.name {
-                    return Err(Error::Config(format!(
-                        "team.members[{index}].sibling must not reference itself: {sibling}"
-                    )));
-                }
-                let Some(other) = self.member(sibling) else {
-                    return Err(Error::Config(format!(
-                        "team.members[{index}].sibling references unknown member: {sibling}"
-                    )));
-                };
-                match (member.logical.as_deref(), other.logical.as_deref()) {
-                    (Some(mine), Some(theirs)) if mine == theirs => {}
-                    (Some(mine), Some(theirs)) => {
-                        return Err(Error::Config(format!(
-                            "team.members[{index}].sibling {sibling} serves logical model \
-                             {theirs}, not {mine}: siblings must be the same model on \
-                             different pools"
-                        )));
-                    }
-                    _ => {
-                        return Err(Error::Config(format!(
-                            "team.members[{index}].sibling {sibling} requires both members to \
-                             declare `logical`: a sibling pair is one model on two pools"
-                        )));
-                    }
-                }
-            }
-
-            let mut seen_fallback = BTreeSet::new();
-            for (position, name) in member.fallback.iter().enumerate() {
-                validate_team_value(&format!("members[{index}].fallback[{position}]"), name)?;
-                if name == &member.name {
-                    return Err(Error::Config(format!(
-                        "team.members[{index}].fallback[{position}] must not reference itself: \
-                         {name}"
-                    )));
-                }
-                if !member_names.contains(name.as_str()) {
-                    return Err(Error::Config(format!(
-                        "team.members[{index}].fallback[{position}] references unknown member: \
-                         {name}"
-                    )));
-                }
-                if !seen_fallback.insert(name.as_str()) {
-                    return Err(Error::Config(format!(
-                        "team.members[{index}].fallback lists {name} twice"
-                    )));
-                }
-            }
-        }
-
-        if let Some(cycle) = fallback_cycle(&self.members) {
-            return Err(Error::Config(format!(
-                "team fallback chain forms a cycle: {}",
-                cycle.join(" -> ")
-            )));
-        }
-        Ok(())
-    }
-
-    /// The difficulty ladder: every explicitly configured tier must be usable,
-    /// and no design-only lane may sit in a tier that implements.
-    fn validate_tiers(&self, member_names: &BTreeSet<&str>) -> Result<()> {
-        for (tier, lanes) in self.tiers.iter() {
-            validate_team_value(&format!("tiers.{tier}"), tier)?;
-            if lanes.is_empty() {
-                return Err(Error::Config(format!(
-                    "team.tiers.{tier} must list at least one member"
-                )));
-            }
-            let mut seen = BTreeSet::new();
-            for name in lanes {
-                validate_team_value(&format!("tiers.{tier}"), name)?;
-                if !member_names.contains(name.as_str()) {
-                    return Err(Error::Config(format!(
-                        "team.tiers.{tier} references unknown member: {name}"
-                    )));
-                }
-                if !seen.insert(name.as_str()) {
-                    return Err(Error::Config(format!(
-                        "team.tiers.{tier} lists {name} twice"
-                    )));
-                }
-            }
-        }
-
-        let effective = self.effective_tiers();
-        if let Some(configured) = &self.policy.design_only_tiers {
-            for tier in configured {
-                validate_team_value("policy.design_only_tiers", tier)?;
-                if !effective.contains(tier) {
-                    return Err(Error::Config(format!(
-                        "team.policy.design_only_tiers references unknown tier: {tier}"
-                    )));
-                }
-            }
-        }
-        if let Some(tier) = &self.policy.default_tier {
-            validate_team_value("policy.default_tier", tier)?;
-            if !effective.contains(tier) {
-                return Err(Error::Config(format!(
-                    "team.policy.default_tier references unknown tier: {tier}"
-                )));
-            }
-        }
-
-        let design_only = self.design_only_tier_names(&effective);
-        for (tier, lanes) in effective.iter() {
-            if design_only.contains(tier) {
-                continue;
-            }
-            for name in lanes {
-                let implements = self.member(name).is_none_or(|member| member.allow_impl);
-                if !implements {
-                    return Err(Error::Config(format!(
-                        "team.tiers.{tier} places design-only member {name} in an implementation \
-                         tier: set allow_impl = true or list {tier} under \
-                         team.policy.design_only_tiers"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// One lane by name.
-    pub fn member(&self, name: &str) -> Option<&TeamMember> {
-        self.members.iter().find(|member| member.name == name)
-    }
-
-    /// The sibling lane of `name`, when it declares one that resolves.
-    pub fn sibling_of(&self, name: &str) -> Option<&TeamMember> {
-        let sibling = self.member(name)?.sibling.as_deref()?;
-        self.member(sibling)
-    }
-
-    /// The difficulty ladder actually in force.
-    ///
-    /// A configured `[team.tiers]` replaces the shipped ladder outright. With
-    /// none configured, the shipped ladder is used but filtered to lanes that
-    /// exist in *this* roster, so a fully custom roster never inherits lane
-    /// names it does not have. Either way, lanes that declare a
-    /// [`TeamMember::tier`] are appended to that tier, creating it when the
-    /// table does not.
-    pub fn effective_tiers(&self) -> TierMap {
-        let names: BTreeSet<&str> = self
-            .members
-            .iter()
-            .map(|member| member.name.as_str())
-            .collect();
-        let mut tiers = if self.tiers.is_empty() {
-            let mut shipped = default_team_tiers();
-            shipped.retain_members(|name| names.contains(name));
-            shipped
-        } else {
-            self.tiers.clone()
-        };
-        for member in &self.members {
-            if let Some(tier) = &member.tier {
-                tiers.push_member(tier, &member.name);
-            }
-        }
-        tiers
-    }
-
-    /// Tiers whose output is a plan, not an edit. Configured names win; with
-    /// none configured the shipped name is used, but only if such a tier
-    /// actually exists — a default must never invalidate a config.
-    fn design_only_tier_names(&self, effective: &TierMap) -> BTreeSet<String> {
-        match &self.policy.design_only_tiers {
-            Some(configured) => configured.iter().cloned().collect(),
-            None => default_design_only_tiers()
-                .into_iter()
-                .filter(|tier| effective.contains(tier))
-                .collect(),
-        }
-    }
-
-    /// Whether a tier is design-only (its lanes plan, they do not implement).
-    pub fn is_design_only_tier(&self, tier: &str) -> bool {
-        self.design_only_tier_names(&self.effective_tiers())
-            .contains(tier)
-    }
-
-    /// The tier to start from when a task's difficulty is unclear: the
-    /// configured one, else the first rung of the ladder.
-    pub fn effective_default_tier(&self) -> Option<String> {
-        if let Some(tier) = &self.policy.default_tier {
-            return Some(tier.clone());
-        }
-        self.effective_tiers().first_name().map(str::to_string)
-    }
-
-    /// How many lanes deep a fallback walk may go. Derived from the roster —
-    /// a walk can visit each lane at most once — unless pinned by the config.
-    pub fn effective_max_fallback_depth(&self) -> usize {
-        self.policy.max_fallback_depth.unwrap_or(self.members.len())
-    }
-
-    /// The fallback chain starting at `name`: every replacement it declares, in
-    /// order, then their replacements, deduplicated and cut at
-    /// [`TeamConfig::effective_max_fallback_depth`]. `name` itself is never in
-    /// the result.
-    ///
-    /// Breadth-first on purpose — a lane's own preferences outrank the
-    /// preferences of its replacement.
-    pub fn fallback_chain(&self, name: &str) -> Vec<String> {
-        let depth = self.effective_max_fallback_depth();
-        let mut chain: Vec<String> = Vec::new();
-        let mut seen: BTreeSet<String> = BTreeSet::from([name.to_string()]);
-        let mut current = name.to_string();
-        let mut cursor = 0usize;
-        loop {
-            if let Some(member) = self.member(&current) {
-                for next in &member.fallback {
-                    if chain.len() >= depth {
-                        return chain;
-                    }
-                    if seen.insert(next.clone()) {
-                        chain.push(next.clone());
-                    }
-                }
-            }
-            let Some(next) = chain.get(cursor) else {
-                return chain;
-            };
-            current = next.clone();
-            cursor += 1;
-        }
-    }
-}
-
-/// The first fallback cycle in the roster, as the looping path, or `None` when
-/// the graph is acyclic. Iterative three-colour DFS: the roster is small, but a
-/// cycle must never blow the stack of whoever loads a config.
-fn fallback_cycle(members: &[TeamMember]) -> Option<Vec<String>> {
-    const WHITE: u8 = 0;
-    const GREY: u8 = 1;
-    const BLACK: u8 = 2;
-
-    let index: BTreeMap<&str, usize> = members
-        .iter()
-        .enumerate()
-        .map(|(position, member)| (member.name.as_str(), position))
-        .collect();
-    let mut colour = vec![WHITE; members.len()];
-    let mut stack: Vec<(usize, usize)> = Vec::new();
-
-    for start in 0..members.len() {
-        if colour[start] != WHITE {
-            continue;
-        }
-        colour[start] = GREY;
-        stack.push((start, 0));
-        while let Some(&(node, cursor)) = stack.last() {
-            let Some(next_name) = members[node].fallback.get(cursor) else {
-                colour[node] = BLACK;
-                stack.pop();
-                continue;
-            };
-            if let Some(top) = stack.last_mut() {
-                top.1 += 1;
-            }
-            // Unresolvable names are reported separately; skip them here so the
-            // cycle report never blames a typo.
-            let Some(&next) = index.get(next_name.as_str()) else {
-                continue;
-            };
-            match colour[next] {
-                GREY => {
-                    let entry = stack
-                        .iter()
-                        .position(|(node, _)| *node == next)
-                        .unwrap_or_default();
-                    let mut cycle: Vec<String> = stack[entry..]
-                        .iter()
-                        .map(|(node, _)| members[*node].name.clone())
-                        .collect();
-                    cycle.push(members[next].name.clone());
-                    return Some(cycle);
-                }
-                WHITE => {
-                    colour[next] = GREY;
-                    stack.push((next, 0));
-                }
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
-/// An insertion-ordered map of tier name -> the lanes serving it.
-///
-/// Order is meaningful — it is the difficulty ladder the leader climbs — so
-/// this preserves the order the config declares instead of sorting names the
-/// way a `BTreeMap` would. Serializes as a plain TOML table, so
-/// `[team.tiers]\nmechanical = ["glm-go"]` is all a user writes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TierMap(Vec<(String, Vec<String>)>);
-
-impl TierMap {
-    /// Build a ladder from ordered `(tier, lanes)` pairs. A repeated tier name
-    /// extends the first occurrence rather than shadowing it.
-    pub fn from_pairs<N, M>(pairs: impl IntoIterator<Item = (N, M)>) -> Self
-    where
-        N: Into<String>,
-        M: IntoIterator,
-        M::Item: Into<String>,
-    {
-        let mut map = Self::default();
-        for (tier, lanes) in pairs {
-            let tier = tier.into();
-            for lane in lanes {
-                map.push_member(&tier, &lane.into());
-            }
-        }
-        map
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Tiers in ladder order, each with its lanes in preference order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
-        self.0
-            .iter()
-            .map(|(tier, lanes)| (tier.as_str(), lanes.as_slice()))
-    }
-
-    /// Tier names in ladder order.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(|(tier, _)| tier.as_str())
-    }
-
-    /// The lanes serving one tier, most preferred first.
-    pub fn get(&self, tier: &str) -> Option<&[String]> {
-        self.0
-            .iter()
-            .find(|(name, _)| name == tier)
-            .map(|(_, lanes)| lanes.as_slice())
-    }
-
-    pub fn contains(&self, tier: &str) -> bool {
-        self.0.iter().any(|(name, _)| name == tier)
-    }
-
-    /// The first rung of the ladder.
-    pub fn first_name(&self) -> Option<&str> {
-        self.0.first().map(|(tier, _)| tier.as_str())
-    }
-
-    /// Append a lane to a tier, creating the tier at the end of the ladder when
-    /// it is new. Re-adding a lane it already holds is a no-op, so ordering
-    /// stays with the first declaration.
-    pub fn push_member(&mut self, tier: &str, member: &str) {
-        match self.0.iter_mut().find(|(name, _)| name == tier) {
-            Some((_, lanes)) => {
-                if !lanes.iter().any(|lane| lane == member) {
-                    lanes.push(member.to_string());
-                }
-            }
-            None => self.0.push((tier.to_string(), vec![member.to_string()])),
-        }
-    }
-
-    /// Drop lanes that fail `keep`, then drop tiers left with none. Used to fit
-    /// the shipped ladder to a roster that renamed or removed lanes.
-    pub fn retain_members(&mut self, keep: impl Fn(&str) -> bool) {
-        for (_, lanes) in &mut self.0 {
-            lanes.retain(|lane| keep(lane));
-        }
-        self.0.retain(|(_, lanes)| !lanes.is_empty());
-    }
-}
-
-impl Serialize for TierMap {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_map(self.0.iter().map(|(tier, lanes)| (tier, lanes)))
-    }
-}
-
-impl<'de> Deserialize<'de> for TierMap {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct TierMapVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for TierMapVisitor {
-            type Value = TierMap;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a table of tier name to member names")
-            }
-
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut access: M,
-            ) -> std::result::Result<TierMap, M::Error> {
-                let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
-                while let Some((tier, lanes)) = access.next_entry::<String, Vec<String>>()? {
-                    if pairs.iter().any(|(existing, _)| *existing == tier) {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate team tier: {tier}"
-                        )));
-                    }
-                    pairs.push((tier, lanes));
-                }
-                Ok(TierMap(pairs))
-            }
-        }
-
-        deserializer.deserialize_map(TierMapVisitor)
-    }
-}
-
-/// How the leader climbs the ladder and recovers from failures.
-///
-/// The whole table is omitted from the serialized config while it equals the
-/// defaults, so adding it never rewrites an existing `~/.rtrt/config.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TeamPolicy {
-    /// Same-lane attempts a *transient* failure earns before the lane is
-    /// abandoned for its sibling or fallback chain. `0` falls over on the first
-    /// failure.
-    #[serde(default = "default_team_max_retries")]
-    pub max_retries: u32,
-    /// Redo the delegated work from scratch on the replacement lane instead of
-    /// resuming from whatever the failed lane produced. On by default because a
-    /// lane that failed mid-task usually left partial edits.
-    #[serde(default = "default_true")]
-    pub redo_on_fallback: bool,
-    /// On a *quota* failure, cross over to the lane's sibling pool before
-    /// walking the fallback chain — a pool switch keeps the same model, a
-    /// fallback usually does not.
-    #[serde(default = "default_true")]
-    pub prefer_sibling_on_quota: bool,
-    /// Report which lane produced each delegated result.
-    #[serde(default = "default_true")]
-    pub record_provenance: bool,
-    /// Hard cap on how many lanes deep a fallback walk may go. `None` derives
-    /// it from the roster (a walk visits each lane at most once).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_fallback_depth: Option<usize>,
-    /// Rung to start from when a task's difficulty is unclear. `None` uses the
-    /// first tier of the effective ladder.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tier: Option<String>,
-    /// Tiers whose lanes plan rather than implement; the only tiers a member
-    /// with `allow_impl = false` may appear in. `None` uses the shipped name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub design_only_tiers: Option<Vec<String>>,
-}
-
-impl Default for TeamPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: default_team_max_retries(),
-            redo_on_fallback: true,
-            prefer_sibling_on_quota: true,
-            record_provenance: true,
-            max_fallback_depth: None,
-            default_tier: None,
-            design_only_tiers: None,
-        }
-    }
-}
-
-impl TeamPolicy {
-    /// True while nothing is customised, i.e. the policy is exactly the shipped
-    /// one. Keeps an untouched `[team.policy]` out of the serialized config.
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-fn validate_team_value(name: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(Error::Config(format!("team.{name} must not be empty")));
-    }
-    validate_team_text(name, value)
-}
-
-/// NUL check only — for values that may legitimately be empty, such as a
-/// valueless invocation flag.
-fn validate_team_text(name: &str, value: &str) -> Result<()> {
-    if value.contains('\0') {
-        return Err(Error::Config(format!("team.{name} must not contain NUL")));
-    }
-    Ok(())
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
-fn default_team_manager_provider() -> String {
-    "ollama".to_string()
-}
-
-fn default_team_manager_model() -> String {
-    "granite4:350m".to_string()
-}
-
-fn default_team_leader_order() -> Vec<String> {
-    ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn default_team_members() -> Vec<TeamMember> {
-    vec![
-        TeamMember {
-            // Plans and integrates; the ladder keeps it out of every tier that
-            // writes code.
-            allow_impl: false,
-            fallback: team_names(&["gpt-sol"]),
-            ..team_member(
-                "opus",
-                "claude",
-                "opus",
-                "opus",
-                &["lead", "architecture", "integration"],
-            )
-        },
-        TeamMember {
-            fallback: team_names(&["sonnet"]),
-            ..team_member(
-                "gpt-sol",
-                "opencode",
-                "openai/gpt-5.6-sol",
-                "gpt-5.6-sol",
-                &["deputy", "hard-implementation", "debugging"],
-            )
-        },
-        TeamMember {
-            // Same model as glm-cloud on a different pool: when this pool is
-            // spent the work crosses over instead of dropping a model tier.
-            sibling: Some("glm-cloud".to_string()),
-            fallback: team_names(&["kimi-cloud"]),
-            ..team_member(
-                "glm-go",
-                "opencode",
-                "opencode-go/glm-5.2",
-                "glm-5.2",
-                &["routine", "boilerplate", "bulk-edit"],
-            )
-        },
-        TeamMember {
-            sibling: Some("glm-go".to_string()),
-            fallback: team_names(&["kimi-cloud"]),
-            ..team_member(
-                "glm-cloud",
-                "opencode",
-                "ollama/glm-5.2:cloud",
-                "glm-5.2",
-                &["routine", "overflow", "bulk-edit"],
-            )
-        },
-        TeamMember {
-            fallback: team_names(&["kimi-cloud"]),
-            ..team_member(
-                "sonnet",
-                "claude",
-                "sonnet",
-                "sonnet",
-                &["general-implementation", "tests", "review"],
-            )
-        },
-        // Last rung: the widest-quota lane, so its chain terminates here.
-        team_member(
-            "kimi-cloud",
-            "opencode",
-            "ollama/kimi-k2.7-code:cloud",
-            "kimi-k2.7-code",
-            &["parallel-implementation", "research", "tests"],
-        ),
-    ]
-}
-
-/// The shipped difficulty ladder, expressed over [`default_team_members`].
-///
-/// Only a default: a `[team.tiers]` table replaces it wholesale, and a roster
-/// that renames these lanes drops the ones it no longer has (see
-/// [`TeamConfig::effective_tiers`]).
-fn default_team_tiers() -> TierMap {
-    TierMap::from_pairs([
-        (TIER_MECHANICAL, vec!["glm-go", "glm-cloud"]),
-        (TIER_ROUTINE, vec!["kimi-cloud", "glm-cloud"]),
-        (TIER_MULTIFILE, vec!["gpt-sol", "kimi-cloud"]),
-        (TIER_DESIGN, vec!["opus", "gpt-sol"]),
-        (TIER_REVIEW, vec!["sonnet", "gpt-sol"]),
-    ])
-}
-
-/// Mechanical edits: renames, moves, formatting — cheapest lanes first.
-const TIER_MECHANICAL: &str = "mechanical";
-/// Routine single-file work with a clear spec.
-const TIER_ROUTINE: &str = "routine";
-/// Changes spanning several files that have to stay consistent.
-const TIER_MULTIFILE: &str = "multifile";
-/// Architecture and API shape: a plan, not an edit.
-const TIER_DESIGN: &str = "design";
-/// Reading someone else's diff for defects.
-const TIER_REVIEW: &str = "review";
-
-fn default_design_only_tiers() -> Vec<String> {
-    vec![TIER_DESIGN.to_string()]
-}
-
-/// Same-lane attempts a transient failure earns before the leader gives up on
-/// the lane. Overridable via `[team.policy] max_retries`.
-pub const DEFAULT_TEAM_MAX_RETRIES: u32 = 2;
-
-fn default_team_max_retries() -> u32 {
-    DEFAULT_TEAM_MAX_RETRIES
-}
-
-fn team_member(name: &str, target: &str, model: &str, logical: &str, roles: &[&str]) -> TeamMember {
-    TeamMember {
-        model: Some(model.to_string()),
-        logical: Some(logical.to_string()),
-        roles: team_names(roles),
-        ..TeamMember::new(name, target, TeamMode::Cli)
-    }
-}
-
-fn team_names(values: &[&str]) -> Vec<String> {
-    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 /// Global security defaults applied before any per-project binding. A project
@@ -968,27 +109,10 @@ pub struct ProjectConfig {
     /// core does not need to know it. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline: Option<toml::Value>,
-    /// Per-project orchestration roster (`[team]`).
-    ///
-    /// **Granularity: whole-section replacement, never a field-level merge.**
-    /// When this is `Some`, it *replaces* the global `[team]` outright; keys the
-    /// project omits fall back to the schema default, not to the global value.
-    ///
-    /// The reason is [`TeamConfig::validate`]. A roster is a web of
-    /// cross-references — `leader_order` and `tiers.*` name lanes, lanes name a
-    /// `sibling` and a `fallback` chain, `policy` names tiers — so merging two
-    /// rosters field by field can synthesise a config neither side wrote: a
-    /// global tier naming a lane the project removed, a global leader that no
-    /// longer exists, a sibling pair split across layers. Replacement keeps the
-    /// validator meaningful, because the effective roster is then *exactly* the
-    /// section that was validated (see [`ProjectConfig::validate`]) — there is
-    /// no third, unvalidated combination to reason about.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team: Option<TeamConfig>,
     /// Per-project invocation failure policy (`[failover]`). Whole-section
-    /// replacement, for the same reason as `team`: the three marker classes are
-    /// consulted in priority order, so appending a project list to a global one
-    /// would silently reclassify markers the project never mentioned.
+    /// replacement because the three marker classes are consulted in priority
+    /// order, so appending a project list to a global one would silently
+    /// reclassify markers the project never mentioned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover: Option<FailoverConfig>,
 }
@@ -997,24 +121,7 @@ impl ProjectConfig {
     pub fn from_toml_str(s: &str) -> Result<Self> {
         let over: Self =
             toml::from_str(s).map_err(|e| Error::Config(format!("project config TOML: {e}")))?;
-        over.validate()?;
         Ok(over)
-    }
-
-    /// Reject an override that could not be a valid effective config.
-    ///
-    /// Mirrors [`Config::from_toml_str`], which validates the global `[team]`
-    /// at parse time. Because a project `[team]` *replaces* the global section
-    /// rather than merging into it, the effective roster is byte-for-byte this
-    /// override — so validating it here validates the effective config, and no
-    /// caller of [`Config::load_effective`] can be handed a roster that
-    /// [`TeamConfig::validate`] would reject. Errors carry the validator's own
-    /// message.
-    pub fn validate(&self) -> Result<()> {
-        if let Some(team) = &self.team {
-            team.validate()?;
-        }
-        Ok(())
     }
 
     /// The per-project statusline override serialized as a `[statusline]` TOML
@@ -1038,12 +145,6 @@ impl ProjectConfig {
                 p.enabled.is_empty() && p.active.is_none() && p.api_max_tokens.is_none()
             })
             && self.statusline.is_none()
-            // `team` / `failover` are REPLACEMENT overrides, so — unlike the
-            // `agents` / `providers` overlays above — an "all default" section
-            // is not a no-op: it pins the shipped roster against a divergent
-            // global. Only an absent section counts as no override, exactly as
-            // for `compression` and `statusline`.
-            && self.team.is_none()
             && self.failover.is_none()
     }
 }
@@ -1190,6 +291,10 @@ pub struct AutoCompressConfig {
     /// OpenAI-compatible base URL (e.g. a local Ollama endpoint).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Runtime/provider identity behind `base_url`. This is deliberately
+    /// separate from its OpenAI-compatible wire protocol.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default = "default_compress_interval")]
     pub interval_sec: u64,
     #[serde(default = "default_compress_age")]
@@ -1208,6 +313,7 @@ impl Default for AutoCompressConfig {
             enabled: false,
             model: default_compress_model(),
             base_url: None,
+            provider: None,
             interval_sec: default_compress_interval(),
             age_sec: default_compress_age(),
             min_chars: default_compress_min_chars(),
@@ -1215,6 +321,59 @@ impl Default for AutoCompressConfig {
             max_tokens: default_compress_max_tokens(),
         }
     }
+}
+
+impl AutoCompressConfig {
+    /// Identity for an OpenAI-compatible endpoint. Explicit env/config values
+    /// win. Only Ollama's shipped loopback URL is recognised implicitly;
+    /// arbitrary compatible endpoints retain the neutral identity.
+    pub fn effective_provider(&self, base_url: &str) -> String {
+        let provider = std::env::var("RTRT_OPENAI_COMPAT_PROVIDER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.provider
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                if is_default_ollama_compatible_url(base_url) {
+                    "ollama".to_string()
+                } else {
+                    "openai-compat".to_string()
+                }
+            });
+        normalize_provider_id(&provider)
+    }
+}
+
+/// Canonical provider/runtime identity used at configuration and routing
+/// boundaries. Provider names are case-insensitive. These aliases are limited
+/// to explicit spellings of the same runtime; transport names never become a
+/// provider and collapse to the neutral compatible-endpoint identity.
+pub fn normalize_provider_id(provider: &str) -> String {
+    let normalized = provider.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "openai-compatible" | "openai_compatible" | "openai-compat" => "openai-compat".to_string(),
+        "lmstudio" | "lm_studio" | "lms" | "lm-studio" => "lm-studio".to_string(),
+        "llama" | "llamacpp" | "llama_cpp" | "llama-cpp" | "llama.cpp" => "llama.cpp".to_string(),
+        _ => normalized,
+    }
+}
+
+/// Whether `url` is the known default Ollama loopback endpoint. Do not extend
+/// this into runtime fingerprinting: compatible servers must identify
+/// themselves explicitly.
+pub fn is_default_ollama_compatible_url(url: &str) -> bool {
+    matches!(
+        url.trim().trim_end_matches('/'),
+        "http://127.0.0.1:11434"
+            | "http://127.0.0.1:11434/v1"
+            | "http://localhost:11434"
+            | "http://localhost:11434/v1"
+            | "http://[::1]:11434"
+            | "http://[::1]:11434/v1"
+    )
 }
 
 fn default_compress_model() -> String {
@@ -1280,13 +439,17 @@ fn default_memory_path() -> PathBuf {
     default_memory_store_path()
 }
 
-/// Canonical default memory store: `~/.rtrt/memory.sqlite`.
+/// Explicit legacy/admin memory store: `~/.rtrt/memory.sqlite`.
 ///
-/// Every surface (CLI, MCP server, dashboard, hooks, services) must resolve
-/// the store through this function when no explicit `--store` /
-/// `RTRT_MEMORY_PATH` override is given, so a fresh install reads and writes
-/// one SQLite file instead of scattering cwd-relative stores per directory.
+/// Retained for backward-compatible configuration and explicit migration
+/// workflows. New project-scoped callers must not use this default.
 pub fn default_memory_store_path() -> PathBuf {
+    legacy_memory_store_path()
+}
+
+/// Explicit legacy/admin path. Strict project callers must instead use
+/// [`crate::project_memory_db_path`].
+pub fn legacy_memory_store_path() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -1352,11 +515,15 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     pub fn enabled_override(&self, name: &str) -> Option<bool> {
-        self.enabled.get(name).copied()
+        let normalized = normalize_provider_id(name);
+        self.enabled
+            .iter()
+            .find(|(configured, _)| normalize_provider_id(configured) == normalized)
+            .map(|(_, enabled)| *enabled)
     }
 
     pub fn set_enabled(&mut self, name: &str, enabled: bool) {
-        self.enabled.insert(name.to_string(), enabled);
+        self.enabled.insert(normalize_provider_id(name), enabled);
     }
 
     /// Effective output-token ceiling for API-mode invocations. Resolution
@@ -1464,7 +631,12 @@ impl PoolLimit {
 
 impl LimitsConfig {
     pub fn target(&self, name: &str) -> Option<&TargetLimit> {
-        self.targets.get(name)
+        self.targets.get(name).or_else(|| {
+            self.targets
+                .iter()
+                .find(|(target, _)| target.eq_ignore_ascii_case(name))
+                .map(|(_, limit)| limit)
+        })
     }
 
     /// The cap for one pool inside a target, if the config pins one.
@@ -1485,7 +657,6 @@ impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self> {
         let config: Self =
             toml::from_str(s).map_err(|e| Error::Config(format!("config TOML: {e}")))?;
-        config.team.validate()?;
         Ok(config)
     }
 
@@ -1504,8 +675,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         match Self::default_path() {
             Some(p) if p.exists() => {
-                let raw = std::fs::read_to_string(&p)
-                    .map_err(|e| Error::Config(format!("read {}: {e}", p.display())))?;
+                let raw = read_bounded_config(&p, false)?;
                 Self::from_toml_str(&raw)
             }
             _ => Ok(Self::default()),
@@ -1549,20 +719,27 @@ impl Config {
 
     /// Load a project's override file if present (empty default otherwise).
     pub fn load_project(repo: &Path) -> Result<ProjectConfig> {
-        match std::fs::read_to_string(Self::project_config_path(repo)) {
-            Ok(raw) => ProjectConfig::from_toml_str(&raw),
-            Err(_) => Ok(ProjectConfig::default()),
+        let root = canonical_repo_root(repo)?;
+        let Some(config_dir) = existing_project_config_dir(&root)? else {
+            return Ok(ProjectConfig::default());
+        };
+        let path = config_dir.join("config.toml");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                validate_project_target(&root, &path, &metadata)?;
+                let raw = read_bounded_config(&path, true)?;
+                ProjectConfig::from_toml_str(&raw)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ProjectConfig::default())
+            }
+            Err(error) => Err(config_error("inspect", &path, error)),
         }
     }
 
     /// Load the global config and overlay a project's customization overrides.
     /// The base kernel is never overlaid — only the customization layer
-    /// (output level, compression, enabled agents/providers, orchestration).
-    ///
-    /// The result always satisfies [`TeamConfig::validate`]: the global roster
-    /// is validated by [`Config::from_toml_str`], a project roster by
-    /// [`ProjectConfig::from_toml_str`], and the overlay picks one of the two
-    /// whole rather than blending them.
+    /// (output level, compression, enabled agents/providers, failover).
     pub fn load_effective(repo: Option<&Path>) -> Result<Self> {
         let mut base = Self::load()?;
         if let Some(repo) = repo {
@@ -1605,11 +782,6 @@ impl Config {
                 self.providers.api_max_tokens = providers.api_max_tokens;
             }
         }
-        // Whole-section replacement — see `ProjectConfig::team`. The overlay
-        // takes one validated roster or the other, never a blend of both.
-        if let Some(team) = &over.team {
-            self.team = team.clone();
-        }
         if let Some(failover) = &over.failover {
             self.failover = failover.clone();
         }
@@ -1617,27 +789,304 @@ impl Config {
 
     /// Write a project override file, creating `.rtrt/` as needed. When the
     /// override is empty the file is removed so the repo stays clean.
-    ///
-    /// An override that would make the effective config invalid is rejected
-    /// here — before anything is written — with the validator's own message, so
-    /// no writer (dashboard, CLI, future callers) can persist a broken roster.
     pub fn save_project(repo: &Path, over: &ProjectConfig) -> Result<()> {
-        over.validate()?;
-        let path = Self::project_config_path(repo);
-        if over.is_empty() {
-            let _ = std::fs::remove_file(&path);
+        let root = canonical_repo_root(repo)?;
+        let config_dir = prepare_project_config_dir(&root, !over.is_empty())?;
+        let Some(config_dir) = config_dir else {
             return Ok(());
+        };
+        let path = config_dir.join("config.toml");
+        let target = match fs::symlink_metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(config_error("inspect", &path, error)),
+        };
+        if let Some(metadata) = &target {
+            validate_project_target(&root, &path, metadata)?;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Config(format!("mkdir {}: {e}", parent.display())))?;
+        if over.is_empty() {
+            if target.is_some() {
+                fs::remove_file(&path).map_err(|error| config_error("remove", &path, error))?;
+            }
+            return Ok(());
         }
         let body = toml::to_string_pretty(over)
             .map_err(|e| Error::Config(format!("serialize project config: {e}")))?;
-        std::fs::write(&path, body)
-            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
-        Ok(())
+        if body.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(Error::Config(format!(
+                "project config exceeds {MAX_CONFIG_BYTES} bytes"
+            )));
+        }
+        atomic_write_project_config(&root, &config_dir, &path, body.as_bytes())
     }
+}
+
+fn config_error(action: &str, path: &Path, error: std::io::Error) -> Error {
+    Error::Config(format!("{action} {}: {error}", path.display()))
+}
+
+fn canonical_repo_root(repo: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(repo).map_err(|error| config_error("canonicalize", repo, error))?;
+    let metadata = fs::metadata(&root).map_err(|error| config_error("inspect", &root, error))?;
+    if !metadata.is_dir() {
+        return Err(Error::Config(format!(
+            "project root is not a directory: {}",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+fn existing_project_config_dir(root: &Path) -> Result<Option<PathBuf>> {
+    let path = root.join(".rtrt");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(config_error("inspect", &path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Config(format!(
+            "project config directory must be a real directory: {}",
+            path.display()
+        )));
+    }
+    validate_same_owner(root, &path, &metadata)?;
+    let canonical =
+        fs::canonicalize(&path).map_err(|error| config_error("canonicalize", &path, error))?;
+    if canonical.parent() != Some(root) {
+        return Err(Error::Config(format!(
+            "project config directory escapes repository: {}",
+            path.display()
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+fn prepare_project_config_dir(root: &Path, create: bool) -> Result<Option<PathBuf>> {
+    if let Some(path) = existing_project_config_dir(root)? {
+        return Ok(Some(path));
+    }
+    if !create {
+        return Ok(None);
+    }
+    let path = root.join(".rtrt");
+    create_private_directory(&path)?;
+    existing_project_config_dir(root)
+}
+
+fn validate_project_target(root: &Path, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "project config must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    validate_same_owner(root, path, metadata)
+}
+
+#[cfg(unix)]
+fn validate_same_owner(root: &Path, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root_metadata = fs::metadata(root).map_err(|error| config_error("inspect", root, error))?;
+    if metadata.uid() != root_metadata.uid() {
+        return Err(Error::Config(format!(
+            "project config path has foreign ownership: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_owner(_root: &Path, _path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+fn read_bounded_config(path: &Path, reject_symlink: bool) -> Result<String> {
+    let expected = if reject_symlink {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| config_error("inspect", path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Config(format!(
+                "config must be a regular non-symlink file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_CONFIG_BYTES {
+            return Err(Error::Config(format!(
+                "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+                path.display()
+            )));
+        }
+        Some(metadata)
+    } else {
+        None
+    };
+    let file = File::open(path).map_err(|error| config_error("read", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| config_error("inspect", path, error))?;
+    if expected
+        .as_ref()
+        .is_some_and(|expected| !metadata_same_file(expected, &metadata))
+    {
+        return Err(Error::Config(format!(
+            "config changed while opening: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(Error::Config(format!(
+            "config is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(Error::Config(format!(
+            "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| config_error("read", path, error))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(Error::Config(format!(
+            "config exceeds {MAX_CONFIG_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| Error::Config(format!("read {}: {error}", path.display())))
+}
+
+#[cfg(unix)]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+// True file identity on Windows needs `volume_serial_number`/`file_index`, which
+// are still unstable and only populated for handle-derived metadata. This
+// compares every stable attribute instead: it detects the swap-and-replace this
+// guards against, but two distinct files sharing all of them would compare
+// equal, so it is a tamper check rather than an identity check.
+#[cfg(windows)]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
+        && left.file_type() == right.file_type()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
+}
+
+struct TempConfig {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for TempConfig {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn atomic_write_project_config(
+    root: &Path,
+    config_dir: &Path,
+    destination: &Path,
+    body: &[u8],
+) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..32 {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = config_dir.join(format!(
+            ".config.toml.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(mut file) => {
+                let mut temp = TempConfig {
+                    path: temp_path,
+                    armed: true,
+                };
+                file.write_all(body)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| config_error("write", &temp.path, error))?;
+                let written_metadata = file
+                    .metadata()
+                    .map_err(|error| config_error("inspect", &temp.path, error))?;
+                drop(file);
+                let checked_dir = existing_project_config_dir(root)?.ok_or_else(|| {
+                    Error::Config("project config directory disappeared during write".to_string())
+                })?;
+                if checked_dir != config_dir {
+                    return Err(Error::Config(
+                        "project config directory changed during write".to_string(),
+                    ));
+                }
+                if let Ok(metadata) = fs::symlink_metadata(destination) {
+                    validate_project_target(root, destination, &metadata)?;
+                }
+                let temp_metadata = fs::symlink_metadata(&temp.path)
+                    .map_err(|error| config_error("inspect", &temp.path, error))?;
+                if temp_metadata.file_type().is_symlink()
+                    || !temp_metadata.is_file()
+                    || !metadata_same_file(&written_metadata, &temp_metadata)
+                {
+                    return Err(Error::Config(
+                        "temporary project config changed during write".to_string(),
+                    ));
+                }
+                fs::rename(&temp.path, destination)
+                    .map_err(|error| config_error("replace", destination, error))?;
+                temp.armed = false;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(config_error("create", &temp_path, error)),
+        }
+    }
+    Err(config_error(
+        "create temporary config",
+        config_dir,
+        last_error.unwrap_or_else(|| std::io::Error::other("name collision")),
+    ))
+}
+
+// The directory is born private. Creating it world-readable and narrowing it
+// afterwards would expose a window in which another process can enter it or
+// have the later chmod redirected onto a directory it swapped in.
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| config_error("mkdir", path, error))
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir(path).map_err(|error| config_error("mkdir", path, error))
 }
 
 /// Walk up from `start` to the enclosing repo root — the first ancestor with a
@@ -1739,728 +1188,6 @@ mod tests {
     }
 
     #[test]
-    fn team_defaults_are_backward_compatible_and_ordered() {
-        let team = Config::from_toml_str("").unwrap().team;
-        assert!(!team.enabled);
-        assert_eq!(team.manager_provider, "ollama");
-        assert_eq!(team.manager_model, "granite4:350m");
-        assert_eq!(
-            team.leader_order,
-            ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
-        );
-        assert_eq!(
-            team.members
-                .iter()
-                .map(|member| (
-                    member.name.as_str(),
-                    member.target.as_str(),
-                    member.model.as_deref(),
-                    member.mode,
-                    member.roles.iter().map(String::as_str).collect::<Vec<_>>()
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "opus",
-                    "claude",
-                    Some("opus"),
-                    TeamMode::Cli,
-                    vec!["lead", "architecture", "integration"]
-                ),
-                (
-                    "gpt-sol",
-                    "opencode",
-                    Some("openai/gpt-5.6-sol"),
-                    TeamMode::Cli,
-                    vec!["deputy", "hard-implementation", "debugging"]
-                ),
-                (
-                    "glm-go",
-                    "opencode",
-                    Some("opencode-go/glm-5.2"),
-                    TeamMode::Cli,
-                    vec!["routine", "boilerplate", "bulk-edit"]
-                ),
-                (
-                    "glm-cloud",
-                    "opencode",
-                    Some("ollama/glm-5.2:cloud"),
-                    TeamMode::Cli,
-                    vec!["routine", "overflow", "bulk-edit"]
-                ),
-                (
-                    "sonnet",
-                    "claude",
-                    Some("sonnet"),
-                    TeamMode::Cli,
-                    vec!["general-implementation", "tests", "review"]
-                ),
-                (
-                    "kimi-cloud",
-                    "opencode",
-                    Some("ollama/kimi-k2.7-code:cloud"),
-                    TeamMode::Cli,
-                    vec!["parallel-implementation", "research", "tests"]
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn partial_team_config_keeps_field_defaults() {
-        let team = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            manager_model = "qwen3:8b"
-            "#,
-        )
-        .unwrap()
-        .team;
-
-        assert!(team.enabled);
-        assert_eq!(team.manager_provider, "ollama");
-        assert_eq!(team.manager_model, "qwen3:8b");
-        assert_eq!(team.leader_order, default_team_leader_order());
-        assert_eq!(team.members, default_team_members());
-    }
-
-    #[test]
-    fn team_manager_base_url_roundtrips() {
-        let config =
-            Config::from_toml_str("[team]\nmanager_base_url = \"https://manager.example/v1\"\n")
-                .unwrap();
-
-        assert_eq!(
-            config.team.manager_base_url.as_deref(),
-            Some("https://manager.example/v1")
-        );
-        let roundtripped = Config::from_toml_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(
-            roundtripped.team.manager_base_url,
-            config.team.manager_base_url
-        );
-    }
-
-    #[test]
-    fn customized_team_roundtrip_preserves_member_and_leader_order() {
-        let config = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            manager_provider = "openai"
-            manager_model = "gpt-5"
-            leader_order = ["second", "first"]
-
-            [[team.members]]
-            name = "first"
-            target = "opencode"
-            model = "first"
-            mode = "api"
-            roles = ["worker"]
-
-            [[team.members]]
-            name = "second"
-            target = "claude"
-            mode = "auto"
-            roles = ["lead", "review"]
-            "#,
-        )
-        .unwrap();
-
-        let serialized = toml::to_string(&config).unwrap();
-        let roundtripped = Config::from_toml_str(&serialized).unwrap();
-        assert_eq!(roundtripped.team, config.team);
-        assert_eq!(roundtripped.team.members[0].name, "first");
-        assert_eq!(roundtripped.team.members[1].name, "second");
-        assert_eq!(roundtripped.team.leader_order, ["second", "first"]);
-    }
-
-    #[test]
-    fn workers_remain_available_outside_leader_order() {
-        let team = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            leader_order = ["opus"]
-            "#,
-        )
-        .unwrap()
-        .team;
-
-        assert_eq!(team.leader_order, ["opus"]);
-        assert!(team.members.iter().any(|member| member.name == "glm-cloud"));
-        assert!(!team.leader_order.iter().any(|name| name == "glm-cloud"));
-    }
-
-    #[test]
-    fn invalid_team_values_and_duplicates_are_rejected() {
-        let enabled_team = || TeamConfig {
-            enabled: true,
-            ..TeamConfig::default()
-        };
-        for invalid in [
-            "[team]\nmanager_provider = \" \"",
-            "[team]\nmanager_model = \"\"",
-            "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"shell\", roles = [\"lead\"] }]",
-            "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"cli\", roles = [\"lead\"], command = \"rm\" }]",
-        ] {
-            assert!(
-                Config::from_toml_str(invalid).is_err(),
-                "accepted {invalid}"
-            );
-        }
-
-        let empty_leaders = TeamConfig {
-            enabled: true,
-            leader_order: Vec::new(),
-            ..TeamConfig::default()
-        };
-        assert!(empty_leaders.validate().is_err());
-
-        let empty_members = TeamConfig {
-            enabled: true,
-            members: Vec::new(),
-            ..TeamConfig::default()
-        };
-        assert!(empty_members.validate().is_err());
-
-        let mut duplicate_name = enabled_team();
-        let mut member = duplicate_name.members[0].clone();
-        member.target = "other".to_string();
-        duplicate_name.members.push(member);
-        assert!(duplicate_name.validate().is_err());
-
-        let mut duplicate_target = enabled_team();
-        let mut member = duplicate_target.members[0].clone();
-        member.name = "other".to_string();
-        duplicate_target.members.push(member);
-        assert!(duplicate_target.validate().is_err());
-
-        let mut duplicate_leader = enabled_team();
-        duplicate_leader.leader_order.push("opus".to_string());
-        assert!(duplicate_leader.validate().is_err());
-
-        let mut unknown_leader = enabled_team();
-        unknown_leader.leader_order.push("missing".to_string());
-        assert!(unknown_leader.validate().is_err());
-
-        let mut empty_roles = enabled_team();
-        empty_roles.members[0].roles.clear();
-        assert!(empty_roles.validate().is_err());
-
-        let mut blank_role = enabled_team();
-        blank_role.members[0].roles[0] = " ".to_string();
-        assert!(blank_role.validate().is_err());
-
-        let mut blank_name = enabled_team();
-        blank_name.members[0].name = " ".to_string();
-        assert!(blank_name.validate().is_err());
-
-        let mut blank_target = enabled_team();
-        blank_target.members[0].target.clear();
-        assert!(blank_target.validate().is_err());
-
-        let mut blank_model = enabled_team();
-        blank_model.members[0].model = Some(String::new());
-        assert!(blank_model.validate().is_err());
-
-        let mut nul = enabled_team();
-        nul.members[0].target.push('\0');
-        assert!(nul.validate().is_err());
-    }
-
-    /// A `[team]` section exactly as it was written before lanes existed —
-    /// the shape sitting in `~/.rtrt/config.toml` today.
-    const LEGACY_TEAM_TOML: &str = r#"
-        [team]
-        enabled = true
-        manager_provider = "ollama"
-        manager_model = "granite4.1:3b"
-        manager_base_url = "http://127.0.0.1:11434/v1"
-        leader_order = ["opus", "gpt-sol", "glm-go", "sonnet", "kimi-cloud"]
-
-        [[team.members]]
-        name = "opus"
-        target = "claude"
-        model = "opus"
-        mode = "cli"
-        roles = ["lead", "architecture", "integration"]
-
-        [[team.members]]
-        name = "gpt-sol"
-        target = "opencode"
-        model = "openai/gpt-5.6-sol"
-        mode = "cli"
-        roles = ["deputy", "hard-implementation", "debugging"]
-
-        [[team.members]]
-        name = "glm-go"
-        target = "opencode"
-        model = "opencode-go/glm-5.2"
-        mode = "cli"
-        roles = ["routine", "boilerplate", "bulk-edit"]
-
-        [[team.members]]
-        name = "glm-cloud"
-        target = "opencode"
-        model = "ollama/glm-5.2:cloud"
-        mode = "cli"
-        roles = ["routine", "overflow", "bulk-edit"]
-
-        [[team.members]]
-        name = "sonnet"
-        target = "claude"
-        model = "sonnet"
-        mode = "cli"
-        roles = ["general-implementation", "tests", "review"]
-
-        [[team.members]]
-        name = "kimi-cloud"
-        target = "opencode"
-        model = "ollama/kimi-k2.7-code:cloud"
-        mode = "cli"
-        roles = ["parallel-implementation", "research", "tests"]
-    "#;
-
-    #[test]
-    fn legacy_team_toml_round_trips_without_emitting_lane_keys() {
-        let team = Config::from_toml_str(LEGACY_TEAM_TOML).unwrap().team;
-        let serialized = toml::to_string(&team).unwrap();
-
-        // Nothing a lane-less config never wrote may appear on the way out,
-        // otherwise loading and saving would rewrite everyone's config file.
-        for key in [
-            "tiers",
-            "policy",
-            "logical",
-            "sibling",
-            "fallback",
-            "allow_impl",
-            "flags",
-        ] {
-            assert!(
-                !serialized.contains(key),
-                "{key} leaked into a legacy [team] section:\n{serialized}"
-            );
-        }
-
-        let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed, team);
-        assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
-        // The lane fields are present in memory, at their defaults.
-        assert!(team.members.iter().all(|member| member.allow_impl));
-        assert!(team.members.iter().all(|member| member.fallback.is_empty()));
-        assert!(team.tiers.is_empty());
-        assert!(team.policy.is_default());
-        team.validate().unwrap();
-    }
-
-    #[test]
-    fn shipped_tier_ladder_is_ordered_and_validates() {
-        let team = TeamConfig {
-            enabled: true,
-            ..TeamConfig::default()
-        };
-        team.validate().unwrap();
-
-        let tiers = team.effective_tiers();
-        assert_eq!(
-            tiers.names().collect::<Vec<_>>(),
-            ["mechanical", "routine", "multifile", "design", "review"]
-        );
-        assert_eq!(tiers.get("mechanical").unwrap(), ["glm-go", "glm-cloud"]);
-        assert_eq!(tiers.get("design").unwrap(), ["opus", "gpt-sol"]);
-        assert!(team.is_design_only_tier("design"));
-        assert!(!team.is_design_only_tier("review"));
-        assert_eq!(team.effective_default_tier().as_deref(), Some("mechanical"));
-    }
-
-    #[test]
-    fn configured_tiers_replace_the_shipped_ladder_instead_of_merging() {
-        let team = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            leader_order = ["opus"]
-
-            [team.tiers]
-            quick = ["glm-go"]
-            deep = ["opus", "gpt-sol"]
-
-            [team.policy]
-            design_only_tiers = ["deep"]
-            "#,
-        )
-        .unwrap()
-        .team;
-
-        let tiers = team.effective_tiers();
-        // Declaration order, not alphabetical, and none of the shipped rungs.
-        assert_eq!(tiers.names().collect::<Vec<_>>(), ["quick", "deep"]);
-        for shipped in ["mechanical", "routine", "multifile", "review"] {
-            assert!(!tiers.contains(shipped), "{shipped} survived the override");
-        }
-        assert_eq!(team.effective_default_tier().as_deref(), Some("quick"));
-        assert!(team.is_design_only_tier("deep"));
-        assert!(!team.is_design_only_tier("quick"));
-    }
-
-    #[test]
-    fn member_tier_declarations_build_a_ladder_without_a_tiers_table() {
-        let team = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            leader_order = ["lead"]
-
-            [[team.members]]
-            name = "lead"
-            target = "claude"
-            mode = "cli"
-            roles = ["lead"]
-            tier = "solo"
-
-            [[team.members]]
-            name = "helper"
-            target = "opencode"
-            mode = "cli"
-            roles = ["helper"]
-            tier = "solo"
-            "#,
-        )
-        .unwrap()
-        .team;
-
-        // The shipped ladder names lanes this roster does not have, so it is
-        // dropped rather than inherited; the members' own declarations stand.
-        let tiers = team.effective_tiers();
-        assert_eq!(tiers.names().collect::<Vec<_>>(), ["solo"]);
-        assert_eq!(tiers.get("solo").unwrap(), ["lead", "helper"]);
-        team.validate().unwrap();
-    }
-
-    #[test]
-    fn unknown_and_looping_fallbacks_are_rejected() {
-        let enabled_team = || TeamConfig {
-            enabled: true,
-            ..TeamConfig::default()
-        };
-
-        let mut unknown = enabled_team();
-        unknown.members[0].fallback = vec!["missing".to_string()];
-        assert_eq!(
-            unknown.validate().unwrap_err().to_string(),
-            "config error: team.members[0].fallback[0] references unknown member: missing"
-        );
-
-        let mut itself = enabled_team();
-        itself.members[0].fallback = vec!["opus".to_string()];
-        assert!(
-            itself
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("fallback[0] must not reference itself: opus")
-        );
-
-        let mut repeated = enabled_team();
-        repeated.members[0].fallback = vec!["sonnet".to_string(), "sonnet".to_string()];
-        assert!(
-            repeated
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("team.members[0].fallback lists sonnet twice")
-        );
-
-        // Shipped chain is opus -> gpt-sol -> sonnet -> kimi-cloud; close it.
-        let mut cycle = enabled_team();
-        let last = cycle.members.len() - 1;
-        assert_eq!(cycle.members[last].name, "kimi-cloud");
-        cycle.members[last].fallback = vec!["opus".to_string()];
-        assert_eq!(
-            cycle.validate().unwrap_err().to_string(),
-            "config error: team fallback chain forms a cycle: \
-             opus -> gpt-sol -> sonnet -> kimi-cloud -> opus"
-        );
-    }
-
-    #[test]
-    fn siblings_must_be_one_logical_model_on_two_pools() {
-        let enabled_team = || TeamConfig {
-            enabled: true,
-            ..TeamConfig::default()
-        };
-        let glm_go = 2;
-        assert_eq!(enabled_team().members[glm_go].name, "glm-go");
-
-        let mut crossed = enabled_team();
-        crossed.members[glm_go].logical = Some("kimi-k2.7-code".to_string());
-        assert!(
-            crossed
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("sibling glm-cloud serves logical model glm-5.2, not kimi-k2.7-code"),
-        );
-
-        let mut undeclared = enabled_team();
-        undeclared.members[glm_go].logical = None;
-        assert!(
-            undeclared
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("requires both members to declare `logical`")
-        );
-
-        let mut unknown = enabled_team();
-        unknown.members[glm_go].sibling = Some("missing".to_string());
-        assert!(
-            unknown
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("sibling references unknown member: missing")
-        );
-
-        let mut itself = enabled_team();
-        itself.members[glm_go].sibling = Some("glm-go".to_string());
-        assert!(
-            itself
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("sibling must not reference itself")
-        );
-
-        // The shipped pair resolves both ways.
-        let team = enabled_team();
-        assert_eq!(team.sibling_of("glm-go").unwrap().name, "glm-cloud");
-        assert_eq!(team.sibling_of("glm-cloud").unwrap().name, "glm-go");
-        assert!(team.sibling_of("sonnet").is_none());
-    }
-
-    #[test]
-    fn tier_rosters_must_name_real_members_and_real_tiers() {
-        let team = |body: &str| {
-            Config::from_toml_str(&format!(
-                "[team]\nenabled = true\nleader_order = [\"opus\"]\n{body}"
-            ))
-        };
-
-        assert!(
-            team("[team.tiers]\nquick = [\"nope\"]\n")
-                .unwrap_err()
-                .to_string()
-                .contains("team.tiers.quick references unknown member: nope")
-        );
-        assert!(
-            team("[team.tiers]\nquick = []\n")
-                .unwrap_err()
-                .to_string()
-                .contains("team.tiers.quick must list at least one member")
-        );
-        assert!(
-            team("[team.tiers]\nquick = [\"sonnet\", \"sonnet\"]\n")
-                .unwrap_err()
-                .to_string()
-                .contains("team.tiers.quick lists sonnet twice")
-        );
-        assert!(
-            team("[team.policy]\ndesign_only_tiers = [\"nope\"]\n")
-                .unwrap_err()
-                .to_string()
-                .contains("team.policy.design_only_tiers references unknown tier: nope")
-        );
-        assert!(
-            team("[team.policy]\ndefault_tier = \"nope\"\n")
-                .unwrap_err()
-                .to_string()
-                .contains("team.policy.default_tier references unknown tier: nope")
-        );
-    }
-
-    #[test]
-    fn design_only_member_cannot_sit_in_an_implementation_tier() {
-        let error = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            leader_order = ["opus"]
-
-            [team.tiers]
-            deep = ["opus", "gpt-sol"]
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-
-        // `opus` ships with allow_impl = false, and the override renamed the
-        // design rung without saying the new one is design-only.
-        assert!(
-            error.contains(
-                "team.tiers.deep places design-only member opus in an implementation tier"
-            ),
-            "unexpected error: {error}"
-        );
-        assert!(error.contains("team.policy.design_only_tiers"), "{error}");
-    }
-
-    #[test]
-    fn policy_knobs_default_and_derive_from_the_roster() {
-        let team = TeamConfig::default();
-        assert_eq!(team.policy.max_retries, DEFAULT_TEAM_MAX_RETRIES);
-        assert!(team.policy.redo_on_fallback);
-        assert!(team.policy.prefer_sibling_on_quota);
-        assert!(team.policy.record_provenance);
-        assert!(team.policy.max_fallback_depth.is_none());
-        // Derived from the roster, never a flat literal: a walk visits each
-        // lane at most once.
-        assert_eq!(team.effective_max_fallback_depth(), team.members.len());
-
-        let pinned = Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-
-            [team.policy]
-            max_retries = 0
-            redo_on_fallback = false
-            prefer_sibling_on_quota = false
-            max_fallback_depth = 1
-            "#,
-        )
-        .unwrap()
-        .team;
-        assert_eq!(pinned.policy.max_retries, 0);
-        assert!(!pinned.policy.redo_on_fallback);
-        assert!(!pinned.policy.prefer_sibling_on_quota);
-        assert!(pinned.policy.record_provenance);
-        assert_eq!(pinned.effective_max_fallback_depth(), 1);
-        assert!(!pinned.policy.is_default());
-    }
-
-    #[test]
-    fn fallback_chain_is_breadth_first_and_bounded() {
-        let team = TeamConfig::default();
-        assert_eq!(
-            team.fallback_chain("opus"),
-            ["gpt-sol", "sonnet", "kimi-cloud"]
-        );
-        assert!(team.fallback_chain("kimi-cloud").is_empty());
-        assert!(team.fallback_chain("missing").is_empty());
-
-        let mut capped = TeamConfig::default();
-        capped.policy.max_fallback_depth = Some(2);
-        assert_eq!(capped.fallback_chain("opus"), ["gpt-sol", "sonnet"]);
-
-        // Every direct replacement is offered before a replacement's own.
-        let mut branching = TeamConfig::default();
-        branching.members[0].fallback = vec!["glm-go".to_string(), "sonnet".to_string()];
-        assert_eq!(
-            branching.fallback_chain("opus"),
-            ["glm-go", "sonnet", "kimi-cloud"]
-        );
-    }
-
-    #[test]
-    fn lane_fields_round_trip_through_toml() {
-        let source = r#"
-            [team]
-            enabled = true
-            leader_order = ["primary"]
-
-            [team.tiers]
-            mechanical = ["secondary"]
-            deep = ["primary"]
-
-            [team.policy]
-            max_retries = 3
-            design_only_tiers = ["deep"]
-
-            [[team.members]]
-            name = "primary"
-            target = "claude"
-            model = "opus"
-            mode = "cli"
-            roles = ["lead"]
-            logical = "opus"
-            allow_impl = false
-            fallback = ["secondary"]
-
-            [[team.members]]
-            name = "secondary"
-            target = "opencode"
-            model = "opencode-go/glm-5.2"
-            mode = "cli"
-            roles = ["routine"]
-            logical = "glm-5.2"
-
-            [team.members.flags]
-            permission-mode = "acceptEdits"
-            allowed-tools = "Read,Edit"
-        "#;
-
-        let team = Config::from_toml_str(source).unwrap().team;
-        assert!(!team.members[0].allow_impl);
-        assert!(team.members[1].allow_impl);
-        assert_eq!(team.members[1].flag("permission-mode"), Some("acceptEdits"));
-        assert_eq!(team.members[1].flag("allowed-tools"), Some("Read,Edit"));
-        assert_eq!(team.members[1].flag("nope"), None);
-        assert_eq!(team.members[0].fallback, ["secondary"]);
-        assert_eq!(
-            team.effective_tiers().names().collect::<Vec<_>>(),
-            ["mechanical", "deep"]
-        );
-
-        let serialized = toml::to_string(&team).unwrap();
-        assert!(serialized.contains("allow_impl = false"));
-        // The implementing lane keeps the default out of the file.
-        assert_eq!(serialized.matches("allow_impl").count(), 1);
-        let reparsed: TeamConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed, team);
-        assert_eq!(toml::to_string(&reparsed).unwrap(), serialized);
-        reparsed.validate().unwrap();
-    }
-
-    #[test]
-    fn unknown_lane_keys_are_still_rejected() {
-        assert!(
-            Config::from_toml_str(
-                "[team]\nmembers = [{ name = \"x\", target = \"claude\", mode = \"cli\", \
-                 roles = [\"lead\"], laneish = \"typo\" }]"
-            )
-            .is_err()
-        );
-        assert!(Config::from_toml_str("[team]\n[team.policy]\nmax_retry = 1\n").is_err());
-    }
-
-    #[test]
-    fn disabled_team_allows_incomplete_topology() {
-        let config =
-            Config::from_toml_str("[team]\nenabled = false\nleader_order = []\nmembers = []\n")
-                .unwrap();
-
-        assert!(!config.team.enabled);
-        assert!(config.team.leader_order.is_empty());
-        assert!(config.team.members.is_empty());
-    }
-
-    #[test]
-    fn default_team_is_omitted_from_serialization() {
-        let serialized = toml::to_string(&Config::default()).unwrap();
-        let value: toml::Value = toml::from_str(&serialized).unwrap();
-        assert!(value.get("team").is_none());
-
-        let mut config = Config::default();
-        config.team.manager_model = "custom".to_string();
-        let value: toml::Value = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
-        assert!(value.get("team").is_some());
-    }
-
-    #[test]
     fn embeddings_auto_defaults_and_old_configs_load() {
         // Empty config: auto-embed daemon knobs take their defaults.
         let c = Config::from_toml_str("").unwrap();
@@ -2509,6 +1236,7 @@ mod tests {
             enabled = true
             model = "gemma3:4b"
             base_url = "http://127.0.0.1:11434/v1"
+            provider = "ollama"
             min_chars = 256
             "#,
         )
@@ -2520,10 +1248,70 @@ mod tests {
             Some("http://127.0.0.1:11434/v1")
         );
         assert_eq!(c.auto_compress.min_chars, 256);
+        assert_eq!(c.auto_compress.provider.as_deref(), Some("ollama"));
+        assert_eq!(
+            c.auto_compress
+                .effective_provider("https://example.test/v1"),
+            "ollama"
+        );
         // unset field keeps its default
         assert_eq!(c.auto_compress.age_sec, 3600);
         // unrelated section still defaults
         assert!(c.capture.enabled);
+    }
+
+    #[test]
+    fn compatible_provider_identity_is_only_inferred_for_default_ollama_url() {
+        let config = AutoCompressConfig::default();
+        for (url, expected) in [
+            ("http://127.0.0.1:11434/v1", "ollama"),
+            ("http://localhost:11434", "ollama"),
+            ("http://[::1]:11434/v1/", "ollama"),
+            ("http://192.168.1.2:11434/v1", "openai-compat"),
+            ("http://127.0.0.1:8080/v1", "openai-compat"),
+            ("https://azure.example/openai/v1", "openai-compat"),
+        ] {
+            assert_eq!(config.effective_provider(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn provider_names_normalize_case_and_explicit_aliases() {
+        for (input, expected) in [
+            (" OpenAI ", "openai"),
+            ("OPENAI-COMPATIBLE", "openai-compat"),
+            ("openai_compatible", "openai-compat"),
+            ("LMStudio", "lm-studio"),
+            ("lms", "lm-studio"),
+            ("llama_cpp", "llama.cpp"),
+            ("llama", "llama.cpp"),
+            ("vLLM", "vllm"),
+            ("Azure-West", "azure-west"),
+        ] {
+            assert_eq!(normalize_provider_id(input), expected, "{input}");
+        }
+
+        let mut providers = ProvidersConfig::default();
+        providers.enabled.insert("OpenAI".to_string(), false);
+        assert_eq!(providers.enabled_override("openai"), Some(false));
+    }
+
+    #[test]
+    fn limits_targets_are_case_insensitive_without_becoming_provider_identity() {
+        let mut limits = LimitsConfig::default();
+        limits.targets.insert(
+            "OpenCode".to_string(),
+            TargetLimit {
+                daily_tokens: Some(10),
+                ..TargetLimit::default()
+            },
+        );
+        assert_eq!(
+            limits
+                .target("opencode")
+                .and_then(|limit| limit.daily_tokens),
+            Some(10)
+        );
     }
 
     #[test]
@@ -2796,215 +1584,103 @@ mod tests {
 
     /// A global config whose roster shares no lane name with the project one
     /// below, so "replaced" and "merged" cannot be confused.
-    fn global_with_roster() -> Config {
-        Config::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            manager_provider = "global-manager"
-            manager_model = "global-model"
-            leader_order = ["global-lane"]
-
-            [[team.members]]
-            name = "global-lane"
-            target = "global-target"
-            mode = "cli"
-            roles = ["lead"]
-
-            [team.tiers]
-            global-rung = ["global-lane"]
-
-            [failover]
-            quota = ["global marker"]
-            transient_retries = 3
-            "#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn an_absent_orchestration_override_leaves_the_global_untouched() {
-        let base = global_with_roster();
-        let mut effective = base.clone();
-        effective.apply_project_overrides(&ProjectConfig::default());
-        assert_eq!(effective.team, base.team);
-        assert_eq!(effective.failover, base.failover);
-        // …and the empty override is never worth a file.
-        assert!(ProjectConfig::default().is_empty());
-    }
-
-    #[test]
-    fn a_project_roster_replaces_the_global_section_wholesale() {
-        let mut base = global_with_roster();
-        let over = ProjectConfig::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            manager_provider = "project-manager"
-            manager_model = "project-model"
-            leader_order = ["project-lane"]
-
-            [[team.members]]
-            name = "project-lane"
-            target = "project-target"
-            mode = "cli"
-            roles = ["lead"]
-
-            [failover]
-            fatal = ["project marker"]
-            "#,
-        )
-        .unwrap();
-        assert!(!over.is_empty());
-        base.apply_project_overrides(&over);
-
-        // Replacement, not merge: nothing of the global roster survives — not
-        // its lanes, not its leaders, not its ladder, not its manager.
-        assert_eq!(base.team.manager_provider, "project-manager");
-        assert_eq!(base.team.leader_order, ["project-lane"]);
-        assert_eq!(
-            base.team
-                .members
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect::<Vec<_>>(),
-            ["project-lane"]
-        );
-        assert!(base.team.tiers.is_empty(), "the global ladder is dropped");
-        // Same for the failure policy: the global `quota` marker and retry
-        // count are gone rather than blended with the project's `fatal` list.
-        assert_eq!(base.failover.fatal, ["project marker"]);
-        assert!(base.failover.quota.is_empty());
-        assert_eq!(base.failover.transient_retries, None);
-
-        // The effective roster is exactly the validated override.
-        base.team.validate().unwrap();
-    }
-
-    #[test]
-    fn a_project_roster_that_cannot_be_valid_is_rejected_by_the_validator() {
-        // A ladder rung naming a lane this roster does not define — the exact
-        // shape a field-level merge could have synthesised silently.
-        let err = ProjectConfig::from_toml_str(
-            r#"
-            [team]
-            enabled = true
-            leader_order = ["kept"]
-
-            [[team.members]]
-            name = "kept"
-            target = "one"
-            mode = "cli"
-            roles = ["lead"]
-
-            [team.tiers]
-            rung = ["dropped"]
-            "#,
-        )
-        .expect_err("a tier naming an unknown lane must not parse");
-        let message = err.to_string();
-        // The validator's own message, forwarded verbatim.
-        assert!(
-            message.contains("dropped") && message.contains("unknown member"),
-            "expected the validator's message, got: {message}"
-        );
-    }
-
     /// A minimal usable lane: identity plus the one role the validator insists
     /// every lane declares.
-    fn lane(name: &str) -> TeamMember {
-        TeamMember {
-            roles: vec!["work".to_string()],
-            ..TeamMember::new(name, "some-target", TeamMode::Cli)
-        }
+    #[test]
+    fn project_and_global_config_reads_reject_oversize_before_parsing() {
+        let repo = scratch_dir("rtrt-core-project-oversize");
+        let config_dir = repo.join(".rtrt");
+        std::fs::create_dir(&config_dir).unwrap();
+        let project_path = config_dir.join("config.toml");
+        let project_file = std::fs::File::create(&project_path).unwrap();
+        project_file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let error = Config::load_project(&repo).unwrap_err().to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+
+        let global_path = repo.join("global.toml");
+        let global_file = std::fs::File::create(&global_path).unwrap();
+        global_file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let error = read_bounded_config(&global_path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
-    fn save_project_rejects_an_invalid_roster_before_writing() {
-        let repo = scratch_dir("rtrt-core-project-team");
-        let over = ProjectConfig {
-            team: Some(TeamConfig {
-                enabled: true,
-                leader_order: vec!["absent".to_string()],
-                members: vec![lane("present")],
-                ..TeamConfig::default()
-            }),
-            ..ProjectConfig::default()
-        };
-        let err = Config::save_project(&repo, &over).expect_err("invalid roster must not persist");
-        assert!(
-            err.to_string().contains("absent"),
-            "expected the validator's message, got: {err}"
-        );
-        assert!(
-            !Config::project_config_path(&repo).exists(),
-            "a rejected override must not create the project config file"
-        );
-        std::fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn an_orchestration_override_round_trips_and_clears_without_touching_its_neighbours() {
-        let repo = scratch_dir("rtrt-core-project-orch");
-
-        // A project that already customises something else. Written first so
-        // the later orchestration edits have a neighbour to preserve.
-        let mut over = ProjectConfig {
+    fn oversized_save_preserves_existing_project_config_atomically() {
+        let repo = scratch_dir("rtrt-core-project-atomic");
+        let initial = ProjectConfig {
             output_level: Some("lite".to_string()),
             ..ProjectConfig::default()
         };
-        Config::save_project(&repo, &over).unwrap();
-        let raw = std::fs::read_to_string(Config::project_config_path(&repo)).unwrap();
-        assert!(
-            !raw.contains("team") && !raw.contains("failover"),
-            "an unset orchestration override must add no keys, got:\n{raw}"
-        );
-        // Round-trip: reading and rewriting an existing file is a no-op.
-        let reread = Config::load_project(&repo).unwrap();
-        assert!(reread.team.is_none() && reread.failover.is_none());
-        Config::save_project(&repo, &reread).unwrap();
+        Config::save_project(&repo, &initial).unwrap();
+        let path = Config::project_config_path(&repo);
+        let before = std::fs::read(&path).unwrap();
+
+        let oversized = ProjectConfig {
+            output_level: Some("x".repeat(MAX_CONFIG_BYTES as usize)),
+            ..ProjectConfig::default()
+        };
+        let error = Config::save_project(&repo, &oversized)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds 1048576 bytes"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
-            std::fs::read_to_string(Config::project_config_path(&repo)).unwrap(),
-            raw
+            std::fs::read_dir(repo.join(".rtrt")).unwrap().count(),
+            1,
+            "failed save left a sibling temporary file"
         );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
 
-        // Pin both orchestration sections for this project.
-        over.team = Some(TeamConfig {
-            enabled: true,
-            leader_order: vec!["only".to_string()],
-            members: vec![lane("only")],
-            ..TeamConfig::default()
-        });
-        over.failover = Some(FailoverConfig {
-            fatal: vec!["project marker".to_string()],
-            ..FailoverConfig::default()
-        });
-        Config::save_project(&repo, &over).unwrap();
-        let stored = Config::load_project(&repo).unwrap();
-        assert_eq!(stored.team.as_ref().unwrap().leader_order, ["only"]);
+    #[cfg(unix)]
+    #[test]
+    fn project_config_rejects_symlink_traversal_and_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let repo = scratch_dir("rtrt-core-project-symlink");
+        let outside = scratch_dir("rtrt-core-project-outside");
+        symlink(&outside, repo.join(".rtrt")).unwrap();
+        let over = ProjectConfig {
+            output_level: Some("full".to_string()),
+            ..ProjectConfig::default()
+        };
+        assert!(Config::save_project(&repo, &over).is_err());
+        assert!(Config::load_project(&repo).is_err());
+        assert!(!outside.join("config.toml").exists());
+        std::fs::remove_file(repo.join(".rtrt")).unwrap();
+
+        std::fs::create_dir(repo.join(".rtrt")).unwrap();
+        let foreign = outside.join("foreign.toml");
+        std::fs::write(&foreign, "output_level = \"lite\"\n").unwrap();
+        let path = Config::project_config_path(&repo);
+        symlink(&foreign, &path).unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &over).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
         assert_eq!(
-            stored.failover.as_ref().unwrap().fatal,
-            ["project marker".to_string()]
+            std::fs::read_to_string(&foreign).unwrap(),
+            "output_level = \"lite\"\n"
         );
-        assert_eq!(stored.output_level.as_deref(), Some("lite"));
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
 
-        // Clearing `[team]` leaves `[failover]` and the unrelated override in
-        // place — the file is rewritten from the whole ProjectConfig.
-        let mut cleared = stored;
-        cleared.team = None;
-        Config::save_project(&repo, &cleared).unwrap();
-        let after = Config::load_project(&repo).unwrap();
-        assert!(after.team.is_none());
-        assert!(after.failover.is_some());
-        assert_eq!(after.output_level.as_deref(), Some("lite"));
+    #[test]
+    fn project_config_rejects_non_directory_components_and_non_regular_targets() {
+        let repo = scratch_dir("rtrt-core-project-components");
+        std::fs::write(repo.join(".rtrt"), b"not a directory").unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
+        std::fs::remove_file(repo.join(".rtrt")).unwrap();
 
-        // Clearing the last override removes the file so the repo stays clean.
-        let empty = ProjectConfig::default();
-        assert!(empty.is_empty());
-        Config::save_project(&repo, &empty).unwrap();
-        assert!(!Config::project_config_path(&repo).exists());
-
-        std::fs::remove_dir_all(&repo).ok();
+        std::fs::create_dir(repo.join(".rtrt")).unwrap();
+        std::fs::create_dir(Config::project_config_path(&repo)).unwrap();
+        assert!(Config::load_project(&repo).is_err());
+        assert!(Config::save_project(&repo, &ProjectConfig::default()).is_err());
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     /// A unique scratch directory for the file-touching tests above.

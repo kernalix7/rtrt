@@ -30,14 +30,15 @@
 //! - `/api/statusline/config` — `GET` / `POST` statusline rich-format config.
 //! - `/api/statusline/preview` — `GET` rendered `rtrt statusline --rich` preview.
 //!
-//! All `/api/*` routes are gated by a bearer-token middleware when the
-//! `RTRT_DASHBOARD_TOKEN` env var is set; the bundled HTML index and the
-//! `/healthz` probe remain open so the UI can bootstrap.
+//! All `/api/*` routes require a bearer token. The bundled SPA assets and
+//! `/healthz` remain open so the UI can bootstrap and request that token.
 
 mod assets;
 mod daemons;
 mod handlers;
+mod opencode_transcripts;
 mod prelude;
+mod project_catalog;
 mod routes;
 mod state;
 mod transcripts;
@@ -51,13 +52,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use rtrt_memory::Embedder;
 use rtrt_providers::Gateway;
-use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
-use crate::daemons::{
-    spawn_auto_compress_daemon, spawn_auto_embed_daemon, spawn_consolidation_daemon,
-};
-use crate::state::{AppState, memory_store_path, open_memory_store, open_prompt_registry};
+use crate::project_catalog::ProjectCatalog;
+use crate::state::{AppState, open_prompt_registry};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,58 +63,29 @@ async fn main() -> Result<()> {
         .with_env_filter("rtrt=info,tower_http=info")
         .init();
 
-    let bind =
-        std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:7311".to_string());
-    let token = std::env::var("RTRT_DASHBOARD_TOKEN").ok();
-    if token.is_none()
-        && !bind.starts_with("127.")
-        && !bind.starts_with("[::1]")
-        && !bind.starts_with("localhost")
-    {
-        tracing::warn!(
-            "binding {bind} without RTRT_DASHBOARD_TOKEN is risky; non-loopback callers can hit the API without authentication."
-        );
-    }
-    // Feed the config's auto_compress.base_url into the env before building
-    // the gateway, so `Gateway::from_env` registers the local/OpenAI-compat
-    // provider even when only ~/.rtrt/config.toml (not an env var) sets it.
-    // Without this, the LLM compress engine + auto-compress daemon can't
-    // route a local model like gemma3:4b.
-    if std::env::var_os("RTRT_PROVIDER_BASE_URL").is_none()
-        && std::env::var_os("RTRT_OPENAI_COMPAT_URL").is_none()
-        && let Ok(cfg) = rtrt_core::Config::load()
-        && let Some(url) = cfg.auto_compress.base_url.as_deref()
-    {
-        // SAFETY: set during single-threaded startup before any task spawns.
-        unsafe { std::env::set_var("RTRT_PROVIDER_BASE_URL", url) };
-    }
+    let startup = MachineStartup::from_process()?;
+    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let bind = std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| cfg.dashboard.bind.clone());
+    validate_loopback_bind(&bind)?;
+    let token = startup.token;
+    let catalog = Arc::new(ProjectCatalog::new(
+        startup.home.clone(),
+        startup.projects_root,
+    ));
+    catalog.refresh();
     let gateway = Arc::new(Gateway::from_env());
     let prompts = open_prompt_registry();
-    let memory = open_memory_store();
     let auto_capture = std::env::var("RTRT_AUTO_CAPTURE")
         .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(true);
+        .unwrap_or(cfg.capture.enabled);
     let auto_redact = std::env::var("RTRT_AUTO_REDACT")
         .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(true);
+        .unwrap_or(cfg.capture.redact);
     let dedup_window_sec: i64 = std::env::var("RTRT_AUTO_DEDUP_WINDOW_SEC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
-    let default_project =
-        std::env::var("RTRT_DEFAULT_PROJECT").unwrap_or_else(|_| "default".into());
+        .unwrap_or(cfg.capture.dedup_window_sec);
     let session_id = uuid::Uuid::new_v4().to_string();
-    if auto_capture {
-        tracing::info!(
-            "auto-capture on (project={default_project}, redact={auto_redact}, dedup_window={dedup_window_sec}s, session={session_id})"
-        );
-    } else {
-        tracing::info!("auto-capture off (RTRT_AUTO_CAPTURE=0)");
-    }
-    let memory_for_daemon = memory.clone();
-    let memory_for_compress_daemon = memory.clone();
-    let memory_for_transcripts = memory.clone();
-    let gateway_for_compress_daemon = gateway.clone();
     let (events_tx, _) = broadcast::channel::<String>(256);
     // Build the Ollama embedder when enabled in config / env.
     let embedder: Option<Arc<dyn Embedder>> = {
@@ -138,30 +107,21 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let state = AppState {
+    let state = AppState::machine(
         gateway,
         prompts,
-        memory,
         auto_capture,
         auto_redact,
-        default_project,
         session_id,
         dedup_window_sec,
-        events: events_tx,
+        events_tx,
         embedder,
-        cluster_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        brainh_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        level_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        memory_path: memory_store_path(),
-        embedding_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-    };
-    spawn_consolidation_daemon(memory_for_daemon);
-    spawn_auto_compress_daemon(memory_for_compress_daemon, gateway_for_compress_daemon);
-    spawn_auto_embed_daemon(memory_store_path());
-    transcripts::spawn_reattribution(memory_for_transcripts.clone());
-    transcripts::spawn_transcript_watcher(memory_for_transcripts);
+        catalog.clone(),
+        startup.home,
+    )?;
+    state.start_project_daemons();
 
-    let app = routes::router(state, token);
+    let app = routes::router_for_bind(state, token, &bind)?;
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,
@@ -175,5 +135,143 @@ async fn main() -> Result<()> {
     };
     tracing::info!("rtrt-dashboard listening on http://{bind}");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MachineStartup {
+    home: std::path::PathBuf,
+    projects_root: std::path::PathBuf,
+    token: String,
+}
+
+impl MachineStartup {
+    fn from_process() -> Result<Self> {
+        Self::parse(std::env::args_os().skip(1))
+    }
+
+    fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Self> {
+        let args: Vec<_> = args.into_iter().collect();
+        anyhow::ensure!(
+            args.len() == 3 && args[0] == "--machine" && args[1] == "--state-dir",
+            "usage: rtrt-dashboard --machine --state-dir <home>/.rtrt/dashboard"
+        );
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot resolve operator home"))?;
+        let home = std::fs::canonicalize(home)?;
+        let expected = home.join(".rtrt/dashboard");
+        anyhow::ensure!(
+            args[2].as_os_str() == expected.as_os_str(),
+            "invalid dashboard state directory"
+        );
+        validate_private_directory(&home.join(".rtrt"))?;
+        validate_private_directory(&expected)?;
+        anyhow::ensure!(
+            std::fs::canonicalize(&expected)? == expected,
+            "dashboard state directory must not traverse links"
+        );
+        let env_path = expected.join("dashboard.env");
+        let metadata = std::fs::symlink_metadata(&env_path)
+            .map_err(|_| anyhow::anyhow!("dashboard credential unavailable"))?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "dashboard credential unavailable"
+        );
+        validate_private_mode(&metadata, 0o600)?;
+        anyhow::ensure!(
+            metadata.len() <= 16 * 1024,
+            "dashboard credential unavailable"
+        );
+        let raw = std::fs::read_to_string(&env_path)
+            .map_err(|_| anyhow::anyhow!("dashboard credential unavailable"))?;
+        let token = raw
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(key, value)| {
+                (key.trim() == "RTRT_DASHBOARD_TOKEN")
+                    .then(|| value.trim().trim_matches(['\'', '"']).to_string())
+            })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("dashboard credential unavailable"))?;
+        Ok(Self {
+            projects_root: home.join(".rtrt/projects"),
+            home,
+            token,
+        })
+    }
+}
+
+fn validate_private_directory(path: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "dashboard state directory must be a real directory"
+    );
+    validate_private_mode(&metadata, 0o700)
+}
+
+#[cfg(unix)]
+fn validate_private_mode(metadata: &std::fs::Metadata, expected: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc_geteuid() },
+        "dashboard state ownership mismatch"
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o777 == expected,
+        "dashboard state permissions are not private"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+#[cfg(unix)]
+unsafe fn libc_geteuid() -> u32 {
+    unsafe { geteuid() }
+}
+
+#[cfg(not(unix))]
+fn validate_private_mode(_: &std::fs::Metadata, _: u32) -> Result<()> {
+    Ok(())
+}
+
+fn validate_loopback_bind(bind: &str) -> Result<()> {
+    if let Ok(address) = bind.parse::<std::net::SocketAddr>() {
+        anyhow::ensure!(
+            address.ip().is_loopback(),
+            "dashboard bind must be loopback"
+        );
+    } else {
+        let host = bind.rsplit_once(':').map(|(host, _)| host).unwrap_or("");
+        anyhow::ensure!(
+            matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"),
+            "dashboard bind must be loopback"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn dashboard_token() -> Result<String> {
+    std::env::var("RTRT_DASHBOARD_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("dashboard requires nonempty RTRT_DASHBOARD_TOKEN"))
+}
+
+#[cfg(test)]
+fn validate_scope(scope: &str, token: Option<&str>) -> Result<()> {
+    if scope == "admin" {
+        if token.is_none_or(|value| value.trim().is_empty()) {
+            anyhow::bail!("RTRT_DASHBOARD_SCOPE=admin requires nonempty RTRT_DASHBOARD_TOKEN");
+        }
+        anyhow::bail!("admin dashboard store routing is not implemented; refusing to start");
+    }
+    if scope != "project" {
+        anyhow::bail!("RTRT_DASHBOARD_SCOPE must be `project` (admin is unavailable)");
+    }
     Ok(())
 }

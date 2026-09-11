@@ -36,12 +36,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR head with full history (for base ref)
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Bench against `${{ github.base_ref }}` (baseline)
         run: |
@@ -63,7 +65,7 @@ jobs:
       - name: Run regression gate
         run: bash scripts/perf-gate.sh "$PERF_REGRESSION_THRESHOLD"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: criterion-perf-report

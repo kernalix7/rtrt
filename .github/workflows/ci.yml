@@ -16,20 +16,43 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  release-contract:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - name: Test release checksum portability
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/test-release-automation.sh --checksum-only
+      - name: Test complete release automation contract
+        if: runner.os != 'Windows'
+        run: bash scripts/test-release-automation.sh
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -52,21 +75,54 @@ jobs:
           - toolchain: "stable"
             runner: "windows-latest"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
           toolchain: ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
       - name: Run cargo-audit
         run: cargo audit
+
+  opencode:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/opencode
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            plugins/opencode/package-lock.json
+            plugins/opencode/test-fixtures/omo-4.19.4/package-lock.json
+      - run: npm ci --ignore-scripts
+      - name: Create invalid managed-agent state fixture
+        run: |
+          config_dir="$RUNNER_TEMP/invalid-opencode-config"
+          printf 'OPENCODE_CONFIG_DIR=%s\n' "$config_dir" >> "$GITHUB_ENV"
+          mkdir -p "$config_dir/agents"
+          printf '{invalid managed-agent state\n' > "$config_dir/agents/.rtrt-managed-state.json"
+      - run: npm test
+      - name: Install oh-my-openagent compatibility fixture
+        run: npm ci --prefix test-fixtures/omo-4.19.4 --ignore-scripts
+      - name: Test oh-my-openagent 4.19.4 compatibility
+        env:
+          OMO_DISABLE_POSTHOG: "1"
+          RTRT_OMO_PACKAGE_DIR: ${{ github.workspace }}/plugins/opencode/test-fixtures/omo-4.19.4/node_modules/oh-my-openagent
+        run: node --test --test-name-pattern="provenance, sentinel, and oh-my-openagent 4.19.4 coexist in both orders" package.test.mjs
+      - run: npm pack --dry-run --json --ignore-scripts

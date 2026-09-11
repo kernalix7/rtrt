@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 ---
 
 > ### Status: Alpha
-> RTRT is early. **v0.1.0** is the active development line. Every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible / Ollama via OAI-compat), BM25 + vector + graph + HNSW memory, auto-capture pipeline (SHA-256 dedup + secret redaction + session id + hourly consolidation), curl-pipe install / uninstall, criterion benchmarks — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. The tag is held back until live-key smoke tests pass in the user environment. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. This source tree contains the **v0.1.1** release candidate. Every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible / Ollama via OAI-compat), BM25 + vector + graph + HNSW memory, auto-capture pipeline (SHA-256 dedup + secret redaction + session id + hourly consolidation), curl-pipe install / uninstall, criterion benchmarks — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 ## What RTRT is
 
@@ -88,13 +88,10 @@ See [docs/INSTALL.md](docs/INSTALL.md) for the full flag matrix, environment-var
 The web dashboard is `rtrt-dashboard`. By default it serves on `http://127.0.0.1:7311`; set `RTRT_DASHBOARD_TOKEN` to gate every `/api/*` route behind a bearer token (the bundled HTML index and `/healthz` stay open so the UI can bootstrap).
 
 ```bash
-# Open dashboard at http://127.0.0.1:7311 (10 tabs incl. dark mode + bearer-token guard)
+# Open dashboard at http://127.0.0.1:7311 (Project and Tools navigation, dark mode, bearer-token guard)
 rtrt-dashboard
 
-# Production-style bind with auth
-RTRT_DASHBOARD_BIND=0.0.0.0:7311 \
-RTRT_DASHBOARD_TOKEN=$(openssl rand -hex 16) \
-  rtrt-dashboard
+# The dashboard is loopback-only. Use a local reverse proxy if remote access is required.
 ```
 
 CLI surface (everything below is one process, no daemon required):
@@ -109,10 +106,10 @@ rtrt signatures --lang rust < src/file.rs       # tree-sitter signature map
 rtrt repo-map crates/rtrt-core                  # signature map of a directory
 rtrt discover                                   # find proxy candidates in Claude transcripts
 rtrt templates                                  # list built-in templates
-rtrt new rust-cli ./hello --var project_name=hello
+rtrt new dev ./hello --var project_name=hello
 rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
 rtrt setup --agent opencode --apply             # wire RTRT into OpenCode's MCP config
-rtrt team check-manager                          # verify the local manager's exact tool call
+rtrt setup --agent opencode --sandbox --machine-only --apply # machine shell only; authorizes no cwd
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
 rtrt memory extract --project p --provider openai-compat \
@@ -131,7 +128,7 @@ rtrt migrate --apply                            # migrate a repo to the rtrt pro
 rtrt project refresh --apply                    # contract render + canonical settings + audit
 rtrt diagnose --provider anthropic --model claude-haiku-4-5 -- cargo test
 rtrt benchmark                                  # cargo bench wrapper
-rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 12 tools, bearer-token guard
+rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 23 tools, bearer-token guard
 ```
 
 See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.
@@ -207,7 +204,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 <tr><td width="50%">
 
 **Standardized project scaffolds**
-- Six built-in templates: `rust-cli`, `rust-lib`, `rust-axum`, `node-typescript`, `python-uv`, `go-cli`
+- Four built-in templates: `dev`, `design`, `plan`, `standardization`
 - Web-selectable from the dashboard (`/api/templates`)
 - Custom templates load from `~/.rtrt/templates/<name>/manifest.toml`
 - Variable substitution (`{{project_name}}`, `{{author}}`, `{{license}}`) + optional post-init hooks
@@ -216,9 +213,9 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 </td><td width="50%">
 
 **MCP server + dashboard**
-- `rtrt-mcp` (rmcp 1.x) ships 11 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`
-- HTTP transport hardens with `--http-token` (constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
-- `rtrt-dashboard` (axum) — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle. Routes: `/api/{metrics,budget,prompts,memory/*,templates*,compress,proxy,diagnose,repo-map,setup,chat,stats}`. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
+- `rtrt-mcp` (rmcp 1.x) ships 23 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `repo_map`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_timeline`, `memory_profile`, `memory_relations`, `memory_smart_search`, `memory_export`, `memory_consolidate`, `memory_sessions`, `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`, `agent_call`, `agent_route`, `security_scan`, `permission_prompt`
+- HTTP transport hardens with `RTRT_MCP_HTTP_TOKEN` (environment-based constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
+- `rtrt-dashboard` (axum) — Project pages: Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security. Tools pages: LLM, Chat, Limits, Environment, Usage, Failover, Connect. Failover edits global policy only with no project selected; a selected project inherits it read-only until **Custom** writes an override, and **Follow global** removes that override. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
 - `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf / opencode
 - Versioned prompt registry under `~/.rtrt/prompts/<name>/<NNNN>.toml` (`rtrt prompt {save,get,list,versions}`)
 - [Details →](docs/FEATURES.md#mcp-and-dashboard)
@@ -232,7 +229,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 
 | Document | What's inside |
 |----------|---------------|
-| [INSTALL.md](docs/INSTALL.md) | Install paths — source, crates.io (planned), pre-built binaries (planned), uninstall |
+| [INSTALL.md](docs/INSTALL.md) | Install paths — source, v0.1.1 crates.io and pre-built binary release channels, uninstall |
 | [USAGE.md](docs/USAGE.md) | CLI reference, MCP tools, dashboard tour, configuration file |
 | [FEATURES.md](docs/FEATURES.md) | Compression rules, filter strategy, memory schema, multi-provider routing, templates |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Workspace layout, crate boundaries, data flows |
@@ -254,7 +251,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 | `rtrt-templates` | Built-in + custom scaffolds + handlebars rendering + `PromptRegistry` |
 | `rtrt-security` | Profile-driven security & license scanning (secrets / licenses / deps / patterns / ai engines, standards-mapped profiles) |
 | `rtrt-eval` | Opt-in evaluation harness — recall R@K / MRR + compression ratio + BERTScore (feature-gated) |
-| `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 11 tools, bearer-token guard |
+| `rtrt-mcp` | rmcp 1.x MCP server — stdio + Streamable HTTP, 23 tools, bearer-token guard |
 | `rtrt-dashboard` | Axum web dashboard + REST API (`/api/{chat,metrics,templates,stats}`) |
 | `rtrt-cli` | `rtrt` command-line entry point |
 
@@ -276,10 +273,10 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] `rtrt-proxy` filters for git + cargo
 - [x] `rtrt-memory` SQLite + FTS5 BM25 + dense-vector + RRF hybrid + edges graph + HNSW + memory tiers
 - [x] `rtrt-memory` LLM-driven extract / compress / archival via any provider (local Ollama OK)
-- [x] `rtrt-templates` 6 built-ins + custom loader + handlebars + versioned `PromptRegistry`
+- [x] `rtrt-templates` 4 built-ins + custom loader + handlebars + versioned `PromptRegistry`
 - [x] `rtrt-providers` real Anthropic / OpenAI / OpenAI-compatible HTTP + streaming + Gateway + Budget + Context7 docs
-- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 11 tools (compress / compress_ml / proxy / memory_* / templates_* / provider_chat), bearer-token + RFC 6454 Origin guards
-- [x] `rtrt-dashboard` axum UI — 10 tabs incl. Metrics (SVG sparklines), Budget, Prompts, Memory, Templates, Compression, Proxy, Diagnose, RepoMap, Setup; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
+- [x] `rtrt-mcp` rmcp stdio + Streamable HTTP transport, 23 tools (compress / compress_ml / proxy / repo_map / memory_* / templates_* / provider_chat / agent_* / security_scan / permission_prompt), bearer-token + RFC 6454 Origin guards
+- [x] `rtrt-dashboard` axum UI — Project and Tools navigation, including scoped Failover policy editing; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
 - [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
 - [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf / opencode
 - [x] criterion benchmark harness + per-fixture savings table + `rtrt benchmark` wrapper
@@ -296,8 +293,8 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] Real ONNX token-importance backend behind `MlCompressor` (opt-in `--features onnx`; user-supplied model + tokenizer)
 - [x] BERTScore evaluator in `rtrt-eval` (opt-in `--features bertscore`; user-supplied encoder + tokenizer)
 - [x] MCP Prompts + Resources — `prompts/list` / `prompts/get` (with handlebars args) over the local PromptRegistry; `resources/list` / `resources/read` over project timelines + Letta blocks
-- [ ] Optional multi-agent coordination crate (deferred; see `DESIGN.md`)
-- [ ] First tagged release — once live-key smoke + browser tour pass and the user explicitly approves; version label stays `0.1.0` until then
+- [x] Multi-agent coordination delegated to external agent runtimes; RTRT keeps no native orchestration surface
+- [x] Paired-tag, dependency-ordered Rust/npm release automation for v0.1.1
 
 ## Inspired by
 

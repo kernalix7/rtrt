@@ -26,7 +26,7 @@
 <div class="topbar">
   <div class="brand"><span class="logo">RT</span> RTRT</div>
   <!-- Top-level MODE switch: Project (per-project work) vs Tools (multi-provider /
-       orchestration). Each mode owns its own sidebar nav set (see aside [data-mode]).
+       routing). Each mode owns its own sidebar nav set (see aside [data-mode]).
        setMode() in app.js toggles the visible sidebar, persists to localStorage,
        and navigates to the mode's default page. -->
   <div id="mode-switch" class="mode-switch" role="tablist" aria-label="Top-level mode">
@@ -38,19 +38,21 @@
   <span id="pill-cache" class="pill"><span class="dot"></span>Cache</span>
   <span class="spacer"></span>
   <button id="open-palette" title="Quick jump (Ctrl/Cmd + K)" style="cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--muted);padding:0.3rem 0.7rem;border-radius:6px;font-size:0.85em;">⌘K Jump</button>
+  <button id="dashboard-token-action" type="button" title="Forget the dashboard bearer token stored for this tab">Clear API token</button>
   <button id="theme-toggle" title="Dark / Light">🌗</button>
 </div>
 
 <div class="layout">
   <aside>
-    <div class="project-picker">
+    <div class="project-picker" aria-label="Active project">
       <div class="project-picker-head">
-        <span>Project</span>
+        <label for="project-selector">Project</label>
       </div>
       <div class="project-selector-row">
-        <select id="project-selector"><option value="">Loading projects…</option></select>
-        <button id="project-add-btn" class="ghost icon-btn" type="button" title="Add / edit project">＋</button>
+        <select id="project-selector" aria-describedby="project-selector-status"><option value="">Loading projects…</option></select>
+        <button id="project-add-btn" class="ghost icon-btn" type="button" title="Project registry is read-only in dashboard mode" disabled>＋</button>
       </div>
+      <div id="project-selector-status" class="project-selector-status" role="status" aria-live="polite">Loading availability…</div>
     </div>
     <!-- ── PROJECT MODE nav (per-project work) ──────────────────────────────
          Overview · Memory · Output Optimizer · Command Optimizer · Settings
@@ -101,7 +103,7 @@
       </details>
     </nav>
 
-    <!-- ── TOOLS MODE nav (multi-AI-provider / orchestration) ────────────────
+    <!-- ── TOOLS MODE nav (multi-AI-provider / routing) ──────────────────────
          Providers · Chat · Limits · Environment · Router · Setup. Default page
          = providers (the dedicated provider settings). Structured into groups
          so the load-balancing router has room to grow. -->
@@ -113,12 +115,12 @@
         <a class="nav" data-page="chat"><span class="icon">✎</span><span class="nav-copy"><span class="nav-label">Chat</span><span class="nav-sub">gateway playground</span></span></a>
         <a class="nav" data-page="limits"><span class="icon">⛽</span><span class="nav-copy"><span class="nav-label">Limits</span><span class="nav-sub">daily usage ceilings</span></span></a>
       </details>
-      <div class="nav-divider">Orchestrate</div>
+      <div class="nav-divider">Routing</div>
       <details class="nav-group" open>
         <summary class="group">🔀 Routing</summary>
         <a class="nav" data-page="environment"><span class="icon">◬</span><span class="nav-copy"><span class="nav-label">Environment</span><span class="nav-sub">detected tools</span></span></a>
         <a class="nav" data-page="usage"><span class="icon">⚖</span><span class="nav-copy"><span class="nav-label">Router</span><span class="nav-sub">usage · headroom · preview</span></span></a>
-        <a class="nav" data-page="orchestration"><span class="icon">⋔</span><span class="nav-copy"><span class="nav-label">Orchestration</span><span class="nav-sub">lanes · ladder · failover</span></span></a>
+          <a class="nav" data-page="failover"><span class="icon">⋔</span><span class="nav-copy"><span class="nav-label">Failover</span><span class="nav-sub">failure policy</span></span></a>
       </details>
       <div class="nav-divider">Connect</div>
       <details class="nav-group" open>
@@ -144,6 +146,11 @@
           <button type="button" data-window="30d">30d</button>
           <button type="button" data-window="all">All</button>
         </div>
+      </div>
+      <div id="global-project-overview" class="card" hidden>
+        <div class="head"><h2>All projects</h2><span id="global-project-summary" class="hint">Loading…</span></div>
+        <p class="lede">Select an available project to enable project pages and actions.</p>
+        <table><thead><tr><th>Project</th><th>Canonical slug</th><th>Memories</th><th>Status</th></tr></thead><tbody id="global-project-overview-body"></tbody></table>
       </div>
       <!-- Pillar-led savings model: Σ agent-token saved % + three pillar cards -->
       <div class="card savings-hero">
@@ -1178,6 +1185,16 @@
       <div class="card">
         <div class="head"><h2>Configuration</h2><span class="hint">Loaded from GET /api/config</span></div>
         <form id="settings-form">
+          <div class="settings-section">
+            <h3>Dashboard <span class="badge warn">restart required</span></h3>
+            <div class="field-row">
+              <label class="field-label"><span>configured bind (next restart)</span><input type="text" id="cfg-dashboard-bind" placeholder="127.0.0.1:7311"></label>
+              <label class="field-label"><span>effective bind</span><input type="text" id="cfg-dashboard-effective-bind" readonly></label>
+              <label class="field-label"><span>configured provider API max output tokens</span><input type="number" id="cfg-provider-max-tokens" min="1"></label>
+              <label class="field-label"><span>effective API max output tokens</span><input type="text" id="cfg-provider-effective-max-tokens" readonly></label>
+            </div>
+            <div id="cfg-dashboard-provenance" class="note"></div>
+          </div>
           <!-- Capture -->
           <div class="settings-section">
             <h3>Capture</h3>
@@ -1194,6 +1211,7 @@
                 <span>dedup_window_sec</span>
                 <input type="number" id="cfg-capture-dedup" min="0" value="60">
               </div>
+              <label class="field-label"><span>project identity (derived/read-only)</span><input type="text" id="cfg-capture-project" readonly></label>
             </div>
           </div>
           <!-- Auto-compress -->
@@ -1212,8 +1230,12 @@
                 <span>base_url</span>
                 <input type="url" id="cfg-ac-base-url" placeholder="https://api.anthropic.com">
               </div>
+              <label class="field-label"><span>compatible endpoint runtime/provider</span><input type="text" id="cfg-ac-provider" placeholder="ollama or openai-compat"></label>
+              <label class="field-label"><span>effective runtime/provider</span><input type="text" id="cfg-provider-runtime" readonly></label>
+              <label class="field-label"><span>effective transport</span><input type="text" id="cfg-provider-transport" readonly></label>
             </div>
             <div class="field-row" style="margin-top:0.5rem;">
+              <div class="field-label"><span>interval_sec (daemon sweep)</span><input type="number" id="cfg-ac-interval" min="1"></div>
               <div class="field-label">
                 <span>age_sec (minimum elapsed seconds)</span>
                 <input type="number" id="cfg-ac-age-sec" min="0" value="3600">
@@ -1241,6 +1263,7 @@
               <input type="checkbox" id="cfg-emb-enabled">
               <label for="cfg-emb-enabled">Enable embeddings</label>
             </div>
+            <div class="toggle-row"><input type="checkbox" id="cfg-emb-auto"><label for="cfg-emb-auto">Auto-embed newly captured rows</label></div>
             <div class="field-row" style="margin-top:0.5rem;">
               <div class="field-label">
                 <span>model</span>
@@ -1251,6 +1274,10 @@
                 <span>base_url</span>
                 <input type="url" id="cfg-emb-base-url" placeholder="http://localhost:11434">
               </div>
+            </div>
+            <div class="field-row" style="margin-top:0.5rem;">
+              <label class="field-label"><span>auto_interval_sec</span><input type="number" id="cfg-emb-interval" min="1"></label>
+              <label class="field-label"><span>auto_batch</span><input type="number" id="cfg-emb-batch" min="1"></label>
             </div>
             <div class="field-label" style="margin-top:0.5rem;">
               <span>Generate (current project)</span>
@@ -1297,27 +1324,24 @@
         </div>
         <div id="compress-now-result" class="compress-now-result out-meta"></div>
       </div>
-      <!-- Memory settings (global [memory]: store path + embed model) -->
+      <!-- Strict-isolation status: memory path is derived and never editable. -->
       <div class="card" style="margin-top:1rem;">
-        <div class="head"><h2>Memory settings</h2><span class="hint" id="memory-settings-hint">~/.rtrt/config.toml [memory]</span></div>
-        <p class="lede">Global memory store location and the embedding model name recorded in <code>[memory]</code>.</p>
+        <div class="head"><h2>Sandbox &amp; memory isolation</h2><span class="badge ok">strict isolation</span></div>
+        <p class="lede">Physical memory store is derived from current project identity. Global/user recall and arbitrary path edits are unavailable.</p>
         <div class="settings-section">
           <div class="field-row">
+            <label class="field-label"><span>project identity</span><input type="text" id="memory-settings-identity" readonly></label>
             <label class="field-label" for="memory-settings-path">
               <span>path (memory store)</span>
-              <input type="text" id="memory-settings-path" placeholder=".rtrt/memory.sqlite">
+              <input type="text" id="memory-settings-path" readonly>
             </label>
             <label class="field-label" for="memory-settings-embed-model">
-              <span>embed_model</span>
-              <input type="text" id="memory-settings-embed-model" placeholder="all-MiniLM-L6-v2">
+              <span>embedding model (source: [embeddings].model)</span>
+              <input type="text" id="memory-settings-embed-model" readonly>
             </label>
           </div>
-          <div class="note" style="margin-top:0.5rem;">
-            <strong>Changing the path points the dashboard and CLI at a different store.</strong>
-            Existing memories are not moved; the new path takes effect after a server restart.
-          </div>
+          <div id="memory-settings-provenance" class="note" style="margin-top:0.5rem;"></div>
           <div style="display:flex;gap:0.6rem;align-items:center;margin-top:0.6rem;flex-wrap:wrap;">
-            <button id="memory-settings-save-btn" class="primary" type="button">Save memory settings</button>
             <span id="memory-settings-result" class="out-meta"></span>
           </div>
         </div>
@@ -1339,7 +1363,7 @@
         <p class="lede">Optional daily ceilings per provider/target. Leave a field blank for no limit on that axis.</p>
         <div class="env-table-wrap">
           <table id="limits-tbl">
-            <thead><tr><th>Target</th><th>daily_tokens</th><th>daily_requests</th><th></th></tr></thead>
+            <thead><tr><th>Target / pool</th><th>daily_tokens</th><th>daily_requests</th><th></th></tr></thead>
             <tbody><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
           </table>
         </div>
@@ -1365,198 +1389,73 @@
       </div>
     </section>
 
-    <!-- Orchestration (Tools › Orchestrate) — the editable `[team]` roster and
-         `[failover]` policy. Everything on this page is DATA: lane names, tier
-         names, targets and models all come from the config or from /api/detect,
-         never from a list baked into the UI. The roster rtrt ships is only a
-         starting point. -->
-    <section id="page-orchestration" class="page" hidden>
+    <section id="page-failover" class="page" hidden>
       <div class="section-head">
         <div class="section-title">
-          <h1>Orchestration</h1>
-          <div class="lede">Lanes, the difficulty ladder, and the failure policy rtrt follows when it delegates work across your detected tools.</div>
+          <h1>Failover</h1>
+          <div class="lede">The failure policy rtrt follows when a provider call fails.</div>
         </div>
       </div>
 
-      <!-- Validation banner. The roster is validated server-side before it is
-           written, so a rejected save lands here verbatim and NOTHING is
-           persisted. -->
-      <div class="card orch-error-card" id="orch-error-card" hidden>
-        <div class="head"><h2>Roster rejected — nothing was saved</h2><span class="badge err">invalid</span></div>
-        <p class="orch-error-text" id="orch-error-text"></p>
-      </div>
-
-      <!-- Manager, leaders, scope -->
       <div class="card">
-        <div class="head"><h2>Manager &amp; leaders</h2><span class="hint" id="team-config-hint">~/.rtrt/config.toml</span></div>
-        <p class="lede">The local manager model that routes a task, and the order leaders are tried in. Leader names must be lanes from the roster below.</p>
-        <div class="settings-section" id="team-scope-section" hidden>
+        <div class="head"><h2>Failure policy scope</h2><span class="hint">[failover]</span></div>
+        <div class="settings-section" id="failover-scope-section" hidden>
           <h3>Scope</h3>
-          <div class="scope-toggle" role="radiogroup" aria-label="Orchestration scope">
+          <div class="scope-toggle" role="radiogroup" aria-label="Failover scope">
             <label class="segment-toggle">
-              <input type="radio" name="team-scope" id="team-scope-global" value="global" checked>
+              <input type="radio" name="failover-scope" id="failover-scope-global" value="global" checked>
               <span>Follow global</span>
             </label>
             <label class="segment-toggle">
-              <input type="radio" name="team-scope" id="team-scope-custom" value="custom">
+              <input type="radio" name="failover-scope" id="failover-scope-custom" value="custom">
               <span>Custom (this project)</span>
             </label>
           </div>
-          <small class="placeholder-hint" id="team-scope-hint"></small>
-        </div>
-        <div class="orch-manager-fields" id="orch-manager-fields">
-          <label class="segment-toggle" style="margin-bottom:0.7rem;">
-            <input type="checkbox" id="orch-enabled">
-            <span>Orchestration enabled — rtrt may delegate to the lanes below</span>
-          </label>
-          <div class="orch-grid">
-            <label class="field-label">
-              <span>manager provider</span>
-              <input type="text" id="orch-manager-provider" list="orch-targets" autocomplete="off">
-            </label>
-            <label class="field-label">
-              <span>manager model</span>
-              <input type="text" id="orch-manager-model" list="orch-models-all" autocomplete="off">
-            </label>
-            <label class="field-label">
-              <span>manager base URL (optional)</span>
-              <input type="text" id="orch-manager-base-url" placeholder="provider default" autocomplete="off">
-            </label>
-          </div>
-          <div class="settings-section" style="margin-top:1rem;margin-bottom:0;">
-            <h3>Leader order</h3>
-            <div class="orch-chips" id="orch-leader-chips"></div>
-            <div class="orch-row">
-              <label class="field-label">
-                <span>add leader</span>
-                <select id="orch-leader-add"></select>
-              </label>
-              <button class="ghost" type="button" id="orch-leader-add-btn">Add leader</button>
-            </div>
-          </div>
+          <small class="placeholder-hint" id="failover-scope-hint"></small>
         </div>
       </div>
 
-      <div id="orch-editors">
-        <!-- Lanes -->
-        <div class="card">
-          <div class="head"><h2>Lanes</h2><span class="hint">[[team.members]]</span></div>
-          <p class="lede">One lane = a concrete target + model + invocation mode, plus the policy that decides when it is used. Target and model suggestions come from detection — any value you type is still accepted.</p>
-          <div id="orch-lanes"></div>
-          <div class="orch-row">
-            <button class="ghost" type="button" id="orch-add-lane">＋ Add lane</button>
-          </div>
-        </div>
-
-        <!-- Tier ladder -->
-        <div class="card">
-          <div class="head"><h2>Difficulty ladder</h2><span class="hint">[team.tiers]</span></div>
-          <p class="lede">Tier names are free text — rename, add, or remove rungs to match how you actually split work. Lanes are listed most-preferred first.</p>
-          <div id="orch-tiers-note" class="orch-note"></div>
-          <div id="orch-tiers"></div>
-          <div class="orch-row">
-            <label class="field-label">
-              <span>new tier name</span>
-              <input type="text" id="orch-tier-name" placeholder="name this rung" autocomplete="off">
-            </label>
-            <button class="ghost" type="button" id="orch-add-tier">＋ Add tier</button>
-            <button class="ghost" type="button" id="orch-pin-tiers" hidden>Start from the effective ladder</button>
-          </div>
-          <div class="settings-section" style="margin-top:1.1rem;margin-bottom:0;">
-            <h3>Effective ladder</h3>
-            <div class="orch-note">What is actually in force once the configured table and each lane's own tier declaration are combined.</div>
-            <div id="orch-effective-tiers" class="orch-chips"></div>
-          </div>
-        </div>
-
-        <!-- Policy -->
-        <div class="card">
-          <div class="head"><h2>Routing policy</h2><span class="hint">[team.policy]</span></div>
-          <p class="lede">How a leader climbs the ladder and recovers when a lane fails.</p>
-          <div class="orch-grid">
-            <label class="field-label">
-              <span>max retries (same lane, transient failure)</span>
-              <input type="number" id="orch-max-retries" min="0" step="1">
-            </label>
-            <label class="field-label">
-              <span>max fallback depth</span>
-              <input type="number" id="orch-max-depth" min="0" step="1" placeholder="auto">
-            </label>
-            <label class="field-label">
-              <span>default tier</span>
-              <select id="orch-default-tier"></select>
-            </label>
-          </div>
-          <div class="orch-row" style="margin-top:0.7rem;">
-            <label class="segment-toggle"><input type="checkbox" id="orch-redo"><span>Redo work on fallback</span></label>
-            <label class="segment-toggle"><input type="checkbox" id="orch-sibling"><span>Prefer sibling pool on quota</span></label>
-            <label class="segment-toggle"><input type="checkbox" id="orch-provenance"><span>Record provenance</span></label>
-          </div>
-          <div class="settings-section" style="margin-top:1.1rem;margin-bottom:0;">
-            <h3>Design-only tiers</h3>
-            <div class="orch-note">Rungs whose output is a plan, not an edit — the only rungs a lane that may not implement is allowed in.</div>
-            <label class="segment-toggle" style="margin:0.5rem 0;">
-              <input type="checkbox" id="orch-design-default">
-              <span>Follow the shipped default</span>
-            </label>
-            <div id="orch-design-tiers" class="orch-chips"></div>
-          </div>
-        </div>
-
-        <!-- Save bar -->
-        <div class="card">
-          <div class="orch-row" style="margin-top:0;">
-            <button id="orch-save-btn" class="primary" type="button">Save orchestration</button>
-            <button id="orch-reload-btn" class="ghost" type="button">Discard changes</button>
-            <span id="orch-save-result" class="out-meta"></span>
-          </div>
-        </div>
-
+      <div id="failover-fields">
         <!-- Failover markers -->
         <div class="card">
           <div class="head"><h2>Failure classification</h2><span class="hint" id="failover-config-hint">[failover]</span></div>
           <p class="lede">Extra error markers, one per line, layered on top of the built-in classification. A marker listed here is matched first, so putting a built-in marker under a different class reclassifies it.</p>
-          <div class="orch-grid">
+          <div class="failover-grid">
             <label class="field-label">
               <span>fatal — stop the walk, no retry, no failover</span>
-              <textarea id="orch-fail-fatal" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-fatal" rows="4" spellcheck="false"></textarea>
             </label>
             <label class="field-label">
               <span>quota — fail over immediately, no retry</span>
-              <textarea id="orch-fail-quota" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-quota" rows="4" spellcheck="false"></textarea>
             </label>
             <label class="field-label">
               <span>transient — earn a backed-off retry</span>
-              <textarea id="orch-fail-transient" rows="4" spellcheck="false"></textarea>
+              <textarea id="failover-transient" rows="4" spellcheck="false"></textarea>
             </label>
           </div>
-          <div class="orch-grid" style="margin-top:0.7rem;">
+          <div class="failover-grid" style="margin-top:0.7rem;">
             <label class="field-label">
               <span>transient retries</span>
-              <input type="number" id="orch-fail-retries" min="0" step="1" placeholder="built-in">
+              <input type="number" id="failover-retries" min="0" step="1" placeholder="built-in">
             </label>
             <label class="field-label">
               <span>backoff divisor (of the call timeout)</span>
-              <input type="number" id="orch-fail-divisor" min="1" step="1" placeholder="built-in">
+              <input type="number" id="failover-divisor" min="1" step="1" placeholder="built-in">
             </label>
             <label class="field-label">
               <span>fixed backoff (ms)</span>
-              <input type="number" id="orch-fail-backoff" min="0" step="1" placeholder="derived from timeout">
+              <input type="number" id="failover-backoff" min="0" step="1" placeholder="derived from timeout">
             </label>
           </div>
-          <div class="orch-row">
-            <button id="orch-fail-save-btn" class="primary" type="button">Save failure policy</button>
-            <span id="orch-fail-save-result" class="out-meta"></span>
+          <div class="failover-row">
+            <button id="failover-save-btn" class="primary" type="button">Save failure policy</button>
+            <button id="failover-reload-btn" class="ghost" type="button">Discard changes</button>
+            <span id="failover-save-result" class="out-meta"></span>
           </div>
         </div>
       </div>
 
-      <!-- Detection-backed suggestion lists, rebuilt from /api/detect on load so
-           no target or model name is ever hardcoded in the markup. -->
-      <datalist id="orch-targets"></datalist>
-      <datalist id="orch-models-all"></datalist>
-      <datalist id="orch-lane-names"></datalist>
-      <datalist id="orch-tier-names"></datalist>
     </section>
 
     <!-- Providers -->
@@ -1671,7 +1570,7 @@
           <div id="security-project-meta" class="out-meta scope-status"></div>
           <div class="security-scan-row">
             <select id="security-profile-select"><option value="">Loading…</option></select>
-            <button id="security-apply-profile-btn" class="ghost" type="button">Apply to this project</button>
+            <button id="security-apply-profile-btn" class="ghost" type="button" title="Project registry is read-only in dashboard mode" disabled>Apply to this project</button>
             <button id="security-scan-btn" class="primary" type="button">Scan</button>
             <button id="security-view-profile-btn" class="ghost" type="button">View profile</button>
           </div>
@@ -1805,9 +1704,9 @@
 <script src="/assets/js/api.js"></script>
 <script src="/assets/js/components.js"></script>
 <script src="/assets/js/pages.js"></script>
-<!-- Tools › Orchestration. After pages.js (it reuses the shared scope helpers)
+<!-- Tools › Failover. After pages.js (it reuses the shared scope helpers)
      and before app.js, which routes to the initial page on load. -->
-<script src="/assets/js/orchestration.js"></script>
+<script src="/assets/js/failover.js"></script>
 <script src="/assets/js/app.js"></script>
 </body>
 </html>

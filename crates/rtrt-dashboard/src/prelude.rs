@@ -4,10 +4,10 @@
 #![allow(unused_imports)]
 
 pub(crate) use crate::assets::{
-    ASSET_JS_API, ASSET_JS_APP, ASSET_JS_COMPONENTS, ASSET_JS_ORCHESTRATION, ASSET_JS_PAGES,
+    ASSET_JS_API, ASSET_JS_APP, ASSET_JS_COMPONENTS, ASSET_JS_FAILOVER, ASSET_JS_PAGES,
     ASSET_STYLES_CSS, INDEX_HTML, VENDOR_COLA, VENDOR_COSE_BASE, VENDOR_CYTO_COLA,
     VENDOR_CYTOSCAPE, VENDOR_FCOSE, VENDOR_LAYOUT_BASE, asset_js_api, asset_js_app,
-    asset_js_components, asset_js_orchestration, asset_js_pages, asset_response, asset_styles_css,
+    asset_js_components, asset_js_failover, asset_js_pages, asset_response, asset_styles_css,
     index, spa_fallback, vendor_asset,
 };
 pub(crate) use crate::daemons::{
@@ -26,6 +26,9 @@ pub(crate) use crate::handlers::config::{
     ConfigResponse, ConfigWriteRequest, ConfigWriteResponse, MemorySettingsResponse, ModelEntry,
     ModelsResponse, SetMemorySettingsRequest, get_config, get_memory_settings, get_models,
     post_config, post_memory_settings,
+};
+pub(crate) use crate::handlers::failover::{
+    SetFailoverRequest, get_failover_config, post_failover_config,
 };
 pub(crate) use crate::handlers::limits::{
     LimitTargetView, LimitsConfigResponse, SetLimitsRequest, get_limits_config, post_limits_config,
@@ -59,7 +62,8 @@ pub(crate) use crate::handlers::orch::{
 };
 pub(crate) use crate::handlers::projects::{
     HiddenBucketView, ProjectUpsertReq, ProjectView, ProjectsResponse, ReassignProjectReq,
-    ReassignProjectResp, list_hidden_buckets, list_projects, reassign_project, upsert_project,
+    ReassignProjectResp, list_hidden_buckets, list_projects, projects_overview, reassign_project,
+    upsert_project,
 };
 pub(crate) use crate::handlers::prompts::{
     PromptSummary, get_prompt, list_prompt_versions, list_prompts, require_prompts,
@@ -95,10 +99,6 @@ pub(crate) use crate::handlers::statusline::{
     read_global_statusline_config, run_statusline_preview, statusline_config_path,
     statusline_preview, upgrade_legacy_statusline_config, validate_statusline_segments,
 };
-pub(crate) use crate::handlers::team::{
-    SetFailoverRequest, SetTeamRequest, TeamMemberView, TeamPolicyView, TierView,
-    get_failover_config, get_team_config, post_failover_config, post_team_config,
-};
 pub(crate) use crate::handlers::templates::{
     ScaffoldPreviewFile, ScaffoldPreviewResponse, ScaffoldRequest, ScaffoldResponse,
     TemplateSummary, TemplateUpsertRequest, create_template, default_template_category,
@@ -114,7 +114,7 @@ pub(crate) use crate::handlers::usage::{
 pub(crate) use crate::state::{
     AppState, CLUSTER_INDEX_TTL, GatewayAdapter, LEVEL_TOKEN_SEQ, LEVEL_TOKEN_TTL, STALL_DOMINANCE,
     TokenEntry, broadcast_event, compress_saved_pct_from_meta, dynamic_branch, dynamic_leaf,
-    memory_store_path, mint_level_token, open_memory_store, open_prompt_registry,
+    mint_level_token, open_prompt_registry,
 };
 pub(crate) use crate::util::{
     ApiError, DashboardJsonResult, SECS_PER_DAY, SECS_PER_HOUR, api_error, bearer_guard,

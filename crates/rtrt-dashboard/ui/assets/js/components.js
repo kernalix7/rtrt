@@ -27,8 +27,7 @@ function openProject(name) {
   const memCount = project && project.mem_count !== undefined ? `${project.mem_count} memories` : '';
   const path = project && project.path ? project.path : 'no path set';
   document.getElementById('mem-detail-meta').textContent = [memCount, path].filter(Boolean).join(' · ');
-  localStorage.setItem('rtrt.project', name);
-  localStorage.setItem('rtrt-project', name);
+  sessionStorage.setItem('rtrt.project', name);
   // Default sub = history.
   document.querySelectorAll('#memory-subtabs a').forEach(x => x.classList.remove('active'));
   document.querySelector('#memory-subtabs a[data-sub="memhistory"]').classList.add('active');
@@ -151,10 +150,26 @@ function renderBody(body) {
 
 // Build a model <select> option list from the shared MODELS_CACHE.
 // Includes a blank "default" option so model can be omitted.
+function canonicalModelValue(value) {
+  if (!value) return '';
+  const exact = MODELS_CACHE.find(m => m.id === value);
+  if (exact) return exact.id;
+  const slash = value.indexOf('/');
+  if (slash > 0) {
+    const provider = normalizeProviderId(value.slice(0, slash));
+    const upstream = value.slice(slash + 1);
+    const canonical = MODELS_CACHE.find(m => m.provider === provider && m.upstream_id === upstream);
+    if (canonical) return canonical.id;
+  }
+  const legacy = MODELS_CACHE.find(m => m.source === 'configured' && m.upstream_id === value)
+    || MODELS_CACHE.find(m => m.upstream_id === value);
+  return legacy ? legacy.id : value;
+}
 function buildModelOptions(selected) {
   const base = `<option value="">default</option>`;
+  const canonicalSelected = canonicalModelValue(selected);
   return base + MODELS_CACHE.map(m =>
-    `<option value="${escapeHtml(m.id)}"${m.id === selected ? ' selected' : ''}>${escapeHtml(m.id)} (${escapeHtml(m.source)})</option>`
+    `<option value="${escapeAttr(m.id)}"${m.id === canonicalSelected ? ' selected' : ''}>${escapeHtml(m.label)}${m.available === false ? ' · unavailable' : ''}</option>`
   ).join('');
 }
 
@@ -465,7 +480,7 @@ document.getElementById('bulk-clear-btn').onclick = () => {
 // Re-load history after save.
 const originalSaveHandler = () => {};
 
-const savedProject = localStorage.getItem('rtrt.project') || localStorage.getItem('rtrt-project');
+const savedProject = sessionStorage.getItem('rtrt.project');
 if (savedProject && !isGlobalProjectValue(savedProject)) syncProjectInputs(savedProject);
 
 // Sample data — one-click form fillers so the user can try a tool without
@@ -527,9 +542,9 @@ const PALETTE_ITEMS = [
   { label: 'Providers · Active & models', hint: 'providers / local models', run: () => navigate('llm') },
   { label: 'Providers · Chat playground', hint: 'gateway chat / POST /api/chat', run: () => navigate('chat') },
   { label: 'Providers · Limits', hint: 'daily usage ceilings', run: () => navigate('limits') },
-  { label: 'Orchestrate · Environment', hint: 'detected tools', run: () => navigate('environment') },
-  { label: 'Orchestrate · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
-  { label: 'Orchestrate · Orchestration', hint: 'lanes / tier ladder / policy / failover', run: () => navigate('orchestration') },
+  { label: 'Routing · Environment', hint: 'detected tools', run: () => navigate('environment') },
+  { label: 'Routing · Router', hint: 'usage / headroom / routing preview', run: () => navigate('usage') },
+  { label: 'Routing · Failover', hint: 'failure classes / retries / backoff', run: () => navigate('failover') },
   { label: 'Connect · Setup', hint: 'client snippets', run: () => navigate('connect') },
   // ── Actions ──
   { label: 'Add / edit project', hint: 'Project / selector', run: () => openProjectModal(false) },
@@ -569,9 +584,9 @@ function refreshProjectScopePage() {
   // Providers (active + enabled) and Agents enable/disable are per-project too.
   if (page === 'llm') loadProvidersConfig();
   if (page === 'environment') loadAgentsConfig();
-  // Orchestration reads through the same ?project= selector, so the scope hint
+  // Failover reads through the same ?project= selector, so the scope hint
   // it shows has to follow the selector too.
-  if (page === 'orchestration') loadOrchestration();
+  if (page === 'failover') loadFailover();
 }
 function setCompressEngine(engine, level) {
   if (!engine) return;
@@ -599,6 +614,11 @@ function focusOptimizerLevel() {
 }
 
 function navigate(page, opts = {}) {
+  if (isGlobalScope() && page !== 'overview' && page !== 'failover') {
+    page = 'overview';
+    opts = {};
+    showToast('Select an available project to use project pages and actions.', 'err');
+  }
   updateGlobalScopeIndicators();
   // Keep the top-level mode switch + visible sidebar in sync with the target
   // page (defined in app.js). A page may be opened programmatically from the
@@ -654,9 +674,9 @@ function navigate(page, opts = {}) {
     // Tools › Limits — daily usage ceilings (moved out of Capture/Config).
     loadLimitsConfig();
   }
-  if (page === 'orchestration') {
-    // Tools › Orchestration — the editable [team] roster + [failover] policy.
-    loadOrchestration();
+  if (page === 'failover') {
+    // Tools › Failover — the editable [failover] policy.
+    loadFailover();
   }
   if (page === 'usage') {
     // Tools › Router — provider usage + headroom + load-balancing decision.
@@ -806,4 +826,3 @@ function spark(svgId, values, color) {
     `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>` +
     `<text x="${w-pad}" y="11" text-anchor="end" fill="var(--muted)" font-size="10">max ${max}</text>`;
 }
-

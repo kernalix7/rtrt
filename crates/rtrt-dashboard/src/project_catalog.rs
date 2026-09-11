@@ -319,11 +319,34 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    /// macOS reaches the system temp dir through `/var -> /private/var`, and
+    /// project identity derives from the canonical path, so a raw handle path
+    /// makes the derived slug disagree with the home the catalog scans.
+    struct CanonicalTempDir {
+        _guard: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        fn new() -> Self {
+            let guard = tempfile::tempdir().unwrap();
+            let path = std::fs::canonicalize(guard.path()).unwrap();
+            Self {
+                _guard: guard,
+                path,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
     #[test]
     fn discovers_same_basename_projects_as_distinct_canonical_slugs() {
         use std::os::unix::fs::PermissionsExt;
 
-        let home = tempfile::tempdir().unwrap();
+        let home = CanonicalTempDir::new();
         std::fs::create_dir_all(home.path().join(".rtrt/projects")).unwrap();
         for path in [
             home.path().join(".rtrt"),

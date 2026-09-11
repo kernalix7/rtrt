@@ -4574,6 +4574,20 @@ pub fn memory_reachable_status(health: bool) -> (CheckState, String) {
 mod tests {
     use super::*;
 
+    /// An absolute path with a space in it, spelled the way the running platform
+    /// spells absolute paths. The TUI writer rejects relative binaries, and a
+    /// POSIX-shaped literal is not absolute on Windows.
+    fn absolute_fixture(tail: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(format!("C:\\{}", tail.replace('/', "\\")))
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from(format!("/{tail}"))
+        }
+    }
+
     #[test]
     fn legacy_claude_tech_lead_is_not_an_active_agent() {
         // Given: the active Claude agent inventory.
@@ -6542,7 +6556,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let binary = Path::new("/opt/RTRT tools/bin/rtrt");
+        let binary = absolute_fixture("opt/RTRT tools/bin/rtrt");
+        let binary = binary.as_path();
 
         apply_opencode_tui_config_at(&path, true, binary).unwrap();
         let first = std::fs::read_to_string(&path).unwrap();
@@ -6585,7 +6600,8 @@ mod tests {
 "#,
         )
         .unwrap();
-        let binary = Path::new("/home/user/My Tools/rtrt");
+        let binary = absolute_fixture("home/user/My Tools/rtrt");
+        let binary = binary.as_path();
 
         apply_opencode_tui_config_at(&path, true, binary).unwrap();
         let installed: serde_json::Value =
@@ -6593,7 +6609,10 @@ mod tests {
         assert_eq!(installed["unknown"]["keep"], true);
         assert_eq!(installed["plugin"].as_array().unwrap().len(), 3);
         assert_eq!(installed["plugin"][2][0], OPENCODE_TUI_STATUSLINE_PLUGIN_ID);
-        assert_eq!(installed["plugin"][2][1]["bin"], "/home/user/My Tools/rtrt");
+        assert_eq!(
+            installed["plugin"][2][1]["bin"],
+            binary.to_string_lossy().as_ref()
+        );
 
         drop_opencode_tui_config_at(&path, true).unwrap();
         let removed: serde_json::Value =
@@ -6725,7 +6744,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config with spaces/tui");
         let config = dir.path().join("config with spaces/tui.json");
-        let binary = Path::new("/opt/RTRT tools/rtrt");
+        let binary = absolute_fixture("opt/RTRT tools/rtrt");
+        let binary = binary.as_path();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(
             &config,

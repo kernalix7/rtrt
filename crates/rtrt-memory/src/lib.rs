@@ -125,20 +125,14 @@ fn inspect_project_store_inner(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| unsafe_store_path("project store has an invalid slug", store_dir))?;
-    let expected_dir = root.join(slug);
-    let expected_db = expected_dir.join("memory.sqlite");
-    let expected_candidate = if candidate_db {
-        expected_db.as_path()
-    } else {
-        expected_dir.as_path()
-    };
-    if candidate != expected_candidate {
+    if store_dir.parent() != Some(projects_root) {
         return Err(unsafe_store_path(
             "project store is not a direct catalog child",
             candidate,
         ));
     }
 
+    let expected_dir = root.join(slug);
     let dir_metadata = fs::symlink_metadata(&expected_dir).map_err(Error::Io)?;
     if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
         return Err(unsafe_store_path(
@@ -7088,6 +7082,26 @@ mod tests {
         assert!(inspected.database_schema_compatible);
         assert!(inspected.integrity_ok);
         assert_eq!(directory_snapshot(&store_dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_store_inspection_accepts_equivalent_catalog_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("inspect-equivalent-root");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        drop(MemoryStore::open_project_in(&identity, &home).unwrap());
+        let alias = temp.path().join("home-alias");
+        symlink(&home, &alias).unwrap();
+        let projects_root = alias.join(".rtrt").join("projects");
+        let database = projects_root.join(identity.slug()).join("memory.sqlite");
+
+        let inspected =
+            inspect_project_store_for_identity_in(&projects_root, &database, &identity).unwrap();
+
+        assert_eq!(inspected.slug, identity.slug());
     }
 
     #[test]

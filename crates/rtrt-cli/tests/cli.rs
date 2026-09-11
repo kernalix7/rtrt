@@ -1799,9 +1799,10 @@ fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
+    let first_json = parse_statusline_json(&first.stdout);
     assert_eq!(
-        parse_statusline_json(&first.stdout)["data"]["savings"]["cached"],
-        true
+        first_json["data"]["savings"]["cached"], true,
+        "statusline did not use the seeded savings cache: {first_json}"
     );
 
     let started = std::time::Instant::now();
@@ -1850,7 +1851,13 @@ fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("rtrt-opencode-git-"))
         })
-        .expect("primed Git cache");
+        .unwrap_or_else(|| {
+            panic!(
+                "priming run wrote no Git cache into {}: {}",
+                runtime.display(),
+                String::from_utf8_lossy(&prime.stdout)
+            )
+        });
     let mut cache: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&git_cache).unwrap()).unwrap();
     cache["ts"] = serde_json::json!(0);

@@ -419,7 +419,7 @@ fn claude_runtime_tmp_candidate(
     Ok(candidate)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn claude_runtime_tmp_candidate_for_test(
     os_tmp: &Path,
     project_fingerprint: &str,

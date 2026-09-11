@@ -3762,7 +3762,14 @@ mod opencode_launcher_tests {
             &linked_paths,
             &args,
         );
-        assert_eq!(command.get_current_dir(), Some(linked.as_path()));
+        // The launcher canonicalizes the cwd, which on Windows also expands the
+        // 8.3 form the temp path carries, so compare resolved locations.
+        assert_eq!(
+            command
+                .get_current_dir()
+                .map(|dir| fs::canonicalize(dir).unwrap()),
+            Some(fs::canonicalize(&linked).unwrap())
+        );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             args.iter().map(OsString::as_os_str).collect::<Vec<_>>()

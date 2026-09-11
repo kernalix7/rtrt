@@ -195,11 +195,6 @@ fn standardization() -> Template {
                 content: STANDARDIZATION_LOG_ANALYZER.into(),
                 executable: false,
             },
-            TemplateFile {
-                path: ".claude/agents/tech-lead.md".into(),
-                content: STANDARDIZATION_TECH_LEAD.into(),
-                executable: false,
-            },
         ],
         post_hooks: vec![],
     }
@@ -467,8 +462,9 @@ cargo fmt --check
 - **Branch naming**: `feature/<short-name>`, `fix/<short-name>`, `chore/<short-name>`.
 - **Commit convention**: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`.
 - **Merge strategy**: squash merge reviewed changes to the main branch.
+"#;
 
-## 11. Agent Teams
+pub(crate) const LEGACY_STANDARDIZATION_AGENT_TEAMS: &str = r#"## 11. Agent Teams
 
 | Agent | Owned Paths | Domain | Model |
 |-------|-------------|--------|-------|
@@ -508,7 +504,7 @@ model: claude-sonnet-4-5
 Parse logs, stack traces, and command output to identify the most likely root cause. Surface file and line references when available, explain the failure path concisely, and recommend the smallest useful next check.
 "#;
 
-const STANDARDIZATION_TECH_LEAD: &str = r#"---
+pub(crate) const LEGACY_STANDARDIZATION_TECH_LEAD: &str = r#"---
 name: tech-lead
 description: Orchestrates cross-cutting work, assigns sub-agents, integrates results, and enforces conventions.
 tools: Read, Bash, Glob, Grep, Edit, Write

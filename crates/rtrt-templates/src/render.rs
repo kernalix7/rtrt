@@ -118,7 +118,7 @@ fn write_exclusive(path: &Path, content: &[u8], executable: bool) -> Result<()> 
 }
 
 #[cfg(unix)]
-fn write_replacing(path: &Path, content: &[u8], executable: bool) -> Result<()> {
+pub(crate) fn write_replacing(path: &Path, content: &[u8], executable: bool) -> Result<()> {
     let (temp_path, file) = create_sibling_temp(path)?;
     let mut cleanup = RemoveOnDrop::new(temp_path.clone());
 
@@ -135,7 +135,7 @@ fn write_replacing(path: &Path, content: &[u8], executable: bool) -> Result<()> 
 }
 
 #[cfg(not(unix))]
-fn write_replacing(_path: &Path, _content: &[u8], _executable: bool) -> Result<()> {
+pub(crate) fn write_replacing(_path: &Path, _content: &[u8], _executable: bool) -> Result<()> {
     Err(Error::Config(
         "atomic scaffold file replacement is unsupported on this platform".to_string(),
     ))

@@ -636,12 +636,13 @@ fn rendered_contract(
     vars: BTreeMap<String, String>,
 ) -> Result<RenderedStandardization> {
     let plan = render::plan(template, root.as_ref(), vars)?;
+    let planned_root = plan.root;
     let mut contract_content = None;
     let mut agent_files = Vec::new();
     for file in plan.files {
         let relative = file
             .path
-            .strip_prefix(root.as_ref())
+            .strip_prefix(&planned_root)
             .map_err(|_| {
                 Error::Config(format!(
                     "template path escaped root: {}",
@@ -825,6 +826,13 @@ mod tests {
                 .iter()
                 .all(|n| (FIRST_MANAGED_SECTION..=LAST_MANAGED_SECTION).contains(n))
         );
+    }
+
+    #[test]
+    fn expected_sections_accepts_relative_project_root() {
+        let sections = expected_sections(".").expect("sections from relative root");
+
+        assert_eq!(sections.len(), 7);
     }
 
     #[test]

@@ -510,24 +510,11 @@ fn apply_legacy_orchestration_retirement_with_hooks(
         // remaining targets are still being checked.
         verify_retirement_source(&plan.root, file, "before retirement")?;
         match &file.replacement {
-            Some(replacement) => replace_retirement_target(&file.path, replacement)?,
+            Some(replacement) => render::replace_contents_no_follow(&file.path, replacement)?,
             None => std::fs::remove_file(&file.path).map_err(Error::Io)?,
         }
     }
     Ok(())
-}
-
-// Retirement must never write *through* a symlink a racing process drops at the
-// target. A sibling temp file plus rename replaces such a link instead of
-// following it, which no amount of pre-write checking can guarantee on its own.
-#[cfg(unix)]
-fn replace_retirement_target(path: &Path, content: &[u8]) -> Result<()> {
-    render::write_replacing(path, content, false)
-}
-
-#[cfg(not(unix))]
-fn replace_retirement_target(path: &Path, content: &[u8]) -> Result<()> {
-    std::fs::write(path, content).map_err(Error::Io)
 }
 
 fn verify_retirement_source(root: &Path, file: &LegacyRetirementFile, stage: &str) -> Result<()> {

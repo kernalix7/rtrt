@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use handlebars::Handlebars;
@@ -117,6 +116,25 @@ fn write_exclusive(path: &Path, content: &[u8], executable: bool) -> Result<()> 
     Ok(())
 }
 
+/// Replace `path`'s contents without ever writing *through* a symlink that
+/// appears there. The bytes land in a sibling temporary file and `rename` swaps
+/// it in, which replaces such a link on every supported platform rather than
+/// following it; a pre-write check alone cannot guarantee that.
+pub(crate) fn replace_contents_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    let (temp_path, file) = create_sibling_temp(path)?;
+    let mut cleanup = RemoveOnDrop::new(temp_path.clone());
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_file()
+    {
+        file.set_permissions(metadata.permissions())
+            .map_err(Error::Io)?;
+    }
+    write_open_file(file, content, false)?;
+    std::fs::rename(&temp_path, path).map_err(Error::Io)?;
+    cleanup.keep();
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) fn write_replacing(path: &Path, content: &[u8], executable: bool) -> Result<()> {
     let (temp_path, file) = create_sibling_temp(path)?;
@@ -155,10 +173,8 @@ fn write_open_file(mut file: File, content: &[u8], executable: bool) -> Result<(
     Ok(())
 }
 
-#[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(unix)]
 fn create_sibling_temp(path: &Path) -> Result<(PathBuf, File)> {
     let parent = path
         .parent()

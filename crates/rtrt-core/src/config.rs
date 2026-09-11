@@ -44,18 +44,6 @@ pub struct Config {
     pub projects: Vec<ProjectEntry>,
 }
 
-/// How the host reaches a team member.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Delegation {
-    /// Use the current host's native Task / agent mechanism.
-    #[default]
-    Native,
-    /// Spawn an external CLI via `claude -p`.
-    #[serde(rename = "cli", alias = "shell")]
-    Shell,
-}
-
 /// Global security defaults applied before any per-project binding. A project
 /// without its own `security_profile` (and any ad-hoc scan) falls back to
 /// `default_profile`.
@@ -882,8 +870,7 @@ fn prepare_project_config_dir(root: &Path, create: bool) -> Result<Option<PathBu
         return Ok(None);
     }
     let path = root.join(".rtrt");
-    fs::create_dir(&path).map_err(|error| config_error("mkdir", &path, error))?;
-    set_private_directory_mode(&path)?;
+    create_private_directory(&path)?;
     existing_project_config_dir(root)
 }
 
@@ -1077,16 +1064,21 @@ fn atomic_write_project_config(
     ))
 }
 
+// The directory is born private. Creating it world-readable and narrowing it
+// afterwards would expose a window in which another process can enter it or
+// have the later chmod redirected onto a directory it swapped in.
 #[cfg(unix)]
-fn set_private_directory_mode(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| config_error("chmod", path, error))
+fn create_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| config_error("mkdir", path, error))
 }
 
 #[cfg(not(unix))]
-fn set_private_directory_mode(_path: &Path) -> Result<()> {
-    Ok(())
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir(path).map_err(|error| config_error("mkdir", path, error))
 }
 
 /// Walk up from `start` to the enclosing repo root — the first ancestor with a

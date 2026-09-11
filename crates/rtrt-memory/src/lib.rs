@@ -343,6 +343,7 @@ fn ensure_private_store_directory(parent: &Path, component: &str) -> Result<Path
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             {
@@ -382,6 +383,7 @@ fn prepare_private_db_file(path: &Path) -> Result<()> {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
+            #[cfg_attr(not(unix), allow(unused_variables))]
             let file = options.open(path).map_err(Error::Io)?;
             #[cfg(unix)]
             {

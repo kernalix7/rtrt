@@ -9,6 +9,31 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 /// A `rtrt` command with HOME isolated to `home`.
+/// A temp HOME whose path is canonical.
+///
+/// macOS reaches the system temp dir through `/var -> /private/var`, and the
+/// OpenCode store deliberately refuses any database reached through a symlink.
+/// Exposing `path()` keeps every call site identical to a plain `TempDir`.
+struct CanonicalHome {
+    _guard: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl CanonicalHome {
+    fn new() -> Self {
+        let guard = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(guard.path()).unwrap();
+        Self {
+            _guard: guard,
+            path,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 fn rtrt(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("rtrt").expect("rtrt binary builds");
     cmd.env("HOME", home)
@@ -53,7 +78,7 @@ fn read_http_request(stream: &mut TcpStream) {
 
 #[test]
 fn version_prints_version_string() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     rtrt(home.path())
         .arg("--version")
         .assert()
@@ -83,7 +108,7 @@ Break down cross-cutting tasks, assign focused sub-agent work, integrate results
 "#;
 
     // Given a repository containing exact bytes emitted by the legacy standardization template.
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     let agents = project.join(".claude/agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -123,7 +148,7 @@ Break down cross-cutting tasks, assign focused sub-agent work, integrate results
 
 #[test]
 fn opencode_session_status_and_dry_run_are_cwd_independent_and_read_only() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let data = home.path().join("xdg-data");
     std::fs::create_dir_all(data.join("opencode")).unwrap();
     let source = data.join("opencode/opencode.db");
@@ -154,7 +179,7 @@ fn opencode_session_status_and_dry_run_are_cwd_independent_and_read_only() {
 
 #[test]
 fn compress_ultra_preserves_paths_and_negations() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     rtrt(home.path())
         .args(["compress", "--level", "ultra"])
         .write_stdin("Make sure you do not delete docs/reference/api.md")
@@ -166,7 +191,7 @@ fn compress_ultra_preserves_paths_and_negations() {
 
 #[test]
 fn memory_save_then_recall_roundtrip() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -201,7 +226,7 @@ fn memory_save_then_recall_roundtrip() {
 
 #[test]
 fn punctuated_recall_query_does_not_error() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -237,7 +262,7 @@ fn punctuated_recall_query_does_not_error() {
 
 #[test]
 fn memory_reembed_dry_run_honours_project_scope() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -293,7 +318,7 @@ fn memory_reembed_dry_run_honours_project_scope() {
 
 #[test]
 fn memory_reembed_rejects_invalid_batch_and_conflicting_scope() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
 
     rtrt(home.path())
         .args(["memory", "reembed", "--batch", "0", "--dry-run"])
@@ -322,7 +347,7 @@ fn memory_reembed_rejects_invalid_batch_and_conflicting_scope() {
 
 #[test]
 fn memory_reembed_probe_reports_pending_rows() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -360,7 +385,7 @@ fn memory_reembed_probe_reports_pending_rows() {
 fn memory_reembed_rejects_malformed_config() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let config_dir = home.path().join(".rtrt");
     std::fs::create_dir(&config_dir).unwrap();
     #[cfg(unix)]
@@ -376,7 +401,7 @@ fn memory_reembed_rejects_malformed_config() {
 
 #[test]
 fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -472,7 +497,7 @@ fn memory_reembed_persists_successful_rows_before_mid_batch_failure() {
 
 #[test]
 fn memory_reembed_falls_back_to_legacy_ollama_endpoint() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let store = home.path().join("mem.sqlite");
     let store_s = store.to_str().unwrap();
 
@@ -548,7 +573,7 @@ fn memory_reembed_falls_back_to_legacy_ollama_endpoint() {
 
 #[test]
 fn gain_survives_empty_stats() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     rtrt(home.path()).arg("gain").assert().success();
 }
 
@@ -558,7 +583,7 @@ fn repo(root: &std::path::Path) {
 
 #[test]
 fn normal_memory_isolates_same_basename_repositories_and_rejects_spoofing() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let first = home.path().join("one/repo");
     let second = home.path().join("two/repo");
     repo(&first);
@@ -640,7 +665,7 @@ fn normal_memory_isolates_same_basename_repositories_and_rejects_spoofing() {
 
 #[test]
 fn linked_worktree_uses_main_repository_memory() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let main = home.path().join("main");
     let linked = home.path().join("linked");
     std::fs::create_dir(&main).unwrap();
@@ -687,7 +712,7 @@ fn linked_worktree_uses_main_repository_memory() {
 
 #[test]
 fn opencode_setup_has_no_shared_memory_argv_and_restores_history_keybinds() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let opencode = home.path().join(".config/opencode");
     std::fs::create_dir_all(&opencode).unwrap();
     let config = opencode.join("opencode.json");
@@ -735,7 +760,7 @@ fn opencode_setup_has_no_shared_memory_argv_and_restores_history_keybinds() {
 
 #[test]
 fn opencode_history_quarantine_is_dry_run_by_default() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let history = home
         .path()
         .join(".local/state/opencode/prompt-history.jsonl");
@@ -760,7 +785,7 @@ fn opencode_history_quarantine_is_dry_run_by_default() {
 
 #[test]
 fn opencode_launcher_refuses_nested_session_before_resolving_binary() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     repo(&project);
     rtrt(home.path())
@@ -777,7 +802,7 @@ fn opencode_launcher_refuses_nested_session_before_resolving_binary() {
 
 #[test]
 fn legacy_isolation_requires_claim_and_quarantines_cross_row_state() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     repo(&project);
     let identity = rtrt_core::ProjectIdentity::derive(&project).unwrap();
@@ -892,7 +917,7 @@ fn legacy_isolation_requires_claim_and_quarantines_cross_row_state() {
 #[cfg(target_os = "linux")]
 #[test]
 fn service_machine_mode_has_no_project_working_directory_or_legacy_memory_path() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     repo(&project);
     rtrt(home.path())
@@ -911,7 +936,7 @@ fn service_machine_mode_has_no_project_working_directory_or_legacy_memory_path()
 
 #[test]
 fn opencode_setup_dry_run_lists_tui_targets_without_writing() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let opencode = home.path().join(".config/opencode");
 
     rtrt(home.path())
@@ -943,7 +968,7 @@ fn opencode_setup_dry_run_lists_tui_targets_without_writing() {
 
 #[test]
 fn opencode_setup_and_uninstall_ignore_all_global_claude_config() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let claude_json = home.path().join(".claude.json");
     let claude_dir = home.path().join(".claude");
     let claude_settings = claude_dir.join("settings.json");
@@ -984,7 +1009,7 @@ fn opencode_sandbox_rejects_project_executable_before_home_writes() {
     }) else {
         return;
     };
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = statusline_workspace_root();
 
     rtrt(home.path())
@@ -1003,7 +1028,7 @@ fn opencode_sandbox_rejects_project_executable_before_home_writes() {
 
 #[test]
 fn opencode_machine_only_rejects_invalid_scope_combinations() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     rtrt(home.path())
         .args(["setup", "--agent", "opencode", "--machine-only"])
         .assert()
@@ -1030,7 +1055,7 @@ fn opencode_machine_only_rejects_invalid_scope_combinations() {
 #[cfg(target_os = "linux")]
 #[test]
 fn opencode_machine_only_never_requires_git_cwd() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     rtrt(home.path())
         .current_dir(home.path())
         .args([
@@ -1089,7 +1114,7 @@ fn opencode_sandbox_accepts_trusted_executable_outside_project() {
 fn setup_never_probes_ollama_or_mutates_embeddings() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let bin = home.path().join("bin");
     let marker = home.path().join("ollama-probed");
     std::fs::create_dir_all(&bin).unwrap();
@@ -1122,7 +1147,7 @@ fn setup_never_probes_ollama_or_mutates_embeddings() {
 
 #[test]
 fn opencode_unsandboxed_setup_preserves_config_and_does_not_create_agents() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let opencode = home.path().join(".config/opencode");
     let config = opencode.join("opencode.json");
     std::fs::create_dir_all(&opencode).unwrap();
@@ -1144,7 +1169,7 @@ fn opencode_unsandboxed_setup_preserves_config_and_does_not_create_agents() {
 
 #[test]
 fn hidden_shell_dispatch_fails_closed_without_managed_state() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     std::fs::create_dir_all(project.join(".git")).unwrap();
     rtrt(home.path())
@@ -1184,7 +1209,7 @@ fn opencode_linux_sandbox_dry_run_and_boundary_rejections() {
     }) else {
         return;
     };
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let project = home.path().join("project");
     let config_dir = home.path().join(".config/opencode");
     let config = config_dir.join("opencode.jsonc");
@@ -1247,7 +1272,7 @@ fn parse_statusline_json(stdout: &[u8]) -> serde_json::Value {
 
 #[test]
 fn opencode_statusline_returns_partial_json_at_zero_budget_and_honors_no_git() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let output = rtrt(home.path())
         .args([
             "statusline",
@@ -1297,7 +1322,7 @@ fn opencode_statusline_returns_partial_json_at_zero_budget_and_honors_no_git() {
 
 #[test]
 fn opencode_statusline_sanitizes_malicious_cwd_controls() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let cwd = home.path().join("bad\n\t\u{1b}[31m");
     std::fs::create_dir(&cwd).unwrap();
     let output = rtrt(home.path())
@@ -1335,7 +1360,7 @@ fn opencode_statusline_sanitizes_malicious_cwd_controls() {
 
 #[test]
 fn opencode_statusline_never_waits_for_stdin() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rtrt"))
         .args([
             "statusline",
@@ -1383,7 +1408,7 @@ fn official_claude_rate_limits_roundtrip_without_changing_claude_bytes() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let config_dir = home.path().join(".rtrt");
     std::fs::create_dir(&config_dir).unwrap();
     #[cfg(unix)]
@@ -1524,7 +1549,7 @@ codex_check_timeout_ms = 1
 fn opencode_statusline_reads_and_migrates_secure_legacy_cache_under_0755_state_dir() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let state = home.path().join(".rtrt");
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1602,7 +1627,7 @@ fn opencode_statusline_reads_and_migrates_secure_legacy_cache_under_0755_state_d
 fn opencode_statusline_rejects_insecure_legacy_cache() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let state = home.path().join(".rtrt");
     std::fs::create_dir(&state).unwrap();
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1662,7 +1687,7 @@ fn opencode_statusline_rejects_insecure_legacy_cache() {
 
 #[test]
 fn opencode_statusline_degrades_quota_when_cache_is_absent() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let output = rtrt(home.path())
         .args([
             "statusline",
@@ -1752,7 +1777,7 @@ fn cached_statusline_command(home: &std::path::Path, runtime: &std::path::Path) 
 
 #[test]
 fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
 
@@ -1794,7 +1819,7 @@ fn opencode_statusline_uses_normal_cached_data_within_wall_budget() {
 fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = tempfile::tempdir().unwrap();
+    let home = CanonicalHome::new();
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
     let prime = cached_statusline_command(home.path(), &runtime)

@@ -1833,7 +1833,19 @@ fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
     let home = CanonicalHome::new();
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
+
+    // The probe only trusts a Git binary whose whole path is private, which the
+    // Git shipped on some runners is not. Priming through a fixture we own makes
+    // the cache this test then ages deterministic on every platform.
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let prime_git = bin.join("git");
+    std::fs::write(&prime_git, "#!/bin/sh\nprintf '# branch.head main\\n'\n").unwrap();
+    std::fs::set_permissions(&prime_git, std::fs::Permissions::from_mode(0o700)).unwrap();
+
     let prime = cached_statusline_command_with_budget(home.path(), &runtime, "5000")
+        .env("PATH", &bin)
         .output()
         .unwrap();
     assert!(
@@ -1873,8 +1885,6 @@ fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
     )
     .unwrap();
 
-    let bin = home.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
     let fake_git = bin.join("git");
     let git_pid = home.path().join("git.pid");
     std::fs::write(

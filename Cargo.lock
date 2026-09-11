@@ -1356,9 +1356,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-compress"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-dashboard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3306,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-eval"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3347,7 +3347,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -3368,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "once_cell",
  "regex",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-security"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-templates"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",

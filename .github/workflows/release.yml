@@ -1,28 +1,61 @@
 name: Release
 
-# Triggers:
-#   - push of `vX.Y.Z` tag → build artefacts + create GitHub Release
-#   - push of `REL-vX.Y.Z` tag → additionally extract the matching CHANGELOG
-#     section into the release body and publish all crates to crates.io
-#   - workflow_dispatch → manual dry run (matrix only; no release created)
+# Stable releases use a paired vX.Y.Z / REL-vX.Y.Z tag at one commit. The
+# ordinary v tag builds and validates only; the REL tag publishes registries
+# first and creates or updates the GitHub Release last.
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-*'
       - 'REL-v[0-9]+.[0-9]+.[0-9]+'
-      - 'REL-v[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  # Paired tags at the same commit serialize instead of racing each other.
+  group: release-${{ github.repository }}-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: Validate release contract
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      version_tag: ${{ steps.release.outputs.version_tag }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - id: release
+        name: Validate paired tags and versions
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: scripts/release-preflight.sh
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Test Rust workspace without credentials
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
   build:
-    name: build ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -35,7 +68,7 @@ jobs:
             runner: ubuntu-24.04-arm
             ext: tar.gz
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             ext: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -44,180 +77,259 @@ jobs:
             runner: windows-latest
             ext: zip
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
-      - name: Resolve version tag
-        id: ver
-        shell: bash
-        run: |
-          ref="${GITHUB_REF##*/}"
-          if [[ "$ref" == REL-* ]]; then
-            version="${ref#REL-}"
-          else
-            version="${ref}"
-          fi
-          if [[ "$version" != v* ]]; then
-            version="v0.0.0-dispatch"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "version_bare=${version#v}" >> "$GITHUB_OUTPUT"
       - name: Build release binaries
+        run: >-
+          cargo build --locked --release --workspace
+          --bin rtrt --bin rtrt-mcp --bin rtrt-dashboard
+          --target ${{ matrix.target }}
+      - name: Stage archive and checksum
+        id: package
         shell: bash
-        run: |
-          cargo build --release --workspace \
-            --bin rtrt --bin rtrt-mcp --bin rtrt-dashboard \
-            --target ${{ matrix.target }}
-      - name: Stage tarball
-        id: pkg
-        shell: bash
-        run: |
-          name="rtrt-${{ steps.ver.outputs.version_bare }}-${{ matrix.target }}"
-          stage="dist/$name"
-          mkdir -p "$stage"
-          ext="${{ matrix.ext }}"
-          for bin in rtrt rtrt-mcp rtrt-dashboard; do
-            if [ -f "target/${{ matrix.target }}/release/${bin}.exe" ]; then
-              cp "target/${{ matrix.target }}/release/${bin}.exe" "$stage/"
-            else
-              cp "target/${{ matrix.target }}/release/$bin" "$stage/"
-            fi
-          done
-          cp LICENSE README.md CHANGELOG.md "$stage/"
-          cd dist
-          if [ "$ext" = "zip" ]; then
-            7z a -tzip "$name.$ext" "$name" >/dev/null
-          else
-            tar -czf "$name.$ext" "$name"
-          fi
-          # checksum
-          if command -v sha256sum >/dev/null; then
-            sha256sum "$name.$ext" | awk '{print $1}' > "$name.$ext.sha256"
-          else
-            shasum -a 256 "$name.$ext" | awk '{print $1}' > "$name.$ext.sha256"
-          fi
-          echo "asset=$name.$ext" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rtrt-${{ steps.ver.outputs.version_bare }}-${{ matrix.target }}
-          path: |
-            dist/${{ steps.pkg.outputs.asset }}
-            dist/${{ steps.pkg.outputs.asset }}.sha256
-          if-no-files-found: error
-
-  release:
-    name: Create / update GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Resolve version tag
-        id: ver
-        shell: bash
-        run: |
-          ref="${GITHUB_REF##*/}"
-          if [[ "$ref" == REL-* ]]; then
-            version="${ref#REL-}"
-            echo "rel=true" >> "$GITHUB_OUTPUT"
-          else
-            version="${ref}"
-            echo "rel=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        with:
-          path: artefacts
-      - name: Extract CHANGELOG section (REL- tag only)
-        id: body
-        if: steps.ver.outputs.rel == 'true'
-        shell: bash
-        run: |
-          version="${{ steps.ver.outputs.version }}"
-          # awk extract: from "## [X.Y.Z]" up to the next "## " line, exclusive
-          awk -v v="${version#v}" '
-            $0 ~ "^## \\[" v "\\]" { inside=1; print; next }
-            inside && /^## \[/ { exit }
-            inside { print }
-          ' CHANGELOG.md > body.md
-          if [ ! -s body.md ]; then
-            printf 'CHANGELOG section for %s not found; using generic body.\n' "$version" >&2
-            printf 'Release %s\n' "$version" > body.md
-          fi
-          echo "body_path=$PWD/body.md" >> "$GITHUB_OUTPUT"
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.version }}
-          name: ${{ steps.ver.outputs.version }}
-          body_path: ${{ steps.body.outputs.body_path }}
-          fail_on_unmatched_files: true
-          files: |
-            artefacts/**/rtrt-*.tar.gz
-            artefacts/**/rtrt-*.tar.gz.sha256
-            artefacts/**/rtrt-*.zip
-            artefacts/**/rtrt-*.zip.sha256
-
-  publish-crates:
-    name: cargo publish (REL- tag only)
-    needs: release
-    if: startsWith(github.ref, 'refs/tags/REL-v')
-    runs-on: ubuntu-latest
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Publish in dependency order
-        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_EXT: ${{ matrix.ext }}
         run: |
           set -euo pipefail
-          # Every publishable workspace crate, topologically sorted by their
-          # rtrt-* dependencies. Optional deps count too: crates.io refuses a
-          # publish whose optional path dep is not on the registry yet.
-          #   core → (providers) → compress/proxy/memory/templates/security
-          #        → eval → mcp/dashboard/cli
-          crates=(
-            rtrt-core
-            rtrt-providers
-            rtrt-compress
-            rtrt-proxy
-            rtrt-memory
-            rtrt-templates
-            rtrt-security
-            rtrt-eval
-            rtrt-mcp
-            rtrt-dashboard
-            rtrt-cli
+          name="rtrt-${RELEASE_VERSION}-${RELEASE_TARGET}"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          for bin in rtrt rtrt-mcp rtrt-dashboard; do
+            source="target/${RELEASE_TARGET}/release/$bin"
+            if [ -f "$source.exe" ]; then source="$source.exe"; fi
+            cp "$source" "$stage/"
+          done
+          cp LICENSE README.md CHANGELOG.md "$stage/"
+          (
+            cd dist
+            if [ "$RELEASE_EXT" = zip ]; then
+              7z a -tzip "$name.$RELEASE_EXT" "$name" >/dev/null
+            else
+              tar -czf "$name.$RELEASE_EXT" "$name"
+            fi
+            source ../scripts/release-helpers.sh
+            canonical_sha256_record "$name.$RELEASE_EXT" > "$name.$RELEASE_EXT.sha256"
           )
-          # Guard: fail fast if the workspace gains/loses a crate this list
-          # does not know about, instead of silently skipping it.
-          expected=$(printf '%s\n' "${crates[@]}" | sort)
-          actual=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[].name' | sort)
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::publish list is out of sync with workspace members"
-            diff <(echo "$expected") <(echo "$actual") || true
+          printf 'asset=%s\n' "$name.$RELEASE_EXT" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rtrt-${{ needs.preflight.outputs.version }}-${{ matrix.target }}
+          path: |
+            dist/${{ steps.package.outputs.asset }}
+            dist/${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  package-npm:
+    name: Test and package npm artifact
+    needs: preflight
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/opencode
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Pack exact npm artifact
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive=$(npm pack --ignore-scripts --json | jq -r '.[0].filename')
+          test "$archive" = "rtrt-agent-${RELEASE_VERSION}.tgz"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ needs.preflight.outputs.version }}
+          path: plugins/opencode/rtrt-agent-${{ needs.preflight.outputs.version }}.tgz
+          if-no-files-found: error
+
+  release-credentials:
+    name: Validate release publication credential
+    needs: [preflight, build, package-npm]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io-publish
+    steps:
+      - name: Require crates.io publication credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo '::error::CARGO_REGISTRY_TOKEN is required in the crates-io-publish environment' >&2
             exit 1
           fi
-          for crate in "${crates[@]}"; do
-            echo "== publishing $crate =="
-            rc=0
-            out=$(cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN" --no-verify 2>&1) || rc=$?
-            printf '%s\n' "$out"
-            if [ "$rc" -ne 0 ]; then
-              # Idempotent re-run: a version already on crates.io is fine.
-              if grep -qiE 'already (uploaded|exists)' <<< "$out"; then
-                echo "== $crate already published — skipping =="
-              else
-                echo "::error::cargo publish failed for $crate"
-                exit "$rc"
-              fi
-            fi
-            sleep 10  # let crates.io index settle before the next dep publishes
+
+  publish-npm:
+    name: Publish and verify npm
+    needs: [preflight, build, package-npm, release-credentials]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package-${{ needs.preflight.outputs.version }}
+          path: package
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Pin npm CLI for trusted publication
+        run: npm install --global npm@11.11.0
+      - id: registry
+        name: Check exact npm version
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://registry.npmjs.org/rtrt-agent/${RELEASE_VERSION}"
+          status=$(curl --silent --show-error --output npm-version.json --write-out '%{http_code}' "$url")
+           case "$status" in
+             200)
+               jq -e --arg version "$RELEASE_VERSION" '.version == $version' npm-version.json >/dev/null
+               cp "package/rtrt-agent-${RELEASE_VERSION}.tgz" npm-version.tgz
+               integrity=$(jq -r '.dist.integrity // empty' npm-version.json)
+               shasum=$(jq -r '.dist.shasum // empty' npm-version.json)
+               if [ -n "$integrity" ]; then
+                 actual="sha512-$(openssl dgst -sha512 -binary npm-version.tgz | openssl base64 -A)"
+                 [ "$actual" = "$integrity" ] || {
+                   echo '::error::existing npm package integrity does not match the local artifact' >&2
+                   exit 1
+                 }
+               elif [[ "$shasum" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                 actual=$(openssl dgst -sha1 npm-version.tgz | awk '{print $NF}')
+                 [ "${actual,,}" = "${shasum,,}" ] || {
+                   echo '::error::existing npm package shasum does not match the local artifact' >&2
+                   exit 1
+                 }
+               else
+                 echo '::error::existing npm package has no supported dist.integrity or dist.shasum' >&2
+                 exit 1
+               fi
+               echo 'published=true' >> "$GITHUB_OUTPUT"
+              ;;
+            404) echo 'published=false' >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::npm registry returned HTTP $status" >&2; exit 1 ;;
+          esac
+      - name: Publish npm artifact with provenance
+        if: steps.registry.outputs.published != 'true'
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: npm publish "package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance
+      - name: Wait for exact npm version visibility
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://registry.npmjs.org/rtrt-agent/${RELEASE_VERSION}"
+           for attempt in $(seq 1 12); do
+             status=$(curl --silent --show-error --output npm-version.json --write-out '%{http_code}' "$url" || true)
+             if [ "$status" = 200 ] \
+               && jq -e --arg version "$RELEASE_VERSION" '.version == $version' npm-version.json >/dev/null; then
+               cp "package/rtrt-agent-${RELEASE_VERSION}.tgz" npm-version.tgz
+               integrity=$(jq -r '.dist.integrity // empty' npm-version.json)
+               shasum=$(jq -r '.dist.shasum // empty' npm-version.json)
+               if [ -n "$integrity" ]; then
+                 actual="sha512-$(openssl dgst -sha512 -binary npm-version.tgz | openssl base64 -A)"
+                 if [ "$actual" = "$integrity" ]; then exit 0; fi
+                 echo '::error::published npm package integrity does not match the local artifact' >&2
+                 exit 1
+               fi
+               if [[ "$shasum" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                 actual=$(openssl dgst -sha1 npm-version.tgz | awk '{print $NF}')
+                 if [ "${actual,,}" = "${shasum,,}" ]; then exit 0; fi
+                 echo '::error::published npm package shasum does not match the local artifact' >&2
+                 exit 1
+               fi
+               echo '::error::published npm package has no supported dist.integrity or dist.shasum' >&2
+               exit 1
+             fi
+            [ "$attempt" -eq 12 ] || sleep 10
           done
+          echo "::error::rtrt-agent@${RELEASE_VERSION} did not become visible" >&2
+          exit 1
+
+  publish-crates:
+    name: Publish and verify crates.io
+    needs: [preflight, build, release-credentials]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io-publish
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - name: Publish missing crates and wait for dependency visibility
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: scripts/publish-crates.sh
+
+  release:
+    name: Create or update GitHub Release
+    needs: [preflight, build, publish-npm, publish-crates]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: rtrt-${{ needs.preflight.outputs.version }}-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify assets and extract release notes
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(find artifacts -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 5
+          test "$(find artifacts -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 5
+          (
+            cd artifacts
+            for checksum in *.sha256; do sha256sum -c "$checksum"; done
+          )
+          source scripts/release-helpers.sh
+          extract_changelog_section CHANGELOG.md "$RELEASE_VERSION" > body.md
+          test -s body.md
+      - name: Publish GitHub Release after registry verification
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.preflight.outputs.version_tag }}
+          name: ${{ needs.preflight.outputs.version_tag }}
+          body_path: body.md
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+            artifacts/*.zip
+            artifacts/*.zip.sha256

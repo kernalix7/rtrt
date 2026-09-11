@@ -27,9 +27,9 @@ class Rtrt < Formula
   # `bin.install` the three executables). The placeholder URL/sha256 below
   # MUST be updated before publishing the tap; until then the formula is a
   # local-dev artefact only.
-  url "https://github.com/kernalix7/rtrt/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/kernalix7/rtrt/archive/refs/tags/v0.1.1.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  version "0.1.0"
+  version "0.1.1"
 
   head "https://github.com/kernalix7/rtrt.git", branch: "main"
 

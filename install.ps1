@@ -365,21 +365,28 @@ try {
     $archivePath = Join-Path $work $asset
     Invoke-Step "downloading $url" { Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing }
     if (-not $DryRun) {
-        $checksumContent = $null
         try {
             $checksumContent = (Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing).Content
         } catch {
-            Write-Warn "  checksum: SHA256 file not yet attached; skipping verification"
+            throw "checksum file is missing for release asset $asset`: $checksumUrl"
         }
-        if ($null -ne $checksumContent) {
-            $expected = $checksumContent.Trim().Split(' ')[0]
-            if (-not $expected) { throw "invalid empty checksum response from $checksumUrl" }
-            $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
-            if ($actual -ne $expected.ToLower()) {
-                throw "checksum mismatch: expected $expected actual $actual"
-            }
-            Write-Log "  checksum: ok"
+        $checksumLines = @($checksumContent.Trim() -split '\r?\n')
+        $checksumParts = @($checksumLines[0] -split '\s+')
+        if ($checksumLines.Count -ne 1 -or $checksumParts.Count -ne 2) {
+            throw "checksum file must contain exactly one SHA256 record: $checksumUrl"
         }
+        $expected = $checksumParts[0]
+        if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "checksum file must begin with exactly 64 hexadecimal characters: $checksumUrl"
+        }
+        if ($checksumParts[1] -cne $asset) {
+            throw "checksum filename does not match release asset: expected $asset, found $($checksumParts[1])"
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+        if ($actual -ne $expected.ToLower()) {
+            throw "checksum mismatch: expected $expected actual $actual"
+        }
+        Write-Log "  checksum: ok"
     }
     $extract = Join-Path $work "extracted"
     Invoke-Step "extract" { Expand-Archive -Path $archivePath -DestinationPath $extract -Force }

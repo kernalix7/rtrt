@@ -493,30 +493,46 @@ log "  downloading $URL"
 run "download $ASSET" curl -fsSL -o "$WORK/$ASSET" "$URL"
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    # A missing .sha256 asset (`curl -f` fails) must surface as an empty
-    # EXPECTED — not abort the install under set -e / pipefail.
-    EXPECTED="$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null | awk '{print $1}' | head -1)" || EXPECTED=""
-    if [ -n "$EXPECTED" ]; then
-        ACTUAL="$(sha256sum "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
-        if [ -z "$ACTUAL" ]; then
-            ACTUAL="$(shasum -a 256 "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
-        fi
-        if [ -z "$ACTUAL" ]; then
-            err "a SHA256 checksum is published for $ASSET but neither sha256sum nor shasum is available to verify it."
-            err "Install coreutils (sha256sum) or perl (shasum), or verify manually against:"
-            err "  $CHECKSUM_URL"
-            exit 1
-        fi
-        if [ "$ACTUAL" != "$EXPECTED" ]; then
-            err "checksum mismatch:"
-            err "  expected $EXPECTED"
-            err "  actual   $ACTUAL"
-            exit 1
-        fi
-        log "  checksum: ok"
-    else
-        warn "  checksum: no SHA256 file attached to the release; skipping verification"
+    if ! curl -fsSL -o "$WORK/$ASSET.sha256" "$CHECKSUM_URL" 2>/dev/null; then
+        err "checksum file is missing for release asset $ASSET"
+        err "  $CHECKSUM_URL"
+        exit 1
     fi
+    CHECKSUM_FIELDS="$(awk 'NR == 1 { print NF }' "$WORK/$ASSET.sha256")"
+    CHECKSUM_LINES="$(awk 'END { print NR }' "$WORK/$ASSET.sha256")"
+    EXPECTED="$(awk 'NR == 1 { print $1 }' "$WORK/$ASSET.sha256")"
+    CHECKSUM_ASSET="$(awk 'NR == 1 { print $2 }' "$WORK/$ASSET.sha256")"
+    if [ "$CHECKSUM_LINES" -ne 1 ] || [ "$CHECKSUM_FIELDS" -ne 2 ] || [ "${#EXPECTED}" -ne 64 ]; then
+        err "checksum file must begin with exactly 64 hexadecimal characters"
+        exit 1
+    fi
+    case "$EXPECTED" in
+        *[!0-9a-fA-F]*)
+            err "checksum file must begin with exactly 64 hexadecimal characters"
+            exit 1
+            ;;
+    esac
+    if [ "$CHECKSUM_ASSET" != "$ASSET" ]; then
+        err "checksum filename does not match release asset: expected $ASSET, found $CHECKSUM_ASSET"
+        exit 1
+    fi
+    ACTUAL="$(sha256sum "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
+    if [ -z "$ACTUAL" ]; then
+        ACTUAL="$(shasum -a 256 "$WORK/$ASSET" 2>/dev/null | awk '{print $1}')" || ACTUAL=""
+    fi
+    if [ -z "$ACTUAL" ]; then
+        err "a SHA256 checksum is published for $ASSET but neither sha256sum nor shasum is available to verify it."
+        err "Install coreutils (sha256sum) or perl (shasum), or verify manually against:"
+        err "  $CHECKSUM_URL"
+        exit 1
+    fi
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        err "checksum mismatch:"
+        err "  expected $EXPECTED"
+        err "  actual   $ACTUAL"
+        exit 1
+    fi
+    log "  checksum: ok"
 fi
 
 run "extract $ASSET" tar -xzf "$WORK/$ASSET" -C "$WORK"

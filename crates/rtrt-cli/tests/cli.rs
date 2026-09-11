@@ -1714,8 +1714,17 @@ fn statusline_workspace_root() -> std::path::PathBuf {
 fn seed_statusline_savings_cache(home: &std::path::Path) {
     let state = home.join(".rtrt");
     std::fs::create_dir_all(&state).unwrap();
+    // The cache key is the project name with every non-alphanumeric byte mapped
+    // to `_`, so it follows whatever the checkout directory happens to be named.
+    let key: String = statusline_workspace_root()
+        .file_name()
+        .expect("workspace directory name")
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
     std::fs::write(
-        state.join("statusline-savings-00G_rtrt.cache"),
+        state.join(format!("statusline-savings-{key}.cache")),
         "⚡cmd:25% 💯Σ:40%",
     )
     .unwrap();

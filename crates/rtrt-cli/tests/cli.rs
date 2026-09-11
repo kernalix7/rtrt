@@ -1744,6 +1744,7 @@ fn opencode_statusline_degrades_quota_when_cache_is_absent() {
     );
 }
 
+#[cfg(unix)]
 fn statusline_workspace_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

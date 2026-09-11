@@ -15,8 +15,11 @@ const MAX_REGISTRY_BYTES: u64 = 256 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 const PRIVATE_SCRATCH: &str = "/rtrt-tmp";
+#[cfg(target_os = "linux")]
 const PRIVATE_CARGO_HOME: &str = "/rtrt-tmp/cargo-home";
+#[cfg(target_os = "linux")]
 const PRIVATE_RUSTUP_HOME: &str = "/rtrt-tmp/rustup-home";
 
 #[derive(Debug, Clone)]
@@ -332,6 +335,11 @@ pub(crate) fn validate_machine_config(path: &Path) -> Result<()> {
     validate_config_file(path, current_linux_uid()?)
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn validate_machine_config(_path: &Path) -> Result<()> {
+    bail!("strict OpenCode sandbox is currently available only on Linux")
+}
+
 #[cfg(target_os = "linux")]
 struct RegistryLock {
     path: PathBuf,
@@ -492,6 +500,14 @@ fn linked_git_dirs(root: &Path, git_file: &Path) -> Result<Vec<PathBuf>> {
         bail!("linked-worktree Git backlink mismatch");
     }
     Ok(vec![common, git_dir])
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn with_registry_lock<T>(
+    _registry_path: &Path,
+    _operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    bail!("strict OpenCode sandbox registry is currently available only on Linux")
 }
 
 pub fn registry_path() -> Result<PathBuf> {
@@ -1119,6 +1135,7 @@ fn validated_tool_paths() -> Result<Vec<PathBuf>> {
     Ok(Vec::new())
 }
 
+#[cfg(target_os = "linux")]
 fn add_destination_parents(command: &mut Command, path: &Path) {
     let mut current = PathBuf::from("/");
     if let Some(parent) = path.parent() {
@@ -1129,6 +1146,7 @@ fn add_destination_parents(command: &mut Command, path: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn bind_if_exists(command: &mut Command, source: &str) {
     let path = Path::new(source);
     if path.exists() {
@@ -1136,6 +1154,7 @@ fn bind_if_exists(command: &mut Command, source: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn deterministic_path(tool_paths: &[PathBuf]) -> Result<String> {
     let home = linux_home()?;
     let mut parts = vec![
@@ -1151,6 +1170,7 @@ fn deterministic_path(tool_paths: &[PathBuf]) -> Result<String> {
     Ok(parts.join(":"))
 }
 
+#[cfg(target_os = "linux")]
 fn validated_scratch_mount(boundary: &ProjectBoundary) -> Result<&'static Path> {
     let scratch = Path::new(PRIVATE_SCRATCH);
     let collides = std::iter::once(&boundary.root)
@@ -1164,6 +1184,12 @@ fn validated_scratch_mount(boundary: &ProjectBoundary) -> Result<&'static Path> 
     Ok(scratch)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run(_original: &str) -> Result<i32> {
+    bail!("strict OpenCode sandbox is currently available only on Linux")
+}
+
+#[cfg(target_os = "linux")]
 fn run(original: &str) -> Result<i32> {
     let backend = preflight()?;
     let boundary = discover_project()?;
@@ -1180,6 +1206,7 @@ fn run(original: &str) -> Result<i32> {
     spawn_sandbox(original, &backend, &boundary, &tool_paths)
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_sandbox(
     original: &str,
     backend: &Path,

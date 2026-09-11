@@ -3357,7 +3357,7 @@ fn quarantine_prompt_history_with(
     destination: &Path,
     mut phase: impl FnMut(HistoryQuarantinePhase),
 ) -> Result<bool> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     anyhow::ensure!(
         source.parent() == destination.parent(),
@@ -3369,7 +3369,10 @@ fn quarantine_prompt_history_with(
     // the flag constant. Other Unix targets still reject a followed symlink by
     // comparing the opened inode with symlink_metadata below before mutation.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0o400000);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000);
+    }
     let opened = match options.open(source) {
         Ok(opened) => opened,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),

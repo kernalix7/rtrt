@@ -2944,7 +2944,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         set_permission_env(listener.local_addr().unwrap().port());
         drop(listener);
-        let connect_failure = test_request_permission(&permission_args()).await;
+        // Windows may wait for the production connect timeout instead of
+        // rejecting a recently closed localhost port immediately.
+        let connect_failure = tokio::time::timeout(
+            PERMISSION_CONNECT_TIMEOUT + std::time::Duration::from_secs(1),
+            request_permission(&permission_args()),
+        )
+        .await
+        .expect("permission connect-failure test timed out");
         assert!(matches!(
             connect_failure,
             Err(PermissionFailure::Unavailable)

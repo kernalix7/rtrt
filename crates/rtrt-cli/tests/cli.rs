@@ -16,7 +16,9 @@ fn rtrt(home: &std::path::Path) -> Command {
         .env("RTRT_CONFIG", home.join(".rtrt").join("config.toml"))
         .env_remove("RTRT_MEMORY_PATH")
         .env_remove("RTRT_CLAUDE_RATE_LIMIT_CACHE")
-        .env_remove("RTRT_CLAUDE_RATE_LIMIT_MAX_AGE_SEC");
+        .env_remove("RTRT_CLAUDE_RATE_LIMIT_MAX_AGE_SEC")
+        .env_remove("OPENCODE_CONFIG_DIR")
+        .env_remove("XDG_CONFIG_HOME");
     cmd
 }
 
@@ -57,6 +59,66 @@ fn version_prints_version_string() {
         .assert()
         .success()
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn project_refresh_retires_exact_owned_legacy_orchestration() {
+    const LEGACY_SECTION: &str = r#"## 11. Agent Teams
+
+| Agent | Owned Paths | Domain | Model |
+|-------|-------------|--------|-------|
+| tech-lead | All | orchestration, planning, integration | claude-opus-4-5 |
+| explorer | All | read-only code discovery and symbol mapping | claude-opus-4-5 |
+| code-reviewer | All | diff review, conventions, security, tests | claude-sonnet-4-5 |
+| log-analyzer | logs, traces, CI output | failure diagnosis and root cause analysis | claude-sonnet-4-5 |
+"#;
+    const LEGACY_TECH_LEAD: &str = r#"---
+name: tech-lead
+description: Orchestrates cross-cutting work, assigns sub-agents, integrates results, and enforces conventions.
+tools: Read, Bash, Glob, Grep, Edit, Write
+model: claude-opus-4-5
+---
+
+Break down cross-cutting tasks, assign focused sub-agent work, integrate results, and enforce this repository's conventions. Keep changes scoped, resolve conflicts deliberately, and make verification explicit before handoff.
+"#;
+
+    // Given a repository containing exact bytes emitted by the legacy standardization template.
+    let home = tempfile::tempdir().unwrap();
+    let project = home.path().join("project");
+    let agents = project.join(".claude/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let contract = format!("# project\n\n## 1. Project Identity\n\nKeep me.\n\n{LEGACY_SECTION}");
+    std::fs::write(project.join("CLAUDE.md"), &contract).unwrap();
+    std::fs::write(agents.join("tech-lead.md"), LEGACY_TECH_LEAD).unwrap();
+
+    // When project refresh is applied.
+    rtrt(home.path())
+        .args([
+            "project",
+            "refresh",
+            "--path",
+            project.to_str().unwrap(),
+            "--apply",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("retired legacy orchestration"));
+
+    // Then owned orchestration is absent and its original bytes are backed up.
+    assert!(
+        !std::fs::read_to_string(project.join("CLAUDE.md"))
+            .unwrap()
+            .contains("## 11. Agent Teams")
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("CLAUDE.md.bak")).unwrap(),
+        contract
+    );
+    assert!(!agents.join("tech-lead.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(agents.join("tech-lead.md.bak")).unwrap(),
+        LEGACY_TECH_LEAD
+    );
 }
 
 #[test]
@@ -648,6 +710,10 @@ fn opencode_setup_has_no_shared_memory_argv_and_restores_history_keybinds() {
         !command
             .iter()
             .any(|arg| matches!(arg.as_str(), Some("--memory" | "--admin-legacy-memory")))
+    );
+    assert_eq!(
+        root["plugin"],
+        serde_json::json!([concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"))])
     );
     let installed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&tui).unwrap()).unwrap();

@@ -21,7 +21,6 @@
 
 use std::{
     collections::BTreeSet,
-    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -77,19 +76,14 @@ const CLAUDE_AGENTS_ROOT_REL: &str = "~/.claude/agents";
 const CURSOR_RULES_REL: &str = "~/.cursor/rules/rtrt-output-optimizer.mdc";
 const WINDSURF_RULES_REL: &str = "~/.codeium/windsurf/memories/global_rules.md";
 const CODEX_RULES_REL: &str = "~/.codex/AGENTS.md";
-const OPENCODE_MCP_CONFIG_JSON_REL: &str = "~/.config/opencode/opencode.json";
-const OPENCODE_MCP_CONFIG_JSONC_REL: &str = "~/.config/opencode/opencode.jsonc";
-const OPENCODE_RULES_REL: &str = "~/.config/opencode/AGENTS.md";
-const OPENCODE_PROVENANCE_PLUGIN_REL: &str = "~/.config/opencode/plugins/rtrt-provenance.js";
+const OPENCODE_NPM_PLUGIN_NAME: &str = "rtrt-agent";
+const OPENCODE_NPM_PLUGIN_ID: &str = concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"));
 /// Relative registration emitted by older RTRT versions. OpenCode resolves it
 /// against the current package/project, not the global config directory.
 const OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID: &str = "./plugins/rtrt-provenance.js";
 const OPENCODE_PROVENANCE_STATE_FILE: &str = ".rtrt-provenance-state.json";
 const OPENCODE_PROVENANCE_STATE_OWNER: &str = "rtrt-opencode-provenance-plugin";
 const OPENCODE_PROVENANCE_STATE_VERSION: u64 = 1;
-const OPENCODE_TUI_CONFIG_JSON_REL: &str = "~/.config/opencode/tui.json";
-const OPENCODE_TUI_CONFIG_JSONC_REL: &str = "~/.config/opencode/tui.jsonc";
-const OPENCODE_TUI_ROOT_REL: &str = "~/.config/opencode/tui";
 const OPENCODE_TUI_STATUSLINE_PLUGIN_ID: &str = "./tui/rtrt-statusline.tsx";
 const OPENCODE_TUI_STATUSLINE_FILE: &str = "rtrt-statusline.tsx";
 const OPENCODE_TUI_STATUSLINE_CORE_FILE: &str = "rtrt-statusline-core.mjs";
@@ -522,10 +516,13 @@ model: inherit
 Read logs, stack traces, and build output. Identify the most likely root cause, cite exact file paths or line references when present, and give the smallest useful next step. Do not edit files or run commands. Reply in the user's language. Keep it compact.
 "#,
     },
-    AgentSpec {
-        name: "tech-lead",
-        description: "rtrt team orchestration lead. Breaks down cross-cutting work, delegates focused agents, and integrates results.",
-        body: r#"---
+];
+
+// Exact former setup-installed bytes; retained only to recognize and retire the owned legacy file.
+const CLAUDE_TECH_LEAD_LEGACY: AgentSpec = AgentSpec {
+    name: "tech-lead",
+    description: "rtrt team orchestration lead. Breaks down cross-cutting work, delegates focused agents, and integrates results.",
+    body: r#"---
 name: tech-lead
 description: rtrt team orchestration lead. Breaks down cross-cutting work, delegates focused agents, and integrates results.
 tools: Read, Grep, Glob
@@ -534,8 +531,7 @@ model: inherit
 
 Plan cross-cutting work, decide when TeamCreate delegation is useful, assign focused read/edit/review tasks, and integrate results into a concise handoff. Keep ownership and verification explicit. Do not make broad edits directly; delegate or return the smallest actionable plan. Reply in the user's language.
 "#,
-    },
-];
+};
 
 pub fn style_reinforcement(level: OutputStyleLevel) -> String {
     format!(
@@ -578,18 +574,18 @@ fn opencode_workspace_rules_block() -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenCodeSetupSurface {
-    ProvenancePlugin,
     Rules,
     TuiStatusline,
     McpConfig,
+    ProvenancePlugin,
 }
 
 fn run_opencode_setup_steps(mut run: impl FnMut(OpenCodeSetupSurface) -> Result<()>) -> Result<()> {
     for surface in [
-        OpenCodeSetupSurface::ProvenancePlugin,
         OpenCodeSetupSurface::Rules,
         OpenCodeSetupSurface::TuiStatusline,
         OpenCodeSetupSurface::McpConfig,
+        OpenCodeSetupSurface::ProvenancePlugin,
     ] {
         run(surface)?;
     }
@@ -685,9 +681,16 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             apply_codex_toml(&plan, &binary, &memory_path)
         }
         AgentKind::Opencode => {
+            let provenance_path =
+                opencode_provenance_plugin_path_in(&resolve_opencode_config_root()?);
+            inspect_opencode_provenance_plugin_at(&provenance_path, false)?;
             run_opencode_setup_steps(|surface| match surface {
                 OpenCodeSetupSurface::ProvenancePlugin => {
-                    install_opencode_provenance_plugin(plan.apply)
+                    remove_opencode_provenance_plugin_at_with_policy(
+                        &provenance_path,
+                        plan.apply,
+                        false,
+                    )
                 }
                 OpenCodeSetupSurface::Rules => install_opencode_agents_rules(plan.apply),
                 OpenCodeSetupSurface::TuiStatusline => install_opencode_tui_statusline(plan.apply),
@@ -812,7 +815,7 @@ fn apply_codex_toml(plan: &SetupPlan, binary: &str, memory_path: &Option<PathBuf
 
 fn build_json_entry(binary: &str, memory_path: &Option<PathBuf>) -> serde_json::Value {
     let args = match memory_path {
-        Some(p) => serde_json::json!(["--memory", p.to_string_lossy()]),
+        Some(p) => serde_json::json!(["--admin", "--memory", p.to_string_lossy()]),
         None => serde_json::json!([]),
     };
     serde_json::json!({
@@ -834,7 +837,7 @@ fn render_codex_toml_snippet(binary: &str, memory_path: &Option<PathBuf>) -> Str
     match memory_path {
         Some(p) => {
             out.push_str(&format!(
-                "args = [\"--memory\", {:?}]\n",
+                "args = [\"--admin\", \"--memory\", {:?}]\n",
                 p.to_string_lossy()
             ));
         }
@@ -851,6 +854,7 @@ fn render_codex_toml_snippet(binary: &str, memory_path: &Option<PathBuf>) -> Str
 fn build_opencode_entry(binary: &str, memory_path: &Option<PathBuf>) -> serde_json::Value {
     let mut command = vec![serde_json::Value::String(binary.to_string())];
     if let Some(p) = memory_path {
+        command.push(serde_json::Value::String("--admin".to_string()));
         command.push(serde_json::Value::String("--memory".to_string()));
         command.push(serde_json::Value::String(p.to_string_lossy().into_owned()));
     }
@@ -881,8 +885,8 @@ fn render_opencode_snippet(binary: &str, memory_path: &Option<PathBuf>) -> Strin
 /// exists yet, targets `.json` — matching what a fresh opencode install
 /// itself creates.
 pub(crate) fn resolve_opencode_config_path() -> Result<PathBuf> {
-    let home = dirs_home()?;
-    Ok(resolve_opencode_config_path_in(&home))
+    let root = resolve_opencode_config_root()?;
+    Ok(resolve_opencode_config_path_in(&root))
 }
 
 /// Read-only validation used by `rtrt opencode`. Launcher authorization must
@@ -899,15 +903,12 @@ pub(crate) fn validate_opencode_sandbox_shell(path: &Path, executable: &Path) ->
     Ok(())
 }
 
-/// Home-parameterized core of `resolve_opencode_config_path`, split out so
-/// tests can exercise the resolution logic against a temp directory instead
-/// of the real `$HOME`.
-fn resolve_opencode_config_path_in(home: &Path) -> PathBuf {
-    let json = expand_in_home(home, OPENCODE_MCP_CONFIG_JSON_REL);
+fn resolve_opencode_config_path_in(root: &Path) -> PathBuf {
+    let json = root.join("opencode.json");
     if json.exists() {
         return json;
     }
-    let jsonc = expand_in_home(home, OPENCODE_MCP_CONFIG_JSONC_REL);
+    let jsonc = root.join("opencode.jsonc");
     if jsonc.exists() {
         return jsonc;
     }
@@ -1297,11 +1298,12 @@ fn apply_opencode_jsonc_at(
     if !path.exists() {
         let root = serde_json::json!({
             "mcp": { "rtrt": entry },
+            "plugin": [OPENCODE_NPM_PLUGIN_ID],
         });
         let rendered = serde_json::to_string_pretty(&root)?;
         write_private_file_atomic_same_dir(path, rendered.as_bytes())?;
         println!(
-            "wrote {} with mcp.rtrt; provenance plugin auto-loads from the OpenCode plugins directory",
+            "wrote {} with mcp.rtrt and the {OPENCODE_NPM_PLUGIN_ID} plugin",
             path.display(),
         );
         return Ok(());
@@ -1319,12 +1321,12 @@ fn apply_opencode_jsonc_at(
     mcp.as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{}: mcp is not an object", path.display()))?
         .insert("rtrt".to_string(), entry);
-    drop_opencode_provenance_registration(&mut root, path, &plugin_url)?;
+    upsert_opencode_plugin_registration(&mut root, path, &plugin_url)?;
     if root != before {
         write_opencode_config(path, &raw, &before, &root)?;
     }
     println!(
-        "merged mcp.rtrt and removed legacy RTRT plugin registrations from {}",
+        "merged mcp.rtrt and {OPENCODE_NPM_PLUGIN_ID} into {}",
         path.display(),
     );
     Ok(())
@@ -1441,11 +1443,98 @@ fn opencode_provenance_plugin_url(config_path: &Path) -> Result<String> {
 
 fn opencode_provenance_dry_run_status(plugin_url: &str) -> String {
     format!(
-        "[dry-run] provenance plugin auto-loads; would remove legacy registrations {plugin_url} and {OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID}"
+        "[dry-run] would register {OPENCODE_NPM_PLUGIN_ID} and migrate legacy registrations {plugin_url} and {OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID}"
     )
 }
 
-fn drop_opencode_provenance_registration(
+fn is_rtrt_opencode_plugin_string(plugin: &serde_json::Value, plugin_url: &str) -> bool {
+    plugin.as_str().is_some_and(|id| {
+        is_rtrt_opencode_package(id) || is_exact_legacy_opencode_plugin(id, plugin_url)
+    }) || is_rtrt_opencode_package_tuple(plugin)
+        || is_rtrt_opencode_package_object(plugin)
+}
+
+fn is_rtrt_opencode_package(id: &str) -> bool {
+    if id == OPENCODE_NPM_PLUGIN_NAME {
+        return true;
+    }
+    id.strip_prefix("rtrt-agent@")
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn is_exact_legacy_opencode_plugin(id: &str, plugin_url: &str) -> bool {
+    id == OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID || id == plugin_url
+}
+
+fn is_rtrt_opencode_package_tuple(plugin: &serde_json::Value) -> bool {
+    let Some(tuple) = plugin.as_array() else {
+        return false;
+    };
+    tuple.len() == 2
+        && tuple[0].as_str().is_some_and(is_rtrt_opencode_package)
+        && tuple[1].is_object()
+}
+
+fn is_rtrt_opencode_package_object(plugin: &serde_json::Value) -> bool {
+    let Some(object) = plugin.as_object() else {
+        return false;
+    };
+    if object.len() > 2
+        || !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "package" | "options"))
+    {
+        return false;
+    }
+    object
+        .get("package")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_rtrt_opencode_package)
+        && object
+            .get("options")
+            .is_none_or(serde_json::Value::is_object)
+}
+
+fn upsert_opencode_plugin_registration(
+    root: &mut serde_json::Value,
+    path: &Path,
+    plugin_url: &str,
+) -> Result<bool> {
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: root is not a JSON object", path.display()))?;
+    let plugins = object
+        .entry("plugin")
+        .or_insert_with(|| serde_json::json!([]));
+    let plugins = plugins
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: plugin is not an array", path.display()))?;
+    let before = plugins.clone();
+    let mut registered = false;
+    let mut merged = Vec::with_capacity(before.len() + 1);
+    for plugin in &before {
+        if is_rtrt_opencode_plugin_string(plugin, plugin_url) {
+            if !registered {
+                merged.push(serde_json::Value::String(
+                    OPENCODE_NPM_PLUGIN_ID.to_string(),
+                ));
+                registered = true;
+            }
+        } else {
+            merged.push(plugin.clone());
+        }
+    }
+    if !registered {
+        merged.push(serde_json::Value::String(
+            OPENCODE_NPM_PLUGIN_ID.to_string(),
+        ));
+    }
+    let changed = merged != before;
+    *plugins = merged;
+    Ok(changed)
+}
+
+fn drop_opencode_plugin_registration(
     root: &mut serde_json::Value,
     path: &Path,
     plugin_url: &str,
@@ -1456,14 +1545,11 @@ fn drop_opencode_provenance_registration(
     let Some(plugins) = object.get_mut("plugin") else {
         return Ok(false);
     };
-    let Some(plugins) = plugins.as_array_mut() else {
-        // This field is unrelated to RTRT when it is not the legacy array shape.
-        return Ok(false);
-    };
+    let plugins = plugins
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: plugin is not an array", path.display()))?;
     let before = plugins.len();
-    plugins.retain(|plugin| {
-        !matches!(plugin.as_str(), Some(id) if id == OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID || id == plugin_url)
-    });
+    plugins.retain(|plugin| !is_rtrt_opencode_plugin_string(plugin, plugin_url));
     Ok(plugins.len() != before)
 }
 
@@ -1544,7 +1630,7 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
     }
     if !apply {
         println!(
-            "[dry-run] would unset mcp.rtrt and remove provenance plugin registrations {plugin_url} and {OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID} in {}",
+            "[dry-run] would unset mcp.rtrt and remove {OPENCODE_NPM_PLUGIN_ID} plus legacy registrations {plugin_url} and {OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID} in {}",
             path.display()
         );
         return Ok(());
@@ -1558,7 +1644,7 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
     {
         removed = true;
     }
-    removed |= drop_opencode_provenance_registration(&mut root, path, &plugin_url)?;
+    removed |= drop_opencode_plugin_registration(&mut root, path, &plugin_url)?;
     if !removed {
         println!(
             "{}: managed rtrt OpenCode settings not present",
@@ -1571,17 +1657,12 @@ fn drop_opencode_jsonc_at(path: &Path, apply: bool) -> Result<()> {
     Ok(())
 }
 
-fn resolve_opencode_tui_config_path() -> Result<PathBuf> {
-    let home = dirs_home()?;
-    Ok(resolve_opencode_tui_config_path_in(&home))
-}
-
-fn resolve_opencode_tui_config_path_in(home: &Path) -> PathBuf {
-    let json = expand_in_home(home, OPENCODE_TUI_CONFIG_JSON_REL);
+fn resolve_opencode_tui_config_path_in(root: &Path) -> PathBuf {
+    let json = root.join("tui.json");
     if json.exists() {
         return json;
     }
-    let jsonc = expand_in_home(home, OPENCODE_TUI_CONFIG_JSONC_REL);
+    let jsonc = root.join("tui.jsonc");
     if jsonc.exists() {
         return jsonc;
     }
@@ -1643,6 +1724,7 @@ fn ensure_managed_tui_file_installable(
     begin: &str,
     end: &str,
 ) -> Result<()> {
+    reject_symlink(path, "OpenCode TUI managed file")?;
     if !path.exists() {
         return Ok(());
     }
@@ -1667,12 +1749,14 @@ fn install_managed_tui_file_at(
         println!("[dry-run] OpenCode TUI managed file: {}", path.display());
         return Ok(());
     }
+    reject_symlink(path, "OpenCode TUI managed file")?;
     if !path.exists() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
-        std::fs::write(path, current).with_context(|| format!("write {}", path.display()))?;
+        write_private_file_atomic_same_dir(path, current.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
         println!("wrote managed OpenCode TUI file {}", path.display());
         return Ok(());
     }
@@ -1692,8 +1776,11 @@ fn install_managed_tui_file_at(
         );
     }
     let backup = backup_path(path);
-    std::fs::copy(path, &backup).with_context(|| format!("backup {}", backup.display()))?;
-    std::fs::write(path, current).with_context(|| format!("write {}", path.display()))?;
+    reject_symlink(&backup, "OpenCode TUI backup")?;
+    write_private_file_atomic_same_dir(&backup, raw.as_bytes())
+        .with_context(|| format!("backup {}", backup.display()))?;
+    write_private_file_atomic_same_dir(path, current.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     println!("upgraded managed OpenCode TUI file {}", path.display());
     Ok(())
 }
@@ -2025,7 +2112,7 @@ fn restore_history_keybinds(
     }
     if keybinds.is_empty() {
         root.as_object_mut()
-            .expect("validated object")
+            .context("OpenCode TUI config root is not a JSON object")?
             .remove("keybinds");
     }
     Ok(Some(state_path))
@@ -2077,7 +2164,7 @@ fn apply_opencode_tui_config_at(path: &Path, apply: bool, binary: &Path) -> Resu
     } else {
         None
     };
-    if let Err(error) = std::fs::write(path, rendered) {
+    if let Err(error) = write_private_file_atomic_same_dir(path, rendered.as_bytes()) {
         if let Some(state_path) = new_state_path {
             let _ = std::fs::remove_file(state_path);
         }
@@ -2149,8 +2236,9 @@ fn absolute_rtrt_binary() -> Result<PathBuf> {
 }
 
 fn install_opencode_tui_statusline(apply: bool) -> Result<()> {
-    let root = expand_home(OPENCODE_TUI_ROOT_REL)?;
-    let config = resolve_opencode_tui_config_path()?;
+    let config_root = resolve_opencode_config_root()?;
+    let root = opencode_tui_root_in(&config_root);
+    let config = resolve_opencode_tui_config_path_in(&config_root);
     let binary = absolute_rtrt_binary()?;
     install_opencode_tui_statusline_at(&root, &config, apply, &binary)
 }
@@ -2205,8 +2293,9 @@ fn install_opencode_tui_statusline_at(
 }
 
 fn remove_opencode_tui_statusline(apply: bool) -> Result<()> {
-    let root = expand_home(OPENCODE_TUI_ROOT_REL)?;
-    let config = resolve_opencode_tui_config_path()?;
+    let config_root = resolve_opencode_config_root()?;
+    let root = opencode_tui_root_in(&config_root);
+    let config = resolve_opencode_tui_config_path_in(&config_root);
     remove_opencode_tui_statusline_at(&root, &config, apply)
 }
 
@@ -2251,6 +2340,52 @@ pub(crate) fn dirs_home() -> Result<PathBuf> {
         return Ok(PathBuf::from(h));
     }
     bail!("cannot resolve home dir: neither HOME nor USERPROFILE is set")
+}
+
+fn resolve_opencode_config_root() -> Result<PathBuf> {
+    let opencode = std::env::var_os("OPENCODE_CONFIG_DIR").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    resolve_opencode_config_root_from(
+        opencode.as_deref(),
+        xdg.as_deref(),
+        home.as_deref(),
+        profile.as_deref(),
+    )
+}
+
+fn resolve_opencode_config_root_from(
+    opencode: Option<&Path>,
+    xdg: Option<&Path>,
+    home: Option<&Path>,
+    profile: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(root) = opencode.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(root.to_path_buf());
+    }
+    if let Some(root) = xdg.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(root.join("opencode"));
+    }
+    if let Some(root) = home
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| profile.filter(|path| !path.as_os_str().is_empty()))
+    {
+        return Ok(root.join(".config/opencode"));
+    }
+    bail!("cannot resolve OpenCode config root: no nonempty config or home environment is set")
+}
+
+fn opencode_rules_path_in(root: &Path) -> PathBuf {
+    root.join("AGENTS.md")
+}
+
+fn opencode_provenance_plugin_path_in(root: &Path) -> PathBuf {
+    root.join("plugins/rtrt-provenance.js")
+}
+
+fn opencode_tui_root_in(root: &Path) -> PathBuf {
+    root.join("tui")
 }
 
 fn proxy_rewrite_hook_entry() -> serde_json::Value {
@@ -2629,9 +2764,88 @@ fn claude_agent_path(agents_root: &Path, agent: &AgentSpec) -> PathBuf {
     agents_root.join(format!("{}.md", agent.name))
 }
 
+fn retire_legacy_claude_tech_lead_at(agents_root: &Path, apply: bool) -> Result<()> {
+    let path = claude_agent_path(agents_root, &CLAUDE_TECH_LEAD_LEGACY);
+    let Some(existing) = read_real_file(&path, "legacy Claude tech-lead agent")? else {
+        return Ok(());
+    };
+    if existing.as_bytes() != CLAUDE_TECH_LEAD_LEGACY.body.as_bytes() {
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "[dry-run] would back up and remove legacy Claude agent file {}",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let backup = backup_path(&path);
+    match read_real_file(&backup, "legacy Claude tech-lead backup")? {
+        Some(content) if content.as_bytes() == CLAUDE_TECH_LEAD_LEGACY.body.as_bytes() => {}
+        Some(_) => bail!(
+            "{}: conflicting legacy Claude tech-lead backup; refusing to remove source",
+            backup.display()
+        ),
+        None => {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup);
+            let mut file = match file {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create backup {}", backup.display()));
+                }
+            };
+            if let Some(file) = file.as_mut() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .with_context(|| format!("chmod 0600 {}", backup.display()))?;
+                }
+                file.write_all(CLAUDE_TECH_LEAD_LEGACY.body.as_bytes())
+                    .with_context(|| format!("write backup {}", backup.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("sync backup {}", backup.display()))?;
+            }
+            let content = read_real_file(&backup, "legacy Claude tech-lead backup")?
+                .ok_or_else(|| anyhow::anyhow!("{}: backup disappeared", backup.display()))?;
+            if content.as_bytes() != CLAUDE_TECH_LEAD_LEGACY.body.as_bytes() {
+                bail!(
+                    "{}: conflicting legacy Claude tech-lead backup; refusing to remove source",
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    let backup_content = read_real_file(&backup, "legacy Claude tech-lead backup")?
+        .ok_or_else(|| anyhow::anyhow!("{}: backup disappeared", backup.display()))?;
+    if backup_content.as_bytes() != CLAUDE_TECH_LEAD_LEGACY.body.as_bytes() {
+        bail!(
+            "{}: backup changed during retirement; refusing to remove source",
+            backup.display()
+        );
+    }
+
+    let current = read_real_file(&path, "legacy Claude tech-lead agent")?
+        .ok_or_else(|| anyhow::anyhow!("{}: source disappeared", path.display()))?;
+    if current.as_bytes() != CLAUDE_TECH_LEAD_LEGACY.body.as_bytes() {
+        bail!("{}: source changed during retirement", path.display());
+    }
+    std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    println!("retired legacy Claude agent file {}", path.display());
+    Ok(())
+}
+
 fn install_claude_skills_agents(apply: bool) -> Result<()> {
     let skills_root = expand_home(CLAUDE_SKILLS_ROOT_REL)?;
     let agents_root = expand_home(CLAUDE_AGENTS_ROOT_REL)?;
+    retire_legacy_claude_tech_lead_at(&agents_root, apply)?;
     if !apply {
         println!("[dry-run] Claude skill root: {}", skills_root.display());
         println!("[dry-run] Claude agent root: {}", agents_root.display());
@@ -2696,7 +2910,7 @@ fn terse_rules_path(agent: AgentKind) -> Option<&'static str> {
         AgentKind::Cursor => Some(CURSOR_RULES_REL),
         AgentKind::Windsurf => Some(WINDSURF_RULES_REL),
         AgentKind::Codex => Some(CODEX_RULES_REL),
-        AgentKind::Opencode => Some(OPENCODE_RULES_REL),
+        AgentKind::Opencode => None,
         AgentKind::Aider => Some(AIDER_RULES_REL),
     }
 }
@@ -3172,7 +3386,7 @@ fn skip_jsonc_trivia(raw: &str, cursor: &mut usize, limit: usize) -> Result<()> 
 }
 
 fn install_opencode_agents_rules(apply: bool) -> Result<()> {
-    let path = expand_home(OPENCODE_RULES_REL)?;
+    let path = opencode_rules_path_in(&resolve_opencode_config_root()?);
     install_opencode_agents_rules_at(&path, apply)
 }
 
@@ -3184,6 +3398,7 @@ fn install_opencode_agents_rules_at(path: &Path, apply: bool) -> Result<()> {
         println!("[dry-run] OpenCode rules blocks:\n{terse_block}\n{workspace_block}");
         return Ok(());
     }
+    reject_symlink(path, "OpenCode rules")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
@@ -3216,7 +3431,8 @@ fn install_opencode_agents_rules_at(path: &Path, apply: bool) -> Result<()> {
     if path.exists() {
         backup_if_needed(path)?;
     }
-    std::fs::write(path, rendered).with_context(|| format!("write {}", path.display()))?;
+    write_private_file_atomic_same_dir(path, rendered.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     println!("wrote managed rtrt OpenCode rules to {}", path.display());
     Ok(())
 }
@@ -3260,11 +3476,6 @@ fn remove_exact_managed_block(existing: &str, block: &str) -> (String, bool) {
         removed = true;
     }
     (rendered, removed)
-}
-
-fn install_opencode_provenance_plugin(apply: bool) -> Result<()> {
-    let path = expand_home(OPENCODE_PROVENANCE_PLUGIN_REL)?;
-    install_opencode_provenance_plugin_at(&path, apply)
 }
 
 fn managed_opencode_provenance_plugin() -> String {
@@ -3355,6 +3566,7 @@ fn load_opencode_provenance_state(state_path: &Path, plugin_path: &Path) -> Resu
     Ok(installed_content.map(str::to_owned))
 }
 
+#[cfg(test)]
 fn write_opencode_provenance_state(
     state_path: &Path,
     plugin_path: &Path,
@@ -3384,6 +3596,7 @@ fn read_real_file(path: &Path, label: &str) -> Result<Option<String>> {
         .map(Some)
 }
 
+#[cfg(test)]
 fn install_opencode_provenance_plugin_at(path: &Path, apply: bool) -> Result<()> {
     let rendered = managed_opencode_provenance_plugin();
     let state_path = opencode_provenance_state_path(path)?;
@@ -3414,7 +3627,6 @@ fn install_opencode_provenance_plugin_at(path: &Path, apply: bool) -> Result<()>
         if existing != OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1
             && existing != OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2
             && state_content.as_deref() != Some(existing.as_str())
-            && !(state_content.is_none() && is_whole_file_managed_provenance_plugin(&existing))
         {
             bail!(
                 "{}: refusing to overwrite unrecognized pre-existing plugin content",
@@ -3437,69 +3649,140 @@ fn install_opencode_provenance_plugin_at(path: &Path, apply: bool) -> Result<()>
 }
 
 fn remove_opencode_provenance_plugin(apply: bool) -> Result<()> {
-    let path = expand_home(OPENCODE_PROVENANCE_PLUGIN_REL)?;
+    let path = opencode_provenance_plugin_path_in(&resolve_opencode_config_root()?);
     remove_opencode_provenance_plugin_at(&path, apply)
 }
 
 fn remove_opencode_provenance_plugin_at(path: &Path, apply: bool) -> Result<()> {
+    remove_opencode_provenance_plugin_at_with_policy(path, apply, true)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenCodeProvenanceBackupInspection {
+    Discard(PathBuf),
+    Foreign { path: PathBuf, content: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenCodeProvenanceInspection {
+    NoPlugin,
+    RemoveOrphanState(PathBuf),
+    PreserveUnrecognized,
+    RemoveManaged {
+        state_path: Option<PathBuf>,
+        backup: Option<OpenCodeProvenanceBackupInspection>,
+    },
+}
+
+fn inspect_opencode_provenance_plugin_at(
+    path: &Path,
+    preserve_unrecognized: bool,
+) -> Result<OpenCodeProvenanceInspection> {
     let state_path = opencode_provenance_state_path(path)?;
     let state_content = load_opencode_provenance_state(&state_path, path)?;
-    let existing = read_real_file(path, "provenance plugin")?;
+    let Some(raw) = read_real_file(path, "provenance plugin")? else {
+        return Ok(match state_content {
+            Some(_) => OpenCodeProvenanceInspection::RemoveOrphanState(state_path),
+            None => OpenCodeProvenanceInspection::NoPlugin,
+        });
+    };
+    let managed = managed_opencode_provenance_plugin();
+    let recognized = match state_content.as_deref() {
+        Some(installed) => raw == installed,
+        None => {
+            raw == managed
+                || raw == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1
+                || raw == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2
+        }
+    };
+    if !recognized {
+        if preserve_unrecognized {
+            return Ok(OpenCodeProvenanceInspection::PreserveUnrecognized);
+        }
+        bail!(
+            "{}: plugin content was modified or is not rtrt-managed; refusing to remove it",
+            path.display()
+        );
+    }
+
+    let backup_path = backup_path(path);
+    let backup = match read_real_file(&backup_path, "provenance backup")? {
+        Some(content)
+            if content.is_empty()
+                || content == managed
+                || content == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1
+                || content == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2 =>
+        {
+            Some(OpenCodeProvenanceBackupInspection::Discard(backup_path))
+        }
+        Some(content) => Some(OpenCodeProvenanceBackupInspection::Foreign {
+            path: backup_path,
+            content,
+        }),
+        None => None,
+    };
+    Ok(OpenCodeProvenanceInspection::RemoveManaged {
+        state_path: state_content.map(|_| state_path),
+        backup,
+    })
+}
+
+fn remove_opencode_provenance_plugin_at_with_policy(
+    path: &Path,
+    apply: bool,
+    preserve_unrecognized: bool,
+) -> Result<()> {
+    let inspection = inspect_opencode_provenance_plugin_at(path, preserve_unrecognized)?;
     if !apply {
         println!("[dry-run] would remove {}", path.display());
         return Ok(());
     }
-    let Some(raw) = existing else {
-        return Ok(());
-    };
-    let managed = managed_opencode_provenance_plugin();
-    let recognized = if let Some(installed) = state_content.as_deref() {
-        raw == installed
-    } else {
-        raw == managed
-            || raw == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1
-            || raw == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2
-            || is_whole_file_managed_provenance_plugin(&raw)
-    };
-    if !recognized {
-        println!(
-            "{}: plugin content was modified or is not rtrt-managed; preserving it",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let backup = backup_path(path);
-    let backup_content = if let Some(content) = read_real_file(&backup, "provenance backup")? {
-        if content == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1
-            || content == OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2
-            || is_whole_file_managed_provenance_plugin(&content)
-        {
-            String::new()
-        } else {
-            content
+    match inspection {
+        OpenCodeProvenanceInspection::NoPlugin => Ok(()),
+        OpenCodeProvenanceInspection::RemoveOrphanState(state_path) => {
+            std::fs::remove_file(&state_path)
+                .with_context(|| format!("remove {}", state_path.display()))?;
+            Ok(())
         }
-    } else {
-        String::new()
-    };
-    if backup_content.is_empty() {
-        std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    } else {
-        write_private_file_atomic_same_dir(path, backup_content.as_bytes())
-            .with_context(|| format!("write {}", path.display()))?;
+        OpenCodeProvenanceInspection::PreserveUnrecognized => {
+            println!(
+                "{}: plugin content was modified or is not rtrt-managed; preserving it",
+                path.display()
+            );
+            Ok(())
+        }
+        OpenCodeProvenanceInspection::RemoveManaged { state_path, backup } => {
+            match &backup {
+                Some(OpenCodeProvenanceBackupInspection::Foreign { content, .. }) => {
+                    write_private_file_atomic_same_dir(path, content.as_bytes())
+                        .with_context(|| format!("write {}", path.display()))?;
+                }
+                Some(OpenCodeProvenanceBackupInspection::Discard(_)) | None => {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("remove {}", path.display()))?;
+                }
+            }
+            match backup {
+                Some(OpenCodeProvenanceBackupInspection::Discard(backup_path))
+                | Some(OpenCodeProvenanceBackupInspection::Foreign {
+                    path: backup_path, ..
+                }) => {
+                    std::fs::remove_file(&backup_path)
+                        .with_context(|| format!("remove {}", backup_path.display()))?;
+                }
+                None => {}
+            }
+            if let Some(state_path) = state_path {
+                std::fs::remove_file(&state_path)
+                    .with_context(|| format!("remove {}", state_path.display()))?;
+            }
+            println!(
+                "removed managed OpenCode provenance plugin from {}",
+                path.display()
+            );
+            Ok(())
+        }
     }
-    if path_metadata(&backup)?.is_some() {
-        std::fs::remove_file(&backup).with_context(|| format!("remove {}", backup.display()))?;
-    }
-    if path_metadata(&state_path)?.is_some() {
-        std::fs::remove_file(&state_path)
-            .with_context(|| format!("remove {}", state_path.display()))?;
-    }
-    println!(
-        "removed managed OpenCode provenance plugin from {}",
-        path.display()
-    );
-    Ok(())
 }
 
 /// Exact-file migration helper retained for a future explicitly scoped cleanup.
@@ -3578,7 +3861,7 @@ fn remove_managed_block_from_text(existing: &str, begin: &str, end: &str) -> (St
 }
 
 fn remove_opencode_agents_rules(apply: bool) -> Result<()> {
-    let path = expand_home(OPENCODE_RULES_REL)?;
+    let path = opencode_rules_path_in(&resolve_opencode_config_root()?);
     remove_opencode_agents_rules_at(&path, apply)
 }
 
@@ -3702,6 +3985,7 @@ pub fn uninstall_claude_plugin(apply: bool) -> Result<()> {
 fn uninstall_claude_skills_agents(apply: bool) -> Result<()> {
     let skills_root = expand_home(CLAUDE_SKILLS_ROOT_REL)?;
     let agents_root = expand_home(CLAUDE_AGENTS_ROOT_REL)?;
+    retire_legacy_claude_tech_lead_at(&agents_root, apply)?;
     if !apply {
         for skill in CLAUDE_SKILLS {
             println!(
@@ -4035,70 +4319,30 @@ fn write_private_file_atomic_same_dir(path: &Path, contents: &[u8]) -> Result<()
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{}: file has no parent", path.display()))?;
     std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{}: file has no name", path.display()))?
-        .to_string_lossy();
-    let mut temporary = None;
-    for sequence in 0..100u8 {
-        let candidate = parent.join(format!(
-            ".{file_name}.rtrt-{}-{sequence}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&candidate) {
-            Ok(file) => {
-                temporary = Some((candidate, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("create {}", candidate.display()));
-            }
-        }
-    }
-    let (temporary_path, mut file) = temporary.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}: cannot allocate same-directory atomic temporary file",
-            path.display()
-        )
-    })?;
-    let result = (|| -> Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    {
+        let file = temporary.as_file_mut();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 0600 {}", temporary_path.display()))?;
+                .with_context(|| format!("chmod 0600 temporary file in {}", parent.display()))?;
         }
         file.write_all(contents)
-            .with_context(|| format!("write {}", temporary_path.display()))?;
+            .with_context(|| format!("write temporary file in {}", parent.display()))?;
         file.sync_all()
-            .with_context(|| format!("sync {}", temporary_path.display()))?;
-        drop(file);
-        std::fs::rename(&temporary_path, path).with_context(|| {
-            format!(
-                "atomically replace {} from {}",
-                path.display(),
-                temporary_path.display()
-            )
-        })?;
-        set_private_file_mode(path)?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("sync directory {}", parent.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
+            .with_context(|| format!("sync temporary file in {}", parent.display()))?;
     }
-    result
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replace {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync directory {}", parent.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4318,6 +4562,178 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_claude_tech_lead_is_not_an_active_agent() {
+        // Given: the active Claude agent inventory.
+        // When: its machine-consumed agent names are inspected.
+        // Then: the retired legacy asset is absent.
+        assert!(
+            CLAUDE_AGENTS
+                .iter()
+                .all(|agent| agent.name != CLAUDE_TECH_LEAD_LEGACY.name)
+        );
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_backs_up_before_removal_and_is_idempotent() {
+        // Given: the exact setup-installed legacy agent and no backup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+
+        // When: retirement is applied twice.
+        retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap();
+        retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap();
+
+        // Then: the source is gone and its exact former bytes remain backed up.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(backup_path(&path)).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_dry_run_has_no_effect() {
+        // Given: the exact setup-installed legacy agent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+
+        // When: retirement is only previewed.
+        retire_legacy_claude_tech_lead_at(dir.path(), false).unwrap();
+
+        // Then: neither source nor backup changed.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_preserves_foreign_file_without_backup() {
+        // Given: a user-modified file at the retired agent path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        std::fs::write(&path, b"user-owned agent\n").unwrap();
+
+        // When: retirement is applied.
+        retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap();
+
+        // Then: the foreign file is untouched and no backup is created.
+        assert_eq!(std::fs::read(&path).unwrap(), b"user-owned agent\n");
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_accepts_identical_backup() {
+        // Given: the exact legacy source and an identical prior backup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        std::fs::write(backup_path(&path), CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+
+        // When: retirement is applied.
+        retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap();
+
+        // Then: the owned source is removed and the identical backup remains.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(backup_path(&path)).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_rejects_conflicting_backup_before_removal() {
+        // Given: the exact legacy source and a foreign backup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        let backup = backup_path(&path);
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        std::fs::write(&backup, b"foreign backup\n").unwrap();
+
+        // When: retirement is attempted.
+        let error = retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap_err();
+
+        // Then: it fails without deleting either file.
+        assert!(error.to_string().contains("backup"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"foreign backup\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_claude_tech_lead_retirement_rejects_symlink_before_removal() {
+        use std::os::unix::fs::symlink;
+
+        // Given: a symlink at the retired agent path.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.md");
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        std::fs::write(&target, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        symlink(&target, &path).unwrap();
+
+        // When: retirement is attempted.
+        let error = retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap_err();
+
+        // Then: it fails before deleting the link or creating a backup.
+        assert!(error.to_string().contains("real file"));
+        assert!(std::fs::symlink_metadata(&path).is_ok());
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_claude_tech_lead_retirement_rejects_backup_symlink_before_removal() {
+        use std::os::unix::fs::symlink;
+
+        // Given: the exact legacy source and a symlink at its backup path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        let backup = backup_path(&path);
+        let target = dir.path().join("backup-target.md");
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        std::fs::write(&target, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        symlink(&target, &backup).unwrap();
+
+        // When: retirement is attempted.
+        let error = retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap_err();
+
+        // Then: it fails before deleting the owned source.
+        assert!(error.to_string().contains("real file"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+        assert!(std::fs::symlink_metadata(&backup).is_ok());
+    }
+
+    #[test]
+    fn legacy_claude_tech_lead_retirement_rejects_backup_io_failure_before_removal() {
+        // Given: the exact legacy source and a directory blocking its backup path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = claude_agent_path(dir.path(), &CLAUDE_TECH_LEAD_LEGACY);
+        let backup = backup_path(&path);
+        std::fs::write(&path, CLAUDE_TECH_LEAD_LEGACY.body).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+
+        // When: retirement is attempted.
+        let error = retire_legacy_claude_tech_lead_at(dir.path(), true).unwrap_err();
+
+        // Then: it fails before deleting the owned source.
+        assert!(error.to_string().contains("real file"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            CLAUDE_TECH_LEAD_LEGACY.body.as_bytes()
+        );
+        assert!(backup.is_dir());
+    }
+
+    #[test]
     fn claude_statusline_entry_uses_rich_command() {
         let entry = claude_statusline_entry("rtrt");
 
@@ -4351,6 +4767,45 @@ mod tests {
     }
 
     #[test]
+    fn json_entry_explicit_memory_enables_admin_profile() {
+        // Given: an explicit legacy/admin memory path.
+        let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
+
+        // When: a conventional MCP JSON entry is built.
+        let entry = build_json_entry("/usr/local/bin/rtrt-mcp", &memory_path);
+
+        // Then: its structured argv selects admin mode before the memory path.
+        assert_eq!(
+            entry.get("args").and_then(serde_json::Value::as_array),
+            Some(&vec![
+                serde_json::json!("--admin"),
+                serde_json::json!("--memory"),
+                serde_json::json!("/home/u/.rtrt/memory.sqlite"),
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_snippet_explicit_memory_enables_admin_profile() {
+        // Given: an explicit legacy/admin memory path.
+        let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
+
+        // When: the Codex MCP TOML snippet is rendered and parsed.
+        let snippet = render_codex_toml_snippet("/usr/local/bin/rtrt-mcp", &memory_path);
+        let parsed: toml::Value = toml::from_str(&snippet).unwrap();
+
+        // Then: its structured argv selects admin mode before the memory path.
+        assert_eq!(
+            parsed["mcp_servers"]["rtrt"]["args"],
+            toml::Value::Array(vec![
+                toml::Value::String("--admin".into()),
+                toml::Value::String("--memory".into()),
+                toml::Value::String("/home/u/.rtrt/memory.sqlite".into()),
+            ])
+        );
+    }
+
+    #[test]
     fn opencode_entry_has_local_type_command_array_and_enabled() {
         let memory_path = Some(PathBuf::from("/home/u/.rtrt/memory.sqlite"));
         let entry = build_opencode_entry("/usr/local/bin/rtrt-mcp", &memory_path);
@@ -4368,6 +4823,7 @@ mod tests {
             command,
             vec![
                 "/usr/local/bin/rtrt-mcp",
+                "--admin",
                 "--memory",
                 "/home/u/.rtrt/memory.sqlite",
             ]
@@ -4547,36 +5003,151 @@ mod tests {
     }
 
     #[test]
-    fn opencode_setup_runs_mcp_after_supporting_surfaces_and_stops_on_failure() {
+    fn opencode_setup_runs_legacy_cleanup_last_and_skips_it_after_failure() {
         let mut visited = Vec::new();
         run_opencode_setup_steps(|surface| {
             visited.push(surface);
             Ok(())
         })
         .unwrap();
-        assert_eq!(visited[0], OpenCodeSetupSurface::ProvenancePlugin);
-        assert!(
-            visited
-                .iter()
-                .position(|surface| *surface == OpenCodeSetupSurface::ProvenancePlugin)
-                < visited
-                    .iter()
-                    .position(|surface| *surface == OpenCodeSetupSurface::McpConfig)
+        assert_eq!(
+            visited,
+            vec![
+                OpenCodeSetupSurface::Rules,
+                OpenCodeSetupSurface::TuiStatusline,
+                OpenCodeSetupSurface::McpConfig,
+                OpenCodeSetupSurface::ProvenancePlugin,
+            ]
         );
-        assert_eq!(visited.last(), Some(&OpenCodeSetupSurface::McpConfig));
 
         visited.clear();
         let error = run_opencode_setup_steps(|surface| {
             visited.push(surface);
-            if surface == OpenCodeSetupSurface::TuiStatusline {
-                bail!("surface failure");
+            if surface == OpenCodeSetupSurface::McpConfig {
+                bail!("registration failure");
             }
             Ok(())
         })
         .unwrap_err();
-        assert!(error.to_string().contains("surface failure"));
-        assert_eq!(visited.last(), Some(&OpenCodeSetupSurface::TuiStatusline));
-        assert!(!visited.contains(&OpenCodeSetupSurface::McpConfig));
+        assert!(error.to_string().contains("registration failure"));
+        assert_eq!(
+            visited,
+            vec![
+                OpenCodeSetupSurface::Rules,
+                OpenCodeSetupSurface::TuiStatusline,
+                OpenCodeSetupSurface::McpConfig,
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_setup_preserves_legacy_runtime_when_registration_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+        let plugin = dir.path().join("plugins/rtrt-provenance.js");
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2).unwrap();
+        std::fs::write(&config, r#"{"plugin":"foreign"}"#).unwrap();
+
+        let error = run_opencode_setup_steps(|surface| match surface {
+            OpenCodeSetupSurface::Rules | OpenCodeSetupSurface::TuiStatusline => Ok(()),
+            OpenCodeSetupSurface::McpConfig => {
+                apply_opencode_jsonc_at(&config, true, "/bin/rtrt-mcp", &None)
+            }
+            OpenCodeSetupSurface::ProvenancePlugin => {
+                remove_opencode_provenance_plugin_at_with_policy(&plugin, true, false)
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("plugin is not an array"));
+        assert_eq!(
+            std::fs::read_to_string(&plugin).unwrap(),
+            OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2
+        );
+    }
+
+    #[test]
+    fn opencode_setup_rejects_internal_provenance_edit_before_any_surface_runs() {
+        // Given
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+        let plugin = dir.path().join("plugins/rtrt-provenance.js");
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        let original_config = b"{}\n";
+        let mut modified_plugin = OPENCODE_PROVENANCE_PLUGIN.as_bytes().to_vec();
+        let edited_byte = OPENCODE_PROVENANCE_PLUGIN
+            .find("const RTRT_AGENT_TOOLS")
+            .unwrap();
+        modified_plugin[edited_byte] = b'C';
+        std::fs::write(&config, original_config).unwrap();
+        std::fs::write(&plugin, &modified_plugin).unwrap();
+        let mut setup_surface_invoked = false;
+
+        // When
+        let error = (|| {
+            remove_opencode_provenance_plugin_at_with_policy(&plugin, false, false)?;
+            run_opencode_setup_steps(|surface| {
+                setup_surface_invoked = true;
+                match surface {
+                    OpenCodeSetupSurface::Rules | OpenCodeSetupSurface::TuiStatusline => Ok(()),
+                    OpenCodeSetupSurface::McpConfig => {
+                        apply_opencode_jsonc_at(&config, true, "/bin/rtrt-mcp", &None)
+                    }
+                    OpenCodeSetupSurface::ProvenancePlugin => {
+                        remove_opencode_provenance_plugin_at_with_policy(&plugin, true, false)
+                    }
+                }
+            })
+        })()
+        .unwrap_err();
+
+        // Then
+        assert!(error.to_string().contains("refusing to remove"));
+        assert!(!setup_surface_invoked);
+        assert_eq!(std::fs::read(&config).unwrap(), original_config);
+        assert_eq!(std::fs::read(&plugin).unwrap(), modified_plugin);
+        assert!(!backup_path(&plugin).exists());
+    }
+
+    #[test]
+    fn opencode_setup_leaves_one_runtime_after_migrating_managed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("opencode.json");
+        let plugin = dir.path().join("plugins/rtrt-provenance.js");
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2).unwrap();
+
+        run_opencode_setup_steps(|surface| match surface {
+            OpenCodeSetupSurface::Rules | OpenCodeSetupSurface::TuiStatusline => Ok(()),
+            OpenCodeSetupSurface::McpConfig => {
+                apply_opencode_jsonc_at(&config, true, "/bin/rtrt-mcp", &None)
+            }
+            OpenCodeSetupSurface::ProvenancePlugin => {
+                remove_opencode_provenance_plugin_at_with_policy(&plugin, true, false)
+            }
+        })
+        .unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(root["plugin"], serde_json::json!([OPENCODE_NPM_PLUGIN_ID]));
+        assert!(!plugin.exists());
+    }
+
+    #[test]
+    fn opencode_setup_cleanup_fails_safely_for_modified_provenance_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("rtrt-provenance.js");
+        let modified = format!("{OPENCODE_PROVENANCE_PLUGIN}export const UserAddition = true\n");
+        std::fs::write(&plugin, &modified).unwrap();
+
+        let error =
+            remove_opencode_provenance_plugin_at_with_policy(&plugin, true, false).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to remove"));
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), modified);
+        assert!(!backup_path(&plugin).exists());
     }
 
     #[test]
@@ -4587,7 +5158,6 @@ mod tests {
         for expected in [
             "rtrt_agent_call",
             "rtrt_agent_route",
-            "rtrt_team_dispatch",
             "tool.execute.before",
             "shell.env",
             "RTRT_INVOCATION_ID",
@@ -4654,23 +5224,22 @@ mod tests {
     }
 
     #[test]
-    fn opencode_provenance_plugin_auto_upgrades_unlisted_whole_file_payload() {
+    fn opencode_provenance_plugin_refuses_unlisted_internal_edit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rtrt-provenance.js");
-        let prior = OPENCODE_PROVENANCE_PLUGIN.replace(
-            "const RTRT_AGENT_TOOLS = new Set([",
-            "// prior managed release\nconst RTRT_AGENT_TOOLS = new Set([",
+        let edited = OPENCODE_PROVENANCE_PLUGIN.replacen(
+            "const RTRT_AGENT_TOOLS",
+            "Const RTRT_AGENT_TOOLS",
+            1,
         );
-        assert!(is_whole_file_managed_provenance_plugin(&prior));
-        std::fs::write(&path, &prior).unwrap();
+        std::fs::write(&path, &edited).unwrap();
 
-        install_opencode_provenance_plugin_at(&path, true).unwrap();
+        let error = install_opencode_provenance_plugin_at(&path, true).unwrap_err();
 
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            OPENCODE_PROVENANCE_PLUGIN
-        );
-        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), prior);
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!backup_path(&path).exists());
+        assert!(!opencode_provenance_state_path(&path).unwrap().exists());
     }
 
     #[test]
@@ -4879,6 +5448,24 @@ mod tests {
     }
 
     #[test]
+    fn opencode_provenance_plugin_uninstall_restores_internally_edited_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let edited = OPENCODE_PROVENANCE_PLUGIN.replacen(
+            "const RTRT_AGENT_TOOLS",
+            "Const RTRT_AGENT_TOOLS",
+            1,
+        );
+        std::fs::write(backup_path(&path), &edited).unwrap();
+        std::fs::write(&path, managed_opencode_provenance_plugin()).unwrap();
+
+        remove_opencode_provenance_plugin_at(&path, true).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[test]
     fn opencode_provenance_plugin_uninstall_preserves_modified_managed_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rtrt-provenance.js");
@@ -4924,20 +5511,208 @@ mod tests {
     }
 
     #[test]
-    fn opencode_provenance_plugin_uninstall_never_restores_managed_backup() {
+    fn opencode_provenance_plugin_uninstall_removes_valid_orphan_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rtrt-provenance.js");
-        let old = OPENCODE_PROVENANCE_PLUGIN.replace(
-            "const RTRT_AGENT_TOOLS = new Set([",
-            "// old managed backup\nconst RTRT_AGENT_TOOLS = new Set([",
-        );
-        std::fs::write(&path, OPENCODE_PROVENANCE_PLUGIN).unwrap();
-        std::fs::write(backup_path(&path), old).unwrap();
+        let state_path = opencode_provenance_state_path(&path).unwrap();
+        write_opencode_provenance_state(&state_path, &path, &managed_opencode_provenance_plugin())
+            .unwrap();
 
         remove_opencode_provenance_plugin_at(&path, true).unwrap();
 
-        assert!(!path.exists());
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn opencode_provenance_plugin_uninstall_dry_run_preserves_valid_orphan_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let state_path = opencode_provenance_state_path(&path).unwrap();
+        write_opencode_provenance_state(&state_path, &path, &managed_opencode_provenance_plugin())
+            .unwrap();
+
+        remove_opencode_provenance_plugin_at(&path, false).unwrap();
+
+        assert!(state_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_provenance_preflight_rejects_plugin_symlink_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        // Given
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let target = dir.path().join("plugin-target.js");
+        let original = OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2.as_bytes();
+        std::fs::write(&target, original).unwrap();
+        symlink(&target, &path).unwrap();
+
+        // When
+        let error =
+            remove_opencode_provenance_plugin_at_with_policy(&path, false, false).unwrap_err();
+
+        // Then
+        assert!(
+            error
+                .to_string()
+                .contains("provenance plugin is not a real file")
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!backup_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_provenance_preflight_rejects_ownership_state_symlink_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        // Given
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let state_path = opencode_provenance_state_path(&path).unwrap();
+        let state_target = dir.path().join("state-target.json");
+        let original_state = b"{}";
+        std::fs::write(&path, OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2).unwrap();
+        std::fs::write(&state_target, original_state).unwrap();
+        symlink(&state_target, &state_path).unwrap();
+
+        // When
+        let error =
+            remove_opencode_provenance_plugin_at_with_policy(&path, false, false).unwrap_err();
+
+        // Then
+        assert!(
+            error
+                .to_string()
+                .contains("provenance ownership state is not a real file")
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2.as_bytes()
+        );
+        assert_eq!(std::fs::read(&state_target).unwrap(), original_state);
+        assert!(
+            std::fs::symlink_metadata(&state_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!backup_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_provenance_preflight_rejects_applicable_backup_symlink_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        // Given
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let backup = backup_path(&path);
+        let backup_target = dir.path().join("backup-target.js");
+        let original_backup = b"export const Foreign = true\n";
+        std::fs::write(&path, OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2).unwrap();
+        std::fs::write(&backup_target, original_backup).unwrap();
+        symlink(&backup_target, &backup).unwrap();
+
+        // When
+        let error =
+            remove_opencode_provenance_plugin_at_with_policy(&path, false, false).unwrap_err();
+
+        // Then
+        assert!(
+            error
+                .to_string()
+                .contains("provenance backup is not a real file")
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup_target).unwrap(), original_backup);
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_provenance_preserve_policy_ignores_backup_for_unrecognized_plugin() {
+        use std::os::unix::fs::symlink;
+
+        // Given
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let backup = backup_path(&path);
+        let backup_target = dir.path().join("backup-target.js");
+        let user_plugin = b"export const UserPlugin = true\n";
+        let original_backup = b"export const Foreign = true\n";
+        std::fs::write(&path, user_plugin).unwrap();
+        std::fs::write(&backup_target, original_backup).unwrap();
+        symlink(&backup_target, &backup).unwrap();
+
+        // When
+        remove_opencode_provenance_plugin_at_with_policy(&path, true, true).unwrap();
+
+        // Then
+        assert_eq!(std::fs::read(&path).unwrap(), user_plugin);
+        assert_eq!(std::fs::read(&backup_target).unwrap(), original_backup);
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn opencode_provenance_plugin_uninstall_protects_invalid_or_mismatched_orphan_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtrt-provenance.js");
+        let state_path = opencode_provenance_state_path(&path).unwrap();
+        std::fs::write(&state_path, "[]").unwrap();
+        assert!(remove_opencode_provenance_plugin_at(&path, true).is_err());
+        assert!(state_path.exists());
+
+        let state = serde_json::json!({
+            "owner": OPENCODE_PROVENANCE_STATE_OWNER,
+            "version": OPENCODE_PROVENANCE_STATE_VERSION,
+            "path": dir.path().join("other.js").to_str().unwrap(),
+            "content": OPENCODE_PROVENANCE_PLUGIN,
+        });
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(remove_opencode_provenance_plugin_at(&path, true).is_err());
+        assert!(state_path.exists());
+    }
+
+    #[test]
+    fn opencode_provenance_plugin_uninstall_discards_exact_managed_backups() {
+        for backup in [
+            OPENCODE_PROVENANCE_PLUGIN,
+            OPENCODE_PROVENANCE_PLUGIN_LEGACY_V1,
+            OPENCODE_PROVENANCE_PLUGIN_LEGACY_V2,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rtrt-provenance.js");
+            std::fs::write(&path, OPENCODE_PROVENANCE_PLUGIN).unwrap();
+            std::fs::write(backup_path(&path), backup).unwrap();
+
+            remove_opencode_provenance_plugin_at(&path, true).unwrap();
+
+            assert!(!path.exists());
+            assert!(!backup_path(&path).exists());
+        }
     }
 
     #[test]
@@ -5042,7 +5817,7 @@ mod tests {
         std::fs::write(opencode_dir.join("opencode.json"), "{}").unwrap();
         std::fs::write(opencode_dir.join("opencode.jsonc"), "{}").unwrap();
 
-        let resolved = resolve_opencode_config_path_in(dir.path());
+        let resolved = resolve_opencode_config_path_in(&opencode_dir);
 
         assert_eq!(resolved, opencode_dir.join("opencode.json"));
     }
@@ -5054,7 +5829,7 @@ mod tests {
         std::fs::create_dir_all(&opencode_dir).unwrap();
         std::fs::write(opencode_dir.join("opencode.jsonc"), "{}").unwrap();
 
-        let resolved = resolve_opencode_config_path_in(dir.path());
+        let resolved = resolve_opencode_config_path_in(&opencode_dir);
 
         assert_eq!(resolved, opencode_dir.join("opencode.jsonc"));
     }
@@ -5062,10 +5837,66 @@ mod tests {
     #[test]
     fn resolve_opencode_config_path_defaults_to_json_when_neither_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let opencode_dir = dir.path().join(".config/opencode");
 
-        let resolved = resolve_opencode_config_path_in(dir.path());
+        let resolved = resolve_opencode_config_path_in(&opencode_dir);
 
         assert_eq!(resolved, dir.path().join(".config/opencode/opencode.json"));
+    }
+
+    #[test]
+    fn opencode_config_root_honors_nonempty_environment_precedence() {
+        let opencode = Path::new("/custom/opencode");
+        let xdg = Path::new("/xdg");
+        let home = Path::new("/home/user");
+        let profile = Path::new("C:/Users/user");
+
+        assert_eq!(
+            resolve_opencode_config_root_from(Some(opencode), Some(xdg), Some(home), Some(profile))
+                .unwrap(),
+            opencode
+        );
+        assert_eq!(
+            resolve_opencode_config_root_from(
+                Some(Path::new("")),
+                Some(xdg),
+                Some(home),
+                Some(profile)
+            )
+            .unwrap(),
+            xdg.join("opencode")
+        );
+        assert_eq!(
+            resolve_opencode_config_root_from(None, Some(Path::new("")), Some(home), Some(profile))
+                .unwrap(),
+            home.join(".config/opencode")
+        );
+        assert_eq!(
+            resolve_opencode_config_root_from(None, None, Some(Path::new("")), Some(profile))
+                .unwrap(),
+            profile.join(".config/opencode")
+        );
+        assert!(resolve_opencode_config_root_from(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn opencode_managed_paths_share_the_resolved_config_root() {
+        let root = Path::new("/custom/opencode");
+
+        assert_eq!(
+            resolve_opencode_config_path_in(root),
+            root.join("opencode.json")
+        );
+        assert_eq!(
+            resolve_opencode_tui_config_path_in(root),
+            root.join("tui.json")
+        );
+        assert_eq!(opencode_rules_path_in(root), root.join("AGENTS.md"));
+        assert_eq!(
+            opencode_provenance_plugin_path_in(root),
+            root.join("plugins/rtrt-provenance.js")
+        );
+        assert_eq!(opencode_tui_root_in(root), root.join("tui"));
     }
 
     #[cfg(unix)]
@@ -5122,8 +5953,17 @@ mod tests {
                 .unwrap();
         assert_eq!(
             opencode_provenance_dry_run_status(&url),
-            "[dry-run] provenance plugin auto-loads; would remove legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
+            "[dry-run] would register rtrt-agent@0.1.1 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
         );
+    }
+
+    #[test]
+    fn opencode_owned_package_registration_is_release_pinned() {
+        assert_eq!(
+            OPENCODE_NPM_PLUGIN_ID,
+            concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.1.1");
     }
 
     /// Writes an opencode config with a pre-existing `mcp.other` server to a
@@ -5171,6 +6011,7 @@ mod tests {
             command,
             vec![
                 "/usr/local/bin/rtrt-mcp",
+                "--admin",
                 "--memory",
                 "/home/u/.rtrt/memory.sqlite",
             ]
@@ -5203,7 +6044,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&second).unwrap();
         assert!(parsed.get("mcp").and_then(|m| m.get("other")).is_some());
         assert!(parsed.get("mcp").and_then(|m| m.get("rtrt")).is_some());
-        assert!(parsed.get("plugin").is_none());
+        assert_eq!(
+            parsed["plugin"],
+            serde_json::json!([OPENCODE_NPM_PLUGIN_ID])
+        );
     }
 
     #[test]
@@ -5227,7 +6071,10 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/usr/local/bin/rtrt-mcp")
         );
-        assert!(parsed.get("plugin").is_none());
+        assert_eq!(
+            parsed["plugin"],
+            serde_json::json!([OPENCODE_NPM_PLUGIN_ID])
+        );
     }
 
     /// A config with a `//` comment can't be safely round-tripped through
@@ -5255,13 +6102,14 @@ mod tests {
         assert!(first.contains("\"other\""), "mcp.other must survive");
         assert!(first.contains("\"rtrt\""), "mcp.rtrt must be inserted");
         assert!(!first.contains("rtrt-provenance.js"));
+        assert!(first.contains(&format!("\"plugin\": [\"{OPENCODE_NPM_PLUGIN_ID}\"]")));
 
         apply_opencode_jsonc_at(&path, true, "/usr/local/bin/rtrt-mcp", &None)
             .expect("second apply should succeed");
         let second = std::fs::read_to_string(&path).expect("read after second apply");
         assert_eq!(
             first, second,
-            "re-running apply on a JSONC file must not duplicate the rtrt block"
+            "re-running apply on a JSONC file must not duplicate the rtrt-agent block"
         );
     }
 
@@ -5344,7 +6192,151 @@ mod tests {
             root["plugin"],
             serde_json::json!([
                 "foreign-a",
-                ["foreign-b", {"x": 1}]
+                ["foreign-b", {"x": 1}],
+                OPENCODE_NPM_PLUGIN_ID
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_migration_canonicalizes_exact_package_forms_at_first_rtrt_agent_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let recognized = serde_json::json!([
+            "rtrt-agent",
+            "rtrt-agent@1.2.3",
+            "rtrt-agent@latest",
+            "rtrt-agent@^1",
+            "rtrt-agent@~1",
+            "rtrt-agent@<2",
+            "rtrt-agent@>1",
+            "rtrt-agent@=1",
+            "rtrt-agent@*",
+            ["rtrt-agent@next", {"trace": true}],
+            {"package": "rtrt-agent@beta", "options": {"trace": true}},
+            {"package": "rtrt-agent", "options": {"trace": true}}
+        ]);
+        let mut plugins = vec![serde_json::json!("foreign-before")];
+        plugins.extend(recognized.as_array().unwrap().iter().cloned());
+        plugins.push(serde_json::json!(["foreign-after", {"keep": true}]));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"plugin": plugins})).unwrap(),
+        )
+        .unwrap();
+
+        apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["plugin"],
+            serde_json::json!([
+                "foreign-before",
+                OPENCODE_NPM_PLUGIN_ID,
+                ["foreign-after", {"keep": true}]
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_migration_preserves_malformed_and_foreign_package_shapes_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let foreign = serde_json::json!([
+            "",
+            "rtrt-agent@",
+            "rtrt",
+            "rtrt@latest",
+            ["rtrt@next", {"trace": true}],
+            {"package": "rtrt@beta", "options": {"trace": true}},
+            {"package": "rtrt", "options": {"trace": true}},
+            "rtrt-extra@1",
+            ["rtrt-agent@1"],
+            ["rtrt-agent@1", "options"],
+            ["rtrt-agent@1", {}, "extra"],
+            {"package": "rtrt-agent", "options": false},
+            {"package": "rtrt-agent", "extra": true},
+            {"package": "rtrt-agent", "options": {}, "extra": true},
+            "rtrt-opencode",
+            "rtrt-opencode@latest",
+            "rtrt-opencode@^1",
+            ["rtrt-opencode@next", {"trace": true}],
+            {"package": "rtrt-opencode@beta", "options": {"trace": true}},
+            {"package": "rtrt-opencode", "options": {"trace": true}},
+            {"package": 7},
+            [OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID, {}],
+            {"package": OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID}
+        ]);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"plugin": foreign})).unwrap(),
+        )
+        .unwrap();
+
+        apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut expected = foreign.as_array().unwrap().clone();
+        expected.push(serde_json::json!(OPENCODE_NPM_PLUGIN_ID));
+        assert_eq!(root["plugin"], serde_json::Value::Array(expected));
+    }
+
+    #[test]
+    fn opencode_uninstall_removes_all_exact_rtrt_agent_package_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let foreign = serde_json::json!([
+            "rtrt",
+            "rtrt@latest",
+            "rtrt@^1",
+            ["rtrt@next", {"trace": true}],
+            {"package": "rtrt@beta", "options": {}},
+            {"package": "rtrt", "options": {"trace": true}},
+            "rtrt-opencode",
+            "rtrt-opencode@latest",
+            "rtrt-opencode@^1",
+            ["rtrt-opencode@next", {"trace": true}],
+            {"package": "rtrt-opencode@beta", "options": {}},
+            {"package": "rtrt-opencode", "options": {"trace": true}}
+        ]);
+        let mut plugins = vec![
+            serde_json::json!("foreign-before"),
+            serde_json::json!("rtrt-agent"),
+            serde_json::json!("rtrt-agent@latest"),
+            serde_json::json!(["rtrt-agent@next", {"trace": true}]),
+            serde_json::json!({"package": "rtrt-agent@beta", "options": {}}),
+        ];
+        plugins.extend(foreign.as_array().unwrap().iter().cloned());
+        plugins.push(serde_json::json!("foreign-after"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"plugin": plugins})).unwrap(),
+        )
+        .unwrap();
+
+        drop_opencode_jsonc_at(&path, true).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["plugin"],
+            serde_json::json!([
+                "foreign-before",
+                "rtrt",
+                "rtrt@latest",
+                "rtrt@^1",
+                ["rtrt@next", {"trace": true}],
+                {"package": "rtrt@beta", "options": {}},
+                {"package": "rtrt", "options": {"trace": true}},
+                "rtrt-opencode",
+                "rtrt-opencode@latest",
+                "rtrt-opencode@^1",
+                ["rtrt-opencode@next", {"trace": true}],
+                {"package": "rtrt-opencode@beta", "options": {}},
+                {"package": "rtrt-opencode", "options": {"trace": true}},
+                "foreign-after"
             ])
         );
     }
@@ -5377,6 +6369,7 @@ mod tests {
             root["plugin"],
             serde_json::json!([
                 "foreign-a",
+                OPENCODE_NPM_PLUGIN_ID,
                 "foreign-b",
                 "./plugins/rtrt-provenance.js?foreign"
             ])
@@ -5400,17 +6393,16 @@ mod tests {
     }
 
     #[test]
-    fn opencode_migration_preserves_unrelated_non_array_plugin_value() {
+    fn opencode_migration_rejects_non_array_plugin_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.jsonc");
         let original = r#"{"plugin":"foreign","mcp":{"other":{}}}"#;
         std::fs::write(&path, original).unwrap();
 
-        apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap();
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(root["plugin"], "foreign");
-        assert!(root["mcp"].get("rtrt").is_some());
+        let error = apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap_err();
+
+        assert!(error.to_string().contains("plugin is not an array"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -5431,6 +6423,7 @@ mod tests {
             serde_json::to_string(&serde_json::json!({
                 "plugin": [
                     "foreign-a",
+                    "rtrt-agent",
                     plugin_url,
                     OPENCODE_PROVENANCE_PLUGIN_LEGACY_ID,
                     "./plugins/rtrt-provenance.js?foreign",
@@ -5457,23 +6450,61 @@ mod tests {
     }
 
     #[test]
+    fn opencode_migration_keeps_one_canonical_package_and_all_foreign_shapes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let plugin_url = opencode_provenance_plugin_url(&path).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "plugin": [
+                    {"name": "foreign-object"},
+                    "rtrt-opencode",
+                    ["./tui/rtrt-statusline.tsx", {"bin": "/bin/rtrt"}],
+                    plugin_url,
+                    "foreign-string",
+                    "rtrt-opencode"
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["plugin"],
+            serde_json::json!([
+                {"name": "foreign-object"},
+                "rtrt-opencode",
+                ["./tui/rtrt-statusline.tsx", {"bin": "/bin/rtrt"}],
+                OPENCODE_NPM_PLUGIN_ID,
+                "foreign-string",
+                "rtrt-opencode"
+            ])
+        );
+    }
+
+    #[test]
     fn resolve_opencode_tui_config_path_prefers_json_then_jsonc() {
         let dir = tempfile::tempdir().unwrap();
         let opencode = dir.path().join(".config/opencode");
         std::fs::create_dir_all(&opencode).unwrap();
 
         assert_eq!(
-            resolve_opencode_tui_config_path_in(dir.path()),
+            resolve_opencode_tui_config_path_in(&opencode),
             opencode.join("tui.json")
         );
         std::fs::write(opencode.join("tui.jsonc"), "{}").unwrap();
         assert_eq!(
-            resolve_opencode_tui_config_path_in(dir.path()),
+            resolve_opencode_tui_config_path_in(&opencode),
             opencode.join("tui.jsonc")
         );
         std::fs::write(opencode.join("tui.json"), "{}").unwrap();
         assert_eq!(
-            resolve_opencode_tui_config_path_in(dir.path()),
+            resolve_opencode_tui_config_path_in(&opencode),
             opencode.join("tui.json")
         );
     }
@@ -5725,5 +6756,209 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
         assert_eq!(root["plugin"], serde_json::json!(["foreign-plugin"]));
         assert_eq!(root["foreign"], "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_rules_refuse_direct_and_dangling_target_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        for dangling in [false, true] {
+            let outside = dir.path().join(format!("outside-rules-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, "foreign rules\n").unwrap();
+            }
+            let path = dir.path().join(format!("AGENTS-{dangling}.md"));
+            symlink(&outside, &path).unwrap();
+
+            let error = install_opencode_agents_rules_at(&path, true).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&outside).unwrap(),
+                    "foreign rules\n"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_rules_refuse_direct_and_dangling_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        for dangling in [false, true] {
+            let path = dir.path().join(format!("AGENTS-{dangling}.md"));
+            std::fs::write(&path, "foreign rules\n").unwrap();
+            let outside = dir.path().join(format!("outside-rules-backup-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, "outside sentinel\n").unwrap();
+            }
+            symlink(&outside, backup_path(&path)).unwrap();
+
+            let error = install_opencode_agents_rules_at(&path, true).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "foreign rules\n");
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&outside).unwrap(),
+                    "outside sentinel\n"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_tui_files_refuse_direct_and_dangling_target_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = managed_tui_statusline_source();
+        for dangling in [false, true] {
+            let outside = dir.path().join(format!("outside-tui-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, "foreign tui\n").unwrap();
+            }
+            let path = dir.path().join(format!("statusline-{dangling}.tsx"));
+            symlink(&outside, &path).unwrap();
+
+            let error = install_managed_tui_file_at(
+                &path,
+                &current,
+                OPENCODE_TUI_STATUSLINE_BEGIN,
+                OPENCODE_TUI_STATUSLINE_END,
+                true,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(&outside).unwrap(), "foreign tui\n");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_tui_files_refuse_direct_and_dangling_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = managed_tui_statusline_source();
+        for dangling in [false, true] {
+            let path = dir.path().join(format!("statusline-{dangling}.tsx"));
+            let old = managed_tui_source(
+                "old RTRT version",
+                OPENCODE_TUI_STATUSLINE_BEGIN,
+                OPENCODE_TUI_STATUSLINE_END,
+            );
+            std::fs::write(&path, &old).unwrap();
+            let outside = dir.path().join(format!("outside-tui-backup-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, "outside sentinel\n").unwrap();
+            }
+            symlink(&outside, backup_path(&path)).unwrap();
+
+            let error = install_managed_tui_file_at(
+                &path,
+                &current,
+                OPENCODE_TUI_STATUSLINE_BEGIN,
+                OPENCODE_TUI_STATUSLINE_END,
+                true,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&outside).unwrap(),
+                    "outside sentinel\n"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_config_refuses_direct_and_dangling_target_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        for dangling in [false, true] {
+            let outside = dir.path().join(format!("outside-config-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, r#"{"foreign":true}"#).unwrap();
+            }
+            let path = dir.path().join(format!("opencode-{dangling}.json"));
+            symlink(&outside, &path).unwrap();
+
+            let error = apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&outside).unwrap(),
+                    r#"{"foreign":true}"#
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_config_refuses_direct_and_dangling_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        for dangling in [false, true] {
+            let path = dir.path().join(format!("opencode-{dangling}.json"));
+            let original = r#"{"foreign":true}"#;
+            std::fs::write(&path, original).unwrap();
+            let outside = dir.path().join(format!("outside-config-backup-{dangling}"));
+            if !dangling {
+                std::fs::write(&outside, "outside sentinel\n").unwrap();
+            }
+            symlink(&outside, backup_path(&path)).unwrap();
+
+            let error = apply_opencode_jsonc_at(&path, true, "/bin/rtrt-mcp", &None).unwrap_err();
+
+            assert!(error.to_string().contains("symlink"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            if dangling {
+                assert!(!outside.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&outside).unwrap(),
+                    "outside sentinel\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_atomic_write_replaces_existing_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_private_file_atomic_same_dir(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 }

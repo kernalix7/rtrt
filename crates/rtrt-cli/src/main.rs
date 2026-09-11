@@ -52,7 +52,7 @@ Command groups (run `rtrt <command> --help` for details):
   Savings & Analytics  compress, stats, gain, proxy, proxy-run, discover,
                        benchmark, repo-map, run, context
   Memory               memory
-  Routing & Providers  provider, call, route, team, usage, diagnose
+  Routing & Providers  provider, call, route, usage, diagnose
   Project              templates, new, init, migrate, project, opencode, docs,
                        security
   Setup & Install      setup, uninstall, mcp, service, detect, config, info,
@@ -373,9 +373,6 @@ enum Cmd {
         /// Explicit arbitrary/global SQLite store (admin/legacy mode only).
         #[arg(long, value_name = "PATH")]
         admin_legacy_memory: Option<PathBuf>,
-        /// Bearer token for HTTP transport. Reads from RTRT_MCP_HTTP_TOKEN by default.
-        #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
-        http_token: Option<String>,
         /// Allowed Origins (comma-separated) for HTTP transport.
         #[arg(long, env = "RTRT_MCP_ALLOWED_ORIGINS", value_delimiter = ',')]
         allowed_origins: Vec<String>,
@@ -1405,6 +1402,7 @@ fn run_migrate(
     let dry_run = !apply;
     let repair =
         rtrt_templates::project::plan_repair_with_vars(&root, &template_name, map.clone())?;
+    let retirement = rtrt_templates::project::plan_legacy_orchestration_retirement(&root)?;
     let gitignore_missing = missing_gitignore_entries(&root)?;
     let mcp_binary = resolve_mcp_binary();
 
@@ -1424,15 +1422,19 @@ fn run_migrate(
     println!("3. Audit whole-project consistency");
 
     println!("\nSTEP 1 — Render template project contract");
-    if repair.actions.is_empty() {
+    if repair.actions.is_empty() && retirement.actions.is_empty() {
         println!("skip: CLAUDE.md managed sections and project agents already present");
     } else {
         for action in &repair.actions {
             print_repair_action(action, dry_run);
         }
+        for action in &retirement.actions {
+            print_legacy_retirement_action(action, dry_run);
+        }
     }
     if apply {
         backup_repo_files_for_repair(&repair)?;
+        rtrt_templates::project::apply_legacy_orchestration_retirement(&retirement)?;
         rtrt_templates::project::apply_repair(&repair)?;
     }
 
@@ -2046,6 +2048,35 @@ fn print_repair_action(action: &rtrt_templates::project::RepairAction, dry_run: 
         rtrt_templates::project::RepairAction::InstallAgent { path } => {
             println!("{prefix} install {}", path.display());
         }
+    }
+}
+
+fn print_legacy_retirement_action(
+    action: &rtrt_templates::project::LegacyOrchestrationRetirementAction,
+    dry_run: bool,
+) {
+    let prefix = if dry_run {
+        "[dry-run] would retire legacy orchestration"
+    } else {
+        "retired legacy orchestration"
+    };
+    match action {
+        rtrt_templates::project::LegacyOrchestrationRetirementAction::RemoveContractSection {
+            path,
+            backup,
+        } => println!(
+            "{prefix}: remove owned section from {} (backup {})",
+            path.display(),
+            backup.display()
+        ),
+        rtrt_templates::project::LegacyOrchestrationRetirementAction::RemoveAgent {
+            path,
+            backup,
+        } => println!(
+            "{prefix}: remove owned agent {} (backup {})",
+            path.display(),
+            backup.display()
+        ),
     }
 }
 
@@ -4207,7 +4238,6 @@ async fn run(command: Cmd) -> Result<()> {
             bind,
             path,
             admin_legacy_memory,
-            http_token,
             allowed_origins,
             binary,
         } => {
@@ -4219,15 +4249,12 @@ async fn run(command: Cmd) -> Result<()> {
             });
             let mut cmd = std::process::Command::new(&binary);
             if let Some(memory) = admin_legacy_memory {
-                cmd.arg("--memory").arg(memory);
+                cmd.arg("--admin").arg("--memory").arg(memory);
             }
             cmd.arg("--transport").arg(&transport);
             if transport == "http" {
                 cmd.arg("--bind").arg(&bind);
                 cmd.arg("--path").arg(&path);
-                if let Some(tok) = http_token.as_deref() {
-                    cmd.env("RTRT_MCP_HTTP_TOKEN", tok);
-                }
                 if !allowed_origins.is_empty() {
                     cmd.env("RTRT_MCP_ALLOWED_ORIGINS", allowed_origins.join(","));
                 }
@@ -11931,6 +11958,30 @@ mod statusline_tests {
             std::fs::symlink_metadata(&runtime_tmp).unwrap().uid()
         );
         assert_eq!(std::fs::read_to_string(cache).unwrap(), "agents");
+    }
+}
+
+#[cfg(test)]
+mod mcp_cli_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_rejects_http_token_argument() {
+        // Given an HTTP MCP wrapper invocation containing the removed secret flag.
+        let args = [
+            "rtrt",
+            "mcp",
+            "--transport",
+            "http",
+            "--http-token",
+            "secret",
+        ];
+
+        // When clap parses the invocation.
+        let result = Cli::try_parse_from(args);
+
+        // Then the secret-bearing argument is rejected.
+        assert!(result.is_err());
     }
 }
 

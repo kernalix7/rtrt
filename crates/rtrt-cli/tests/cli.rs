@@ -1751,6 +1751,7 @@ fn statusline_workspace_root() -> std::path::PathBuf {
         .unwrap()
 }
 
+#[cfg(unix)]
 fn seed_statusline_savings_cache(home: &std::path::Path) {
     let state = home.join(".rtrt");
     std::fs::create_dir_all(&state).unwrap();
@@ -1770,12 +1771,14 @@ fn seed_statusline_savings_cache(home: &std::path::Path) {
     .unwrap();
 }
 
+#[cfg(unix)]
 fn cached_statusline_command(home: &std::path::Path, runtime: &std::path::Path) -> Command {
     cached_statusline_command_with_budget(home, runtime, "120")
 }
 
 /// Priming runs need a budget that a cold runner can actually meet, otherwise
 /// the probe they are meant to cache is abandoned and never written.
+#[cfg(unix)]
 fn cached_statusline_command_with_budget(
     home: &std::path::Path,
     runtime: &std::path::Path,

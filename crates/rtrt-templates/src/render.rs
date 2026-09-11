@@ -384,8 +384,24 @@ mod tests {
         }
     }
 
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, and the path validators reject symlink components.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, so the plain
+    /// temp path is the correct fixture there.
+    fn canonical_temp_root() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(base).expect("canonicalize temp dir")
+        }
+        #[cfg(not(unix))]
+        {
+            base
+        }
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let path = canonical_temp_root().join(format!(
             "rtrt-render-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

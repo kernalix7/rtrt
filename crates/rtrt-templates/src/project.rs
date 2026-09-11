@@ -763,11 +763,27 @@ fn is_safe_relative_path(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Canonical only where it matters. macOS reaches the temp dir through
+    /// `/var -> /private/var`, and the path validators reject symlink components.
+    /// Windows canonicalization instead yields a `\\?\` verbatim path, so the plain
+    /// temp path is the correct fixture there.
+    fn canonical_temp_root() -> std::path::PathBuf {
+        let base = std::env::temp_dir();
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(base).expect("canonicalize temp dir")
+        }
+        #[cfg(not(unix))]
+        {
+            base
+        }
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
+            let path = canonical_temp_root().join(format!(
                 "rtrt-project-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -793,7 +809,7 @@ mod tests {
     #[test]
     fn expected_sections_are_the_project_contract_set() {
         // Given the built-in project contract.
-        let root = std::env::temp_dir();
+        let root = canonical_temp_root();
 
         // When its managed sections are enumerated.
         let sections = expected_sections(&root).expect("sections");

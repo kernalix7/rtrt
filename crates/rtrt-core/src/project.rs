@@ -955,6 +955,10 @@ mod tests {
                 n
             ));
             std::fs::create_dir_all(&base).expect("create temp dir");
+            // macOS reaches the temp dir through `/var -> /private/var`, and the
+            // functions under test return canonical paths, so the fixture has to
+            // start canonical for the comparison to mean anything.
+            let base = std::fs::canonicalize(&base).expect("canonicalize temp dir");
             Self(base)
         }
 

@@ -315,6 +315,7 @@ pub(crate) fn valid_slug(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

@@ -1,0 +1,8 @@
+{
+  "name": "rtrt-opencode-omo-compat-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "oh-my-openagent": "4.19.4"
+  }
+}

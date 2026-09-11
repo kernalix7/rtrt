@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { randomUUID } from "node:crypto"
 import { mkdir, mkdtemp, rename, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -7,7 +8,11 @@ import test from "node:test"
 
 import * as provenance from "./rtrt-provenance.js"
 
-const { RtrtProvenance, __createRtrtProvenanceForTest } = provenance
+const {
+  RtrtProvenance,
+  __createRtrtProvenanceForTest,
+  __resolveManagedAgentStatePathForTest,
+} = provenance
 
 const testClientFactory = () => ({
   permission: { list: async () => ({ data: [] }) },
@@ -23,10 +28,16 @@ const testLegacyClient = () => ({
   },
 })
 
+const isolatedManagedAgentStatePath = () =>
+  path.join(tmpdir(), `rtrt-opencode-managed-${randomUUID()}.json`)
+
 const createTestPlugin = (input) =>
   __createRtrtProvenanceForTest(
     { ...input, client: input.client ?? testLegacyClient() },
-    { clientFactory: testClientFactory },
+    {
+      clientFactory: testClientFactory,
+      managedAgentStatePath: isolatedManagedAgentStatePath(),
+    },
   )
 
 const makeTempDir = (prefix) => mkdtemp(path.join(tmpdir(), prefix))
@@ -60,14 +71,19 @@ test("module exports the plugin and injected test constructor", () => {
   assert.deepEqual(Object.keys(provenance).sort(), [
     "RtrtProvenance",
     "__createRtrtProvenanceForTest",
+    "__resolveManagedAgentStatePathForTest",
   ])
   assert.equal(typeof RtrtProvenance, "function")
+  assert.equal(typeof __resolveManagedAgentStatePathForTest, "function")
 })
 
 test("plugin preserves every provenance hook with an async injected client factory", async () => {
   const hooks = await __createRtrtProvenanceForTest(
     { project: {}, client: testLegacyClient() },
-    { clientFactory: async () => testClientFactory() },
+    {
+      clientFactory: async () => testClientFactory(),
+      managedAgentStatePath: isolatedManagedAgentStatePath(),
+    },
   )
   assert.deepEqual(Object.keys(hooks).sort(), [
     "chat.message",
@@ -167,7 +183,7 @@ test("filesystem root and no-VCS project worktrees preserve host temp variables"
 
         const toolOutput = { args: {} }
         await hooks["tool.execute.before"](
-          { tool: "rtrt_team_dispatch", sessionID: "session", callID: `call-${name}` },
+          { tool: "rtrt_agent_call", sessionID: "session", callID: `call-${name}` },
           toolOutput,
         )
         assert.equal(toolOutput.args.parent_worktree, undefined)
@@ -230,17 +246,39 @@ test("permission.ask auto-allows only bounded project-local safe Bash commands",
     return output.status
   }
   try {
-    const safe = [
-      "pwd",
+    const safe = ["pwd", "pwd -L", "pwd -P"]
+    for (const command of safe) {
+      await t.test(`allow ${command}`, async () => assert.equal(await decision(command), "allow"))
+    }
+
+    // Path-bearing readers are resolved again by the shell after this hook
+    // approves them, so a symlink swapped in between would redirect the read.
+    const pathBearingReaders = [
       "ls -la src",
       "cat src/lib.rs",
       `stat "${path.join(repository, "src", "lib.rs")}"`,
       "head -n 2 src/lib.rs",
+      "tail -n 2 src/lib.rs",
+      "wc -l src/lib.rs",
     ]
-    for (const command of safe) {
-      await t.test(`allow ${command}`, async () => assert.equal(await decision(command), "allow"))
+    for (const command of pathBearingReaders) {
+      await t.test(`ask ${command}`, async () => assert.equal(await decision(command), "ask"))
     }
-    assert.equal(await decision(["pwd", "cat src/lib.rs"]), "allow")
+    assert.equal(await decision(["pwd", "cat src/lib.rs"]), "ask")
+
+    const braceSyntax = [
+      ["balanced", "cat src/{lib.rs,missing.rs}"],
+      ["unmatched opening", "cat src/{lib.rs"],
+      ["unmatched closing", "cat src/lib.rs}"],
+      ["quoted", 'cat "src/{lib.rs}"'],
+      ["escaped", String.raw`cat src/\{lib.rs\}`],
+      ["traversal expansion", "cat .{.,}/secret"],
+    ]
+    for (const [kind, command] of braceSyntax) {
+      await t.test(`ask for ${kind} brace syntax`, async () => {
+        assert.equal(await decision(command), "ask")
+      })
+    }
 
     const unsafe = [
       `cat ${path.join(outside, "secret")}`,
@@ -347,9 +385,10 @@ test("permission.asked replies once only for exact safe bash requests and dedupl
         clientFactory: () => ({
           permission: {
             list: async () => ({ data: [
-              { id: "permission_request_1", sessionID: "session_1", permission: "bash", patterns: ["pwd", "cat src/lib.rs"] },
+              { id: "permission_request_1", sessionID: "session_1", permission: "bash", patterns: ["pwd", "pwd -L"] },
               { id: "sdk_failure", sessionID: "session_1", permission: "bash", patterns: ["pwd"] },
               { id: "child_request", sessionID: "managed_child", permission: "bash", patterns: ["pwd"] },
+              { id: "brace_expansion", sessionID: "session_1", permission: "bash", patterns: ["cat .{.,}/secret"] },
             ] }),
             reply: async (request) => {
               replies.push(request)
@@ -362,13 +401,14 @@ test("permission.asked replies once only for exact safe bash requests and dedupl
             permission: { create: async () => ({ data: { data: { effect: "deny" } } }) },
           },
         }),
+        managedAgentStatePath: isolatedManagedAgentStatePath(),
       },
     )
     const asked = sessionEvent("permission.asked", {
       id: "permission_request_1",
       sessionID: "session_1",
       permission: "bash",
-      patterns: ["pwd", "cat src/lib.rs"],
+      patterns: ["pwd", "pwd -L"],
       metadata: { command: "git status" },
       always: [],
       tool: { messageID: "message_1", callID: "call_1" },
@@ -386,6 +426,8 @@ test("permission.asked replies once only for exact safe bash requests and dedupl
       { ...asked.event.properties, id: "unsafe", patterns: ["git status && rm -rf ."] },
       { ...asked.event.properties, id: "compound", patterns: ["git status", "rm src/lib.rs"] },
       { ...asked.event.properties, id: "external", patterns: ["cat ../secret"] },
+      { ...asked.event.properties, id: "path_bearing_reader", patterns: ["cat src/lib.rs"] },
+      { ...asked.event.properties, id: "brace_expansion", patterns: ["cat .{.,}/secret"] },
       { ...asked.event.properties, id: "ambiguous", patterns: ["echo ok"] },
       { ...asked.event.properties, id: "non_bash", permission: "Bash" },
       { ...asked.event.properties, id: "missing_patterns", patterns: [] },
@@ -485,6 +527,7 @@ const brokerFixture = async ({
       maxApprovalSessions,
       maxApprovalsPerSession,
       clientFactory: asyncFactory ? async (options) => clientFactory(options) : clientFactory,
+      managedAgentStatePath: isolatedManagedAgentStatePath(),
     },
   )
   await hooks["chat.params"]({ sessionID: "parent-session", agent: "builder" })
@@ -1151,7 +1194,7 @@ const circuitFixture = async ({
           permission: { create: async () => ({ data: { data: { effect: "deny" } } }) },
         },
       }),
-      managedAgentStatePath,
+      managedAgentStatePath: managedAgentStatePath ?? isolatedManagedAgentStatePath(),
     },
   )
   if (rememberManager) {
@@ -1286,6 +1329,79 @@ test("validated RTRT-managed child under ordinary build parent interrupts once",
     }
   } finally {
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("managed-agent state resolver follows configured root precedence", async (t) => {
+  const home = path.join(path.sep, "home", "rtrt-test")
+  for (const [name, environment, expected] of [
+    [
+      "OpenCode config directory",
+      { OPENCODE_CONFIG_DIR: "/configured/opencode", XDG_CONFIG_HOME: "/xdg", HOME: home },
+      "/configured/opencode/agents/.rtrt-managed-state.json",
+    ],
+    [
+      "XDG config home",
+      { OPENCODE_CONFIG_DIR: "", XDG_CONFIG_HOME: "/xdg", HOME: home },
+      "/xdg/opencode/agents/.rtrt-managed-state.json",
+    ],
+    [
+      "HOME config directory after empty values",
+      { OPENCODE_CONFIG_DIR: "", XDG_CONFIG_HOME: "", HOME: home },
+      "/home/rtrt-test/.config/opencode/agents/.rtrt-managed-state.json",
+    ],
+    [
+      "HOME config directory after NUL values",
+      { OPENCODE_CONFIG_DIR: "\0invalid", XDG_CONFIG_HOME: "\0invalid", HOME: home },
+      "/home/rtrt-test/.config/opencode/agents/.rtrt-managed-state.json",
+    ],
+  ]) {
+    await t.test(name, () => {
+      assert.equal(__resolveManagedAgentStatePathForTest(environment), expected)
+    })
+  }
+})
+
+test("managed-agent state loads from an explicitly resolved config path", async () => {
+  const configRoot = await makeTempDir("rtrt-provenance-config-")
+  const managedAgentStatePath = __resolveManagedAgentStatePathForTest({
+    OPENCODE_CONFIG_DIR: path.join(configRoot, "opencode"),
+    XDG_CONFIG_HOME: path.join(configRoot, "xdg"),
+    HOME: path.join(configRoot, "home"),
+  })
+  try {
+    await mkdir(path.dirname(managedAgentStatePath), { recursive: true })
+    await writeFile(managedAgentStatePath, JSON.stringify({
+      owner: "rtrt-opencode-task-agents",
+      version: 1,
+      agents: ["rtrt-manager", "kimi-k3"],
+      models: {},
+    }))
+    const fixture = await circuitFixture({ managedAgentStatePath })
+    try {
+      await fixture.hooks.event(sessionEvent("session.created", {
+        info: { id: "config-parent", agent: "build", directory: "/workspace/live" },
+      }))
+      await fixture.hooks.event(sessionEvent("session.created", {
+        info: {
+          id: "config-child",
+          parentID: "config-parent",
+          agent: "kimi-k3",
+          directory: "/workspace/live",
+        },
+      }))
+
+      await fixture.hooks.event(sessionEvent("session.next.retried", {
+        sessionID: "config-child",
+        error: { statusCode: 429 },
+      }))
+
+      assert.deepEqual(fixture.interrupts, [{ sessionID: "config-child" }])
+    } finally {
+      await fixture.hooks.dispose()
+    }
+  } finally {
+    await rm(configRoot, { recursive: true, force: true })
   }
 })
 

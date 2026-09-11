@@ -3,7 +3,7 @@ import { constants } from "node:fs"
 import { chmod, lstat, mkdir, open, readFile, realpath } from "node:fs/promises"
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
-import { fileURLToPath } from "node:url"
+import { homedir } from "node:os"
 import path from "node:path"
 
 const BROKER_PATH = "/rtrt/permission/v1"
@@ -24,12 +24,19 @@ const MAX_MANAGED_AGENTS = 128
 const MANAGED_AGENT_STATE_OWNER = "rtrt-opencode-task-agents"
 const MANAGED_AGENT_STATE_VERSION = 1
 const MANAGER_AGENT = "rtrt-manager"
-const DEFAULT_MANAGED_AGENT_STATE_PATH = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "agents",
-  ".rtrt-managed-state.json",
-)
+const configuredPath = (value) => typeof value === "string" && value && !value.includes("\0")
+const resolveManagedAgentStatePath = ({ OPENCODE_CONFIG_DIR, XDG_CONFIG_HOME, HOME }) => {
+  const configDirectory = configuredPath(OPENCODE_CONFIG_DIR)
+    ? path.resolve(OPENCODE_CONFIG_DIR)
+    : configuredPath(XDG_CONFIG_HOME)
+      ? path.resolve(XDG_CONFIG_HOME, "opencode")
+      : path.resolve(HOME, ".config", "opencode")
+  return path.join(configDirectory, "agents", ".rtrt-managed-state.json")
+}
+const defaultManagedAgentStatePath = () => resolveManagedAgentStatePath({
+  ...process.env,
+  HOME: configuredPath(process.env.HOME) ? process.env.HOME : homedir(),
+})
 
 const tokenizeCommand = (command) => {
   if (typeof command !== "string" || !command || Buffer.byteLength(command) > MAX_COMMAND) return
@@ -121,94 +128,19 @@ const loadManagedAgents = async (statePath) => {
   }
 }
 
-const realisticInside = async (root, operand) => {
-  if (!operand || operand.includes("\0") || URL_ARGUMENT.test(operand)) return false
-  if (!path.isAbsolute(operand) && operand.split(/[\\/]/).includes("..")) return false
-  const context = typeof root === "string" ? { cwd: root, bounds: [root] } : root
-  const target = path.resolve(context.cwd, operand)
-  if (!context.bounds.some((bound) => isWithin(bound, target))) return false
-  let probe = target
-  while (true) {
-    try {
-      const resolved = await realpath(probe)
-      return context.bounds.some((bound) => isWithin(bound, resolved))
-    } catch (error) {
-      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return false
-      const parent = path.dirname(probe)
-      if (parent === probe || !context.bounds.some((bound) => isWithin(bound, parent))) return false
-      probe = parent
-    }
-  }
-}
-
-const splitOptions = (args, valueOptions = new Set()) => {
-  const operands = []
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index]
-    if (argument === "--") {
-      operands.push(...args.slice(index + 1))
-      break
-    }
-    if (!argument.startsWith("-") || argument === "-") {
-      operands.push(argument)
-      continue
-    }
-    const [option, attached] = argument.split(/=(.*)/s, 2)
-    if (valueOptions.has(option)) {
-      const value = attached ?? args[++index]
-      if (!value) return
-      operands.push(value)
-    }
-  }
-  return operands
-}
-
-const allPathsInside = async (root, operands) => {
-  if (!operands) return false
-  for (const operand of operands) if (!(await realisticInside(root, operand))) return false
-  return true
-}
-
-const READ_COMMANDS = new Set(["cat", "wc", "stat"])
-
+// Auto-approval deliberately covers no command that names a path. This hook
+// resolves operands when the permission is evaluated, but the shell resolves
+// them again when it runs, so anyone who can write to the checkout can swap an
+// approved file for a symlink in between and read an arbitrary file into the
+// model's context. `pwd` is the only command whose meaning cannot be redirected
+// that way; everything else stays at "ask".
 const safeCommand = async (command, root) => {
+  if (typeof command !== "string" || /[{}]/.test(command)) return false
   const tokens = tokenizeCommand(command)
   if (!tokens || !root || !BARE_COMMAND.test(tokens[0]) || tokens.some((item) => URL_ARGUMENT.test(item))) return false
   const [executable, ...args] = tokens
-  for (const argument of args) {
-    const value = argument.includes("=") ? argument.slice(argument.indexOf("=") + 1) : argument
-    if ((path.isAbsolute(value) || value.includes("/") || value.includes("\\") || value.startsWith(".")) && !(await realisticInside(root, value))) return false
-  }
-  if (executable === "pwd") return args.every((item) => item === "-L" || item === "-P")
-  if (executable === "ls") {
-    if (args.some((item) => item.startsWith("-") && !/^-[AacdFfghikLlmnopqRrSstuUx1]+$/.test(item))) return false
-    return allPathsInside(root, args.filter((item) => !item.startsWith("-")))
-  }
-  if (READ_COMMANDS.has(executable)) {
-    if (args.some((item) => item.startsWith("-") && item !== "--")) return false
-    const operands = splitOptions(args)
-    return Boolean(operands?.length) && allPathsInside(root, operands)
-  }
-  if (["head", "tail"].includes(executable)) {
-    const operands = []
-    for (let index = 0; index < args.length; index += 1) {
-      const argument = args[index]
-      if (argument === "-q" || argument === "--quiet" || argument === "--silent" || argument === "-v" || argument === "--verbose") continue
-      const attached = argument.match(/^(?:-n|--lines|-c|--bytes)=(.*)$/)
-      if (attached) {
-        if (!/^[-+]?\d+$/.test(attached[1])) return false
-        continue
-      }
-      if (["-n", "--lines", "-c", "--bytes"].includes(argument)) {
-        if (!/^[-+]?\d+$/.test(args[++index] ?? "")) return false
-        continue
-      }
-      if (argument.startsWith("-")) return false
-      operands.push(argument)
-    }
-    return operands.length > 0 && allPathsInside(root, operands)
-  }
-  return false
+  if (executable !== "pwd") return false
+  return args.every((item) => item === "-L" || item === "-P")
 }
 
 const defaultClientFactory = async (options) => {
@@ -219,7 +151,6 @@ const defaultClientFactory = async (options) => {
 const RTRT_AGENT_TOOLS = new Set([
   "rtrt_agent_call",
   "rtrt_agent_route",
-  "rtrt_team_dispatch",
 ])
 
 const sanitizeSessionID = (sessionID) => {
@@ -606,7 +537,7 @@ const createPlugin = async (
     maxApprovalSessions = MAX_APPROVAL_SESSIONS,
     maxApprovalsPerSession = MAX_APPROVALS_PER_SESSION,
     maxTrackedChildren = MAX_TRACKED_CHILDREN,
-    managedAgentStatePath = DEFAULT_MANAGED_AGENT_STATE_PATH,
+    managedAgentStatePath = defaultManagedAgentStatePath(),
   } = {},
 ) => {
   const agents = new Map()
@@ -1259,4 +1190,5 @@ const createPlugin = async (
 export const RtrtProvenance = (input) => createPlugin(input)
 
 export const __createRtrtProvenanceForTest = (input, options) => createPlugin(input, options)
+export const __resolveManagedAgentStatePathForTest = resolveManagedAgentStatePath
 // END rtrt-managed provenance plugin

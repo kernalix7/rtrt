@@ -1,1 +1,43 @@
-{"type":"module"}
+{
+  "name": "rtrt-agent",
+  "version": "0.1.1",
+  "description": "RTRT provenance and permission-broker plugin for OpenCode",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "rtrt-provenance.js",
+    "README.md",
+    "README.ko.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test rtrt-provenance.test.mjs package.test.mjs tui/rtrt-statusline.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "provenance",
+    "rtrt"
+  ],
+  "author": "Kim DaeHyun <kernalix7@kodenet.io>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kernalix7/rtrt.git",
+    "directory": "plugins/opencode"
+  },
+  "homepage": "https://github.com/kernalix7/rtrt#readme",
+  "bugs": {
+    "url": "https://github.com/kernalix7/rtrt/issues"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "1.15.13"
+  }
+}

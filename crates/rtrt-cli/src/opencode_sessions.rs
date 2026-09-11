@@ -2825,6 +2825,15 @@ fn quote(identifier: &str) -> String {
 mod tests {
     use super::*;
 
+    /// macOS resolves the system temp dir through `/var -> /private/var`, and the
+    /// migration deliberately refuses to open a database reached through a
+    /// symlink. Tests therefore need a canonical root, not the raw handle path.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let handle = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(handle.path()).unwrap();
+        (handle, root)
+    }
+
     fn fixture(temp: &Path) -> (PathBuf, PathBuf, PathBuf) {
         let first = temp.join("a/same");
         let second = temp.join("b/same");
@@ -3150,10 +3159,10 @@ mod tests {
 
     #[test]
     fn opencode_1_18_current_schema_routes_complete_resumable_graph() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, second) = fixture(temp.path());
+        let (source, first, second) = fixture(&temp);
         let before = fs::read(&source).unwrap();
         let options = MigrationOptions {
             home: home.clone(),
@@ -3492,10 +3501,10 @@ mod tests {
 
     #[test]
     fn dry_run_writes_nothing_and_unknown_dependency_fails_closed() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, _, _) = fixture(temp.path());
+        let (source, _, _) = fixture(&temp);
         let dry = MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -3517,10 +3526,10 @@ mod tests {
 
     #[test]
     fn explicit_migration_rejects_triggers_and_views() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, _, _) = fixture(temp.path());
+        let (source, _, _) = fixture(&temp);
         let connection = Connection::open(&source).unwrap();
         connection
             .execute_batch(
@@ -3553,10 +3562,10 @@ mod tests {
 
     #[test]
     fn conflict_preserves_existing_private_rows_and_inserts_safe_rows() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, second) = fixture(temp.path());
+        let (source, first, second) = fixture(&temp);
         let destination = destination_db(&home, ProjectIdentity::derive(&first).unwrap().slug());
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         let conn = Connection::open(&destination).unwrap();
@@ -3755,10 +3764,10 @@ mod tests {
 
     #[test]
     fn existing_database_missing_core_tables_is_repaired_to_complete_schema() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, _) = fixture(temp.path());
+        let (source, first, _) = fixture(&temp);
         let destination = destination_db(&home, ProjectIdentity::derive(&first).unwrap().slug());
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         Connection::open(&destination)
@@ -3830,10 +3839,10 @@ mod tests {
 
     #[test]
     fn event_history_owner_prefix_append_and_fork_are_safe_and_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, _) = fixture(temp.path());
+        let (source, first, _) = fixture(&temp);
         let options = MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -3945,10 +3954,10 @@ mod tests {
 
     #[test]
     fn private_event_history_ahead_wins_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, _) = fixture(temp.path());
+        let (source, first, _) = fixture(&temp);
         let options = MigrationOptions {
             home: home.clone(),
             source: Some(source),
@@ -3980,10 +3989,10 @@ mod tests {
 
     #[test]
     fn malformed_event_history_aborts_before_any_destination_mutation() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, _, _) = fixture(temp.path());
+        let (source, _, _) = fixture(&temp);
         Connection::open(&source)
             .unwrap()
             .execute(
@@ -4003,10 +4012,10 @@ mod tests {
 
     #[test]
     fn malformed_private_history_aborts_before_other_project_mutation() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, second) = fixture(temp.path());
+        let (source, first, second) = fixture(&temp);
         let options = MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -4042,10 +4051,10 @@ mod tests {
 
     #[test]
     fn retry_after_partial_project_and_new_event_tail_completes_all_projects() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, second) = fixture(temp.path());
+        let (source, first, second) = fixture(&temp);
         let options = MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -4089,11 +4098,11 @@ mod tests {
 
     #[test]
     fn linked_worktree_uses_main_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let main = temp.path().join("main");
-        let linked = temp.path().join("linked");
+        let main = temp.join("main");
+        let linked = temp.join("linked");
         fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
         fs::create_dir(&linked).unwrap();
         fs::write(
@@ -4111,7 +4120,7 @@ mod tests {
             ProjectIdentity::derive(&main).unwrap().slug(),
             ProjectIdentity::derive(&linked).unwrap().slug()
         );
-        let source = temp.path().join("linked.db");
+        let source = temp.join("linked.db");
         let connection = Connection::open(&source).unwrap();
         connection
             .execute_batch(
@@ -4153,10 +4162,10 @@ mod tests {
 
     #[test]
     fn wal_safe_read_leaves_source_sidecars_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let source = temp.path().join("wal.db");
+        let source = temp.join("wal.db");
         let connection = Connection::open(&source).unwrap();
         connection
             .pragma_update(None, "journal_mode", "WAL")
@@ -4222,10 +4231,10 @@ mod tests {
 
     #[test]
     fn launcher_catch_up_skips_busy_migration_lock() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, _, _) = fixture(temp.path());
+        let (source, _, _) = fixture(&temp);
         let root = home.join(".rtrt");
         super::super::ensure_private_directory(&root).unwrap();
         let _lock = acquire_lock(
@@ -4278,10 +4287,10 @@ mod tests {
     #[test]
     fn runtime_repair_normalizes_stale_and_runtime_directory_rows_idempotently() {
         FULL_REPAIR_SCANS.with(|scans| scans.set(0));
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         let connection = Connection::open(&db).unwrap();
         connection
@@ -4386,10 +4395,10 @@ mod tests {
 
     #[test]
     fn malformed_and_symlink_runtime_checkpoints_fail_closed() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         let checkpoint = runtime_checkpoint_path(&db).unwrap();
         fs::write(&checkpoint, b"not-json").unwrap();
@@ -4411,10 +4420,10 @@ mod tests {
 
     #[test]
     fn db_wal_generation_change_invalidates_runtime_checkpoint() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         let authority = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let generation = source_generation(&db).unwrap();
@@ -4435,10 +4444,10 @@ mod tests {
 
     #[test]
     fn unique_stale_directory_row_does_not_replace_missing_runtime_project_row() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         let connection = Connection::open(&db).unwrap();
         connection
@@ -4483,10 +4492,10 @@ mod tests {
 
     #[test]
     fn runtime_global_overrides_unique_stale_directory_attribution() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         let connection = Connection::open(&db).unwrap();
         connection
@@ -4541,10 +4550,10 @@ mod tests {
 
     #[test]
     fn malformed_session_graph_is_archived_then_removed() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout = temp.path().join("checkout");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let checkout = temp.join("checkout");
         fs::create_dir(&checkout).unwrap();
-        let db = temp.path().join("private.sqlite");
+        let db = temp.join("private.sqlite");
         runtime_fixture(&db, &checkout);
         Connection::open(&db)
             .unwrap()
@@ -4609,10 +4618,10 @@ mod tests {
 
     #[test]
     fn catch_up_current_manifest_does_not_open_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, _) = fixture(temp.path());
+        let (source, first, _) = fixture(&temp);
         migrate(&MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -4634,10 +4643,10 @@ mod tests {
 
     #[test]
     fn catch_up_routes_new_malformed_source_graph_only_to_legacy_archive() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, _) = fixture(temp.path());
+        let (source, first, _) = fixture(&temp);
         migrate(&MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),
@@ -4681,10 +4690,10 @@ mod tests {
 
     #[test]
     fn session_directory_overrides_global_project_and_closes_shared_fk_ancestors() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, first, second) = fixture(temp.path());
+        let (source, first, second) = fixture(&temp);
         let connection = Connection::open(&source).unwrap();
         connection
             .execute_batch(
@@ -4858,10 +4867,10 @@ mod tests {
 
     #[test]
     fn routing_policy_domain_invalidates_old_manifest_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
-        let (source, _, _) = fixture(temp.path());
+        let (source, _, _) = fixture(&temp);
         migrate(&MigrationOptions {
             home: home.clone(),
             source: Some(source.clone()),

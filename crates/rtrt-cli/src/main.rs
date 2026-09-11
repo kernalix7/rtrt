@@ -3531,6 +3531,14 @@ mod opencode_launcher_tests {
     use super::*;
     use std::fs;
 
+    /// macOS reaches the system temp dir through `/var -> /private/var`. The
+    /// launcher compares canonical paths, so a raw handle path would never match.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let handle = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(handle.path()).unwrap();
+        (handle, root)
+    }
+
     fn repo(path: &Path) {
         fs::create_dir_all(path.join(".git")).unwrap();
     }
@@ -3566,9 +3574,9 @@ mod opencode_launcher_tests {
     #[cfg(unix)]
     #[test]
     fn history_quarantine_never_overwrites_existing_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("prompt-history.jsonl");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let source = temp.join("prompt-history.jsonl");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
         private_history(&source, "source");
         private_history(&destination, "existing");
 
@@ -3584,10 +3592,10 @@ mod opencode_launcher_tests {
     fn history_quarantine_rejects_source_symlink_without_touching_target() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("target");
-        let source = temp.path().join("prompt-history.jsonl");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let target = temp.join("target");
+        let source = temp.join("prompt-history.jsonl");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
         private_history(&target, "target");
         symlink(&target, &source).unwrap();
 
@@ -3605,10 +3613,10 @@ mod opencode_launcher_tests {
     #[cfg(unix)]
     #[test]
     fn history_quarantine_detects_source_exchange_after_open() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("prompt-history.jsonl");
-        let original = temp.path().join("original");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let source = temp.join("prompt-history.jsonl");
+        let original = temp.join("original");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
         private_history(&source, "original");
 
         let error = quarantine_prompt_history_with(&source, &destination, |phase| {
@@ -3628,10 +3636,10 @@ mod opencode_launcher_tests {
     #[cfg(unix)]
     #[test]
     fn history_quarantine_does_not_remove_exchanged_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("prompt-history.jsonl");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
-        let displaced_link = temp.path().join("displaced-quarantine-link");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let source = temp.join("prompt-history.jsonl");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
+        let displaced_link = temp.join("displaced-quarantine-link");
         private_history(&source, "original");
 
         let error = quarantine_prompt_history_with(&source, &destination, |phase| {
@@ -3651,10 +3659,10 @@ mod opencode_launcher_tests {
     #[cfg(unix)]
     #[test]
     fn history_quarantine_detects_source_exchange_before_unlink_and_cleans_own_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("prompt-history.jsonl");
-        let original = temp.path().join("original");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let source = temp.join("prompt-history.jsonl");
+        let original = temp.join("original");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
         private_history(&source, "original");
 
         let error = quarantine_prompt_history_with(&source, &destination, |phase| {
@@ -3676,9 +3684,9 @@ mod opencode_launcher_tests {
     fn history_quarantine_links_chmods_handle_then_unlinks_source() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("prompt-history.jsonl");
-        let destination = temp.path().join("prompt-history.jsonl.rtrt-quarantine");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let source = temp.join("prompt-history.jsonl");
+        let destination = temp.join("prompt-history.jsonl.rtrt-quarantine");
         private_history(&source, "private");
         fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -3698,12 +3706,12 @@ mod opencode_launcher_tests {
 
     #[test]
     fn same_basename_projects_get_distinct_opencode_data() {
-        let temp = tempfile::tempdir().unwrap();
-        let first = temp.path().join("one/repo");
-        let second = temp.path().join("two/repo");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let first = temp.join("one/repo");
+        let second = temp.join("two/repo");
         repo(&first);
         repo(&second);
-        let home = temp.path().join("home");
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
 
         let first =
@@ -3716,12 +3724,12 @@ mod opencode_launcher_tests {
 
     #[test]
     fn linked_worktree_shares_data_but_keeps_checkout_cwd_and_argv() {
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main");
-        let linked = temp.path().join("linked");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let main = temp.join("main");
+        let linked = temp.join("linked");
         repo(&main);
         linked_worktree(&main, &linked);
-        let home = temp.path().join("home");
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
         let main_identity = ProjectIdentity::derive(&main).unwrap();
         let linked_identity = ProjectIdentity::derive(&linked).unwrap();
@@ -3751,10 +3759,10 @@ mod opencode_launcher_tests {
     fn private_db_rejects_unsafe_mode_and_data_symlink() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
+        let (_temp_guard, temp) = canonical_tempdir();
+        let project = temp.join("project");
         repo(&project);
-        let home = temp.path().join("home");
+        let home = temp.join("home");
         fs::create_dir(&home).unwrap();
         let identity = ProjectIdentity::derive(&project).unwrap();
         let paths = prepare_opencode_project(&identity, &home).unwrap();
@@ -3763,7 +3771,7 @@ mod opencode_launcher_tests {
 
         fs::set_permissions(&paths.db, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_dir_all(&paths.data).unwrap();
-        symlink(temp.path(), &paths.data).unwrap();
+        symlink(&temp, &paths.data).unwrap();
         assert!(prepare_opencode_project(&identity, &home).is_err());
     }
 

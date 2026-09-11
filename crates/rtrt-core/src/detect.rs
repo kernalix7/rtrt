@@ -261,10 +261,10 @@ fn validate_trusted_executable(candidate: &Path, project_root: &Path) -> Result<
             canonical.display()
         )));
     }
-    let metadata = fs::metadata(&canonical)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(&canonical)?;
         let uid = fs::metadata(&project_root)?.uid();
         if !metadata.is_file()
             || metadata.permissions().mode() & 0o111 == 0

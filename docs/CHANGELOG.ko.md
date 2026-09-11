@@ -39,6 +39,7 @@
 - `<repo>/.rtrt`를 생성 후 권한을 좁히는 대신 처음부터 `0700`으로 만듭니다. 뒤따르는 권한 변경이 다른 디렉터리로 유도될 수 있는 창을 없앴습니다.
 - `--allowed-origins` 없이 실행한 `rtrt-mcp --transport http`는 이제 모든 origin을 허용하지 않고, `Origin` 헤더를 포함한 요청을 전부 거부합니다. `Origin`을 보내지 않는 네이티브 클라이언트는 영향이 없습니다.
 - OpenCode 플러그인은 경로를 인자로 받는 shell 명령을 더 이상 자동 승인하지 않습니다. 권한 판정 시점과 shell 실행 시점의 경로 해석이 달라, 승인된 파일이 그 사이에 심볼릭 링크로 교체될 수 있기 때문입니다. `cat`, `ls`, `head`, `tail`, `wc`, `stat`은 일반 확인 절차로 돌아가며 `pwd`만 자동 승인됩니다.
+- `rtrt-core`가 Windows에서 다시 빌드됩니다. 동일 파일 검사가 아직 불안정한 `volume_serial_number`/`file_index`를 사용해 nightly에서만 컴파일됐습니다. 이제 Windows에서는 안정 속성 전부를 비교하며, 이는 교체를 탐지하지만 진정한 파일 신원 확인이 아닌 변조 검사입니다.
 - 대시보드 페일오버 편집기는 `transient_retries`와 `backoff_divisor`가 `u32::MAX`를 넘으면 조용히 잘라내지 않고 400으로 거부합니다. 정책 로드가 실패하면 폼을 비우고 잠가, 이전 프로젝트 값이 전역 정책으로 저장되는 일이 없습니다.
 - Setup 멱등성, 프로젝트 전용 세션 migration과 catch-up, sandbox 검증, uninstall 순서, 외부 설정 보존을 개선했습니다.
 

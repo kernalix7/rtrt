@@ -40,6 +40,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - `<repo>/.rtrt` is created with `0700` in a single step instead of being created and then narrowed, closing the window in which the later permission change could be redirected.
 - `rtrt-mcp --transport http` with no `--allowed-origins` now rejects every request that carries an `Origin` header instead of accepting any origin. Native clients, which send no `Origin`, are unaffected.
 - The OpenCode plugin no longer auto-approves shell commands that name a path. Permission evaluation and shell execution resolve paths at different times, so an approved file could be swapped for a symlink in between; `cat`, `ls`, `head`, `tail`, `wc`, and `stat` now fall back to a normal prompt and only `pwd` is auto-approved.
+- `rtrt-core` builds on Windows again. Its same-file check used the still-unstable `volume_serial_number`/`file_index` pair, so the crate only compiled on nightly. Windows now compares every stable attribute instead, which detects the swap this guards against but is a tamper check rather than true file identity.
 - The dashboard failover editor rejects `transient_retries` and `backoff_divisor` above `u32::MAX` with a 400 instead of silently truncating them, and a failed policy load now clears and locks the form so stale project values can never be saved into the global policy.
 - Improved setup idempotence, project-private session migration and catch-up, sandbox validation, uninstall ordering, and preservation of foreign configuration.
 

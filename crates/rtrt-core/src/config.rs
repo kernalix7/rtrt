@@ -967,11 +967,19 @@ fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+// True file identity on Windows needs `volume_serial_number`/`file_index`, which
+// are still unstable and only populated for handle-derived metadata. This
+// compares every stable attribute instead: it detects the swap-and-replace this
+// guards against, but two distinct files sharing all of them would compare
+// equal, so it is a tamper check rather than an identity check.
 #[cfg(windows)]
 fn metadata_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
+    left.file_attributes() == right.file_attributes()
+        && left.creation_time() == right.creation_time()
+        && left.last_write_time() == right.last_write_time()
+        && left.file_size() == right.file_size()
+        && left.file_type() == right.file_type()
 }
 
 #[cfg(not(any(unix, windows)))]

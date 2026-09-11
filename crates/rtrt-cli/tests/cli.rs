@@ -971,7 +971,8 @@ fn opencode_setup_dry_run_lists_tui_targets_without_writing() {
         ))
         .stdout(predicate::str::contains(
             opencode
-                .join("tui/rtrt-statusline-core.mjs")
+                .join("tui")
+                .join("rtrt-statusline-core.mjs")
                 .display()
                 .to_string(),
         ))

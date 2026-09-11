@@ -6979,6 +6979,10 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
+            // macOS reaches the temp dir through `/var -> /private/var`, and the
+            // store derives identity from canonical paths, so the fixture has to
+            // start canonical for those comparisons to line up.
+            let path = fs::canonicalize(&path).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

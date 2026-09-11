@@ -327,6 +327,7 @@ mod tests {
         path: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl CanonicalTempDir {
         fn new() -> Self {
             let guard = tempfile::tempdir().unwrap();
@@ -342,6 +343,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovers_same_basename_projects_as_distinct_canonical_slugs() {
         use std::os::unix::fs::PermissionsExt;

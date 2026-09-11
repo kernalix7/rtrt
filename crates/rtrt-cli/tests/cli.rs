@@ -1756,6 +1756,16 @@ fn seed_statusline_savings_cache(home: &std::path::Path) {
 }
 
 fn cached_statusline_command(home: &std::path::Path, runtime: &std::path::Path) -> Command {
+    cached_statusline_command_with_budget(home, runtime, "120")
+}
+
+/// Priming runs need a budget that a cold runner can actually meet, otherwise
+/// the probe they are meant to cache is abandoned and never written.
+fn cached_statusline_command_with_budget(
+    home: &std::path::Path,
+    runtime: &std::path::Path,
+    budget_ms: &str,
+) -> Command {
     let mut command = rtrt(home);
     command
         .args([
@@ -1766,7 +1776,7 @@ fn cached_statusline_command(home: &std::path::Path, runtime: &std::path::Path) 
             "--width",
             "120",
             "--budget-ms",
-            "120",
+            budget_ms,
         ])
         .env("RTRT_TMP_DIR", runtime)
         .env("RTRT_PROVIDER_USAGE_PATH", home.join("missing-usage.tsv"))
@@ -1822,7 +1832,7 @@ fn opencode_statusline_bounds_locked_sqlite_and_slow_stale_git() {
     let home = CanonicalHome::new();
     let runtime = home.path().join("runtime");
     seed_statusline_savings_cache(home.path());
-    let prime = cached_statusline_command(home.path(), &runtime)
+    let prime = cached_statusline_command_with_budget(home.path(), &runtime, "5000")
         .output()
         .unwrap();
     assert!(

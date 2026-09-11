@@ -815,6 +815,10 @@ fn opencode_launcher_refuses_nested_session_before_resolving_binary() {
     assert!(!home.path().join(".rtrt/projects").exists());
 }
 
+// Project stores resolve through `dirs::home_dir()`, which on Windows reads the
+// known-folder API rather than the environment, so this command cannot be kept
+// inside the test home there. See the same note in the dashboard EnvGuard.
+#[cfg(unix)]
 #[test]
 fn legacy_isolation_requires_claim_and_quarantines_cross_row_state() {
     let home = CanonicalHome::new();
@@ -952,7 +956,7 @@ fn service_machine_mode_has_no_project_working_directory_or_legacy_memory_path()
 #[test]
 fn opencode_setup_dry_run_lists_tui_targets_without_writing() {
     let home = CanonicalHome::new();
-    let opencode = home.path().join(".config/opencode");
+    let opencode = home.path().join(".config").join("opencode");
 
     rtrt(home.path())
         .args(["setup", "--agent", "opencode"])
@@ -960,7 +964,8 @@ fn opencode_setup_dry_run_lists_tui_targets_without_writing() {
         .success()
         .stdout(predicate::str::contains(
             opencode
-                .join("tui/rtrt-statusline.tsx")
+                .join("tui")
+                .join("rtrt-statusline.tsx")
                 .display()
                 .to_string(),
         ))
@@ -1335,6 +1340,9 @@ fn opencode_statusline_returns_partial_json_at_zero_budget_and_honors_no_git() {
     );
 }
 
+// A directory whose name carries control characters cannot be created on
+// Windows, so the sanitiser this exercises has nothing to act on there.
+#[cfg(unix)]
 #[test]
 fn opencode_statusline_sanitizes_malicious_cwd_controls() {
     let home = CanonicalHome::new();

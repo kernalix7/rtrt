@@ -58,13 +58,9 @@ struct Cli {
     /// HTTP mount path for the MCP endpoint.
     #[arg(long, default_value = "/mcp")]
     path: String,
-    /// Required bearer token for `--transport http`. Without it the server
-    /// rejects every request with 401. Reading from the environment keeps
-    /// the secret out of the process listing.
-    #[arg(long, env = "RTRT_MCP_HTTP_TOKEN")]
-    http_token: Option<String>,
     /// Allowed browser Origins (comma-separated) for `--transport http`.
-    /// Empty disables Origin validation; non-empty enables it per RFC 6454.
+    /// Empty rejects every request that carries an `Origin` header at all;
+    /// non-empty admits exactly the listed origins per RFC 6454.
     #[arg(long, env = "RTRT_MCP_ALLOWED_ORIGINS", value_delimiter = ',')]
     allowed_origins: Vec<String>,
     /// Stdio-only strict profile exposing only `permission_prompt`.
@@ -2027,9 +2023,50 @@ fn validate_http_auth(transport: Transport, token: Option<&str>) -> Result<()> {
             value.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
         })
     {
-        anyhow::bail!("--transport http requires a non-empty --http-token or RTRT_MCP_HTTP_TOKEN");
+        anyhow::bail!("--transport http requires a non-empty RTRT_MCP_HTTP_TOKEN");
     }
     Ok(())
+}
+
+fn http_token_from_env(transport: Transport) -> Result<Option<String>> {
+    let token = match transport {
+        Transport::Stdio => None,
+        Transport::Http => std::env::var("RTRT_MCP_HTTP_TOKEN").ok(),
+    };
+    validate_http_auth(transport, token.as_deref())?;
+    Ok(token)
+}
+
+/// Decide whether a request's `Origin` header may proceed. An absent header is
+/// a native (non-browser) client and is always allowed; an empty allowlist
+/// admits no browser origin at all, so the default configuration cannot be
+/// reached from a page.
+fn origin_is_allowed(allowlist: &[String], origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    allowlist.iter().any(|allowed| allowed == origin)
+}
+
+async fn origin_guard(
+    allowlist: Arc<Vec<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header::ORIGIN;
+    let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
+    if origin_is_allowed(&allowlist, origin) {
+        return next.run(req).await;
+    }
+    forbidden_origin_response()
+}
+
+fn forbidden_origin_response() -> axum::response::Response {
+    let mut resp = axum::response::Response::new(axum::body::Body::from(
+        "forbidden: origin not allowed for this rtrt-mcp endpoint",
+    ));
+    *resp.status_mut() = axum::http::StatusCode::FORBIDDEN;
+    resp
 }
 
 /// Bearer-token guard for HTTP. Missing server configuration also denies every
@@ -2467,7 +2504,7 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let profile = RuntimeProfile::from_cli(&cli)?;
-    validate_http_auth(cli.transport, cli.http_token.as_deref())?;
+    let http_token = http_token_from_env(cli.transport)?;
     if matches!(profile, RuntimeProfile::PermissionOnly) {
         let state = Arc::new(RtrtState {
             profile,
@@ -2555,7 +2592,7 @@ async fn main() -> Result<()> {
                 memory_path.display(),
                 "bearer",
                 if cli.allowed_origins.is_empty() {
-                    "*".into()
+                    "none (browser origins rejected)".into()
                 } else {
                     cli.allowed_origins.join(",")
                 },
@@ -2568,12 +2605,17 @@ async fn main() -> Result<()> {
                 Arc::new(LocalSessionManager::default()),
                 config,
             );
-            let token = cli.http_token.clone().map(Arc::new);
+            let token = http_token.map(Arc::new);
+            let origin_allowlist = Arc::new(cli.allowed_origins.clone());
             let app = axum::Router::new()
                 .route_service(&cli.path, mcp_service)
                 .layer(axum::middleware::from_fn(move |req, next| {
                     let token = token.clone();
                     async move { bearer_guard(token, req, next).await }
+                }))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    let allowlist = origin_allowlist.clone();
+                    async move { origin_guard(allowlist, req, next).await }
                 }));
             let listener = match tokio::net::TcpListener::bind(&cli.bind).await {
                 Ok(l) => l,
@@ -2595,6 +2637,33 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_origin_allowlist_admits_native_clients_and_no_browser_origin() {
+        assert!(origin_is_allowed(&[], None));
+        assert!(!origin_is_allowed(&[], Some("http://localhost:7311")));
+        assert!(!origin_is_allowed(&[], Some("https://evil.example")));
+        assert!(!origin_is_allowed(&[], Some("null")));
+    }
+
+    #[test]
+    fn configured_origin_allowlist_admits_only_exact_matches() {
+        let allowlist = vec!["http://localhost:7311".to_string()];
+        assert!(origin_is_allowed(&allowlist, None));
+        assert!(origin_is_allowed(&allowlist, Some("http://localhost:7311")));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            Some("http://localhost:7312")
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            Some("http://localhost:7311.evil.example")
+        ));
+        assert!(!origin_is_allowed(
+            &allowlist,
+            Some("HTTP://LOCALHOST:7311")
+        ));
+    }
 
     static PERMISSION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     const PERMISSION_ENV_NAMES: [&str; 7] = [
@@ -2941,6 +3010,40 @@ mod tests {
         assert!(validate_http_auth(Transport::Stdio, None).is_ok());
     }
 
+    #[test]
+    fn cli_rejects_http_token_argument() {
+        // Given a direct HTTP invocation containing the removed secret flag.
+        let args = ["rtrt-mcp", "--transport", "http", "--http-token", "secret"];
+
+        // When clap parses the invocation.
+        let result = Cli::try_parse_from(args);
+
+        // Then the secret-bearing argument is rejected.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn http_auth_reads_token_from_environment() {
+        // Given a valid token only in the HTTP authentication environment.
+        let _guard = PERMISSION_ENV_LOCK.blocking_lock();
+        let previous = std::env::var_os("RTRT_MCP_HTTP_TOKEN");
+        // SAFETY: this test serializes access to RTRT_MCP_HTTP_TOKEN and restores it below.
+        unsafe { std::env::set_var("RTRT_MCP_HTTP_TOKEN", "environment-secret") };
+
+        // When HTTP authentication configuration loads without a token argument.
+        let token = http_token_from_env(Transport::Http);
+
+        // Then the environment token is accepted without a CLI argument.
+        // SAFETY: see the serialized environment access above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RTRT_MCP_HTTP_TOKEN", value),
+                None => std::env::remove_var("RTRT_MCP_HTTP_TOKEN"),
+            }
+        }
+        assert_eq!(token.unwrap().as_deref(), Some("environment-secret"));
+    }
+
     fn cli_for_profile(transport: Transport) -> Cli {
         Cli {
             memory: None,
@@ -2948,7 +3051,6 @@ mod tests {
             transport,
             bind: "127.0.0.1:7312".into(),
             path: "/mcp".into(),
-            http_token: (transport == Transport::Http).then(|| "secret".into()),
             allowed_origins: Vec::new(),
             permission_only: false,
             http_allow_process_execution: false,

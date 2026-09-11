@@ -2,7 +2,7 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 최신 사용법입니다.
+이 문서는 v0.1.1 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
 
 ## 빠른 차림표
 
@@ -13,7 +13,7 @@
 - 비용 인지 라우팅: `rtrt route --explain "prompt"` / 사용량·헤드룸: `rtrt usage`
 - 보안 스캔: `rtrt security scan --profile ai-default`
 - 프로젝트 표준화: `rtrt migrate --apply` / `rtrt project refresh --apply`
-- MCP HTTP: `rtrt mcp --transport http --http-token "$TOKEN"`
+- MCP HTTP: `RTRT_MCP_HTTP_TOKEN="$TOKEN" rtrt mcp --transport http`
 - 벤치: `rtrt benchmark`
 
 ## CLI
@@ -107,78 +107,27 @@ rtrt setup --agent claude --apply
 rtrt hook proxy-rewrite
 ```
 
-### `rtrt team preset` / `rtrt team dispatch`
+### 멀티 에이전트 코디네이션 경계
 
-Classic roster는 비활성 기본값으로 유지되므로 기존 `[team]`이나 `[team]`이 없는 설정의 동작은 자동으로 바뀌지 않습니다. OpenCode-lead roster는 명시적으로 opt-in합니다.
+RTRT는 team 명령, scheduler, roster, worker protocol 또는 `team_dispatch` MCP 도구를 제공하지 않습니다. 멀티 에이전트 코디네이션은 외부 에이전트 런타임이 담당합니다. RTRT는 압축, 메모리, 프로바이더 라우팅과 페일오버, 보안 스캔, setup 통합 및 provenance에 집중합니다.
+
+### OpenCode npm 플러그인과 setup 마이그레이션
+
+`rtrt-agent@0.1.1`을 `npm install rtrt-agent@0.1.1`로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
+
+```json
+{ "plugin": ["rtrt-agent@0.1.1"] }
+```
+
+npm 패키지는 RTRT provenance 및 permission hook만 내보냅니다. TUI 스테이터스라인은 npm에 포함되지 않으며 계속 setup이 관리합니다.
+
+전체 설치에는 다음을 권장합니다.
 
 ```bash
-rtrt team preset opencode-lead           # dry-run 요약; 기록하지 않음
-rtrt team preset opencode-lead --apply   # global [team] 테이블 구체화
-rtrt team show
-rtrt team check-manager
-rtrt team dispatch "이 저장소를 검토하고 테스트해"
-rtrt team dispatch --json --timeout 180 "요청한 변경을 구현해"
+rtrt setup --agent opencode --apply
 ```
 
-`--apply`는 해석된 global config(`~/.rtrt/config.toml`, 또는 `RTRT_CONFIG`)의 `[team]`만 교체하고 관련 없는 section은 보존합니다. `roster = "opencode-lead"` 라벨만 설정하는 대신 활성 roster 전체를 기록합니다. Preset은 편집 가능한 초기값 — GPT manager, Codex-first `hard` tier, Claude plan/review role, Kimi overflow와 관련 lane/link — 을 제공합니다. 이는 기본값일 뿐 task trigger가 아닙니다. Source manager policy는 architecture, security, implementation, review 또는 model-name phase를 강제하지 않습니다.
-
-#### Runtime routing과 편집 가능한 초기값
-
-Runtime routing은 materialized RTRT config에서만 나옵니다. 유효 config의 member `roles`, tiers, `design_only_tiers`, `review_tier`, `leader_order`, siblings, fallbacks, `balance`, delegation, flags가 routing을 결정하며 architecture/security 등의 task 문구나 model-name phase는 hardcode하지 않습니다.
-
-`opencode-lead` preset은 GPT manager, Codex-first `hard` tier, Claude plan/review role, Kimi overflow를 편집 가능한 초기값으로 제공합니다. Dashboard 또는 config에서 materialized `[team]` table을 수정하면 동작이 바뀝니다. Setup이 관리하는 host file까지 반영하려면 `rtrt setup --agent opencode --apply`를 다시 실행합니다.
-
-Quota 실패는 transient failure와 다르게 처리합니다. **같은 lane 재시도는 0회**이며, 해당 lane은 **현재 session에서 skip**합니다. 이후 실행할 eligible lane은 설정된 sibling/fallback 순서가 고릅니다. 이는 CLI/native 구분을 바꾸지 않습니다. `delegation = "native"`는 계속 OpenCode native Task이고, `delegation = "cli"`는 계속 external CLI 실행입니다.
-
-OpenCode native Task 구조화 provider-limit circuit breaker는 기존 RTRT provenance plugin에 구현되어 있으며 `rtrt-manager`가 만든 native child session만 추적합니다. OpenCode SDK가 구조화된 `statusCode` `429` 또는 `529`를 담은 `session.next.retried`를 보내면 정확한 child를 즉시 interrupt하고, manager는 현재 session에서 해당 lane을 제외한 뒤 설정된 sibling, 다음 fallback 순서로 진행하며 같은 lane은 0회 재시도합니다. Free-text를 parsing하지 않고 wall-clock timeout도 사용하지 않으며 Claude permission approval, 일반 review, 무관한 agent, 일반 5xx, auth failure, unstructured error에는 영향을 주지 않습니다. 상태는 bounded in-memory로 유지하고 idle/delete/dispose 때 정리하며 prompt/body data는 저장하지 않습니다. 구조화 status 처리, 정확한 child interrupt, routing 제외, cleanup, 비대상 case를 테스트합니다.
-
-각 `[[team.members]]` lane의 schema는 다음과 같습니다.
-
-| 필드 | 의미 |
-|------|------|
-| `name`, `target`, `model`, `mode` | 구체적인 lane 식별자. `(target, model, mode)` 조합은 고유해야 합니다. |
-| `roles` | 선택·위임 설명에 쓰는 필수 non-empty 자유 형식 role label입니다. |
-| `delegation` | 기본값 `native`. `cli`는 외부 CLI를 선택하며 현재 `target = "claude"`에서만 `claude -p`를 호출합니다. 레거시 `shell`은 읽기 전용 호환 alias로 허용되지만 Team이 비활성인 경우도 포함합니다. 새 serialization과 dashboard 저장은 `cli`를 씁니다. |
-| `host_agent` | OpenCode Task / `@mention` 위임에 사용할 host-native agent 이름입니다. 이 필드 자체가 agent를 실행하지는 않습니다. |
-| `logical`, `sibling`, `tier`, `fallback` | 논리 model 식별자, 같은 model의 pool crossover, 난이도 단계, 순서가 있는 대체 lane입니다. |
-| `allow_impl`, `flags` | 수정 허용 여부와 host/invoker가 사용할 opaque 호출 flag입니다. Setup은 `allow_impl`과 role label에서 보수적인 generated-agent permission을 파생하지만 임의 `flags`를 OpenCode permission으로 적용하지 않습니다. |
-
-#### Native worker permission
-
-Native worker는 기본적으로 OpenCode project/global permission을 상속합니다. 선택적인 `[team.members.permissions]` block이 해당 member의 edit 및 Bash 동작을 override합니다. Role은 routing label일 뿐 permission을 부여하지 않습니다. 필요할 때만 override를 설정합니다.
-
-```toml
-[[team.members]]
-name = "codex-sol"
-target = "opencode"
-model = "openai/gpt-5.6-sol"
-mode = "cli"
-roles = ["routine", "tests"] # label일 뿐 permission이 아님
-
-[team.members.permissions]
-edit = "allow"
-test = "ask"
-build = "ask"
-bash = { "git status" = "allow", "git diff" = "allow", "cargo test" = "ask", "cargo build" = "ask" }
-```
-
-Bash action map은 optional 설정 그대로 렌더링되며 기본 command-list allowlist는 없습니다. `permissions`를 생략하면 OpenCode project/global permission이 그대로 적용됩니다. Task recursion, project 외부 디렉터리 접근, RTRT agent/team bridge는 설정할 수 없는 unconditional deny safety boundary입니다. Native worker에는 host의 confirmation 및 isolation rule도 계속 적용됩니다.
-
-Dashboard의 **Tools › Orchestration**에서 lane을 열고 **Permissions**와 Bash action map을 편집한 뒤 effective `[team]` 설정을 저장할 수 있습니다. Preset 값은 편집 가능한 초기 configuration이며 별도 policy source가 아닙니다.
-
-Claude CLI lane은 `permission-mode`만이 아니라 Claude Code settings와 표준 permission prompt tool을 함께 사용합니다. 직접 lane은 `--permission-prompt-tool mcp__rtrt__permission_prompt`로 호출하며 Opus 기본값은 `plan`, Sonnet 기본값은 `acceptEdits`입니다. OpenCode Claude CLI lane에서는 `allowed-tools`, `bypassPermissions`, `dangerously-skip`을 거부합니다. `[team.members.permissions]`는 native worker 설명이며 Claude Code settings를 대체하지 않습니다.
-
-`[team.policy]` 기본값은 `max_retries = 2`, `redo_on_fallback = true`, `prefer_sibling_on_quota = true`, `record_provenance = true`, `balance = "order"`, `worker_summary_max_lines = 3`, `isolate_conflicting = true`입니다. 설정하지 않은 `max_fallback_depth`는 roster 크기, `default_tier`는 유효 ladder의 첫 tier에서 파생되며, `design_only_tiers`는 유효 config를 따릅니다. `explore_tier`와 `review_tier`의 기본값은 unset입니다. OpenCode-lead preset은 편집 가능한 `balance = "room"`, `default_tier = "hard"`, `explore_tier = "explore"`, `review_tier = "review"`, `design_only_tiers = ["plan"]`을 제공합니다. 이 값들은 model-name phase를 강제하지 않습니다.
-
-`delegation`은 위임 transport입니다. `native`는 OpenCode native Task, `cli`는 외부 CLI 실행을 뜻합니다. 이는 provider invocation mode인 `mode`와 별개이며, `mode`의 값은 계속 `cli | api | auto`입니다(예: `delegation = "cli"`와 `mode = "cli"`는 서로 다른 선택입니다). 레거시 `shell` 값은 읽기 전용 호환 입력으로만 허용하고, config serialization과 dashboard 저장은 `cli`로 정규화합니다. Dashboard delegation dropdown에는 **Native Task / CLI**가 표시되며, `cli`는 현재 `target = "claude"`에서만 `claude -p`를 호출합니다.
-
-호환용 `classic` roster는 기존 local manager 기본값을 유지하지만 명시적 `opencode-lead` preset은 OpenAI GPT-5.6 Sol을 사용합니다. Native delegation은 OpenCode native Task가 소유하며 RTRT agent/team bridge, 중첩 OpenCode process, 중첩 OpenCode delegation은 사용하지 않습니다. Claude CLI lane은 JSON 출력을 요청해 `result` text를 반환하고, 유한한 0 이상의 `total_cost_usd`가 있으면 호출별 optional `cost_usd`에 넣습니다. Cost가 없거나 잘못되었거나 명시적 non-JSON 또는 malformed JSON 출력이면 가격을 만들지 않고 plain 출력을 보존합니다. Claude CLI 인증과 필요한 subscription이 정상이어야 하며, 인증·subscription·호출 실패는 설정된 TeamConfig retry/fallback policy를 따릅니다. RTRT는 아직 team/model aggregate cost report를 제공하지 않습니다.
-
-`rtrt-orchestrator`는 host integration용 검증·계획 primitive를 제공합니다. `WorkerReturn`은 수정 파일 목록, command를 포함한 test 결과, 설정된 줄 수 이내의 summary(기본 3줄), 보관된 상세 기록을 가리키는 non-empty `detail_ref`를 요구합니다. `WorkerResult`는 assigned lane과 actual lane provenance도 검증합니다. 결정론적 isolation planner는 입력 순서를 보존하고, 겹치지 않는 lexical write set을 안정적인 연속 wave로 묶으며, 동일 경로나 부모/자식 경로가 겹치는 모든 task를 전용 worktree 대상으로 표시합니다. 이는 계획일 뿐이며 RTRT는 아직 native host scheduler를 실행하거나 worktree를 자동 merge하지 않습니다.
-
-`rtrt setup --agent opencode --apply`는 `rtrt-manager`와 `delegation = "native"`이면서 `host_agent`가 있는 모든 member를 `~/.config/opencode/agents/`에 구체화합니다. Codex·GLM·Kimi·명시적으로 설정한 Ollama lane은 OpenCode native Task로 dispatch합니다. Claude Opus/Sonnet `cli` lane은 유일한 external CLI execution 예외로 계속 사용할 수 있으며 Claude Code 공식 sandbox 설정을 사용한 exact argv `claude -p`로 직접 호출합니다. 이 lane은 native OpenCode agent가 아닙니다. OpenCode built-in `explore`/`general`/`scout` subagent는 덮어쓰지 않고 참조합니다. 일반 setup은 Ollama probe, embedding 자동 활성화, adapter 설치, `@ai-sdk/openai-compatible` provider 생성을 하지 않습니다. Operator가 Ollama provider를 명시적으로 제공하고 승인해야 합니다. Sandbox 없는 RTRT 생성 agent는 Bash를 거부합니다. Native worker는 optional member override가 없으면 OpenCode project/global permission을 상속합니다. Native delegation은 중첩 OpenCode나 RTRT agent/team bridge를 사용할 수 없습니다.
-
-Manager provider/model과 각 member의 target/model, role, tier, mode, logical model, sibling, fallback, `host_agent`, delegation, implementation 허용 여부는 모두 설정 data입니다. Global `[team]` table을 직접 또는 dashboard에서 수정한 뒤 `rtrt setup --agent opencode --apply`를 다시 실행하면 변경된 RTRT-owned agent file을 upgrade하고 obsolete owned agent를 제거하면서 외부 file과 관련 없는 OpenCode JSON/JSONC 설정은 보존합니다. `enabled = false`는 RTRT-owned native agent만 제거하고 RTRT가 관리한 OpenCode field를 복구합니다. Task spawn, 병렬 실행, session tree, generated permission enforcement는 OpenCode가 소유하므로 setup 후 OpenCode를 재시작해야 합니다. Native delegation은 중첩 `opencode` CLI를 허용하지 않습니다.
+Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.1` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지는 OpenCode가 시작할 때 설치합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지 게시를 담당하며, 이 문서는 게시가 이미 완료되었다고 주장하지 않습니다.
 
 ### OpenCode 영구 스테이터스라인
 
@@ -187,10 +136,10 @@ rtrt setup --agent opencode --apply
 # Setup 후 OpenCode 재시작
 ```
 
-Setup은 관리 대상 TUI file 두 개를 설치합니다.
+Setup은 해석된 OpenCode config root 아래에 관리 대상 TUI file 두 개를 설치합니다.
 
-- `~/.config/opencode/tui/rtrt-statusline.tsx`
-- `~/.config/opencode/tui/rtrt-statusline-core.mjs`
+- `tui/rtrt-statusline.tsx`
+- `tui/rtrt-statusline-core.mjs`
 
 또한 활성 OpenCode TUI config의 `plugin` 배열에 tuple 하나를 추가합니다.
 
@@ -198,7 +147,7 @@ Setup은 관리 대상 TUI file 두 개를 설치합니다.
 ["./tui/rtrt-statusline.tsx", {"bin": "/absolute/path/to/rtrt"}]
 ```
 
-Config resolver는 기존 `~/.config/opencode/tui.json`을 우선하고, 없으면 기존 `tui.jsonc`, 둘 다 없으면 새 `tui.json`을 선택합니다. Setup은 plugin 배열을 교체하지 않고 document를 parse/merge하므로 외부 plugin, 관련 없는 key, RTRT tuple의 기존 `bin` 외 option을 보존합니다. 반복 setup은 idempotent합니다. 관리 대상 TUI 경로에 인식할 수 없는 기존 file이 있으면 덮어쓰지 않습니다.
+Config resolver는 해당 root 아래 기존 `tui.json`을 우선하고, 없으면 기존 `tui.jsonc`, 둘 다 없으면 그곳에 새 `tui.json`을 선택합니다. Setup은 plugin 배열을 교체하지 않고 document를 parse/merge하므로 외부 plugin, 관련 없는 key, RTRT tuple의 기존 `bin` 외 option을 보존합니다. 반복 setup은 idempotent합니다. 관리 대상 TUI 경로에 인식할 수 없는 기존 file이 있으면 덮어쓰지 않습니다.
 
 Plugin은 영구 surface 두 개를 등록합니다.
 
@@ -275,7 +224,7 @@ rtrt uninstall --agent opencode --apply
 # Uninstall 후 OpenCode 재시작
 ```
 
-Uninstall 순서는 의도적입니다. 먼저 RTRT service와 integration을 중지·제거한 뒤 managed binary/file을 제거합니다. OpenCode uninstall은 `tui.json` / `tui.jsonc`에서 RTRT tuple을 제거하고 두 TUI file의 인식 가능한 RTRT 관리 block만 제거합니다. 외부 plugin, 관련 없는 config key, RTRT 소유가 아닌 file content는 유지됩니다. 수정됐거나 인식할 수 없는 관리 file content도 삭제하지 않고 보존합니다. 이 command는 다른 RTRT 관리 OpenCode rules, provenance plugin/bridge, `mcp.rtrt` 항목도 제거합니다. 실행 중인 OpenCode process가 TUI plugin을 unload하려면 재시작이 필요합니다. Typed managed path와 MCP entry는 symlink 및 안전하지 않은 ownership/type 변경을 거부합니다.
+Uninstall 순서는 의도적입니다. 먼저 RTRT service와 integration을 중지·제거한 뒤 managed binary/file을 제거합니다. OpenCode uninstall은 해석된 config root 아래 `tui.json` / `tui.jsonc`에서 RTRT tuple을 제거하고, 그곳의 두 TUI file에서 인식 가능한 RTRT 관리 block만 제거합니다. 외부 plugin, 관련 없는 config key, RTRT 소유가 아닌 file content는 유지됩니다. 수정됐거나 인식할 수 없는 관리 file content도 삭제하지 않고 보존합니다. 이 command는 다른 RTRT 관리 OpenCode rules, provenance plugin/bridge, `mcp.rtrt` 항목도 제거합니다. 실행 중인 OpenCode process가 TUI plugin을 unload하려면 재시작이 필요합니다. Typed managed path와 MCP entry는 symlink 및 안전하지 않은 ownership/type 변경을 거부합니다.
 
 ### OpenCode-to-Claude provenance
 
@@ -458,6 +407,13 @@ rtrt project repair --dry-run       # 누락된 관리 섹션 추가 / 누락 �
 
 사용 가능한 템플릿을 나열합니다(빌트인 + 커스텀).
 
+```text
+design              [BuiltIn]  디자인 키트 문서 체인
+dev                 [BuiltIn]  개발 시작 문서 체인
+plan                [BuiltIn]  계획 문서 체인
+standardization     [BuiltIn]  CLAUDE.md와 에이전트 정의를 담은 프로젝트 컨트랙트
+```
+
 커스텀 템플릿은 `~/.rtrt/templates/<name>/manifest.toml`에 두면 `[Custom]`으로 표시됩니다.
 
 ### `rtrt new`
@@ -465,7 +421,7 @@ rtrt project repair --dry-run       # 누락된 관리 섹션 추가 / 누락 �
 템플릿으로 프로젝트를 만듭니다.
 
 ```bash
-rtrt new rust-cli ./hello \
+rtrt new dev ./hello \
   --var project_name=hello \
   --var author="Kim DaeHyun"
 ```
@@ -543,7 +499,7 @@ curl -N http://127.0.0.1:7412/v1/chat/completions \
 
 ```bash
 # stdio (기본; Claude Code / Codex / Cursor / Windsurf / opencode가 사용)
-rtrt-mcp --memory ~/.rtrt/memory.sqlite
+rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) — axum 라우터
 RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
@@ -571,6 +527,10 @@ RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
 | `templates_list` | `rtrt_templates::list_all` | 빌트인 + 커스텀 |
 | `templates_scaffold` | `rtrt_templates::render::{plan,write}` | 스캐폴드 |
 | `provider_chat` | `Gateway::chat` | 멀티-프로바이더 라우팅 |
+| `agent_call` | 프로바이더 호출 브리지 | 선택한 에이전트 타깃 호출 |
+| `agent_route` | `select_route` | 비용과 헤드룸을 고려한 에이전트 라우트 선택 |
+| `security_scan` | `rtrt_security::run` | 이름으로 지정한 보안 프로파일로 고정 프로젝트 스캔 |
+| `permission_prompt` | 로컬 RTRT permission broker | Claude 권한 결정 요청, 기본값은 deny |
 
 ### MCP 자동 캡처
 
@@ -587,9 +547,9 @@ RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
 
 HTTP 전송 옵션:
 
-- `--http-token <T>` / `RTRT_MCP_HTTP_TOKEN` — 필수 베어러 토큰; 누락/오류 시 401 + `WWW-Authenticate`. 상수-시간 비교.
-- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — `StreamableHttpServerConfig.allowed_origins`에 매핑 (RFC 6454).
-- 비-루프백 바인드 + 토큰 미설정 시 시작 시 경고.
+- `RTRT_MCP_HTTP_TOKEN` — 프로세스 인자에 노출되지 않도록 환경에서만 읽는 필수 베어러 토큰; 누락/오류 시 401 + `WWW-Authenticate`. 상수-시간 비교.
+- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — RFC 6454 Origin 허용 목록. 지정하지 않으면 `Origin` 헤더를 포함한 요청을 403으로 거부합니다. 네이티브 클라이언트는 `Origin`을 보내지 않으므로 영향이 없습니다.
+- `RTRT_MCP_HTTP_TOKEN`이 없거나 비어 있으면 HTTP 시작에 실패합니다.
 
 HTTP MCP는 비어 있거나 누락된 bearer token을 거부합니다. Process/network
 tool은 명시적인 HTTP opt-in 없이는 사용할 수 없고 filesystem tool은 canonical
@@ -602,7 +562,7 @@ Standalone MCP 등록은 `~/.claude.json`(또는 에이전트의 MCP 설정)에 
   "mcpServers": {
     "rtrt": {
       "command": "rtrt-mcp",
-      "args": ["--memory", "/path/to/memory.sqlite"]
+      "args": ["--admin", "--memory", "/path/to/memory.sqlite"]
     }
   }
 }
@@ -610,7 +570,7 @@ Standalone MCP 등록은 `~/.claude.json`(또는 에이전트의 MCP 설정)에 
 
 이는 OpenCode direct-Claude lane과 별개입니다. OpenCode setup은 `~/.claude.json`을 읽거나 쓰거나 요구하지 않고, invocation별 ephemeral settings와 strict RTRT MCP config를 직접 주입합니다.
 
-`rtrt mcp`는 `rtrt-mcp` 바이너리에 `--transport / --bind / --path / --http-token / --allowed-origins`를 그대로 넘기는 CLI 패스스루입니다.
+`rtrt mcp`는 `rtrt-mcp` 바이너리에 `--transport / --bind / --path / --allowed-origins`를 그대로 넘기는 CLI 패스스루입니다. `RTRT_MCP_HTTP_TOKEN`은 환경에서 상속하며 하위 프로세스 인자에는 복사하지 않습니다.
 
 ## 대시보드 (`rtrt-dashboard`)
 
@@ -621,7 +581,7 @@ Standalone MCP 등록은 `~/.claude.json`(또는 에이전트의 MCP 설정)에 
 
 | 경로 | 메서드 | 용도 |
 |------|--------|------|
-| `/` | `GET` | HTML 인덱스 — Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup 탭 |
+| `/` | `GET` | HTML 인덱스. Project 페이지: Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security. Tools 페이지: LLM, Chat, Limits, Environment, Usage, Failover, Connect. |
 | `/healthz` | `GET` | 라이브니스(`ok`) |
 | `/api/metrics` | `GET` | 게이트웨이 요약 + 최근 메트릭 (SVG 스파크라인 데이터원) |
 | `/api/budget` | `GET` | `{ cap_usd, spent_usd, remaining_usd }` |
@@ -642,6 +602,10 @@ Standalone MCP 등록은 `~/.claude.json`(또는 에이전트의 MCP 설정)에 
 Dashboard는 `rtrt-dashboard --machine --state-dir <home>/.rtrt/dashboard` machine invocation만 허용하고 private `dashboard.env`에서 256-bit hexadecimal bearer를 읽습니다. Long-lived token은 environment, argv, URL, log에 들어가지 않습니다. 정확한 POST-only bootstrap exchange를 제외한 모든 `/api/*`는 constant-time bearer 검증이 필수입니다. `/healthz`와 bundled SPA asset은 공개 상태지만 token을 노출하지 않습니다. Browser API Origin은 설정된 고정 bind/loopback authority와 일치해야 하므로 Host 기반 DNS rebinding을 차단합니다. Origin 없는 bearer API client는 계속 지원됩니다.
 
 `~/.local/bin/rtrt service install --apply`는 OS CSPRNG의 256-bit machine token을 정확히 `~/.rtrt/dashboard/dashboard.env`에 생성하거나 기존 소유 token을 promote합니다. 서비스는 `rtrt-dashboard --machine --state-dir ~/.rtrt/dashboard`만 실행하며 project cwd/slug, `RTRT_MEMORY_PATH`, token argv를 사용하지 않습니다. Dashboard는 `~/.rtrt/projects`의 검증된 store를 표시합니다. **All projects**는 writable project가 아닌 aggregate selector이므로 project-specific 작업 전에는 구체적 project를 선택해야 합니다. 설치는 cwd-independent/idempotent이며 token을 출력하지 않습니다.
+
+### Failover 범위
+
+Tools의 **Failover** 페이지는 `/api/failover/config`로 `[failover]` 정책을 관리합니다. 프로젝트를 선택하지 않았을 때만 글로벌 정책을 편집합니다. 프로젝트를 선택한 상태에서 상속된 정책은 읽기 전용입니다. **Custom**을 선택하면 프로젝트 오버라이드를 기록하고, **Follow global**을 선택하면 그 오버라이드를 제거해 다시 상속합니다.
 
 Linux/macOS의 `~/.local/bin/rtrt service open`은 private file과 dashboard health를 검증한 뒤 60초 one-time HMAC bootstrap으로 엽니다. 자동 open이 안 되면 `~/.local/bin/rtrt service open --print-bootstrap`으로 short-lived URL만 출력합니다. Windows는 `rtrt service open` 미지원이므로 <http://127.0.0.1:7311/>을 열고 bootstrap prompt에만 token을 입력합니다. Long-lived token은 URL/opener argv/log에 들어가지 않고, SPA는 fragment를 즉시 지우며 bearer를 해당 tab의 `sessionStorage`에만 저장합니다. Unix uninstall과 `install.ps1 -Uninstall`은 owned definition만 제거하고 token/project DB를 보존합니다.
 
@@ -715,7 +679,7 @@ cargo run --release -p rtrt-eval --features bertscore -- bertscore \
 설정은 2단 구조입니다:
 
 1. **글로벌** — `~/.rtrt/config.toml`(경로 재정의: `RTRT_CONFIG`). `rtrt config init`으로 생성, `rtrt config path`로 경로 확인. 베이스 커널(훅 · MCP 배선 · 스테이터스라인 커맨드 바인딩)이 여기 있으며 `rtrt setup`이 관리합니다.
-2. **프로젝트별** — `<repo>/.rtrt/config.toml`. 오버라이드 전용: 출력 레벨(`off` / `lite` / `full` / `ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인. 비어 있는 필드는 글로벌 값을 상속; 유효 설정 = 글로벌 ⊕ 프로젝트. 모든 오버라이드가 "글로벌 따름"으로 돌아가면 파일을 삭제해 저장소를 깨끗하게 유지합니다. 대시보드의 **글로벌 따름 / 커스텀** 스코프 토글이 이 층을 편집합니다.
+2. **프로젝트별** — `<repo>/.rtrt/config.toml`. 오버라이드 전용: 출력 레벨(`off` / `lite` / `full` / `ultra`), 압축, 프로젝트별 에이전트 + 프로바이더 활성화, 스테이터스라인, Failover. 비어 있는 필드는 글로벌 값을 상속; 유효 설정 = 글로벌 ⊕ 프로젝트. 모든 오버라이드가 "글로벌 따름"으로 돌아가면 파일을 삭제해 저장소를 깨끗하게 유지합니다. 대시보드의 **글로벌 따름 / 커스텀** 스코프 토글이 이 층을 편집합니다.
 
 주요 글로벌 섹션 예:
 

@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.0.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.1.
 
 ## CLI
 
@@ -99,78 +99,27 @@ The hook implementation can also be invoked directly by hook runners:
 rtrt hook proxy-rewrite
 ```
 
-### `rtrt team preset` / `rtrt team dispatch`
+### Multi-agent coordination boundary
 
-The classic roster remains the disabled default, so an existing or absent `[team]` section does not silently change behavior. The OpenCode-lead roster is an explicit opt-in:
+RTRT does not provide a team command, scheduler, roster, worker protocol, or `team_dispatch` MCP tool. Multi-agent coordination belongs to the external agent runtime. RTRT remains responsible for compression, memory, provider routing and failover, security scanning, setup integration, and provenance.
+
+### OpenCode npm plugin and setup migration
+
+Install `rtrt-agent@0.1.1` with `npm install rtrt-agent@0.1.1` and register it directly with OpenCode's singular root `plugin` key:
+
+```json
+{ "plugin": ["rtrt-agent@0.1.1"] }
+```
+
+The npm package exports RTRT's provenance and permission hooks only; the TUI statusline is not shipped in npm and remains setup-managed.
+
+For a complete installation, prefer:
 
 ```bash
-rtrt team preset opencode-lead           # dry-run summary; writes nothing
-rtrt team preset opencode-lead --apply   # materialize the global [team] table
-rtrt team show
-rtrt team check-manager
-rtrt team dispatch "Review this repository and run its tests"
-rtrt team dispatch --json --timeout 180 "Implement the requested change"
+rtrt setup --agent opencode --apply
 ```
 
-`--apply` replaces only `[team]` in the resolved global config (`~/.rtrt/config.toml`, or `RTRT_CONFIG`) and preserves unrelated sections. It writes the complete enabled roster rather than only setting `roster = "opencode-lead"`. The preset supplies editable initial defaults: a GPT manager, Codex-first `hard` tier, Claude plan/review roles, and Kimi overflow, plus the associated lanes and links. These are defaults, not task triggers: source manager policy does not force architecture, security, implementation, review, or any other model-name phase.
-
-#### Runtime routing and editable defaults
-
-Runtime routing comes only from the materialized RTRT config. The effective manager, `leader_order`, member `roles`, tiers, `design_only_tiers`, `review_tier`, siblings, fallbacks, `balance`, delegation transport, and member `flags` determine routing; no architecture/security/etc. task wording or model-name phase is hardcoded.
-
-The `opencode-lead` preset provides editable initial defaults — GPT manager, Codex-first `hard` tier, Claude plan/review roles, and Kimi overflow. Edit the materialized `[team]` table in the dashboard or config file to change behavior. Dashboard/config edits take effect through the effective config; rerun `rtrt setup --agent opencode --apply` to reconcile generated host files after changing setup-managed behavior.
-
-Quota handling is deliberately different from transient failure handling: a quota failure consumes **zero same-lane retries**, and that lane is skipped for the **current session**. The configured sibling/fallback order then selects the next eligible lane. This does not change the CLI/native distinction: `delegation = "native"` remains OpenCode native Task, while `delegation = "cli"` remains external CLI execution.
-
-The OpenCode native Task structured provider-limit circuit breaker is implemented by the existing RTRT provenance plugin, which tracks only native child sessions created by `rtrt-manager`. When the OpenCode SDK emits `session.next.retried` with structured `statusCode` `429` or `529`, it immediately interrupts the exact child; the manager excludes that lane for the current session and follows configured sibling, then fallback, with zero same-lane retries. It does not parse free text or use a wall-clock timeout, and does not affect Claude permission approvals, normal review, unrelated agents, generic 5xx, auth failures, or unstructured errors. State is bounded in memory, cleaned up on idle/delete/dispose, and never persists prompt/body data. Tests cover structured status handling, exact-child interruption, routing exclusion, cleanup, and non-matching cases.
-
-Each `[[team.members]]` lane uses this schema:
-
-| Field | Meaning |
-|-------|---------|
-| `name`, `target`, `model`, `mode` | Concrete lane identity. A `(target, model, mode)` tuple must be unique. |
-| `roles` | Required, non-empty free-form role labels used when selecting or describing delegation. |
-| `delegation` | `native` by default; `cli` selects an external CLI (currently only `target = "claude"`, invoking `claude -p`). Legacy `shell` is accepted as a read-only compatibility alias, including while the team is disabled; new serialization and dashboard writes use `cli`. |
-| `host_agent` | Host-native agent name for OpenCode Task / `@mention` delegation. It does not launch that agent itself. |
-| `logical`, `sibling`, `tier`, `fallback` | Logical-model identity, same-model pool crossover, difficulty rung, and ordered replacement lanes. |
-| `allow_impl`, `flags` | Whether the lane may edit, plus opaque invocation flags stored for the host/invoker. Setup derives conservative generated-agent permissions from `allow_impl` and role labels; it does not turn arbitrary `flags` into OpenCode permissions. |
-
-#### Native worker permissions
-
-For native workers, OpenCode project/global permissions apply by default. An optional `[team.members.permissions]` block overrides edit and Bash behavior for that member. Roles are descriptive routing labels only; they do not grant permissions. Use overrides only when needed:
-
-```toml
-[[team.members]]
-name = "codex-sol"
-target = "opencode"
-model = "openai/gpt-5.6-sol"
-mode = "cli"
-roles = ["routine", "tests"] # labels, not permissions
-
-[team.members.permissions]
-edit = "allow"
-test = "ask"
-build = "ask"
-bash = { "git status" = "allow", "git diff" = "allow", "cargo test" = "ask", "cargo build" = "ask" }
-```
-
-The optional Bash action map is rendered as configured; there is no default command-list allowlist. An omitted `permissions` field leaves OpenCode's project/global permissions in force. Task recursion, access outside the project, and RTRT agent/team bridges remain unconditional denies. Native workers also remain subject to the host's confirmation and isolation rules.
-
-The dashboard exposes these fields in **Tools › Orchestration**. Open a lane, edit **Permissions** and its Bash action map, then save the effective `[team]` configuration. Preset values are editable initial configuration, not a second policy source.
-
-Claude CLI lanes use Claude Code settings plus the canonical permission prompt tool, not `permission-mode` alone. RTRT invokes direct lanes with `--permission-prompt-tool mcp__rtrt__permission_prompt`; `plan` remains the Opus default and `acceptEdits` the Sonnet default. OpenCode Claude CLI lanes reject `allowed-tools`, `bypassPermissions`, and `dangerously-skip`. `[team.members.permissions]` describes native workers and does not replace Claude Code settings.
-
-`[team.policy]` defaults are `max_retries = 2`, `redo_on_fallback = true`, `prefer_sibling_on_quota = true`, `record_provenance = true`, `balance = "order"`, `worker_summary_max_lines = 3`, and `isolate_conflicting = true`. Unset `max_fallback_depth` derives from roster size, unset `default_tier` uses the first effective tier, and unset `design_only_tiers` follows the effective config. `explore_tier` and `review_tier` are unset by default. The OpenCode-lead preset supplies editable `balance = "room"`, `default_tier = "hard"`, `explore_tier = "explore"`, `review_tier = "review"`, and `design_only_tiers = ["plan"]`; these values do not impose model-name phases.
-
-`delegation` is the delegation transport: `native` means OpenCode native Task, while `cli` means external CLI execution. It is separate from `mode`, the provider invocation mode, which remains `cli | api | auto` (for example, `delegation = "cli"` and `mode = "cli"` describe different choices). The legacy `shell` value is read-only compatibility input; config serialization and dashboard saves normalize it to `cli`. The dashboard delegation dropdown is labeled **Native Task / CLI**; `cli` currently supports only `target = "claude"` and invokes `claude -p`.
-
-The compatibility `classic` roster retains its local manager default; the explicit `opencode-lead` preset uses OpenAI GPT-5.6 Sol. OpenCode native Task owns native delegation; RTRT does not use an RTRT agent/team bridge, nested OpenCode process, or nested OpenCode delegation. Claude CLI lanes request JSON output, return its `result` text, and include a finite non-negative `total_cost_usd` as optional per-invocation `cost_usd`; missing, invalid, explicit non-JSON, and malformed JSON output remains unpriced and preserves the plain output. Claude CLI authentication and the required subscription must work. Authentication, subscription, or invocation failures follow the configured TeamConfig retry/fallback policy. RTRT does not currently expose an aggregate team/model cost report.
-
-`rtrt-orchestrator` provides validation and planning primitives for host integrations. `WorkerReturn` requires a modified-file list, test results with commands, a summary within the configured line limit (three by default), and a non-empty `detail_ref` pointing to the archived detail; `WorkerResult` also validates assigned-versus-actual lane provenance. The deterministic isolation planner preserves input order, groups non-overlapping lexical write sets into stable contiguous waves, and marks every task involved in an exact or parent/child path overlap for a dedicated worktree. This is a plan only: RTRT does not yet run a native host scheduler or auto-merge worktrees.
-
-`rtrt setup --agent opencode --apply` materializes `rtrt-manager` plus every `delegation = "native"` member with a `host_agent` under `~/.config/opencode/agents/`. Codex, GLM, Kimi, and explicitly configured Ollama lanes are dispatched through OpenCode native Task. Claude Opus/Sonnet `cli` lanes remain available as the sole external CLI execution exception and are invoked directly with exact argv `claude -p` using Claude Code's official sandbox settings; they are not native OpenCode agents. OpenCode's built-in `explore`/`general`/`scout` subagents are referenced without overwriting them. Generic setup performs no Ollama probe, embedding auto-enable, adapter install, or `@ai-sdk/openai-compatible` provider creation: the operator must explicitly provide and approve an Ollama provider. Unsandboxed RTRT-generated agents deny Bash. Native workers inherit OpenCode project/global permissions unless an optional member override is configured. Native delegation cannot launch nested OpenCode or an RTRT agent/team bridge.
-
-Manager provider/model and every member's target/model, roles, tier, mode, logical model, sibling, fallback, `host_agent`, delegation, and implementation flag are configuration data. Edit the global `[team]` table directly or through the dashboard, then rerun `rtrt setup --agent opencode --apply`; setup upgrades changed RTRT-owned agent files, removes obsolete owned agents, and preserves foreign files and unrelated OpenCode JSON/JSONC settings. Setting `enabled = false` removes only RTRT-owned native agents and restores RTRT-managed OpenCode fields. OpenCode owns Task spawning, parallel execution, session trees, and enforcement of the generated permissions, so restart OpenCode after setup. Native delegation never permits a nested `opencode` CLI.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.1` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package when it starts. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow is responsible for publishing the version-matched Rust artifacts and npm package; this documentation does not assert that publication has already completed.
 
 ### OpenCode persistent statusline
 
@@ -179,10 +128,10 @@ rtrt setup --agent opencode --apply
 # Restart OpenCode after setup.
 ```
 
-Setup installs two managed TUI files:
+Setup installs two managed TUI files under the resolved OpenCode config root:
 
-- `~/.config/opencode/tui/rtrt-statusline.tsx`
-- `~/.config/opencode/tui/rtrt-statusline-core.mjs`
+- `tui/rtrt-statusline.tsx`
+- `tui/rtrt-statusline-core.mjs`
 
 It also adds one tuple to the active OpenCode TUI config's `plugin` array:
 
@@ -190,7 +139,7 @@ It also adds one tuple to the active OpenCode TUI config's `plugin` array:
 ["./tui/rtrt-statusline.tsx", {"bin": "/absolute/path/to/rtrt"}]
 ```
 
-The config resolver prefers an existing `~/.config/opencode/tui.json`, then an existing `tui.jsonc`, and creates `tui.json` when neither exists. Setup parses and merges the document instead of replacing the plugin array: foreign plugins, unrelated keys, and existing non-`bin` options on the RTRT tuple survive. Repeated setup is idempotent. An unrecognized pre-existing file at either managed TUI path is not overwritten.
+The config resolver prefers an existing `tui.json` under that root, then an existing `tui.jsonc`, and creates `tui.json` there when neither exists. Setup parses and merges the document instead of replacing the plugin array: foreign plugins, unrelated keys, and existing non-`bin` options on the RTRT tuple survive. Repeated setup is idempotent. An unrecognized pre-existing file at either managed TUI path is not overwritten.
 
 The plugin registers two persistent surfaces:
 
@@ -267,7 +216,7 @@ rtrt uninstall --agent opencode --apply
 # Restart OpenCode after uninstall.
 ```
 
-Uninstall ordering is deliberate: stop/remove RTRT services and integrations first, then remove managed binaries/files. OpenCode uninstall removes the RTRT tuple from `tui.json` / `tui.jsonc` and removes only recognized RTRT-managed blocks from the two TUI files. Foreign plugins, unrelated config keys, and non-RTRT file content remain. Modified or unrecognized managed-file content is preserved rather than deleted. The command also removes the other RTRT-managed OpenCode rules, provenance plugin/bridge, and `mcp.rtrt` entry. Restart is required for an existing OpenCode process to unload the TUI plugin. Typed managed paths and MCP entries reject symlinks and unsafe ownership/type changes.
+Uninstall ordering is deliberate: stop/remove RTRT services and integrations first, then remove managed binaries/files. OpenCode uninstall removes the RTRT tuple from `tui.json` / `tui.jsonc` under the resolved config root and removes only recognized RTRT-managed blocks from the two TUI files there. Foreign plugins, unrelated config keys, and non-RTRT file content remain. Modified or unrecognized managed-file content is preserved rather than deleted. The command also removes the other RTRT-managed OpenCode rules, provenance plugin/bridge, and `mcp.rtrt` entry. Restart is required for an existing OpenCode process to unload the TUI plugin. Typed managed paths and MCP entries reject symlinks and unsafe ownership/type changes.
 
 ### OpenCode-to-Claude provenance
 
@@ -451,12 +400,10 @@ Both `migrate` and `project refresh` strip project-level rtrt-owned key shadows 
 List available templates (built-in + custom).
 
 ```text
-rust-cli           [BuiltIn]  Rust binary crate with clap + anyhow + tracing
-rust-lib           [BuiltIn]  Rust library crate with criterion benches
-rust-axum          [BuiltIn]  Rust HTTP service with axum + tokio + tracing
-node-typescript    [BuiltIn]  Node.js TypeScript project (ESM, tsx runner)
-python-uv          [BuiltIn]  Python project managed with uv (pyproject.toml)
-go-cli             [BuiltIn]  Go CLI with cobra + standard layout
+design              [BuiltIn]  Document chain that generates a design kit
+dev                 [BuiltIn]  Document chain that generates a development starter set
+plan                [BuiltIn]  Document chain that generates a planning set
+standardization     [BuiltIn]  Project contract with CLAUDE.md and agent definitions
 ```
 
 Custom templates live in `~/.rtrt/templates/<name>/manifest.toml` and appear under `[Custom]`.
@@ -466,7 +413,7 @@ Custom templates live in `~/.rtrt/templates/<name>/manifest.toml` and appear und
 Scaffold a project from a template.
 
 ```bash
-rtrt new rust-cli ./hello \
+rtrt new dev ./hello \
   --var project_name=hello \
   --var author="Kim DaeHyun"
 ```
@@ -510,8 +457,8 @@ rtrt diagnose --provider anthropic --model claude-haiku-4-5 \
 Launch the bundled MCP server without remembering the binary name.
 
 ```bash
-rtrt mcp --transport http --bind 127.0.0.1:7312 \
-  --http-token "$RTRT_MCP_HTTP_TOKEN" \
+RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
+  rtrt mcp --transport http --bind 127.0.0.1:7312 \
   --allowed-origins https://app.example.com
 ```
 
@@ -597,7 +544,7 @@ curl -N http://127.0.0.1:7412/v1/chat/completions \
 
 ```bash
 # stdio (default; what Claude Code / Codex / Cursor / Windsurf / opencode use)
-rtrt-mcp --memory ~/.rtrt/memory.sqlite
+rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 
 # Streamable HTTP (MCP 2025-06-18) behind axum
 RTRT_MCP_HTTP_TOKEN=$(openssl rand -hex 16) \
@@ -625,6 +572,10 @@ Implemented via [`rmcp`](https://crates.io/crates/rmcp), the official Rust MCP S
 | `templates_list` | `rtrt_templates::list_all` | built-in + custom templates |
 | `templates_scaffold` | `rtrt_templates::render::{plan,write}` | scaffold from a template |
 | `provider_chat` | `Gateway::chat` | multi-provider routing through the bundled gateway |
+| `agent_call` | provider invocation bridge | invoke a selected agent target |
+| `agent_route` | `select_route` | choose a cost- and headroom-aware agent route |
+| `security_scan` | `rtrt_security::run` | scan the pinned project with a named security profile |
+| `permission_prompt` | local RTRT permission broker | request a Claude permission decision; defaults to deny |
 
 ### MCP auto-capture
 
@@ -641,9 +592,9 @@ Local stdio MCP auto-capture resolves linked worktrees to their main Git reposit
 
 HTTP transport flags:
 
-- `--http-token <T>` / `RTRT_MCP_HTTP_TOKEN` — required bearer token; 401 + `WWW-Authenticate` on miss. Constant-time comparison.
-- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — pluck into `StreamableHttpServerConfig.allowed_origins` for RFC 6454 Origin validation.
-- Non-loopback bind without a token logs a startup warning.
+- `RTRT_MCP_HTTP_TOKEN` — required bearer token, read only from the environment so it never appears in process arguments; 401 + `WWW-Authenticate` on miss. Constant-time comparison.
+- `--allowed-origins host1,host2` / `RTRT_MCP_ALLOWED_ORIGINS` — the RFC 6454 Origin allowlist. Left unset, every request carrying an `Origin` header is rejected with 403; native clients send no `Origin` and are unaffected.
+- HTTP startup fails when `RTRT_MCP_HTTP_TOKEN` is missing or empty.
 
 HTTP MCP refuses an empty or missing bearer token. Process and network tools
 are unavailable unless their explicit HTTP opt-ins are enabled; filesystem
@@ -657,7 +608,7 @@ For standalone MCP registration, wire it up in `~/.claude.json` (or your agent's
   "mcpServers": {
     "rtrt": {
       "command": "rtrt-mcp",
-      "args": ["--memory", "/path/to/memory.sqlite"]
+      "args": ["--admin", "--memory", "/path/to/memory.sqlite"]
     }
   }
 }
@@ -665,7 +616,7 @@ For standalone MCP registration, wire it up in `~/.claude.json` (or your agent's
 
 This standalone registration is separate from OpenCode direct-Claude lanes. OpenCode setup does not read, write, or require `~/.claude.json`; it injects its ephemeral per-invocation settings and strict RTRT MCP config directly.
 
-`rtrt mcp` is a CLI passthrough that forwards `--transport / --bind / --path / --http-token / --allowed-origins` to the bundled `rtrt-mcp` binary.
+`rtrt mcp` is a CLI passthrough that forwards `--transport / --bind / --path / --allowed-origins` to the bundled `rtrt-mcp` binary. It inherits `RTRT_MCP_HTTP_TOKEN` from its environment without copying the secret into child-process arguments.
 
 ## Dashboard (`rtrt-dashboard`)
 
@@ -678,7 +629,7 @@ The dashboard serves:
 
 | Path | Method | Purpose |
 |------|--------|---------|
-| `/` | `GET` | Bundled HTML index — Metrics / Budget / Prompts / Memory / Templates / Compression / Proxy / Diagnose / RepoMap / Setup tabs |
+| `/` | `GET` | Bundled HTML index. Project pages: Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security. Tools pages: LLM, Chat, Limits, Environment, Usage, Failover, Connect. |
 | `/healthz` | `GET` | Liveness probe (`ok`) |
 | `/api/metrics` | `GET` | Gateway summary + recent metrics (drives the SVG sparklines) |
 | `/api/budget` | `GET` | `{ cap_usd, spent_usd, remaining_usd }` from the gateway budget meter |
@@ -699,6 +650,10 @@ The dashboard serves:
 The dashboard accepts only machine invocation `rtrt-dashboard --machine --state-dir <home>/.rtrt/dashboard` and reads its 256-bit hexadecimal bearer from the private `dashboard.env`; environment, argv, URL, and logs never carry the long-lived token. Every `/api/*` route requires constant-time bearer verification except the exact POST-only bootstrap exchange. `/healthz` and bundled SPA assets remain public but never expose the token. Browser API requests must also use an Origin matching the fixed configured bind/loopback authorities, preventing Host-based DNS rebinding; bearer-authenticated API clients without `Origin` remain supported.
 
 `~/.local/bin/rtrt service install --apply` creates or promotes one machine token at exactly `~/.rtrt/dashboard/dashboard.env` (private directory/file). Linux/macOS services invoke `rtrt-dashboard --machine --state-dir ~/.rtrt/dashboard`; no repository cwd, project slug, `RTRT_MEMORY_PATH`, or token argv is used. The dashboard lists verified stores under `~/.rtrt/projects`. **All projects** is an aggregate selector, not a writable project; select a concrete project for project-specific operations. Installation is cwd-independent, idempotent, and prints no secret.
+
+### Failover scope
+
+The Tools **Failover** page manages the `[failover]` policy through `/api/failover/config`. With no project selected, it edits the global policy. With a project selected, an inherited policy is read-only. Choose **Custom** to write a project override, or **Follow global** to remove that override and restore inheritance.
 
 Open the running Linux/macOS dashboard from a trusted terminal with `~/.local/bin/rtrt service open`. It uses a one-time HMAC bootstrap valid for 60 seconds; the long-lived token never enters the URL, opener argv, or logs. If automatic opening is unavailable, `~/.local/bin/rtrt service open --print-bootstrap` prints only the short-lived URL. On Windows, where `rtrt service open` is unsupported, visit <http://127.0.0.1:7311/> and enter the token only in the bootstrap prompt. The SPA erases the fragment after exchange and keeps the bearer only in `sessionStorage`; **Clear API token** removes it for that tab.
 
@@ -813,7 +768,7 @@ rtrt memory compress --project rtrt --keep 20 --provider openai-compat \
 Configuration is two-tier:
 
 1. **Global** — `~/.rtrt/config.toml` (override the path with `RTRT_CONFIG`). Create it with `rtrt config init`; inspect the resolved path with `rtrt config path`. The base kernel — hooks, MCP wiring, statusline command binding — lives here and is managed by `rtrt setup`.
-2. **Per-project** — `<repo>/.rtrt/config.toml`. Optional overrides only: output level (`off` / `lite` / `full` / `ultra`), compression, per-project agent + provider enablement, and the statusline. Absent fields inherit the global value; the effective config is global ⊕ project. When every override is back at "follow global", the file is deleted so the repo stays clean. The dashboard edits this layer through its **Follow global / Custom** scope toggles.
+2. **Per-project** — `<repo>/.rtrt/config.toml`. Optional overrides only: output level (`off` / `lite` / `full` / `ultra`), compression, per-project agent + provider enablement, statusline, and Failover. Absent fields inherit the global value; the effective config is global ⊕ project. When every override is back at "follow global", the file is deleted so the repo stays clean. The dashboard edits this layer through its **Follow global / Custom** scope toggles.
 
 Selected global sections:
 

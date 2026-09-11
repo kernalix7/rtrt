@@ -77,12 +77,8 @@ chore(ci): bump cargo-audit to 0.21
 
 ### No AI tool co-author trailers
 
-Do **not** add `Co-authored-by:` trailers that name AI tools / coding agents. This applies to all of:
-
-- `Co-authored-by: Claude <noreply@anthropic.com>` (and any other Anthropic email)
-- `Co-authored-by: Cursor <cursoragent@cursor.com>`
-- `Co-authored-by: Copilot <...>` (any GitHub Copilot variant)
-- `Co-authored-by: <any other AI tool / agent identity>`
+Do **not** add co-author trailers that name AI tools or coding agents. Generator-credit
+trailers and prose attribution to an AI tool are prohibited as well.
 
 You wrote the patch — the human author of record is you. AI tooling doesn't get co-authorship credit in this repo regardless of how much it contributed. If you forgot and a trailer slipped in, we'll ask you to amend (or, for already-merged PRs, propose a coordinated history-rewrite via a follow-up PR).
 
@@ -117,12 +113,16 @@ Skeleton:
 - (detailed bullets)
 ```
 
-When cutting a release, push the `REL-vX.Y.Z` marker tag alongside the version tag — the release workflow keys off the `REL-` marker for body extraction.
+Before cutting a release, create the GitHub `crates-io-publish` environment and add its `CARGO_REGISTRY_TOKEN` secret. The paired-tag release requires this environment and token to publish the Rust crates.
+
+Then create both tags on the merged `main` commit. The release workflow keys off the `REL-` marker for body extraction. Push both tags in one atomic push.
 
 ```bash
-git tag vX.Y.Z <commit>
-git tag REL-vX.Y.Z vX.Y.Z^{}    # dereference to commit to avoid a nested-tag warning
-git push origin vX.Y.Z REL-vX.Y.Z
+git checkout main
+git pull --ff-only origin main
+git tag vX.Y.Z HEAD
+git tag REL-vX.Y.Z HEAD
+git push --atomic origin vX.Y.Z REL-vX.Y.Z
 ```
 
 ### Crediting contributors in Highlights

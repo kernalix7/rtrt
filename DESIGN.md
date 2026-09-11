@@ -101,12 +101,13 @@ Examples already in the tree:
 - `rtrt-memory[embeddings]` — fastembed ONNX runtime.
 - `rtrt-memory[hnsw]` — `instant-distance` ANN index.
 - `rtrt-memory[llm]` — `LlmSummariser` wrapper.
+- `rtrt-eval` — opt-in recall and compression evaluation harness.
 
 Future candidates kept out of the core:
 
-- `rtrt-orchestrator` — multi-agent coordination (actions / signals / leases / mesh / sentinels). Implementing this in the core would couple our SQLite schema to ideas that are still evolving in the wider ecosystem. It belongs in its own crate, behind its own opt-in.
 - `rtrt-snapshot` — git-versioned memory snapshots.
-- `rtrt-eval` — recall accuracy benchmarks against labelled datasets.
+
+Multi-agent coordination stays outside this workspace and belongs to external agent runtimes. RTRT does not provide a scheduler, team protocol, or orchestration crate.
 
 The default install stays light.
 
@@ -148,8 +149,8 @@ We accept that:
 
 ## What this rules out
 
-- **53-tool MCP surfaces.** We will not race to feature parity with broader memory platforms. We will ship 10-15 well-thought MCP tools and stop.
-- **Multi-agent coordination in the core.** Signals, leases, mesh sync, sentinels are out. If they prove durable in the next 18 months, `rtrt-orchestrator` picks them up.
+- **Tool-count competition.** We will not race to feature parity with broader memory platforms. The MCP surface stays narrow and reviewed.
+- **Multi-agent coordination in RTRT.** Signals, leases, mesh sync, schedulers, and worker protocols stay in external agent runtimes.
 - **Cloud-only or paid-only features.** Everything in this repo runs offline on a laptop.
 - **Frameworks built on top of frameworks.** No agent runtime, no orchestration DSL, no plugin marketplace.
 

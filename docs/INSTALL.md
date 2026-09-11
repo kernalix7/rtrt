@@ -2,12 +2,12 @@
 
 **English** | [한국어](INSTALL.ko.md)
 
-RTRT is in alpha. Two install paths are supported today: **one-line script** (fetches the binary or builds from `main` if no release matches) and **from source via `cargo`**. No GitHub Release is published yet — until the first one is cut, the one-liner detects that automatically, prints a notice, and builds from `main` (a Rust toolchain + git are required for that path).
+RTRT is in alpha. Two install paths are supported today: **one-line script** and **from source via `cargo`**. The one-liner fetches the latest release binary and verifies its checksum. It falls back to a source build from `main` only when the latest release is unavailable or does not exist. Once a release is selected, any release asset or checksum failure fails closed and never falls back to source.
 
 ## One-liner (recommended)
 
 ```bash
-# Linux / macOS / WSL — latest release, auto-falls back to `--main` if none yet
+# Linux / macOS / WSL — latest release; only an unavailable or absent release falls back to `--main`
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 ```
 
@@ -33,7 +33,7 @@ The installers detect OS + arch, download the matching tarball / zip from the la
 | `--uninstall` | `-Uninstall` | — | Data-preserving compatibility shim; full interactive/purge flow uses the platform uninstaller |
 | `--dry-run` | `-DryRun` | — | Print intended actions without writing |
 
-Flags take precedence over the env-var equivalents. When no release exists and no flag is set, the installer prints a notice and falls back to `--ref main` automatically.
+Flags take precedence over the env-var equivalents. When the latest release is unavailable or does not exist and no flag is set, the installer prints a notice and falls back to `--ref main` automatically. After a release is selected, a missing or invalid asset or checksum fails the installation instead of falling back to source.
 
 On Linux/WSL, existing OpenCode config/managed state, or an exact safe absolute `command -v opencode` result, plus operator-installed fixed `bwrap`, makes a non-root installation eligible for automatic bootstrap using the exact newly installed `rtrt`. No directory is searched and OpenCode is not executed. This machine-only setup authorizes no checkout, then losslessly migrates existing global sessions; migration/setup failures leave binaries and source data intact and print manual commands. Native Windows and macOS skip strict `bwrap` setup. Later `rtrt opencode --` authorizes only its explicitly selected checkout.
 
@@ -53,7 +53,7 @@ Examples:
 
 ```bash
 # Pin a release
-curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+curl -fsSL .../install.sh | sh -s -- --version v0.1.1
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -113,7 +113,7 @@ cargo install --path crates/rtrt-cli
 
 Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP server and dashboard binaries globally available.
 
-## crates.io (planned)
+## crates.io
 
 ```bash
 cargo install rtrt-cli         # `rtrt` binary
@@ -121,11 +121,11 @@ cargo install rtrt-mcp         # MCP server
 cargo install rtrt-dashboard   # web dashboard
 ```
 
-Not yet published.
+These three are the installable binary crates. The v0.1.1 release channel publishes every workspace crate to crates.io in dependency order, because the binaries depend on the library crates.
 
-## Pre-built binaries (planned)
+## Pre-built binaries
 
-GitHub Releases will publish:
+The v0.1.1 GitHub Release channel publishes:
 
 - `rtrt-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `rtrt-<version>-aarch64-unknown-linux-gnu.tar.gz`
@@ -143,7 +143,7 @@ rtrt info
 rtrt templates
 ```
 
-`rtrt info` should print the version + crate manifest. `rtrt templates` should list six built-in templates.
+`rtrt info` should print the version and 11-crate workspace manifest. `rtrt templates` should list the four built-in templates: `dev`, `design`, `plan`, and `standardization`.
 
 ## Uninstall (manual)
 

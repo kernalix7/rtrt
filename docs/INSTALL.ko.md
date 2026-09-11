@@ -2,12 +2,12 @@
 
 [English](INSTALL.md) | **한국어**
 
-RTRT는 알파 단계입니다. 설치 경로는 **원라이너 스크립트** (`install.sh` / `install.ps1` — 최신 릴리스가 없으면 `--main`으로 소스 빌드 폴백)와 **`cargo`로 소스 빌드** 두 가지입니다.
+RTRT는 알파 단계입니다. 설치 경로는 **원라이너 스크립트**와 **`cargo`로 소스 빌드** 두 가지입니다. 원라이너는 최신 릴리스 바이너리를 받고 체크섬을 검증합니다. 최신 릴리스를 찾을 수 없거나 릴리스가 없을 때만 `main` 소스 빌드로 폴백합니다. 릴리스를 선택한 뒤에는 asset 또는 체크섬 오류가 있으면 소스 폴백 없이 실패합니다.
 
 ## 원라이너 (권장)
 
 ```bash
-# Linux / macOS / WSL — 최신 릴리스. 릴리스 없으면 자동으로 --main 폴백
+# Linux / macOS / WSL — 최신 릴리스. 최신 릴리스를 찾을 수 없거나 없을 때만 --main 폴백
 curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 ```
 
@@ -33,7 +33,7 @@ irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
 | `--uninstall` | `-Uninstall` | — | 데이터를 보존하는 호환성 셰임; 대화형/purge는 플랫폼 uninstaller 사용 |
 | `--dry-run` | `-DryRun` | — | 실제 쓰기 없이 동작만 출력 |
 
-플래그가 환경 변수보다 우선. 릴리스 없고 플래그도 없으면 안내 후 `--ref main`으로 자동 폴백.
+플래그가 환경 변수보다 우선. 최신 릴리스를 찾을 수 없거나 릴리스가 없고 플래그도 없으면 안내 후 `--ref main`으로 자동 폴백합니다. 릴리스를 선택한 뒤 asset 또는 체크섬이 없거나 유효하지 않으면 소스 폴백 대신 설치에 실패합니다.
 
 Linux/WSL에서 기존 OpenCode config/managed state 또는 안전한 absolute `command -v opencode` 결과와 operator-installed fixed `bwrap` 증거가 있고 root가 아니면, 새로 설치한 exact `rtrt`로 machine-only 보안 bootstrap을 자동 적용합니다. 디렉터리를 검색하거나 OpenCode를 실행하지 않습니다. 설치 cwd는 승인하지 않고 기존 global session을 lossless migration합니다. 실패해도 binary와 source DB를 보존하고 manual command를 출력합니다. Native Windows/macOS는 strict `bwrap` setup을 건너뜁니다. 이후 `rtrt opencode --`만 명시적으로 실행한 checkout을 승인합니다.
 
@@ -53,7 +53,7 @@ Windows에서는 현재 `rtrt service` 관리/open을 지원하지 않습니다.
 
 ```bash
 # 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+curl -fsSL .../install.sh | sh -s -- --version v0.1.1
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -113,7 +113,7 @@ cargo install --path crates/rtrt-cli
 
 MCP 서버 / 대시보드 바이너리까지 전역으로 두려면 `crates/rtrt-mcp`, `crates/rtrt-dashboard`도 같은 방식으로 설치하세요.
 
-## crates.io (예정)
+## crates.io
 
 ```bash
 cargo install rtrt-cli         # rtrt 바이너리
@@ -121,11 +121,11 @@ cargo install rtrt-mcp         # MCP 서버
 cargo install rtrt-dashboard   # 웹 대시보드
 ```
 
-아직 게시 전입니다.
+설치 대상 바이너리 크레이트는 위 세 개입니다. 바이너리가 라이브러리 크레이트에 의존하므로, v0.1.1 릴리스 채널은 워크스페이스의 모든 크레이트를 의존성 순서에 따라 crates.io에 게시합니다.
 
-## 사전 빌드 바이너리 (예정)
+## 사전 빌드 바이너리
 
-GitHub 릴리스에 다음 아카이브를 게시할 예정입니다.
+v0.1.1 GitHub 릴리스 채널은 다음 아카이브를 게시합니다.
 
 - `rtrt-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `rtrt-<version>-aarch64-unknown-linux-gnu.tar.gz`
@@ -143,7 +143,7 @@ rtrt info
 rtrt templates
 ```
 
-`rtrt info`는 버전과 크레이트 목록을, `rtrt templates`는 빌트인 6종을 출력해야 합니다.
+`rtrt info`는 버전과 11개 크레이트 워크스페이스 목록을, `rtrt templates`는 빌트인 4종(`dev`, `design`, `plan`, `standardization`)을 출력해야 합니다.
 
 ## 제거 (수동)
 

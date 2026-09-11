@@ -71,7 +71,7 @@
 2. `save(project, kind, body)`이 `memories`와 `memories_fts`에 동시 삽입.
 3. `recall_bm25(project, query, limit)`이 FTS5 랭크 + `project` 필터를 조인.
 
-벡터 회수와 그래프 순회는 예정. 테이블은 이미 만들어져 있지만 v0.1.0에서는 기록 경로가 없습니다.
+벡터 회수는 `embeddings` 기능의 `recall_vector` / `recall_hybrid`로 제공됩니다. 방향 관계는 `edges`에 저장하며 `recall_via_graph`가 그래프 기반 회수를 위해 이를 순회합니다.
 
 ### 템플릿
 
@@ -81,9 +81,9 @@
 4. `render::write(plan, overwrite)`이 파일 기록 + 실행 비트 설정.
 5. 포스트-인스톨 훅은 `std::process::Command`로 실행되며 라인을 공백 기준으로 분리합니다(셸 사용 안 함).
 
-### 프로바이더 채팅 (예정)
+### 프로바이더 채팅
 
-트레이트는 정의되어 있지만 채팅 구현은 모두 `Error::Provider(...)`를 반환합니다. `reqwest` 기반 실제 호출과 스트리밍 응답 파싱을 추가합니다.
+채팅은 Anthropic Messages, OpenAI Chat Completions, OpenAI 호환 엔드포인트(Ollama, llama.cpp, vLLM, LM Studio)의 실제 HTTP API에 연결됩니다. 스트리밍은 `Stream<Item = ChatStreamEvent>`를 반환하는 `chat_stream`으로 제공되며, 이벤트는 `Delta` / `Usage` / `Done`이고 공유 SSE 디코더는 `stream.rs`에 있습니다. 등록된 프로바이더 앞의 `Gateway`는 대시보드가 실시간 토큰 지출을 관찰할 수 있도록 요청마다 `RequestMetric { provider, model, started_at, latency_ms, usage, ok }`를 기록합니다.
 
 ## 동시성 모델
 

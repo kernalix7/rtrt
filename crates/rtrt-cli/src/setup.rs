@@ -1222,7 +1222,7 @@ fn disable_opencode_sandbox_global(apply: bool) -> Result<()> {
     disable_opencode_sandbox_global_at(apply, &registry_path, &executable)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn disable_opencode_sandbox_global_at(
     apply: bool,
     registry_path: &Path,

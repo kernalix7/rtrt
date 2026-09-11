@@ -297,10 +297,11 @@ fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]
-    fn temp_dir(tag: &str) -> PathBuf {
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "rtrt-custom-{tag}-{}-{}",
             std::process::id(),

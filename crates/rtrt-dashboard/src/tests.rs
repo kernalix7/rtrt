@@ -102,6 +102,31 @@ impl Drop for EnvGuard {
 /// Build a minimal `AppState` backed by a fresh SQLite store at
 /// `<tmp_home>/memory.sqlite`. No embedder / no auto-capture / no daemons, so
 /// the router is exercised in isolation.
+/// A temp dir whose path is canonical.
+///
+/// macOS reaches the system temp dir through `/var -> /private/var`, and project
+/// identity derives from the canonical path, so a raw handle path makes every
+/// derived slug disagree with the home the catalog was built from.
+struct CanonicalTempDir {
+    _guard: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl CanonicalTempDir {
+    fn new() -> Self {
+        let guard = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(guard.path()).unwrap();
+        Self {
+            _guard: guard,
+            path,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 fn test_state(tmp_home: &std::path::Path) -> AppState {
     let root = tmp_home.join("demo");
     std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -205,7 +230,7 @@ fn admin_scope_without_token_fails_closed() {
 
 #[test]
 fn startup_without_token_fails_closed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     assert!(
         crate::dashboard_token()
@@ -220,7 +245,7 @@ fn startup_without_token_fails_closed() {
 fn machine_startup_requires_exact_private_state_and_redacts_token() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state_dir = tmp.path().join(".rtrt/dashboard");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -253,7 +278,7 @@ fn machine_startup_requires_exact_private_state_and_redacts_token() {
 
 #[tokio::test]
 async fn project_bound_route_never_falls_back_without_selector() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let request = Request::builder()
@@ -302,7 +327,7 @@ fn ui_auth_uses_session_storage_and_one_retry() {
 
 #[tokio::test]
 async fn foreign_project_and_global_routes_are_denied() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     assert_eq!(
@@ -328,7 +353,7 @@ async fn foreign_project_and_global_routes_are_denied() {
 
 #[tokio::test]
 async fn bearer_api_mutation_without_origin_is_accepted() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let request = Request::builder()
@@ -351,10 +376,10 @@ async fn bearer_api_mutation_without_origin_is_accepted() {
 #[cfg(unix)]
 #[tokio::test]
 async fn repo_map_rejects_outside_and_symlink_escape() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
-    let outside = tempfile::tempdir().unwrap();
+    let outside = CanonicalTempDir::new();
     std::os::unix::fs::symlink(outside.path(), state.project.checkout_root().join("escape"))
         .unwrap();
     for root in [
@@ -376,7 +401,7 @@ async fn repo_map_rejects_outside_and_symlink_escape() {
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/healthz")).await;
@@ -386,7 +411,7 @@ async fn healthz_returns_ok() {
 
 #[tokio::test]
 async fn models_contract_preserves_unavailable_configured_compatible_model() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let path = config_file(tmp.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -510,7 +535,7 @@ fn unknown_provider_without_compatible_endpoint_is_not_given_a_protocol_identity
 
 #[tokio::test]
 async fn stats_returns_zeroed_json() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/stats")).await;
@@ -523,7 +548,7 @@ async fn stats_returns_zeroed_json() {
 
 #[tokio::test]
 async fn projects_lists_memory_buckets() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -554,7 +579,7 @@ async fn projects_lists_memory_buckets() {
 #[tokio::test]
 #[ignore = "legacy multi-project registry behavior removed by project isolation"]
 async fn projects_survives_invalid_unrelated_team_config() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let config = config_file(tmp.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -606,7 +631,7 @@ fallback = ["loop"]
 #[tokio::test]
 #[ignore = "legacy multi-project registry behavior removed by project isolation"]
 async fn projects_filters_capture_buckets_when_registry_is_unavailable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let config = config_file(tmp.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -638,7 +663,7 @@ async fn projects_filters_capture_buckets_when_registry_is_unavailable() {
 #[tokio::test]
 #[ignore = "legacy multi-project registry behavior removed by project isolation"]
 async fn projects_memory_disabled_returns_config_only_with_warning() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let config = config_file(tmp.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -656,7 +681,7 @@ async fn projects_memory_disabled_returns_config_only_with_warning() {
 #[tokio::test]
 #[ignore = "legacy multi-project registry behavior removed by project isolation"]
 async fn projects_memory_query_error_returns_config_only_with_warning() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let config = config_file(tmp.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -677,7 +702,7 @@ async fn projects_memory_query_error_returns_config_only_with_warning() {
 #[tokio::test]
 #[ignore = "legacy multi-project registry behavior removed by project isolation"]
 async fn projects_both_sources_failed_returns_bounded_503() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let config = config_file(tmp.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -700,7 +725,7 @@ async fn projects_both_sources_failed_returns_bounded_503() {
 #[tokio::test]
 #[ignore = "legacy hidden-bucket enumeration removed by project isolation"]
 async fn projects_hides_orphan_capture_buckets_but_keeps_rows() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let orphan = "30877432d1026706d7e805da846a32c3-bb81e3c29b62179273c8eb5bb682575ec87a171a";
@@ -753,7 +778,7 @@ async fn projects_hides_orphan_capture_buckets_but_keeps_rows() {
 #[tokio::test]
 #[ignore = "legacy registry mutation removed by project isolation"]
 async fn projects_registered_entry_is_never_hidden_even_if_name_matches() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let app = router(state.clone(), None);
@@ -790,7 +815,7 @@ async fn projects_registered_entry_is_never_hidden_even_if_name_matches() {
 #[tokio::test]
 #[ignore = "legacy project reassignment removed by project isolation"]
 async fn projects_reassign_folds_orphan_rows_into_target() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let orphan = "agent-1234";
@@ -836,7 +861,7 @@ async fn projects_reassign_folds_orphan_rows_into_target() {
 #[tokio::test]
 #[ignore = "legacy project reassignment removed by project isolation"]
 async fn projects_reassign_rejects_same_from_and_to() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let app = router(state, None);
@@ -854,7 +879,7 @@ async fn projects_reassign_rejects_same_from_and_to() {
 
 #[tokio::test]
 async fn compression_config_get_post_roundtrip() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
@@ -907,7 +932,7 @@ async fn compression_config_get_post_roundtrip() {
 
 #[tokio::test]
 async fn memory_sessions_groups_by_session_id() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -941,7 +966,7 @@ async fn memory_sessions_groups_by_session_id() {
 
 #[tokio::test]
 async fn memory_sessions_empty_project_returns_empty() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/memory/sessions?project=ghost")).await;
@@ -952,7 +977,7 @@ async fn memory_sessions_empty_project_returns_empty() {
 /// token per bubble — the live path the Memory map actually uses.
 #[tokio::test]
 async fn memory_graph_overview_returns_bubbles_with_tokens() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -986,7 +1011,7 @@ async fn memory_graph_overview_returns_bubbles_with_tokens() {
 /// is the ONLY drill-down path the shipped frontend uses.
 #[tokio::test]
 async fn memory_graph_token_drill_returns_members() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -1034,7 +1059,7 @@ async fn memory_graph_token_drill_returns_members() {
 /// via `token` instead of rendering a bogus empty cluster.
 #[tokio::test]
 async fn memory_graph_legacy_cluster_query_returns_410() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/memory/graph?project=demo&cluster=123")).await;
@@ -1048,7 +1073,7 @@ async fn memory_graph_legacy_cluster_query_returns_410() {
 
 #[tokio::test]
 async fn bearer_guard_blocks_api_without_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let resp = call(app, get("/api/stats")).await;
@@ -1059,7 +1084,7 @@ async fn bearer_guard_blocks_api_without_token() {
 
 #[tokio::test]
 async fn bearer_guard_advertises_challenge() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let resp = call(app, get("/api/stats")).await;
@@ -1076,7 +1101,7 @@ async fn bearer_guard_advertises_challenge() {
 
 #[tokio::test]
 async fn bearer_guard_exempt_spa_shell_and_healthz() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let token = Some("s3cr3t".to_string());
 
@@ -1097,7 +1122,7 @@ async fn bearer_guard_exempt_spa_shell_and_healthz() {
 
 #[tokio::test]
 async fn browser_origin_cannot_follow_attacker_host() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let req = Request::builder()
         .method(Method::GET)
@@ -1121,7 +1146,7 @@ async fn browser_origin_cannot_follow_attacker_host() {
 
 #[tokio::test]
 async fn explicit_bearer_client_without_origin_is_accepted() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let req = Request::builder()
@@ -1144,7 +1169,7 @@ async fn explicit_bearer_client_without_origin_is_accepted() {
 
 #[tokio::test]
 async fn bearer_guard_accepts_correct_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let req = Request::builder()
@@ -1163,7 +1188,7 @@ async fn bearer_guard_accepts_correct_token() {
 
 #[tokio::test]
 async fn bearer_guard_rejects_wrong_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     let req = Request::builder()
@@ -1192,7 +1217,7 @@ fn bootstrap_request(body: String, origin: bool) -> Request<Body> {
 
 #[tokio::test]
 async fn bootstrap_exchange_requires_origin_but_not_bearer() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1218,7 +1243,7 @@ async fn bootstrap_exchange_requires_origin_but_not_bearer() {
 
 #[tokio::test]
 async fn bootstrap_exchange_rejects_replay_malformed_and_oversized_generically() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1293,7 +1318,7 @@ fn dashboard_app_waits_for_auth_and_direct_visits_keep_manual_fallback() {
 
 #[tokio::test]
 async fn bootstrap_shell_and_unhashed_assets_are_never_stored() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), Some("s3cr3t".to_string()));
     for path in [
@@ -1314,7 +1339,7 @@ async fn bootstrap_shell_and_unhashed_assets_are_never_stored() {
 
 #[tokio::test]
 async fn spa_fallback_serves_deep_path_as_html() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/memory/search")).await;
@@ -1332,7 +1357,7 @@ async fn spa_fallback_serves_deep_path_as_html() {
 
 #[tokio::test]
 async fn spa_fallback_404_for_bogus_api() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/api/bogus")).await;
@@ -1358,7 +1383,7 @@ async fn spa_fallback_404_for_bogus_api() {
 /// still resolves to its members.
 #[tokio::test]
 async fn memory_graph_overview_balances_dominant_catchall_bubble() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     const TOTAL: usize = 300;
@@ -1460,7 +1485,7 @@ async fn memory_graph_overview_balances_dominant_catchall_bubble() {
 /// item count (no pagination drift between the count and paged queries).
 #[tokio::test]
 async fn timeline_role_filter_splits_input_and_output() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let input_kinds = [
@@ -1544,7 +1569,7 @@ async fn timeline_role_filter_splits_input_and_output() {
 /// prompts or just agent output.
 #[tokio::test]
 async fn recall_role_filter_restricts_hits() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     {
@@ -1693,7 +1718,7 @@ async fn failover_handler_post(
 
 #[tokio::test]
 async fn team_config_api_is_unavailable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
@@ -1712,7 +1737,7 @@ async fn team_config_api_is_unavailable() {
 
 #[tokio::test]
 async fn failover_global_get_post_roundtrip() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let repo = state.project.memory_root().to_path_buf();
@@ -1759,7 +1784,7 @@ async fn failover_global_get_post_roundtrip() {
 
 #[tokio::test]
 async fn failover_inherited_project_get_shows_global_policy() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -1788,7 +1813,7 @@ async fn failover_inherited_project_get_shows_global_policy() {
 
 #[tokio::test]
 async fn failover_project_custom_write_preserves_global() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -1843,7 +1868,7 @@ async fn failover_project_custom_write_preserves_global() {
 
 #[tokio::test]
 async fn failover_project_follow_global_preserves_unrelated_overrides() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -1890,7 +1915,7 @@ async fn failover_project_follow_global_preserves_unrelated_overrides() {
 
 #[tokio::test]
 async fn failover_project_post_rejects_missing_and_invalid_scope() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -1934,7 +1959,7 @@ async fn failover_project_post_rejects_missing_and_invalid_scope() {
 
 #[tokio::test]
 async fn failover_numeric_fields_reject_values_above_u32_max() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
@@ -1982,7 +2007,7 @@ async fn failover_numeric_fields_reject_values_above_u32_max() {
 
 #[tokio::test]
 async fn failover_header_only_project_selection() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -2029,7 +2054,7 @@ async fn failover_header_only_project_selection() {
 
 #[tokio::test]
 async fn failover_rejects_zero_backoff_divisor() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
     let slug = test_slug();
@@ -2068,7 +2093,7 @@ async fn failover_rejects_zero_backoff_divisor() {
 
 #[tokio::test]
 async fn config_patch_omissions_preserve_every_hidden_setting() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     std::fs::create_dir_all(config_file(tmp.path()).parent().unwrap()).unwrap();
     std::fs::write(
@@ -2129,7 +2154,7 @@ auto_batch = 97
 #[tokio::test]
 #[ignore = "legacy project-registry mutation removed by project isolation"]
 async fn project_patch_omissions_preserve_path_security_and_embedding() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let first = r#"{"name":"demo","path":"/kept/path","security_profile":"ai-strict","embeddings_mode":"off"}"#;
     assert_eq!(
@@ -2184,7 +2209,7 @@ async fn project_patch_omissions_preserve_path_security_and_embedding() {
 
 #[tokio::test]
 async fn limits_patch_omissions_preserve_axes_and_pool_only_limits() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let initial = r#"{"targets":[{"target":"api","daily_tokens":10,"daily_requests":20,"pools":[{"pool":"paid","daily_tokens":30}]}]}"#;
     assert_eq!(
@@ -2239,7 +2264,7 @@ async fn limits_patch_omissions_preserve_axes_and_pool_only_limits() {
 
 #[tokio::test]
 async fn security_profile_clone_payload_preserves_full_schema() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let toml = r#"name = "complete"
 description = "all fields"
@@ -2282,7 +2307,7 @@ langs = ["rs", "js"]
 
 #[tokio::test]
 async fn security_profile_rejects_traversal_and_name_mismatch() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let bad = r#"{"name":"../escape","toml":"name = 'escape'\n"}"#;
@@ -2308,7 +2333,7 @@ async fn security_profile_rejects_traversal_and_name_mismatch() {
 #[tokio::test]
 async fn config_writer_rejects_symlink_target_without_touching_destination() {
     use std::os::unix::fs::symlink;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     std::fs::create_dir_all(config_file(tmp.path()).parent().unwrap()).unwrap();
     let destination = tmp.path().join("victim");
@@ -2329,7 +2354,7 @@ async fn config_writer_rejects_symlink_target_without_touching_destination() {
 
 #[tokio::test]
 async fn failover_page_assets_are_served_and_deep_linkable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let state = test_state(tmp.path());
 
@@ -2370,7 +2395,7 @@ async fn failover_page_assets_are_served_and_deep_linkable() {
 
 #[tokio::test]
 async fn retired_orchestration_asset_is_not_served() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
     let app = router(test_state(tmp.path()), None);
     let resp = call(app, get("/assets/js/orchestration.js")).await;

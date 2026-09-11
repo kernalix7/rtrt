@@ -941,6 +941,16 @@ mod tests {
     /// A unique, self-cleaning temp directory rooted in the system temp dir.
     /// Avoids pulling in an external `tempfile` dependency while staying
     /// deterministic (unique per test via pid + monotonic counter).
+    /// The resolver returns paths the way the platform resolves them, which on
+    /// Windows means the `\\?\` verbatim form rather than the 8.3 spelling a
+    /// temp path carries. Expectations therefore have to be resolved too.
+    fn resolved_runtime_tmp(root: &Path) -> PathBuf {
+        std::fs::canonicalize(root)
+            .expect("resolve fixture root")
+            .join(".rtrt")
+            .join("tmp")
+    }
+
     /// Canonical only where it matters. macOS reaches the temp dir through
     /// `/var -> /private/var`, which breaks comparisons against canonical paths.
     /// Windows canonicalization instead yields a `\\?\` verbatim path, which the
@@ -1135,7 +1145,7 @@ mod tests {
 
         let path = runtime_tmp_dir_for_cwd(&repo, None, &tmp.path().join("os-tmp"));
 
-        assert_eq!(path, repo.join(".rtrt").join("tmp"));
+        assert_eq!(path, resolved_runtime_tmp(&repo));
         assert!(
             !path.exists(),
             "pure resolver must not create the directory"
@@ -1152,7 +1162,7 @@ mod tests {
 
         assert_eq!(
             runtime_tmp_dir_for_cwd(&subdir, None, &tmp.path().join("os-tmp")),
-            repo.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&repo)
         );
     }
 
@@ -1167,7 +1177,7 @@ mod tests {
 
         assert_eq!(
             runtime_tmp_dir_for_cwd(&subdir, None, &tmp.path().join("os-tmp")),
-            main.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&main)
         );
     }
 
@@ -1196,7 +1206,7 @@ mod tests {
 
         assert_eq!(
             runtime_tmp_dir_for_cwd(&repo, Some(OsStr::new("")), &tmp.path().join("os-tmp")),
-            repo.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&repo)
         );
     }
 
@@ -1222,7 +1232,7 @@ mod tests {
         assert_eq!(project_for_cwd(&nested), "checkout");
         assert_eq!(
             runtime_tmp_dir_for_cwd(&nested, None, &tmp.path().join("os-tmp")),
-            checkout.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&checkout)
         );
     }
 
@@ -1243,7 +1253,7 @@ mod tests {
         assert_eq!(project_for_cwd(&checkout), "checkout");
         assert_eq!(
             runtime_tmp_dir_for_cwd(&checkout, None, &tmp.path().join("os-tmp")),
-            checkout.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&checkout)
         );
     }
 
@@ -1260,7 +1270,7 @@ mod tests {
         assert_eq!(project_for_cwd(&nested), "child");
         assert_eq!(
             runtime_tmp_dir_for_cwd(&nested, None, &tmp.path().join("os-tmp")),
-            child.join(".rtrt").join("tmp")
+            resolved_runtime_tmp(&child)
         );
     }
 

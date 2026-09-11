@@ -1432,16 +1432,27 @@ mod tests {
         assert!(validated_scratch_mount(&colliding_git).is_err());
     }
 
+    // These fixtures need scratch space inside the workspace rather than the
+    // system temp dir, whose ownership and symlinking the sandbox validator
+    // legitimately rejects. `.rtrt/` is ignored by git, so a fresh checkout has
+    // no `.rtrt/tmp` to find and the directory has to be created here.
+    #[cfg(unix)]
+    fn workspace_scratch_dir() -> PathBuf {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let workspace = cwd
+            .ancestors()
+            .find(|ancestor| ancestor.join("Cargo.lock").is_file())
+            .expect("workspace root containing Cargo.lock");
+        let scratch = workspace.join(".rtrt").join("tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        scratch
+    }
+
     #[cfg(target_os = "linux")]
     fn trusted_shell_fixture() -> (tempfile::TempDir, ProjectBoundary, PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
-        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        let workspace = cwd
-            .ancestors()
-            .find(|ancestor| ancestor.join(".rtrt/tmp").is_dir())
-            .unwrap();
-        let temp = tempfile::tempdir_in(workspace.join(".rtrt/tmp")).unwrap();
+        let temp = tempfile::tempdir_in(workspace_scratch_dir()).unwrap();
         let project = temp.path().join("project");
         let bin = temp.path().join(".cargo/bin");
         std::fs::create_dir_all(&project).unwrap();
@@ -1507,13 +1518,7 @@ mod tests {
     fn direct_launch_validator_accepts_trusted_file_and_rejects_checkout_or_symlink() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
-        let workspace = cwd
-            .ancestors()
-            .find(|ancestor| ancestor.join(".rtrt/tmp").is_dir())
-            .unwrap()
-            .to_path_buf();
-        let fixture = tempfile::tempdir_in(workspace.join(".rtrt/tmp")).unwrap();
+        let fixture = tempfile::tempdir_in(workspace_scratch_dir()).unwrap();
         let project = fixture.path().join("project");
         let bin = fixture.path().join("bin");
         std::fs::create_dir(&project).unwrap();
@@ -1528,7 +1533,7 @@ mod tests {
             cwd: project.clone(),
             git_writable: Vec::new(),
         };
-        let uid = std::fs::metadata(&workspace).unwrap().uid();
+        let uid = std::fs::metadata(fixture.path()).unwrap().uid();
         validate_direct_launch_executable_for_uid(&boundary, &executable, uid).unwrap();
 
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o770)).unwrap();

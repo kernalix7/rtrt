@@ -113,9 +113,12 @@ Skeleton:
 - (detailed bullets)
 ```
 
-Before cutting a release, create the GitHub `crates-io-publish` environment and add its `CARGO_REGISTRY_TOKEN` secret. The paired-tag release requires this environment and token to publish the Rust crates.
+Before cutting a release, ensure the npm trusted-publishing OIDC subject and GitHub `npm-publish` environment are configured for the repo. Workspace crates are not published to crates.io, so no `CARGO_REGISTRY_TOKEN` is required. `rtrt-agent` ships to npm exclusively through npm trusted publishing.
 
-Then create both tags on the merged `main` commit. The release workflow keys off the `REL-` marker for body extraction. Push both tags in one atomic push.
+The release uses two tags on the same merged `main` commit. Push them together in one atomic push; the release workflow extracts the version body using the `REL-` marker.
+
+- `vX.Y.Z` triggers the `release.yml` validate-and-build job. It produces the per-platform Rust binaries and publishes them only as Actions artifacts; no GitHub Release is created on this run.
+- `REL-vX.Y.Z` re-runs the build, then runs the npm publish job (trusted publishing pushes `rtrt-agent` to npm), then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag.
 
 ```bash
 git checkout main

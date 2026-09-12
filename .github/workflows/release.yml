@@ -1,7 +1,7 @@
 name: Release
 
 # Stable releases use a paired vX.Y.Z / REL-vX.Y.Z tag at one commit. The
-# ordinary v tag builds and validates only; the REL tag publishes registries
+# ordinary v tag builds and validates only; the REL tag publishes npm
 # first and creates or updates the GitHub Release last.
 on:
   push:
@@ -159,26 +159,9 @@ jobs:
           path: plugins/opencode/rtrt-agent-${{ needs.preflight.outputs.version }}.tgz
           if-no-files-found: error
 
-  release-credentials:
-    name: Validate release publication credential
-    needs: [preflight, build, package-npm]
-    if: needs.preflight.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    environment: crates-io-publish
-    steps:
-      - name: Require crates.io publication credential
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo '::error::CARGO_REGISTRY_TOKEN is required in the crates-io-publish environment' >&2
-            exit 1
-          fi
-
   publish-npm:
     name: Publish and verify npm
-    needs: [preflight, build, package-npm, release-credentials]
+    needs: [preflight, build, package-npm]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: npm-publish
@@ -270,28 +253,9 @@ jobs:
           echo "::error::rtrt-agent@${RELEASE_VERSION} did not become visible" >&2
           exit 1
 
-  publish-crates:
-    name: Publish and verify crates.io
-    needs: [preflight, build, release-credentials]
-    if: needs.preflight.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    environment: crates-io-publish
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
-        with:
-          toolchain: stable
-      - name: Publish missing crates and wait for dependency visibility
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-        run: scripts/publish-crates.sh
-
   release:
     name: Create or update GitHub Release
-    needs: [preflight, build, publish-npm, publish-crates]
+    needs: [preflight, build, publish-npm]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -320,7 +284,7 @@ jobs:
           source scripts/release-helpers.sh
           extract_changelog_section CHANGELOG.md "$RELEASE_VERSION" > body.md
           test -s body.md
-      - name: Publish GitHub Release after registry verification
+      - name: Publish GitHub Release after npm verification
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.preflight.outputs.version_tag }}

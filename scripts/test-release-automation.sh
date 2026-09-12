@@ -7,7 +7,6 @@ WORKFLOW="$ROOT/.github/workflows/release.yml"
 CI_WORKFLOW="$ROOT/.github/workflows/ci.yml"
 SMOKE="$ROOT/scripts/smoke.sh"
 HELPERS="$ROOT/scripts/release-helpers.sh"
-PUBLISH_CRATES="$ROOT/scripts/publish-crates.sh"
 INSTALL_SH="$ROOT/install.sh"
 INSTALL_PS1="$ROOT/install.ps1"
 
@@ -90,12 +89,9 @@ for tag in v0.1 v0.1.1-rc.1 v01.1.1 REL-v1.2.3-alpha 'v1.2.3;echo bad' refs/tags
     fi
 done
 
-python3 - "$WORKFLOW" "$SMOKE" "$CI_WORKFLOW" "$INSTALL_SH" "$INSTALL_PS1" "$HELPERS" "$PUBLISH_CRATES" <<'PY'
+python3 - "$WORKFLOW" "$SMOKE" "$CI_WORKFLOW" "$INSTALL_SH" "$INSTALL_PS1" "$HELPERS" <<'PY'
 from pathlib import Path
-import json
 import re
-import shlex
-import subprocess
 import sys
 
 workflow = Path(sys.argv[1]).read_text()
@@ -105,7 +101,6 @@ ci_workflow = Path(sys.argv[3]).read_text()
 install_sh = Path(sys.argv[4]).read_text()
 install_ps1 = Path(sys.argv[5]).read_text()
 helpers = Path(sys.argv[6]).read_text()
-publish_script = Path(sys.argv[7]).read_text()
 root = Path(sys.argv[1]).parents[2]
 
 workflow_paths = sorted(
@@ -143,11 +138,7 @@ required = (
     "id-token: write",
     "release:\n",
     "contents: write",
-    "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
-    'if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then',
     "scripts/release-preflight.sh",
-    "release-credentials:\n",
-    "environment: crates-io-publish",
     "npm install --global npm@11.11.0",
     "npm ci --ignore-scripts",
     "npm pack --ignore-scripts --json",
@@ -157,18 +148,20 @@ for fragment in required:
     if fragment not in workflow:
         raise SystemExit(f"missing release contract fragment: {fragment}")
 
+for forbidden in (
+    "release-credentials:\n",
+    "publish-crates:\n",
+    "CARGO_REGISTRY_TOKEN",
+    "crates-io-publish",
+    "scripts/publish-crates.sh",
+):
+    if forbidden in workflow:
+        raise SystemExit(f"obsolete crates.io release contract remains: {forbidden}")
+if re.search(r"\bcargo\s+publish\b", workflow):
+    raise SystemExit("release workflow must not publish workspace crates")
+
 if workflow.index("publish-npm:\n") > workflow.index("release:\n"):
     raise SystemExit("npm publication must precede the GitHub Release job")
-if workflow.index("publish-crates:\n") > workflow.index("release:\n"):
-    raise SystemExit("crates.io publication must precede the GitHub Release job")
-if re.search(r"^env:\n(?:  .*\n)*  CARGO_REGISTRY_TOKEN:", workflow, re.MULTILINE):
-    raise SystemExit("Cargo token must not be workflow-scoped")
-if workflow.count("${{ secrets.CARGO_REGISTRY_TOKEN }}") != 2:
-    raise SystemExit("Cargo token must appear once in credential preflight and once in cargo publish")
-if re.search(r"(?m)^\s*cargo\s+publish\b[^\n]*\s--token(?:\s|=)", workflow):
-    raise SystemExit("Cargo token must not be passed on the cargo publish process argv")
-if "sleep 10  #" in workflow:
-    raise SystemExit("fixed crates.io publication sleep remains")
 
 def job_block(name: str) -> str:
     match = re.search(
@@ -186,64 +179,29 @@ if re.search(r"\bcargo\s+(?:package|publish)\b", preflight_job):
 if preflight_job.index("dtolnay/rust-toolchain@") > preflight_job.index("scripts/release-preflight.sh"):
     raise SystemExit("release preflight must select the pinned Rust toolchain before cargo metadata")
 
-credential_job = job_block("release-credentials")
+npm_job = job_block("publish-npm")
+npm_dependencies = npm_job.partition("steps:")[0]
+if re.search(r"(?m)^\s+needs:\s*(?:preflight|\[[^\]]*\bpreflight\b[^\]]*\])\s*$", npm_dependencies) is None:
+    raise SystemExit("npm publication must need release preflight")
 for fragment in (
     "if: needs.preflight.outputs.publish == 'true'",
-    "environment: crates-io-publish",
-    "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+    "id-token: write",
+    "npm publish",
+    "--provenance",
+    "--access public",
 ):
-    if fragment not in credential_job:
-        raise SystemExit(f"credential preflight missing: {fragment}")
-if re.search(r"\b(?:cargo|npm)\s+publish\b", credential_job):
-    raise SystemExit("credential preflight must not publish")
+    if fragment not in npm_job:
+        raise SystemExit(f"npm OIDC publication contract missing: {fragment}")
 
-for job_name in ("publish-npm", "publish-crates"):
-    job = job_block(job_name)
-    if "release-credentials" not in job.partition("steps:")[0]:
-        raise SystemExit(f"{job_name} must need release-credentials")
-    if "if: needs.preflight.outputs.publish == 'true'" not in job:
-        raise SystemExit(f"{job_name} must retain independent publish gating")
-
-publish_crates_job = job_block("publish-crates")
-if "scripts/publish-crates.sh" not in publish_crates_job:
-    raise SystemExit("publish job must execute the tested crate publication script")
-if 'cargo publish --locked -p "$crate"' not in publish_script:
-    raise SystemExit("publish job must use locked Cargo publication with the step-scoped token env")
-array_match = re.search(r"(?ms)^crates=\(\n(.*?)^\)", publish_script)
-if array_match is None:
-    raise SystemExit("publish-crates must define an explicit crates array")
-publish_order = shlex.split(array_match.group(1))
-metadata = json.loads(
-    subprocess.run(
-        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-)
-members = {package["name"] for package in metadata["packages"]}
-if len(publish_order) != len(set(publish_order)) or set(publish_order) != members:
-    raise SystemExit("publish crates array must exactly cover workspace members without duplicates")
-position = {name: index for index, name in enumerate(publish_order)}
-for package in metadata["packages"]:
-    for dependency in package["dependencies"]:
-        if dependency.get("path") is None or dependency["name"] not in members:
-            continue
-        if position[dependency["name"]] >= position[package["name"]]:
-            raise SystemExit(
-                f"publish order is not topological: {dependency['name']} must precede {package['name']}"
-            )
-for fragment in (
-    "metadata=$(cargo metadata --locked --no-deps --format-version 1)",
-    "declare -A publish_position",
-    "select(.path != null)",
-    "dependency must be published before dependent",
-):
-    if fragment not in publish_script:
-        raise SystemExit(f"publish job missing runtime topology validation: {fragment}")
-if publish_script.index("declare -A publish_position") > publish_script.index("sparse_index_status()"):
-    raise SystemExit("publish topology validation must run before registry interaction")
+release_job = job_block("release")
+release_dependencies = release_job.partition("steps:")[0]
+for dependency in ("build", "publish-npm"):
+    needs_dependency = re.search(
+        rf"(?m)^\s+needs:\s*\[[^\]]*\b{re.escape(dependency)}\b[^\]]*\]\s*$",
+        release_dependencies,
+    )
+    if needs_dependency is None:
+        raise SystemExit(f"GitHub Release job must need {dependency}")
 
 ci_contract = re.search(
     r"(?ms)^  release-contract:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
@@ -264,25 +222,12 @@ for fragment in ("windows-latest", "--checksum-only", "shell: bash"):
     if fragment not in ci_contract.group(0):
         raise SystemExit(f"release-contract CI job missing Windows checksum coverage: {fragment}")
 
-npm_job = workflow[workflow.index("  publish-npm:\n"):workflow.index("  publish-crates:\n")]
 if npm_job.index("npm install --global npm@11.11.0") > npm_job.index("npm publish"):
     raise SystemExit("pinned npm CLI must be installed before npm publish")
 for fragment in (".dist.integrity", ".dist.shasum", "npm-version.tgz", "openssl dgst -sha512 -binary"):
     if fragment not in npm_job:
         raise SystemExit(f"npm rerun verification must compare registry metadata to package bytes: {fragment}")
 
-for fragment in (
-    'cargo package --locked -p "$crate"',
-    '${crate}-${RELEASE_VERSION}.crate',
-    "https://index.crates.io/",
-    ".cksum // empty",
-    'sha256_digest "$package"',
-):
-    if fragment not in publish_script:
-        raise SystemExit(f"crates rerun verification must compare registry checksum to package bytes: {fragment}")
-publication_loop = publish_script.rsplit('for crate in "${crates[@]}"; do', 1)[1]
-if publication_loop.index('cargo package --locked -p "$crate"') > publication_loop.index('sparse_index_status "$crate"'):
-    raise SystemExit("each crate must be packaged before accepting its existing registry version")
 for fragment in ("canonical_sha256_record", "tr '[:upper:]' '[:lower:]'", 'printf \'%s  %s\\n\''):
     if fragment not in helpers:
         raise SystemExit(f"release helpers missing canonical checksum behavior: {fragment}")
@@ -426,181 +371,6 @@ for delivered_signal, expected_status in ((signal.SIGINT, 130), (signal.SIGTERM,
         if list(temporary.iterdir()):
             raise SystemExit(f"smoke signal {delivered_signal} left temporary state behind")
 PY
-
-test_publish_crates_sparse_index() {
-    fixture=$(mktemp -d)
-    trap 'rm -rf "$fixture"' EXIT
-    mkdir -p "$fixture/bin" "$fixture/state" "$fixture/target"
-    real_cargo=$(command -v cargo)
-    cat > "$fixture/bin/cargo" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-command=$1
-shift
-case "$command" in
-    metadata) exec "$RTRT_TEST_REAL_CARGO" metadata "$@" ;;
-    package)
-        while [ "$#" -gt 0 ]; do
-            if [ "$1" = -p ]; then crate=$2; break; fi
-            shift
-        done
-        printf 'package %s\n' "$crate" >> "$RTRT_TEST_EVENT_LOG"
-        printf '%s\n' "$crate" >> "$RTRT_TEST_PACKAGE_LOG"
-        while IFS=$'\t' read -r dependent dependency; do
-            [ "$dependent" != "$crate" ] || [ -f "$RTRT_TEST_STATE/$dependency" ] || {
-                printf 'dependency is not index-visible: %s -> %s\n' "$dependency" "$dependent" >&2
-                exit 94
-            }
-        done < "$RTRT_TEST_DEPENDENCIES"
-        mkdir -p "$CARGO_TARGET_DIR/package"
-        printf 'package:%s\n' "$crate" > "$CARGO_TARGET_DIR/package/${crate}-${RELEASE_VERSION}.crate"
-        ;;
-    publish)
-        [ "${CARGO_REGISTRY_TOKEN:-}" = release-secret ] || exit 91
-        for argument in "$@"; do [ "$argument" != --token ] || exit 92; done
-        while [ "$#" -gt 0 ]; do
-            if [ "$1" = -p ]; then crate=$2; break; fi
-            shift
-        done
-        printf 'publish %s\n' "$crate" >> "$RTRT_TEST_EVENT_LOG"
-        printf '%s\n' "$crate" >> "$RTRT_TEST_PUBLISH_LOG"
-        [ "$RTRT_TEST_PUBLISH_VISIBLE" != 1 ] || printf 'matching\n' > "$RTRT_TEST_STATE/$crate"
-        ;;
-    *) exit 93 ;;
-esac
-EOF
-    cat > "$fixture/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-output=
-url=
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --output) output=$2; shift 2 ;;
-        --write-out|--user-agent) shift 2 ;;
-        --silent|--show-error) shift ;;
-        *) url=$1; shift ;;
-    esac
-done
-crate=${url##*/}
-printf 'lookup %s\n' "$crate" >> "$RTRT_TEST_EVENT_LOG"
-if [ ! -f "$RTRT_TEST_STATE/$crate" ]; then printf '404'; exit 0; fi
-mode=$(cat "$RTRT_TEST_STATE/$crate")
-case "$mode" in
-    matching) checksum=$(sha256sum "$CARGO_TARGET_DIR/package/${crate}-${RELEASE_VERSION}.crate" | awk '{print $1}') ;;
-    mismatch) checksum=0000000000000000000000000000000000000000000000000000000000000000 ;;
-    malformed) printf 'not-json\n' > "$output"; printf '200'; exit 0 ;;
-esac
-printf '{"name":"%s","vers":"%s","cksum":"%s","yanked":false}\n' \
-    "$crate" "$RELEASE_VERSION" "$checksum" > "$output"
-printf '200'
-EOF
-    chmod +x "$fixture/bin/cargo" "$fixture/bin/curl"
-    crates=(rtrt-core rtrt-providers rtrt-compress rtrt-proxy rtrt-memory rtrt-templates rtrt-security rtrt-eval rtrt-mcp rtrt-dashboard rtrt-cli)
-    "$real_cargo" metadata --locked --no-deps --format-version 1 | jq -r '
-        [.packages[].name] as $members
-        | .packages[] as $package
-        | $package.dependencies[]
-        | select(.path != null)
-        | select(.name as $dependency | $members | index($dependency))
-        | "\($package.name)\t\(.name)"
-    ' > "$fixture/dependencies.tsv"
-    : > "$fixture/package.log"
-    : > "$fixture/publish.log"
-    : > "$fixture/event.log"
-
-    # Given: an empty registry where packaging a dependent requires every workspace dependency
-    # to have already become index-visible.
-    # When: the first-time publication runs in topological order.
-    PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$fixture/target" CARGO_REGISTRY_TOKEN=release-secret \
-        RELEASE_VERSION=0.1.1 RTRT_TEST_REAL_CARGO="$real_cargo" RTRT_TEST_PACKAGE_LOG="$fixture/package.log" \
-        RTRT_TEST_PUBLISH_LOG="$fixture/publish.log" RTRT_TEST_EVENT_LOG="$fixture/event.log" \
-        RTRT_TEST_DEPENDENCIES="$fixture/dependencies.tsv" RTRT_TEST_PUBLISH_VISIBLE=1 \
-        RTRT_TEST_STATE="$fixture/state" RTRT_INDEX_POLL_DELAY=0 "$PUBLISH_CRATES"
-    # Then: each crate is packaged, checked, published, and visible before the next package.
-    expected_events=
-    for crate in "${crates[@]}"; do
-        expected_events+="package $crate"$'\n'"lookup $crate"$'\n'"publish $crate"$'\n'"lookup $crate"$'\n'
-    done
-    [ "$(cat "$fixture/event.log")"$'\n' = "$expected_events" ]
-    [ "$(cat "$fixture/publish.log")" = "$(printf '%s\n' "${crates[@]}")" ]
-
-    # Given: every crate is already present with the exact packaged checksum.
-    : > "$fixture/package.log"
-    : > "$fixture/publish.log"
-    : > "$fixture/event.log"
-    # When: publication is rerun.
-    PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$fixture/target" CARGO_REGISTRY_TOKEN=release-secret \
-        RELEASE_VERSION=0.1.1 RTRT_TEST_REAL_CARGO="$real_cargo" RTRT_TEST_PACKAGE_LOG="$fixture/package.log" \
-        RTRT_TEST_PUBLISH_LOG="$fixture/publish.log" RTRT_TEST_EVENT_LOG="$fixture/event.log" \
-        RTRT_TEST_DEPENDENCIES="$fixture/dependencies.tsv" RTRT_TEST_PUBLISH_VISIBLE=1 \
-        RTRT_TEST_STATE="$fixture/state" RTRT_INDEX_POLL_DELAY=0 "$PUBLISH_CRATES"
-    # Then: package/check sequencing remains dependency-safe and no publish is repeated.
-    expected_events=
-    for crate in "${crates[@]}"; do
-        expected_events+="package $crate"$'\n'"lookup $crate"$'\n'
-    done
-    [ "$(cat "$fixture/event.log")"$'\n' = "$expected_events" ]
-    [ ! -s "$fixture/publish.log" ]
-
-    # Given: a later existing version whose sparse-index checksum differs from the local package.
-    printf 'mismatch\n' > "$fixture/state/rtrt-providers"
-    : > "$fixture/package.log"
-    : > "$fixture/publish.log"
-    : > "$fixture/event.log"
-    # When/Then: verification fails fatally before packaging any later crate.
-    if PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$fixture/target" CARGO_REGISTRY_TOKEN=release-secret \
-        RELEASE_VERSION=0.1.1 RTRT_TEST_REAL_CARGO="$real_cargo" RTRT_TEST_PACKAGE_LOG="$fixture/package.log" \
-        RTRT_TEST_PUBLISH_LOG="$fixture/publish.log" RTRT_TEST_EVENT_LOG="$fixture/event.log" \
-        RTRT_TEST_DEPENDENCIES="$fixture/dependencies.tsv" RTRT_TEST_PUBLISH_VISIBLE=1 \
-        RTRT_TEST_STATE="$fixture/state" RTRT_INDEX_POLL_DELAY=0 "$PUBLISH_CRATES" >/dev/null 2>&1; then
-        echo 'publish accepted a mismatched sparse-index checksum' >&2
-        exit 1
-    fi
-    [ ! -s "$fixture/publish.log" ]
-    [ "$(cat "$fixture/package.log")" = $'rtrt-core\nrtrt-providers' ]
-
-    # Given: malformed sparse-index metadata for the first crate.
-    printf 'malformed\n' > "$fixture/state/rtrt-core"
-    printf 'matching\n' > "$fixture/state/rtrt-providers"
-    : > "$fixture/package.log"
-    : > "$fixture/publish.log"
-    : > "$fixture/event.log"
-    # When/Then: malformed registry metadata is fatal before publication.
-    if PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$fixture/target" CARGO_REGISTRY_TOKEN=release-secret \
-        RELEASE_VERSION=0.1.1 RTRT_TEST_REAL_CARGO="$real_cargo" RTRT_TEST_PACKAGE_LOG="$fixture/package.log" \
-        RTRT_TEST_PUBLISH_LOG="$fixture/publish.log" RTRT_TEST_EVENT_LOG="$fixture/event.log" \
-        RTRT_TEST_DEPENDENCIES="$fixture/dependencies.tsv" RTRT_TEST_PUBLISH_VISIBLE=1 \
-        RTRT_TEST_STATE="$fixture/state" RTRT_INDEX_POLL_DELAY=0 "$PUBLISH_CRATES" >/dev/null 2>&1; then
-        echo 'publish accepted a malformed sparse-index checksum' >&2
-        exit 1
-    fi
-    [ ! -s "$fixture/publish.log" ]
-    [ "$(cat "$fixture/package.log")" = rtrt-core ]
-
-    # Given: publication succeeds but the sparse index remains absent.
-    rm -f "$fixture/state"/*
-    : > "$fixture/package.log"
-    : > "$fixture/publish.log"
-    : > "$fixture/event.log"
-    # When/Then: bounded polling fails before attempting the dependent crate.
-    if PATH="$fixture/bin:$PATH" CARGO_TARGET_DIR="$fixture/target" CARGO_REGISTRY_TOKEN=release-secret \
-        RELEASE_VERSION=0.1.1 RTRT_TEST_REAL_CARGO="$real_cargo" RTRT_TEST_PACKAGE_LOG="$fixture/package.log" \
-        RTRT_TEST_PUBLISH_LOG="$fixture/publish.log" RTRT_TEST_EVENT_LOG="$fixture/event.log" \
-        RTRT_TEST_DEPENDENCIES="$fixture/dependencies.tsv" RTRT_TEST_PUBLISH_VISIBLE=0 \
-        RTRT_TEST_STATE="$fixture/state" RTRT_INDEX_POLL_ATTEMPTS=2 RTRT_INDEX_POLL_DELAY=0 \
-        "$PUBLISH_CRATES" >/dev/null 2>&1; then
-        echo 'publish accepted a version that never reached the sparse index' >&2
-        exit 1
-    fi
-    [ "$(cat "$fixture/publish.log")" = rtrt-core ]
-    [ "$(cat "$fixture/package.log")" = rtrt-core ]
-    rm -rf "$fixture"
-    trap - EXIT
-}
-
-[ -x "$PUBLISH_CRATES" ] || { echo 'crate publication script is missing' >&2; exit 1; }
-test_publish_crates_sparse_index
 
 test_unix_installer_rejects_checksum() {
     mode=$1

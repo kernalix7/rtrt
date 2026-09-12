@@ -98,10 +98,8 @@ git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
     git tag v0.1.1
     git tag REL-v0.1.1
     release_sha=$(git rev-parse HEAD)
-    cp "$PREFLIGHT" scripts/release-preflight.sh
-    git add scripts/release-preflight.sh
     git -c user.name='Release Test' -c user.email='release-test@example.invalid' \
-        commit --quiet -m 'test recovery workflow'
+        commit --quiet --allow-empty -m 'test recovery workflow'
     workflow_sha=$(git rev-parse HEAD)
 
     # When: a publish recovery is requested from a non-default ref.
@@ -175,6 +173,7 @@ for match in re.finditer(
 
 required = (
     "permissions:\n  contents: read",
+    "workflow_dispatch:\n    inputs:\n      release_tag:",
     "publish-npm:\n",
     "id-token: write",
     "release:\n",
@@ -188,6 +187,21 @@ required = (
 for fragment in required:
     if fragment not in workflow:
         raise SystemExit(f"missing release contract fragment: {fragment}")
+
+recovery_required = (
+    "source_sha: ${{ steps.release.outputs.source_sha }}",
+    "RELEASE_RECOVERY_TAG: ${{ inputs.release_tag }}",
+    "RELEASE_WORKFLOW_REF: ${{ github.ref }}",
+    "RELEASE_DEFAULT_BRANCH_REF: refs/heads/${{ github.event.repository.default_branch }}",
+)
+for fragment in recovery_required:
+    if fragment not in workflow:
+        raise SystemExit(f"release recovery contract missing: {fragment}")
+source_checkout = "ref: ${{ needs.preflight.outputs.source_sha }}"
+if workflow.count(source_checkout) != 3:
+    raise SystemExit("build, npm package, and release jobs must checkout validated release source")
+if "ref: ${{ inputs.release_tag" in workflow:
+    raise SystemExit("unvalidated release input must not be passed to checkout")
 
 for forbidden in (
     "release-credentials:\n",

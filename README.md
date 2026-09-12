@@ -229,7 +229,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 
 | Document | What's inside |
 |----------|---------------|
-| [INSTALL.md](docs/INSTALL.md) | Install paths — source, v0.1.1 crates.io and pre-built binary release channels, uninstall |
+| [INSTALL.md](docs/INSTALL.md) | Install paths — source, pre-built GitHub Release binary, Homebrew tap, and uninstall |
 | [USAGE.md](docs/USAGE.md) | CLI reference, MCP tools, dashboard tour, configuration file |
 | [FEATURES.md](docs/FEATURES.md) | Compression rules, filter strategy, memory schema, multi-provider routing, templates |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Workspace layout, crate boundaries, data flows |
@@ -294,7 +294,7 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] BERTScore evaluator in `rtrt-eval` (opt-in `--features bertscore`; user-supplied encoder + tokenizer)
 - [x] MCP Prompts + Resources — `prompts/list` / `prompts/get` (with handlebars args) over the local PromptRegistry; `resources/list` / `resources/read` over project timelines + Letta blocks
 - [x] Multi-agent coordination delegated to external agent runtimes; RTRT keeps no native orchestration surface
-- [x] Paired-tag, dependency-ordered Rust/npm release automation for v0.1.1
+- [x] Paired-tag release automation for v0.1.1: the `vX.Y.Z` tag run validates and builds the Rust binaries, publishing them only as Actions artifacts; the `REL-vX.Y.Z` tag run rebuilds, publishes `rtrt-agent` to npm via trusted publishing, then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag. Workspace crates are not published to crates.io.
 
 ## Inspired by
 

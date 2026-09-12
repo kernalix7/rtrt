@@ -89,6 +89,47 @@ for tag in v0.1 v0.1.1-rc.1 v01.1.1 REL-v1.2.3-alpha 'v1.2.3;echo bad' refs/tags
     fi
 done
 
+# Given: an immutable paired release tag behind a patched default-branch workflow.
+recovery_fixture=$(mktemp -d)
+trap 'rm -rf "$recovery_fixture"' EXIT
+git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
+(
+    cd "$recovery_fixture/repo"
+    git tag v0.1.1
+    git tag REL-v0.1.1
+    release_sha=$(git rev-parse HEAD)
+    cp "$PREFLIGHT" scripts/release-preflight.sh
+    git add scripts/release-preflight.sh
+    git -c user.name='Release Test' -c user.email='release-test@example.invalid' \
+        commit --quiet -m 'test recovery workflow'
+    workflow_sha=$(git rev-parse HEAD)
+
+    # When: a publish recovery is requested from a non-default ref.
+    # Then: preflight rejects it before checking out release source.
+    if RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=feature RELEASE_SHA="$workflow_sha" \
+        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/feature \
+        RELEASE_DEFAULT_BRANCH_REF=refs/heads/main \
+        scripts/release-preflight.sh >/dev/null 2>&1; then
+        echo 'release recovery accepted a non-default workflow ref' >&2
+        exit 1
+    fi
+
+    # When: the default branch requests recovery for the validated REL tag.
+    # Then: preflight switches to the paired tag commit and enables publication.
+    recovery_output="$recovery_fixture/recovery-output"
+    RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
+        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/main \
+        RELEASE_DEFAULT_BRANCH_REF=refs/heads/main GITHUB_OUTPUT="$recovery_output" \
+        scripts/release-preflight.sh >/dev/null
+    [ "$(git rev-parse HEAD)" = "$release_sha" ]
+    grep -Fx 'version=0.1.1' "$recovery_output" >/dev/null
+    grep -Fx 'version_tag=v0.1.1' "$recovery_output" >/dev/null
+    grep -Fx 'publish=true' "$recovery_output" >/dev/null
+    grep -Fx "source_sha=$release_sha" "$recovery_output" >/dev/null
+)
+rm -rf "$recovery_fixture"
+trap - EXIT
+
 python3 - "$WORKFLOW" "$SMOKE" "$CI_WORKFLOW" "$INSTALL_SH" "$INSTALL_PS1" "$HELPERS" <<'PY'
 from pathlib import Path
 import re
@@ -259,6 +300,9 @@ for installer_name, installer, fragments in (
 
 preflight_required = (
     'git rev-parse --verify "${release_sha}^{commit}"',
+    'validate_paired_tags "$version_tag" "$source_sha"',
+    'git checkout --quiet --detach "$source_sha"',
+    "printf 'source_sha=%s\\n' \"$source_sha\"",
     "for changelog in CHANGELOG.md docs/CHANGELOG.ko.md",
     "claude_plugin_version=$(jq -r .version plugins/claude-code/rtrt/.claude-plugin/plugin.json)",
     "homebrew_version=$(awk",

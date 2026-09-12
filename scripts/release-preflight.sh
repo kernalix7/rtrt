@@ -14,6 +14,27 @@ stable_tag_version() {
     return 1
 }
 
+release_commit_for_tag() {
+    local tag=${1:?tag required}
+    git rev-parse --verify "refs/tags/${tag}^{commit}" 2>/dev/null || {
+        echo "release-preflight: release tag $tag is missing" >&2
+        return 1
+    }
+}
+
+validate_paired_tags() {
+    local version_tag=${1:?version tag required}
+    local release_commit=${2:?release commit required}
+    local paired_tag paired_commit
+    for paired_tag in "$version_tag" "REL-$version_tag"; do
+        paired_commit=$(release_commit_for_tag "$paired_tag") || return 1
+        [ "$paired_commit" = "$release_commit" ] || {
+            echo "release-preflight: $paired_tag points to $paired_commit, expected $release_commit" >&2
+            return 1
+        }
+    done
+}
+
 if [ "${1:-}" = --validate-tag ]; then
     [ "$#" -eq 2 ] || { echo 'usage: release-preflight.sh --validate-tag <tag>' >&2; exit 2; }
     stable_tag_version "$2"
@@ -24,11 +45,39 @@ fi
 event=${RELEASE_EVENT:?RELEASE_EVENT is required}
 ref_name=${RELEASE_REF_NAME:?RELEASE_REF_NAME is required}
 release_sha=${RELEASE_SHA:?RELEASE_SHA is required}
+recovery_tag=${RELEASE_RECOVERY_TAG:-}
+source_sha=$release_sha
 
 if [ "$event" = workflow_dispatch ]; then
-    version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
-    version_tag="v$version"
-    publish=false
+    workflow_commit=$(git rev-parse --verify "${release_sha}^{commit}") || {
+        echo "release-preflight: event SHA $release_sha does not resolve to a commit" >&2
+        exit 1
+    }
+    head_commit=$(git rev-parse --verify 'HEAD^{commit}')
+    [ "$head_commit" = "$workflow_commit" ] || {
+        echo "release-preflight: checkout $head_commit does not match event commit $workflow_commit" >&2
+        exit 1
+    }
+    if [ -n "$recovery_tag" ]; then
+        workflow_ref=${RELEASE_WORKFLOW_REF:?RELEASE_WORKFLOW_REF is required for recovery}
+        default_branch_ref=${RELEASE_DEFAULT_BRANCH_REF:?RELEASE_DEFAULT_BRANCH_REF is required for recovery}
+        [ "$workflow_ref" = "$default_branch_ref" ] || {
+            echo "release-preflight: recovery must run from $default_branch_ref, found $workflow_ref" >&2
+            exit 1
+        }
+        version=$(stable_tag_version "$recovery_tag")
+        version_tag="v$version"
+        publish=false
+        [[ "$recovery_tag" == REL-v* ]] && publish=true
+        source_sha=$(release_commit_for_tag "$recovery_tag")
+        validate_paired_tags "$version_tag" "$source_sha"
+        git checkout --quiet --detach "$source_sha"
+    else
+        version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+        version_tag="v$version"
+        publish=false
+        source_sha=$workflow_commit
+    fi
 else
     version=$(stable_tag_version "$ref_name")
     version_tag="v$version"
@@ -44,16 +93,8 @@ else
         echo "release-preflight: checkout $head_commit does not match event commit $release_commit" >&2
         exit 1
     }
-    for paired_tag in "$version_tag" "REL-$version_tag"; do
-        paired_commit=$(git rev-parse --verify "refs/tags/${paired_tag}^{commit}" 2>/dev/null) || {
-            echo "release-preflight: required paired tag $paired_tag is missing" >&2
-            exit 1
-        }
-        [ "$paired_commit" = "$release_commit" ] || {
-            echo "release-preflight: $paired_tag points to $paired_commit, expected $release_commit" >&2
-            exit 1
-        }
-    done
+    validate_paired_tags "$version_tag" "$release_commit"
+    source_sha=$release_commit
 fi
 
 workspace_version=$(awk '
@@ -131,6 +172,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
         printf 'version=%s\n' "$version"
         printf 'version_tag=%s\n' "$version_tag"
         printf 'publish=%s\n' "$publish"
+        printf 'source_sha=%s\n' "$source_sha"
     } >> "$GITHUB_OUTPUT"
 fi
 printf 'release-preflight: %s metadata is consistent (publish=%s)\n' "$version_tag" "$publish"

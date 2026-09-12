@@ -219,7 +219,7 @@ jobs:
         if: steps.registry.outputs.published != 'true'
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-        run: npm publish "package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance
+        run: npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance
       - name: Wait for exact npm version visibility
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}

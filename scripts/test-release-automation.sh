@@ -192,6 +192,11 @@ for fragment in (
 ):
     if fragment not in npm_job:
         raise SystemExit(f"npm OIDC publication contract missing: {fragment}")
+local_tarball_publish = (
+    'npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance'
+)
+if local_tarball_publish not in npm_job:
+    raise SystemExit("npm publish must use an explicit relative path for the packed tarball")
 
 release_job = job_block("release")
 release_dependencies = release_job.partition("steps:")[0]

@@ -9,6 +9,11 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'REL-v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing paired tag (REL-vX.Y.Z publishes; vX.Y.Z builds only)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       version_tag: ${{ steps.release.outputs.version_tag }}
       publish: ${{ steps.release.outputs.publish }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -44,6 +50,9 @@ jobs:
           RELEASE_EVENT: ${{ github.event_name }}
           RELEASE_REF_NAME: ${{ github.ref_name }}
           RELEASE_SHA: ${{ github.sha }}
+          RELEASE_RECOVERY_TAG: ${{ inputs.release_tag }}
+          RELEASE_WORKFLOW_REF: ${{ github.ref }}
+          RELEASE_DEFAULT_BRANCH_REF: refs/heads/${{ github.event.repository.default_branch }}
         run: scripts/release-preflight.sh
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Test Rust workspace without credentials
@@ -79,6 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
@@ -139,6 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -219,7 +230,7 @@ jobs:
         if: steps.registry.outputs.published != 'true'
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-        run: npm publish "package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance
+        run: npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance
       - name: Wait for exact npm version visibility
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
@@ -263,6 +274,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

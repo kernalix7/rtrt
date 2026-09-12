@@ -89,6 +89,45 @@ for tag in v0.1 v0.1.1-rc.1 v01.1.1 REL-v1.2.3-alpha 'v1.2.3;echo bad' refs/tags
     fi
 done
 
+# Given: an immutable paired release tag behind a patched default-branch workflow.
+recovery_fixture=$(mktemp -d)
+trap 'rm -rf "$recovery_fixture"' EXIT
+git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
+(
+    cd "$recovery_fixture/repo"
+    git tag v0.1.1
+    git tag REL-v0.1.1
+    release_sha=$(git rev-parse HEAD)
+    git -c user.name='Release Test' -c user.email='release-test@example.invalid' \
+        commit --quiet --allow-empty -m 'test recovery workflow'
+    workflow_sha=$(git rev-parse HEAD)
+
+    # When: a publish recovery is requested from a non-default ref.
+    # Then: preflight rejects it before checking out release source.
+    if RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=feature RELEASE_SHA="$workflow_sha" \
+        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/feature \
+        RELEASE_DEFAULT_BRANCH_REF=refs/heads/main \
+        scripts/release-preflight.sh >/dev/null 2>&1; then
+        echo 'release recovery accepted a non-default workflow ref' >&2
+        exit 1
+    fi
+
+    # When: the default branch requests recovery for the validated REL tag.
+    # Then: preflight switches to the paired tag commit and enables publication.
+    recovery_output="$recovery_fixture/recovery-output"
+    RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
+        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/main \
+        RELEASE_DEFAULT_BRANCH_REF=refs/heads/main GITHUB_OUTPUT="$recovery_output" \
+        scripts/release-preflight.sh >/dev/null
+    [ "$(git rev-parse HEAD)" = "$release_sha" ]
+    grep -Fx 'version=0.1.1' "$recovery_output" >/dev/null
+    grep -Fx 'version_tag=v0.1.1' "$recovery_output" >/dev/null
+    grep -Fx 'publish=true' "$recovery_output" >/dev/null
+    grep -Fx "source_sha=$release_sha" "$recovery_output" >/dev/null
+)
+rm -rf "$recovery_fixture"
+trap - EXIT
+
 python3 - "$WORKFLOW" "$SMOKE" "$CI_WORKFLOW" "$INSTALL_SH" "$INSTALL_PS1" "$HELPERS" <<'PY'
 from pathlib import Path
 import re
@@ -134,6 +173,7 @@ for match in re.finditer(
 
 required = (
     "permissions:\n  contents: read",
+    "workflow_dispatch:\n    inputs:\n      release_tag:",
     "publish-npm:\n",
     "id-token: write",
     "release:\n",
@@ -147,6 +187,21 @@ required = (
 for fragment in required:
     if fragment not in workflow:
         raise SystemExit(f"missing release contract fragment: {fragment}")
+
+recovery_required = (
+    "source_sha: ${{ steps.release.outputs.source_sha }}",
+    "RELEASE_RECOVERY_TAG: ${{ inputs.release_tag }}",
+    "RELEASE_WORKFLOW_REF: ${{ github.ref }}",
+    "RELEASE_DEFAULT_BRANCH_REF: refs/heads/${{ github.event.repository.default_branch }}",
+)
+for fragment in recovery_required:
+    if fragment not in workflow:
+        raise SystemExit(f"release recovery contract missing: {fragment}")
+source_checkout = "ref: ${{ needs.preflight.outputs.source_sha }}"
+if workflow.count(source_checkout) != 3:
+    raise SystemExit("build, npm package, and release jobs must checkout validated release source")
+if "ref: ${{ inputs.release_tag" in workflow:
+    raise SystemExit("unvalidated release input must not be passed to checkout")
 
 for forbidden in (
     "release-credentials:\n",
@@ -192,6 +247,11 @@ for fragment in (
 ):
     if fragment not in npm_job:
         raise SystemExit(f"npm OIDC publication contract missing: {fragment}")
+local_tarball_publish = (
+    'npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance'
+)
+if local_tarball_publish not in npm_job:
+    raise SystemExit("npm publish must use an explicit relative path for the packed tarball")
 
 release_job = job_block("release")
 release_dependencies = release_job.partition("steps:")[0]
@@ -254,6 +314,9 @@ for installer_name, installer, fragments in (
 
 preflight_required = (
     'git rev-parse --verify "${release_sha}^{commit}"',
+    'validate_paired_tags "$version_tag" "$source_sha"',
+    'git checkout --quiet --detach "$source_sha"',
+    "printf 'source_sha=%s\\n' \"$source_sha\"",
     "for changelog in CHANGELOG.md docs/CHANGELOG.ko.md",
     "claude_plugin_version=$(jq -r .version plugins/claude-code/rtrt/.claude-plugin/plugin.json)",
     "homebrew_version=$(awk",

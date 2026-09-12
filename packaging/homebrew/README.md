@@ -2,7 +2,7 @@
 
 This directory hosts the formula in-source. To publish it as a real tap:
 
-> **0.1.1 note:** Homebrew is not an automated 0.1.1 release channel. The in-source formula's all-zero checksum is a post-tag template; do not publish or install it until the real checksum is available and the separate tap PR has been merged.
+> **0.1.1 note:** Homebrew is not an automated 0.1.1 release channel. The in-source formula's all-zero checksum is a post-tag template; do not publish or install it until the real checksum is available and the separate tap PR has been merged. The `v0.1.1` tag validates and builds Actions artifacts; `REL-v0.1.1` publishes `rtrt-agent` to npm via trusted publishing, then creates the GitHub Release with the Rust binary archives. GitHub generates source archives from the version tag automatically; workspace crates stay source-only and are not on crates.io.
 
 1. Create a separate GitHub repo named `homebrew-tap` under the same owner
    (e.g. `kernalix7/homebrew-tap`).

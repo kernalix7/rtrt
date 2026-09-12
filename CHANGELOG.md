@@ -16,8 +16,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 **RTRT 0.1.1 finalizes the local-first toolkit release; multi-agent orchestration remains the host runtime's responsibility.**
 
 - 11-crate workspace, three product binaries, opt-in `rtrt-eval`, 23 MCP tools, and four built-in templates: `dev`, `design`, `plan`, and `standardization`.
-- OpenCode integration registers the exact `rtrt-agent@0.1.1` npm package and remains compatible with OMO.
-- Paired-tag, dependency-ordered automation releases Rust crates and the npm package from one versioned release.
+- OpenCode integration registers the exact `rtrt-agent@0.1.1` npm package and remains compatible with OMO. `rtrt-agent` is published to npm via trusted publishing; workspace crates stay source-only.
+- Paired-tag release automation: the `vX.Y.Z` tag run validates and builds the Rust binaries, publishing them only as Actions artifacts; the `REL-vX.Y.Z` tag run rebuilds, publishes `rtrt-agent` to npm via trusted publishing, then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag.
 - Setup hardening adds strict preflight, symlink protection, and atomic writes for managed OpenCode state.
 
 ### Added
@@ -31,7 +31,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - The dashboard Orchestration page becomes Failover, served at `/failover` and backed by `/api/failover/config`; `/orchestration` resolves to the overview and `assets/js/orchestration.js` no longer exists.
 - Failover policy is editable without a project selected: no selector reads and writes the global `[failover]` policy, a selected project inherits it read-only, **Custom** writes `<repo>/.rtrt/config.toml`, and **Follow global** removes only that override.
 - OpenCode setup validates strict legacy cleanup before any Rules, TUI, or MCP writes, then performs recognized cleanup last; any earlier failure preserves the legacy runtime.
-- The unified release workflow provides paired-tag, dependency-ordered Rust/npm release automation from one versioned release; each crate is packaged, published, and confirmed visible in the registry before the next dependent crate is published.
+- The unified release workflow provides paired-tag release automation from one versioned release. The `vX.Y.Z` tag run triggers the `release.yml` validate-and-build job, which produces the per-platform Rust binaries and publishes them only as Actions artifacts. The `REL-vX.Y.Z` tag run re-runs the build, runs the npm publish job (trusted publishing pushes `rtrt-agent` to npm), then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag. Workspace crates are not published to crates.io.
 
 ### Fixed
 

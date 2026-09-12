@@ -111,17 +111,7 @@ CLI를 `PATH`에 설치하려면:
 cargo install --path crates/rtrt-cli
 ```
 
-MCP 서버 / 대시보드 바이너리까지 전역으로 두려면 `crates/rtrt-mcp`, `crates/rtrt-dashboard`도 같은 방식으로 설치하세요.
-
-## crates.io
-
-```bash
-cargo install rtrt-cli         # rtrt 바이너리
-cargo install rtrt-mcp         # MCP 서버
-cargo install rtrt-dashboard   # 웹 대시보드
-```
-
-설치 대상 바이너리 크레이트는 위 세 개입니다. 바이너리가 라이브러리 크레이트에 의존하므로, v0.1.1 릴리스 채널은 워크스페이스의 모든 크레이트를 의존성 순서에 따라 crates.io에 게시합니다.
+MCP 서버 / 대시보드 바이너리까지 전역으로 두려면 `crates/rtrt-mcp`, `crates/rtrt-dashboard`도 같은 방식으로 설치하세요. 이 명령들은 로컬 클론에서 빌드하며, 워크스페이스 크레이트를 crates.io에 게시하지 않습니다.
 
 ## 사전 빌드 바이너리
 
@@ -147,7 +137,7 @@ rtrt templates
 
 ## 제거 (수동)
 
-`cargo install` 경로로 설치했다면:
+`cargo install`로 소스에서 설치했다면:
 
 ```bash
 cargo uninstall rtrt-cli rtrt-mcp rtrt-dashboard

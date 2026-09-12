@@ -90,9 +90,12 @@ AI 도구를 밝히는 생성 크레딧 트레일러와 본문 표기도 금지�
 
 이후의 `### Added` / `### Changed` / `### Fixed`는 상세 추적용입니다.
 
-릴리스를 자르기 전에 GitHub `crates-io-publish` 환경을 만들고 해당 환경에 `CARGO_REGISTRY_TOKEN` 시크릿을 추가해야 합니다. 쌍 태그 릴리스는 Rust 크레이트를 게시하려면 이 환경과 토큰이 필요합니다.
+릴리스를 자르기 전에 npm trusted publishing의 OIDC subject와 GitHub `npm-publish` 환경이 저장소에 설정돼 있는지 확인하세요. 워크스페이스 크레이트는 crates.io에 게시하지 않으므로 `CARGO_REGISTRY_TOKEN`은 필요 없습니다. `rtrt-agent`는 npm trusted publishing으로만 게시됩니다.
 
-그런 다음 릴리스 태그는 병합된 `main` 커밋에 모두 만듭니다. 릴리스 워크플로우는 본문 추출에 `REL-` 마커를 사용하므로 두 태그를 한 번의 atomic push로 함께 올려야 합니다.
+릴리스는 같은 병합 `main` 커밋에 두 태그를 사용합니다. 한 번의 atomic push로 함께 올려야 하며, 릴리스 워크플로는 본문 추출에 `REL-` 마커를 사용합니다.
+
+- `vX.Y.Z`는 `release.yml`의 validate-and-build 작업을 트리거합니다. 플랫폼별 Rust 바이너리를 만들어 Actions artifact로만 게시하며, 이 run에서는 GitHub Release를 만들지 않습니다.
+- `REL-vX.Y.Z`는 빌드를 다시 돌리고 npm publish 작업(trusted publishing으로 `rtrt-agent`를 npm에 게시)을 실행한 뒤 `vX.Y.Z` 아래에 GitHub Release를 생성/갱신하고 플랫폼별 바이너리 아카이브 5개와 체크섬을 첨부합니다. source archive는 GitHub이 `vX.Y.Z` 태그에서 자동 생성합니다.
 
 ```bash
 git checkout main

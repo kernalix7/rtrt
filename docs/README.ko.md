@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/install.sh | sh
 # 소스 빌드
 git clone https://github.com/kernalix7/rtrt
 cd rtrt
-cargo install --path crates/rtrt-cli</code></pre>
+cargo build --release --workspace</code></pre>
 
 [![Alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge)](#상태-알파)
 [![Latest](https://img.shields.io/github/v/release/kernalix7/rtrt?include_prereleases&style=for-the-badge&label=latest&color=2962FF)](https://github.com/kernalix7/rtrt/releases)
@@ -122,7 +122,7 @@ rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 
 | 문서 | 내용 |
 |------|------|
-| [INSTALL.ko.md](INSTALL.ko.md) | 설치 경로 — 소스 / v0.1.1 crates.io 및 사전 빌드 바이너리 릴리스 채널 / 제거 |
+| [INSTALL.ko.md](INSTALL.ko.md) | 설치 경로 — 소스 / GitHub Release 사전 빌드 바이너리 / Homebrew tap / 제거 |
 | [USAGE.ko.md](USAGE.ko.md) | CLI · MCP · 대시보드 사용법 + 자동 캡처 파이프라인 |
 | [FEATURES.ko.md](FEATURES.ko.md) | 압축 규칙 / 필터 / 메모리 스키마 / 템플릿 |
 | [ARCHITECTURE.ko.md](ARCHITECTURE.ko.md) | 크레이트 경계 · 데이터 흐름 |
@@ -161,7 +161,7 @@ rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 - [x] `rtrt-security` 프로파일 기반 보안 & 라이선스 스캔 (엔진 5종, 표준 매핑 프로파일 6종, CI `gate`)
 - [x] 2단 설정 (글로벌 베이스 커널 + 프로젝트별 `.rtrt/config.toml` 오버라이드) + `rtrt migrate` / `rtrt project refresh`
 - [x] 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 위임하고 RTRT native orchestration 표면은 제거
-- [x] v0.1.1용 쌍 태그·의존성 순서 기반 Rust/npm 릴리스 자동화
+- [x] v0.1.1용 쌍 태그 릴리스 자동화 — `vX.Y.Z` 태그 run은 Rust 바이너리를 검증·빌드해 Actions artifact로만 게시하고, `REL-vX.Y.Z` 태그 run은 다시 빌드한 뒤 trusted publishing으로 `rtrt-agent`를 npm에 게시하고 `vX.Y.Z` 아래에 GitHub Release를 생성/갱신해 플랫폼별 바이너리 아카이브 5개와 체크섬을 첨부합니다. source archive는 GitHub이 `vX.Y.Z` 태그에서 자동 생성합니다. 워크스페이스 크레이트는 crates.io에 게시하지 않습니다.
 
 ## 라이선스
 

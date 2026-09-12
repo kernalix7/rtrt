@@ -111,17 +111,7 @@ Install the CLI on your `PATH`:
 cargo install --path crates/rtrt-cli
 ```
 
-Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP server and dashboard binaries globally available.
-
-## crates.io
-
-```bash
-cargo install rtrt-cli         # `rtrt` binary
-cargo install rtrt-mcp         # MCP server
-cargo install rtrt-dashboard   # web dashboard
-```
-
-These three are the installable binary crates. The v0.1.1 release channel publishes every workspace crate to crates.io in dependency order, because the binaries depend on the library crates.
+Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP server and dashboard binaries globally available. These commands build from the local clone; workspace crates are not published to crates.io.
 
 ## Pre-built binaries
 

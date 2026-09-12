@@ -15,8 +15,8 @@
 **RTRT 0.1.1은 로컬 우선 툴킷 릴리스를 완성하며, 멀티 에이전트 오케스트레이션은 호스트 런타임이 담당합니다.**
 
 - 제품 바이너리 3개, 옵트인 `rtrt-eval`, MCP 도구 23개, 빌트인 템플릿 `dev`, `design`, `plan`, `standardization` 4종을 갖춘 11개 크레이트 워크스페이스입니다.
-- OpenCode 통합은 정확한 `rtrt-agent@0.1.1` npm 패키지를 등록하며 OMO와 호환됩니다.
-- 쌍 태그와 의존성 순서를 따르는 자동화가 하나의 버전 릴리스에서 Rust 크레이트와 npm 패키지를 릴리스합니다.
+- OpenCode 통합은 정확한 `rtrt-agent@0.1.1` npm 패키지를 등록하며 OMO와 호환됩니다. `rtrt-agent`는 trusted publishing으로 npm에 게시되며 워크스페이스 크레이트는 소스 전용입니다.
+- 쌍 태그 릴리스 자동화: `vX.Y.Z` 태그 run은 Rust 바이너리를 검증·빌드해 Actions artifact로만 게시하고, `REL-vX.Y.Z` 태그 run은 다시 빌드한 뒤 trusted publishing으로 `rtrt-agent`를 npm에 게시하고 `vX.Y.Z` 아래에 GitHub Release를 생성/갱신해 플랫폼별 바이너리 아카이브 5개와 체크섬을 첨부합니다. source archive는 GitHub이 `vX.Y.Z` 태그에서 자동 생성합니다.
 - Setup 강화로 관리 OpenCode 상태에 엄격한 사전 점검, 심볼릭 링크 보호, 원자적 쓰기를 적용합니다.
 
 ### 추가
@@ -30,7 +30,7 @@
 - 대시보드 Orchestration 페이지를 Failover로 변경했습니다. 경로는 `/failover`, 백엔드는 `/api/failover/config`이며, `/orchestration`은 overview로 이동하고 `assets/js/orchestration.js`는 더 이상 존재하지 않습니다.
 - 프로젝트를 선택하지 않아도 페일오버 정책을 편집할 수 있습니다. 셀렉터가 없으면 전역 `[failover]` 정책을 읽고 쓰며, 선택한 프로젝트는 이를 읽기 전용으로 상속합니다. **Custom**은 `<repo>/.rtrt/config.toml`에 기록하고, **Follow global**은 그 override만 제거합니다.
 - OpenCode setup은 Rules, TUI, MCP를 쓰기 전에 엄격한 legacy 정리를 검증하고, 마지막에 인식 가능한 항목을 정리합니다. 그 이전 단계가 실패하면 legacy runtime을 보존합니다.
-- 통합 릴리스 워크플로는 쌍 태그와 의존성 순서를 따라 하나의 versioned release에서 Rust/npm 릴리스를 자동화합니다. 각 크레이트는 패키징, 게시, 레지스트리 노출 확인을 마친 뒤에야 다음 의존 크레이트를 게시합니다.
+- 통합 릴리스 워크플로는 쌍 태그 기반으로 하나의 versioned release에서 릴리스를 자동화합니다. `vX.Y.Z` 태그 run은 `release.yml`의 validate-and-build 작업을 트리거해 플랫폼별 Rust 바이너리를 만들어 Actions artifact로만 게시합니다. `REL-vX.Y.Z` 태그 run은 빌드를 다시 돌리고 npm publish 작업(trusted publishing으로 `rtrt-agent`를 npm에 게시)을 실행한 뒤 `vX.Y.Z` 아래에 GitHub Release를 생성/갱신하고 플랫폼별 바이너리 아카이브 5개와 체크섬을 첨부합니다. source archive는 GitHub이 `vX.Y.Z` 태그에서 자동 생성합니다. 워크스페이스 크레이트는 crates.io에 게시하지 않습니다.
 
 ### 수정
 

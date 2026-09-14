@@ -53,7 +53,7 @@ Windows에서는 현재 `rtrt service` 관리/open을 지원하지 않습니다.
 
 ```bash
 # 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.1.1
+curl -fsSL .../install.sh | sh -s -- --version v0.1.2
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -115,7 +115,7 @@ MCP 서버 / 대시보드 바이너리까지 전역으로 두려면 `crates/rtrt
 
 ## 사전 빌드 바이너리
 
-v0.1.1 GitHub 릴리스 채널은 다음 아카이브를 게시합니다.
+v0.1.2 GitHub 릴리스 채널은 다음 아카이브를 게시합니다.
 
 - `rtrt-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `rtrt-<version>-aarch64-unknown-linux-gnu.tar.gz`

@@ -1,6 +1,6 @@
 {
   "name": "rtrt-agent",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "RTRT provenance and permission-broker plugin for OpenCode",
   "type": "module",
   "main": "./index.js",

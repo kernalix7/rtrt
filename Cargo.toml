@@ -18,7 +18,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
@@ -29,13 +29,13 @@ description = "Retort — a Rust toolkit that distills AI agent context: memory,
 readme = "README.md"
 
 [workspace.dependencies]
-rtrt-core = { path = "crates/rtrt-core", version = "0.1.1" }
-rtrt-compress = { path = "crates/rtrt-compress", version = "0.1.1" }
-rtrt-proxy = { path = "crates/rtrt-proxy", version = "0.1.1" }
-rtrt-memory = { path = "crates/rtrt-memory", version = "0.1.1" }
-rtrt-providers = { path = "crates/rtrt-providers", version = "0.1.1" }
-rtrt-templates = { path = "crates/rtrt-templates", version = "0.1.1" }
-rtrt-security = { path = "crates/rtrt-security", version = "0.1.1" }
+rtrt-core = { path = "crates/rtrt-core", version = "0.1.2" }
+rtrt-compress = { path = "crates/rtrt-compress", version = "0.1.2" }
+rtrt-proxy = { path = "crates/rtrt-proxy", version = "0.1.2" }
+rtrt-memory = { path = "crates/rtrt-memory", version = "0.1.2" }
+rtrt-providers = { path = "crates/rtrt-providers", version = "0.1.2" }
+rtrt-templates = { path = "crates/rtrt-templates", version = "0.1.2" }
+rtrt-security = { path = "crates/rtrt-security", version = "0.1.2" }
 
 anyhow = "1"
 thiserror = "2"

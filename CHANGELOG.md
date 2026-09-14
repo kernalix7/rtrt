@@ -9,6 +9,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-14
+
+### Highlights
+
+**RTRT 0.1.2 is a hardening release: the OpenCode statusline stops starving keyboard input, proxy stats stay private on Unix, and the release contract pins `rtrt-agent@0.1.2` under trusted publishing.**
+
+- The OpenCode statusline samples session economics only on scoped lifecycle/status events, so long-running local sessions no longer lose keyboard input to statusline render loops.
+- Proxy stats storage on Unix is created private (`~/.rtrt` at `0700`, `proxy-stats.sqlite` and sidecars at `0600`), with legacy modes repaired and unsafe paths rejected.
+- OpenCode setup registers the exact `rtrt-agent@0.1.2` package, and the paired-tag release contract plus its preflight checks are hardened around npm trusted publishing.
+
+### Changed
+
+- OpenCode setup now registers the exact `rtrt-agent@0.1.2` npm package through the singular root `plugin` key; existing `0.1.1` registrations are rewritten on the next `rtrt setup --agent opencode --apply`.
+- The paired-tag release contract is hardened: the `vX.Y.Z` and `REL-vX.Y.Z` runs verify that the tag, workspace version, `rtrt-agent` package version, plugin metadata, and changelog section all agree before building, and the npm trusted-publishing step refuses to run when that preflight fails.
+
+### Fixed
+
+- The OpenCode statusline no longer subscribes to high-volume file and message-part events, tracks streaming message state from Solid render computations, broadcasts unscoped events to every mounted session, or renders inside the prompt-right input path. Session economics are sampled only on scoped lifecycle/status events in the application-bottom surface, preventing statusline render loops from starving keyboard input on long-running local sessions.
+- Proxy stats storage is now private on Unix: the default `~/.rtrt` directory is created at `0700`, and `proxy-stats.sqlite` plus any existing `-wal`, `-shm`, or `-journal` sidecars are held at `0600`. Owner-owned files left with looser legacy modes are repaired on the next writable stats access, while symlinks, non-regular files, and paths owned by another user are rejected. When `RTRT_PROXY_STATS_PATH` points elsewhere, the permissions of that parent directory are left untouched.
+
 ## [0.1.1] - 2026-09-10
 
 ### Highlights

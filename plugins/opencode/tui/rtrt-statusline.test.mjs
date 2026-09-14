@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
+import { readFileSync } from "node:fs"
 import test from "node:test"
 
 import {
@@ -19,9 +20,12 @@ import {
   runStatusline,
   statuslineBinaryCandidates,
   statuslineCommandArgs,
+  STATUSLINE_REFRESH_EVENTS,
+  statuslineRefreshTarget,
 } from "./rtrt-statusline-core.mjs"
 
 const payload = (segments, stale = false, degraded = []) => ({ version: 1, stale, degraded, segments })
+const TUI_SOURCE = readFileSync(new URL("./rtrt-statusline.tsx", import.meta.url), "utf8")
 
 const RICH_SEGMENTS = [
   { id: "project", text: "00G_rtrt", compact: "00G_rtrt", tone: "accent", priority: 100 },
@@ -132,6 +136,52 @@ const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mill
 const flushMicrotasks = async () => {
   for (let index = 0; index < 8; index += 1) await Promise.resolve()
 }
+
+test("refresh subscriptions exclude high-volume message and file events", () => {
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("message.updated"), false)
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("message.part.updated"), false)
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("file.edited"), false)
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("file.watcher.updated"), false)
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("session.status"), true)
+  assert.equal(STATUSLINE_REFRESH_EVENTS.includes("session.updated"), true)
+})
+
+test("TUI snapshots OpenCode message state without subscribing render computations to stream deltas", () => {
+  assert.match(TUI_SOURCE, /untrack\(\(\) => sessionEconomicsSnapshot\(props\.api, sessionID\)\)/u)
+  assert.doesNotMatch(TUI_SOURCE, /createMemo\(\(\) => sessionEconomicsSnapshot/u)
+})
+
+test("TUI statusline stays outside the prompt input render path", () => {
+  assert.match(TUI_SOURCE, /app_bottom\(context\)/u)
+  assert.doesNotMatch(TUI_SOURCE, /session_prompt_right/u)
+})
+
+test("refresh targets stay scoped to the active or matching session", () => {
+  assert.deepEqual(
+    statuslineRefreshTarget(
+      { type: "session.status", properties: { sessionID: "active" } },
+      "active",
+    ),
+    { app: true, sessionID: "active" },
+  )
+  assert.deepEqual(
+    statuslineRefreshTarget(
+      { type: "session.updated", properties: { info: { id: "background" } } },
+      "active",
+    ),
+    { app: false, sessionID: "background" },
+  )
+  assert.deepEqual(
+    statuslineRefreshTarget(
+      { type: "message.part.updated", properties: { part: { sessionID: "nested" } } },
+      "active",
+    ),
+    { app: false, sessionID: "nested" },
+  )
+  assert.deepEqual(statuslineRefreshTarget({ type: "project.updated", properties: {} }, "active"), {
+    app: true,
+  })
+})
 
 const createFakeClock = () => {
   let now = 0

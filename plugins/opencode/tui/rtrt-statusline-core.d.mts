@@ -60,6 +60,18 @@ export type StatuslineState = {
   unavailable: boolean
 }
 export type StatuslineContext = { cwd: string; session: string; width: number; model?: string }
+export type StatuslineRefreshEvent =
+  | "server.connected"
+  | "project.updated"
+  | "session.created"
+  | "session.updated"
+  | "session.compacted"
+  | "session.deleted"
+  | "session.diff"
+  | "session.error"
+  | "session.idle"
+  | "session.status"
+export type StatuslineRefreshTarget = { app: boolean; sessionID?: string }
 
 export const STATUSLINE_VERSION: 1
 export const STATUSLINE_SEPARATOR: string
@@ -70,8 +82,10 @@ export const STATUSLINE_MEDIUM_WIDTH: number
 export const DEFAULT_DEBOUNCE_MS: number
 export const DEFAULT_INTERVAL_MS: number
 export const DEFAULT_TIMEOUT_MS: number
+export const STATUSLINE_REFRESH_EVENTS: readonly StatuslineRefreshEvent[]
 
 export function parseStatuslineJson(raw: string): StatuslinePayload | undefined
+export function statuslineRefreshTarget(event: unknown, activeSessionID?: string): StatuslineRefreshTarget
 export function statuslineCommandArgs(context: StatuslineContext): string[]
 export function statuslineBinaryCandidates(bin?: unknown, env?: Record<string, string | undefined>): string[]
 export function runStatusline(input: StatuslineContext & {

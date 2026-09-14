@@ -10,6 +10,18 @@ export const STATUSLINE_MEDIUM_WIDTH = 70
 export const DEFAULT_DEBOUNCE_MS = 750
 export const DEFAULT_INTERVAL_MS = 15_000
 export const DEFAULT_TIMEOUT_MS = 1_500
+export const STATUSLINE_REFRESH_EVENTS = Object.freeze([
+  "server.connected",
+  "project.updated",
+  "session.created",
+  "session.updated",
+  "session.compacted",
+  "session.deleted",
+  "session.diff",
+  "session.error",
+  "session.idle",
+  "session.status",
+])
 
 const MAX_OUTPUT_BYTES = 64 * 1024
 const MAX_SEGMENTS = 32
@@ -40,6 +52,26 @@ const validText = (value, allowEmpty = false) => {
   const text = value.trim()
   if (!allowEmpty && !text) return undefined
   return text
+}
+
+const eventSessionID = (event) => {
+  if (!isRecord(event) || !isRecord(event.properties)) return undefined
+  if (typeof event.properties.sessionID === "string") return event.properties.sessionID
+  for (const key of ["part", "message", "info"]) {
+    const child = event.properties[key]
+    if (!isRecord(child)) continue
+    if (typeof child.sessionID === "string") return child.sessionID
+    if (key === "info" && typeof event.type === "string" && event.type.startsWith("session.")) {
+      if (typeof child.id === "string") return child.id
+    }
+  }
+  return undefined
+}
+
+export function statuslineRefreshTarget(event, activeSessionID = "") {
+  const sessionID = eventSessionID(event)
+  if (!sessionID) return { app: true }
+  return { app: sessionID === activeSessionID, sessionID }
 }
 
 const hasControlChars = (value) => {

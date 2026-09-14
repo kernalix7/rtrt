@@ -145,7 +145,7 @@ let hits = store.recall_bm25("my-project", "rust", 5)?;
 
 ```toml
 [dependencies]
-rtrt-memory = { version = "0.1.1", features = ["embeddings"] }
+rtrt-memory = { version = "0.1.2", features = ["embeddings"] }
 ```
 
 사용:

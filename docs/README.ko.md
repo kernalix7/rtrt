@@ -34,7 +34,7 @@ cargo build --release --workspace</code></pre>
 ---
 
 > ### 상태: 알파
-> RTRT는 초기 단계입니다. 이 소스 트리에는 **v0.1.1** 릴리스 후보가 들어 있습니다. 워크스페이스가 컴파일되고, 출력 압축 · 명령 출력 필터링 · SQLite-FTS5 BM25 회수 · 자동 캡처 파이프라인 (`redact_secrets` → SHA-256 dedup → save → 세션 태깅) · 시간당 콘솔리데이션 데몬 · MCP 23개 도구 · 대시보드 SSE 라이브 스트림이 모두 동작합니다. 회귀 게이트는 `docs/PERF.ko.md` SLO 기반입니다.
+> RTRT는 초기 단계입니다. 이 소스 트리에는 **v0.1.2** 릴리스 후보가 들어 있습니다. 워크스페이스가 컴파일되고, 출력 압축 · 명령 출력 필터링 · SQLite-FTS5 BM25 회수 · 자동 캡처 파이프라인 (`redact_secrets` → SHA-256 dedup → save → 세션 태깅) · 시간당 콘솔리데이션 데몬 · MCP 23개 도구 · 대시보드 SSE 라이브 스트림이 모두 동작합니다. 회귀 게이트는 `docs/PERF.ko.md` SLO 기반입니다.
 
 RTRT는 세 기둥만 합칩니다. [`DESIGN.ko.md`](DESIGN.ko.md)에 10개 원칙, [`PERF.ko.md`](PERF.ko.md)에 SLO 표 + 최신 측정값. 프레임워크가 아닌 유닉스 도구 모음 — 안정된 substrate (SQLite / Markdown / JSONL / SHA-256 / Rust / tree-sitter / MCP / SSE / 파이프) 위에 얇은 러스트 레이어. 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 맡깁니다. 핵심 크레이트 zero-`unsafe`, edition 2024.
 

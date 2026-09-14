@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 ---
 
 > ### Status: Alpha
-> RTRT is early. This source tree contains the **v0.1.1** release candidate. Every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible / Ollama via OAI-compat), BM25 + vector + graph + HNSW memory, auto-capture pipeline (SHA-256 dedup + secret redaction + session id + hourly consolidation), curl-pipe install / uninstall, criterion benchmarks — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. This source tree contains the **v0.1.2** release candidate. Every headline surface — MCP (stdio + Streamable HTTP), provider chat (Anthropic / OpenAI / OpenAI-compatible / Ollama via OAI-compat), BM25 + vector + graph + HNSW memory, auto-capture pipeline (SHA-256 dedup + secret redaction + session id + hourly consolidation), curl-pipe install / uninstall, criterion benchmarks — is implemented and gated by `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt --check`. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 ## What RTRT is
 

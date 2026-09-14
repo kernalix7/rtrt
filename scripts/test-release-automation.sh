@@ -95,8 +95,11 @@ trap 'rm -rf "$recovery_fixture"' EXIT
 git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
 (
     cd "$recovery_fixture/repo"
-    git tag v0.1.1
-    git tag REL-v0.1.1
+    release_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+    version_tag="v$release_version"
+    release_tag="REL-$version_tag"
+    git tag "$version_tag"
+    git tag "$release_tag"
     release_sha=$(git rev-parse HEAD)
     git -c user.name='Release Test' -c user.email='release-test@example.invalid' \
         commit --quiet --allow-empty -m 'test recovery workflow'
@@ -105,9 +108,9 @@ git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
     # When: a publish recovery is requested from a non-default ref.
     # Then: preflight rejects it before checking out release source.
     if RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=feature RELEASE_SHA="$workflow_sha" \
-        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/feature \
+        RELEASE_RECOVERY_TAG="$release_tag" RELEASE_WORKFLOW_REF=refs/heads/feature \
         RELEASE_DEFAULT_BRANCH_REF=refs/heads/main \
-        scripts/release-preflight.sh >/dev/null 2>&1; then
+        "$PREFLIGHT" >/dev/null 2>&1; then
         echo 'release recovery accepted a non-default workflow ref' >&2
         exit 1
     fi
@@ -116,14 +119,34 @@ git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
     # Then: preflight switches to the paired tag commit and enables publication.
     recovery_output="$recovery_fixture/recovery-output"
     RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
-        RELEASE_RECOVERY_TAG=REL-v0.1.1 RELEASE_WORKFLOW_REF=refs/heads/main \
+        RELEASE_RECOVERY_TAG="$release_tag" RELEASE_WORKFLOW_REF=refs/heads/main \
         RELEASE_DEFAULT_BRANCH_REF=refs/heads/main GITHUB_OUTPUT="$recovery_output" \
-        scripts/release-preflight.sh >/dev/null
+        "$PREFLIGHT" >/dev/null
     [ "$(git rev-parse HEAD)" = "$release_sha" ]
-    grep -Fx 'version=0.1.1' "$recovery_output" >/dev/null
-    grep -Fx 'version_tag=v0.1.1' "$recovery_output" >/dev/null
+    grep -Fx "version=$release_version" "$recovery_output" >/dev/null
+    grep -Fx "version_tag=$version_tag" "$recovery_output" >/dev/null
     grep -Fx 'publish=true' "$recovery_output" >/dev/null
     grep -Fx "source_sha=$release_sha" "$recovery_output" >/dev/null
+
+    # Given: validated release metadata in an isolated clone, not the real worktree.
+    cp plugins/opencode/package.json "$recovery_fixture/package.json"
+    for field in url directory; do
+        # When: either npm repository field differs from the trusted publisher contract.
+        jq --arg field "$field" '.repository[$field] = "mismatched-repository"' \
+            "$recovery_fixture/package.json" > plugins/opencode/package.json
+        if RELEASE_EVENT=push RELEASE_REF_NAME="$release_tag" RELEASE_SHA="$release_sha" \
+            "$PREFLIGHT" >"$recovery_fixture/preflight-output" 2>&1; then
+            printf 'release preflight accepted mismatched npm repository.%s\n' "$field" >&2
+            exit 1
+        fi
+        # Then: preflight reports the exact field, expected value, and rejected value.
+        case "$field" in
+            url) expected=git+https://github.com/kernalix7/rtrt.git ;;
+            directory) expected=plugins/opencode ;;
+        esac
+        grep -Fx "release-preflight: npm repository.$field must be $expected, found mismatched-repository" \
+            "$recovery_fixture/preflight-output" >/dev/null
+    done
 )
 rm -rf "$recovery_fixture"
 trap - EXIT
@@ -175,11 +198,9 @@ required = (
     "permissions:\n  contents: read",
     "workflow_dispatch:\n    inputs:\n      release_tag:",
     "publish-npm:\n",
-    "id-token: write",
     "release:\n",
     "contents: write",
     "scripts/release-preflight.sh",
-    "npm install --global npm@11.11.0",
     "npm ci --ignore-scripts",
     "npm pack --ignore-scripts --json",
     "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3",
@@ -238,20 +259,95 @@ npm_job = job_block("publish-npm")
 npm_dependencies = npm_job.partition("steps:")[0]
 if re.search(r"(?m)^\s+needs:\s*(?:preflight|\[[^\]]*\bpreflight\b[^\]]*\])\s*$", npm_dependencies) is None:
     raise SystemExit("npm publication must need release preflight")
-for fragment in (
-    "if: needs.preflight.outputs.publish == 'true'",
-    "id-token: write",
-    "npm publish",
-    "--provenance",
-    "--access public",
-):
-    if fragment not in npm_job:
-        raise SystemExit(f"npm OIDC publication contract missing: {fragment}")
 local_tarball_publish = (
     'npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance'
 )
-if local_tarball_publish not in npm_job:
-    raise SystemExit("npm publish must use an explicit relative path for the packed tarball")
+
+
+def validate_npm_job(job: str) -> None:
+    header = job.partition("    steps:\n")[0]
+    for setting in (
+        "if: needs.preflight.outputs.publish == 'true'",
+        "runs-on: ubuntu-latest",
+        "environment: npm-publish",
+    ):
+        if re.search(rf"(?m)^    {re.escape(setting)}$", header) is None:
+            raise SystemExit(f"npm OIDC publication job setting missing: {setting}")
+    permissions = re.findall(r"(?m)^    permissions:\n((?:      [^\n]+\n)+)", header)
+    if len(permissions) != 1 or sorted(permissions[0].splitlines()) != [
+        "      contents: read", "      id-token: write",
+    ]:
+        raise SystemExit("npm publication job permissions must be contents: read and id-token: write")
+    for forbidden in ("self-hosted", "NPM_TOKEN", "NODE_AUTH_TOKEN", "secrets."):
+        if forbidden.lower() in job.lower():
+            raise SystemExit(f"npm trusted publication forbids: {forbidden}")
+    # Match explicit credential configuration, not OIDC's id-token permission or request variables.
+    if re.search(
+        r"(?i)_auth(?:token)?\b|auth-token\b|(?<![\w-])token[\"']?\s*[:=]"
+        r"|--token\b|authorization\s*[:=]|\bbearer\s+|\bnpm\s+(?:login|adduser)\b"
+        r"|auth-type\s*[=:]\s*legacy",
+        job,
+    ):
+        raise SystemExit("npm trusted publication must not configure token authentication")
+    setup_steps = re.findall(
+        r"(?ms)^      - uses: actions/setup-node@[^\n]+\n.*?(?=^      - |\Z)", job,
+    )
+    if len(setup_steps) != 1:
+        raise SystemExit("npm publication must have exactly one setup-node step")
+    setup = setup_steps[0]
+    node_versions = re.findall(r"(?m)^          node-version: [\"']?(\d+(?:\.\d+){0,2})[\"']?$", setup)
+    if len(node_versions) != 1:
+        raise SystemExit("npm publication must select a numeric Node version")
+    node_version = tuple(int(part) for part in node_versions[0].split("."))
+    if node_version + (0,) * (3 - len(node_version)) < (22, 14, 0):
+        raise SystemExit("npm trusted publication requires Node >=22.14.0")
+    if re.search(r"(?m)^          registry-url: https://registry\.npmjs\.org$", setup) is None:
+        raise SystemExit("npm setup-node must select registry-url: https://registry.npmjs.org")
+    npm_pins = list(re.finditer(
+        r"(?m)^        run: npm install --global npm@(\d+\.\d+\.\d+)$", job,
+    ))
+    if len(npm_pins) != 1 or tuple(int(part) for part in npm_pins[0].group(1).split(".")) < (11, 5, 1):
+        raise SystemExit("npm trusted publication requires an exact npm pin >=11.5.1")
+    publish = re.search(rf"(?m)^        run: {re.escape(local_tarball_publish)}$", job)
+    if publish is None or len(re.findall(r"\bnpm\s+publish\b", job)) != 1:
+        raise SystemExit("npm publish must directly publish the local tarball with public access and provenance")
+    if setup_steps[0] not in job[:npm_pins[0].start()] or npm_pins[0].start() > publish.start():
+        raise SystemExit("setup-node and the pinned npm CLI must precede npm publish")
+
+
+validate_npm_job(npm_job)
+
+# Given: compliant OIDC settings and the exact supported minimum versions.
+minimum_job = re.sub(r"node-version: \S+", "node-version: 22.14.0", npm_job)
+minimum_job = re.sub(r"npm@\d+\.\d+\.\d+", "npm@11.5.1", minimum_job)
+validate_npm_job(minimum_job)
+# When: a job-scoped setting is weakened, even if another job still complies.
+# Then: the contract fails instead of accepting a workflow-wide substring match.
+for old, new in (
+    ("runs-on: ubuntu-latest", "runs-on: self-hosted"),
+    ("runs-on: ubuntu-latest", "runs-on: ubuntu-24.04"),
+    ("environment: npm-publish", "environment: other"),
+    ("      contents: read", "      contents: write"),
+    ("      id-token: write", "      id-token: read"),
+    ("node-version: 22.14.0", "node-version: 22.13.9"),
+    ("node-version: 22.14.0", "node-version: 22"),
+    ("npm@11.5.1", "npm@11.5.0"),
+    ("npm@11.5.1", "npm@latest"),
+    ("registry-url: https://registry.npmjs.org", "registry-url: https://example.invalid"),
+    (local_tarball_publish, local_tarball_publish.replace("./package/", "")),
+    (local_tarball_publish, local_tarball_publish.replace(" --provenance", "")),
+    (local_tarball_publish, local_tarball_publish.replace("--access public", "--access restricted")),
+    ("    steps:\n", "    env:\n      NPM_TOKEN: forbidden\n    steps:\n"),
+    ("    steps:\n", "    env:\n      NODE_AUTH_TOKEN: forbidden\n    steps:\n"),
+    ("    steps:\n", "    env:\n      OTHER: ${{ secrets.NPM }}\n    steps:\n"),
+    ("    steps:\n", "    env:\n      npm_config__authToken: forbidden\n    steps:\n"),
+    ("    steps:\n", "    steps:\n      - run: npm config set //registry.npmjs.org/:_authToken forbidden\n"),
+):
+    try:
+        validate_npm_job(minimum_job.replace(old, new))
+    except SystemExit:
+        continue
+    raise SystemExit(f"npm publication contract accepted invalid fixture: {new}")
 
 release_job = job_block("release")
 release_dependencies = release_job.partition("steps:")[0]
@@ -282,8 +378,6 @@ for fragment in ("windows-latest", "--checksum-only", "shell: bash"):
     if fragment not in ci_contract.group(0):
         raise SystemExit(f"release-contract CI job missing Windows checksum coverage: {fragment}")
 
-if npm_job.index("npm install --global npm@11.11.0") > npm_job.index("npm publish"):
-    raise SystemExit("pinned npm CLI must be installed before npm publish")
 for fragment in (".dist.integrity", ".dist.shasum", "npm-version.tgz", "openssl dgst -sha512 -binary"):
     if fragment not in npm_job:
         raise SystemExit(f"npm rerun verification must compare registry metadata to package bytes: {fragment}")
@@ -323,6 +417,10 @@ preflight_required = (
     "homebrew_url=$(awk",
     '*/archive/refs/tags/"v${version}.tar.gz")',
     'package_name=$(jq -r .name plugins/opencode/package.json)',
+    'package_repository_url=$(jq -r .repository.url plugins/opencode/package.json)',
+    'package_repository_directory=$(jq -r .repository.directory plugins/opencode/package.json)',
+    '[ "$package_repository_url" = git+https://github.com/kernalix7/rtrt.git ]',
+    '[ "$package_repository_directory" = plugins/opencode ]',
     'lock_name=$(jq -r .name plugins/opencode/package-lock.json)',
     'lock_root_name=$(jq -r \'.packages[""].name\' plugins/opencode/package-lock.json)',
 )

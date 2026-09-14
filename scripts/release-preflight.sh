@@ -122,12 +122,22 @@ bad_crates=$(cargo metadata --locked --no-deps --format-version 1 \
 
 package_version=$(jq -r .version plugins/opencode/package.json)
 package_name=$(jq -r .name plugins/opencode/package.json)
+package_repository_url=$(jq -r .repository.url plugins/opencode/package.json)
+package_repository_directory=$(jq -r .repository.directory plugins/opencode/package.json)
 lock_version=$(jq -r .version plugins/opencode/package-lock.json)
 lock_name=$(jq -r .name plugins/opencode/package-lock.json)
 lock_root_version=$(jq -r '.packages[""].version' plugins/opencode/package-lock.json)
 lock_root_name=$(jq -r '.packages[""].name' plugins/opencode/package-lock.json)
 [ "$package_name" = rtrt-agent ] || {
     echo "release-preflight: npm package name must be rtrt-agent, found $package_name" >&2
+    exit 1
+}
+[ "$package_repository_url" = git+https://github.com/kernalix7/rtrt.git ] || {
+    echo "release-preflight: npm repository.url must be git+https://github.com/kernalix7/rtrt.git, found $package_repository_url" >&2
+    exit 1
+}
+[ "$package_repository_directory" = plugins/opencode ] || {
+    echo "release-preflight: npm repository.directory must be plugins/opencode, found $package_repository_directory" >&2
     exit 1
 }
 for candidate in "$lock_name" "$lock_root_name"; do

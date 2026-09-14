@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
 
+#[path = "proxy_stats_permissions.rs"]
+mod permissions;
+
 pub const DB_FILE_NAME: &str = "proxy-stats.sqlite";
 pub const TABLE_SCHEMA: &str = "proxy_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, project TEXT NOT NULL, original_cmd TEXT NOT NULL, mode TEXT NOT NULL, input_chars INTEGER NOT NULL, output_chars INTEGER NOT NULL, saved_chars INTEGER NOT NULL, saved_pct REAL NOT NULL, exec_ms INTEGER NOT NULL)";
 
@@ -247,10 +250,12 @@ pub fn load_savings_averages() -> SavingsAverages {
 }
 
 fn open_writable(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    permissions::prepare_private_store(path)?;
+    let flags = OpenFlags::default();
+    #[cfg(unix)]
+    let flags = flags | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("open {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute(&format!("CREATE TABLE IF NOT EXISTS {TABLE_SCHEMA}"), [])?;
     Ok(conn)

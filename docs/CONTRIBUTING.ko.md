@@ -90,7 +90,33 @@ AI 도구를 밝히는 생성 크레딧 트레일러와 본문 표기도 금지�
 
 이후의 `### Added` / `### Changed` / `### Fixed`는 상세 추적용입니다.
 
-릴리스를 자르기 전에 npm trusted publishing의 OIDC subject와 GitHub `npm-publish` 환경이 저장소에 설정돼 있는지 확인하세요. 워크스페이스 크레이트는 crates.io에 게시하지 않으므로 `CARGO_REGISTRY_TOKEN`은 필요 없습니다. `rtrt-agent`는 npm trusted publishing으로만 게시됩니다.
+### npm trusted publishing
+
+`rtrt-agent`는 npm trusted publishing(OIDC)으로만 게시됩니다. 릴리스 워크플로는 장기 npm 토큰을 받지 않습니다. 워크스페이스 크레이트는 crates.io에 게시하지 않으므로 `CARGO_REGISTRY_TOKEN`도 필요 없습니다.
+
+npm 패키지의 trusted publisher는 저장소 워크플로와 정확히 일치해야 합니다. npmjs.com의 `rtrt-agent` 패키지 설정에서 다음 필드로 구성하세요.
+
+| Publisher 필드 | 값 |
+|---|---|
+| Publisher | GitHub Actions |
+| Organization or user | `kernalix7` |
+| Repository | `rtrt` |
+| Workflow filename | `release.yml` |
+| Environment name | `npm-publish` |
+| Allowed actions | 직접 `npm publish` 활성화 |
+
+저장소 쪽이 보장하는 것, 즉 테스트와 preflight 검사가 트리에서 검증할 수 있는 항목:
+
+- publish 작업은 GitHub 호스팅 `ubuntu-latest`에서 실행됩니다 (self-hosted runner는 npm OIDC 교환에서 거부됩니다).
+- 작업은 `id-token: write`와 `contents: read`를 선언하며, 워크플로 기본 권한은 `contents: read`입니다.
+- Node `>=22.14.0` (현재 24), npm `>=11.5.1` (현재 11.11.0). npm이 OIDC 게시에 요구하는 최소 버전입니다.
+- `actions/setup-node`가 `registry-url`을 설정해 npm이 `https://registry.npmjs.org`를 대상으로 합니다.
+- publish 작업은 `NPM_TOKEN`, `NODE_AUTH_TOKEN`, `CARGO_REGISTRY_TOKEN`을 참조하거나 주입하지 않습니다. 그 작업에 하나라도 나타나면 run이 잘못 구성된 것이며, 토큰 fallback을 추가하지 마세요.
+- 게시는 `npm publish ... --provenance`로 실행되므로 모든 릴리스에 워크플로 run과 연결된 SLSA provenance attestation이 붙습니다.
+
+저장소 쪽이 볼 수 없는 것: 위 검사 중 어느 것도 npm 계정 설정을 들여다볼 수 없습니다. 릴리스마다 npmjs.com에서 패키지의 trusted publisher 설정을 열어 표의 각 필드를 확인하세요. OIDC 또는 `E404`/`E403` 메시지가 있는 publish 실패는 먼저 계정 쪽 불일치로 취급하세요. npm은 기존 publisher의 allowed action 편집을 허용하지 않습니다. allowed action을 바꿔야 하면 publisher를 삭제하고 위 값으로 다시 만드세요.
+
+### 릴리스 자르기
 
 릴리스는 같은 병합 `main` 커밋에 두 태그를 사용합니다. 한 번의 atomic push로 함께 올려야 하며, 릴리스 워크플로는 본문 추출에 `REL-` 마커를 사용합니다.
 
@@ -98,12 +124,22 @@ AI 도구를 밝히는 생성 크레딧 트레일러와 본문 표기도 금지�
 - `REL-vX.Y.Z`는 빌드를 다시 돌리고 npm publish 작업(trusted publishing으로 `rtrt-agent`를 npm에 게시)을 실행한 뒤 `vX.Y.Z` 아래에 GitHub Release를 생성/갱신하고 플랫폼별 바이너리 아카이브 5개와 체크섬을 첨부합니다. source archive는 GitHub이 `vX.Y.Z` 태그에서 자동 생성합니다.
 
 ```bash
-git checkout main
-git pull --ff-only origin main
-git tag vX.Y.Z HEAD
-git tag REL-vX.Y.Z HEAD
-git push --atomic origin vX.Y.Z REL-vX.Y.Z
+GIT_MASTER=1 git checkout main
+GIT_MASTER=1 git pull --ff-only origin main
+GIT_MASTER=1 git tag vX.Y.Z HEAD
+GIT_MASTER=1 git tag REL-vX.Y.Z HEAD
+GIT_MASTER=1 git push --atomic origin vX.Y.Z REL-vX.Y.Z
 ```
+
+### 실패한 릴리스 run 복구
+
+태그를 이미 push한 뒤 run이 실패하면 (예: trusted publisher 설정 오류), 태그를 옮기거나 다시 push하지 말고 토큰 fallback도 추가하지 마세요. 계정 쪽 설정을 고친 뒤 워크플로를 수동으로 다시 실행합니다.
+
+1. `main` 브랜치에서 **Actions → Release → Run workflow**를 엽니다.
+2. `release_tag`에 기존 쌍 태그를 입력합니다. `REL-vX.Y.Z`는 다시 빌드하고 npm에 게시한 뒤 GitHub Release를 생성/갱신합니다. `vX.Y.Z`는 다시 빌드해 Actions artifact만 올립니다.
+3. dispatch된 run은 해당 태그의 커밋을 checkout하므로, 태그가 이미 `origin`에 있어야 하고 두 태그가 여전히 같은 커밋을 가리켜야 합니다.
+
+수동 run도 태그 push와 같은 `npm-publish` 환경과 OIDC 교환을 사용하므로 위 publisher 표가 그대로 적용됩니다.
 
 ### 외부 기여자 크레딧
 

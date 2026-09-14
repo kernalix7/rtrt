@@ -113,7 +113,33 @@ Skeleton:
 - (detailed bullets)
 ```
 
-Before cutting a release, ensure the npm trusted-publishing OIDC subject and GitHub `npm-publish` environment are configured for the repo. Workspace crates are not published to crates.io, so no `CARGO_REGISTRY_TOKEN` is required. `rtrt-agent` ships to npm exclusively through npm trusted publishing.
+### npm trusted publishing
+
+`rtrt-agent` ships to npm exclusively through npm trusted publishing (OIDC). The release workflow accepts no long-lived npm token. Workspace crates are not published to crates.io, so no `CARGO_REGISTRY_TOKEN` is required either.
+
+The npm package's trusted publisher must match the repository workflow exactly. Configure it on npmjs.com under the `rtrt-agent` package settings with these fields:
+
+| Publisher field | Value |
+|---|---|
+| Publisher | GitHub Actions |
+| Organization or user | `kernalix7` |
+| Repository | `rtrt` |
+| Workflow filename | `release.yml` |
+| Environment name | `npm-publish` |
+| Allowed actions | Enable direct `npm publish` |
+
+What the repository side guarantees, and what tests and preflight checks can verify from the tree:
+
+- The publish job runs on GitHub-hosted `ubuntu-latest` (self-hosted runners aren't accepted by npm's OIDC exchange).
+- The job declares `id-token: write` plus `contents: read`, and the workflow-level default is `contents: read`.
+- Node `>=22.14.0` (currently 24) and npm `>=11.5.1` (currently 11.11.0), the minimums npm requires for OIDC publishing.
+- `actions/setup-node` sets `registry-url` so npm targets `https://registry.npmjs.org`.
+- The publish job references or injects no `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or `CARGO_REGISTRY_TOKEN`. If one appears there, the run is misconfigured; don't add a token fallback.
+- Publication runs `npm publish ... --provenance`, so every release carries a SLSA provenance attestation linked to the workflow run.
+
+What the repository side can't see: none of the checks above can inspect npm account settings. Before every release, open the package's trusted publisher configuration on npmjs.com and confirm each field in the table. Treat a publish failure with an OIDC or `E404`/`E403` message as an account-side mismatch first. npm doesn't let you edit the allowed action on an existing publisher; if the allowed action needs to change, delete the publisher and recreate it with the values above.
+
+### Cutting a release
 
 The release uses two tags on the same merged `main` commit. Push them together in one atomic push; the release workflow extracts the version body using the `REL-` marker.
 
@@ -121,12 +147,22 @@ The release uses two tags on the same merged `main` commit. Push them together i
 - `REL-vX.Y.Z` re-runs the build, then runs the npm publish job (trusted publishing pushes `rtrt-agent` to npm), then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag.
 
 ```bash
-git checkout main
-git pull --ff-only origin main
-git tag vX.Y.Z HEAD
-git tag REL-vX.Y.Z HEAD
-git push --atomic origin vX.Y.Z REL-vX.Y.Z
+GIT_MASTER=1 git checkout main
+GIT_MASTER=1 git pull --ff-only origin main
+GIT_MASTER=1 git tag vX.Y.Z HEAD
+GIT_MASTER=1 git tag REL-vX.Y.Z HEAD
+GIT_MASTER=1 git push --atomic origin vX.Y.Z REL-vX.Y.Z
 ```
+
+### Recovering a failed release run
+
+If a tag run fails after the tags are already pushed (for example, the trusted publisher was misconfigured), don't move or re-push the tags and don't add a token fallback. Fix the account-side setting, then re-run the workflow by hand:
+
+1. Open **Actions → Release → Run workflow** on the `main` branch.
+2. Set `release_tag` to the existing paired tag. `REL-vX.Y.Z` rebuilds, publishes to npm, and creates/updates the GitHub Release; `vX.Y.Z` only rebuilds and uploads Actions artifacts.
+3. The dispatched run checks out that tag's commit, so the tag must already exist on `origin` and both tags must still point at the same commit.
+
+The manual run uses the same `npm-publish` environment and OIDC exchange as a tag push, so the publisher table above applies unchanged.
 
 ### Crediting contributors in Highlights
 

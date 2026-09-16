@@ -115,9 +115,17 @@ Skeleton:
 
 ### npm trusted publishing
 
-`rtrt-agent` ships to npm exclusively through npm trusted publishing (OIDC). The release workflow accepts no long-lived npm token. Workspace crates are not published to crates.io, so no `CARGO_REGISTRY_TOKEN` is required either.
+Six npm packages ship exclusively through npm trusted publishing (OIDC): `rtrt-agent` plus the five exact-version dashboard platform packages. The release workflow accepts no long-lived npm token. Workspace crates are not published to crates.io, so no `CARGO_REGISTRY_TOKEN` is required either.
 
-The npm package's trusted publisher must match the repository workflow exactly. Configure it on npmjs.com under the `rtrt-agent` package settings with these fields:
+The five platform packages carry the native `rtrt-dashboard` executable, one per build target, as optional dependencies of `rtrt-agent`:
+
+- `rtrt-dashboard-linux-x64`
+- `rtrt-dashboard-linux-arm64`
+- `rtrt-dashboard-darwin-x64`
+- `rtrt-dashboard-darwin-arm64`
+- `rtrt-dashboard-win32-x64`
+
+Each package's trusted publisher must match the repository workflow exactly. Configure it on npmjs.com under the `rtrt-agent` package settings, and repeat the identical configuration for each of the five platform packages, with these fields:
 
 | Publisher field | Value |
 |---|---|
@@ -130,21 +138,21 @@ The npm package's trusted publisher must match the repository workflow exactly. 
 
 What the repository side guarantees, and what tests and preflight checks can verify from the tree:
 
-- The publish job runs on GitHub-hosted `ubuntu-latest` (self-hosted runners aren't accepted by npm's OIDC exchange).
-- The job declares `id-token: write` plus `contents: read`, and the workflow-level default is `contents: read`.
+- The publish jobs run on GitHub-hosted `ubuntu-latest` (self-hosted runners aren't accepted by npm's OIDC exchange).
+- Each job declares `id-token: write` plus `contents: read`, and the workflow-level default is `contents: read`.
 - Node `>=22.14.0` (currently 24) and npm `>=11.5.1` (currently 11.11.0), the minimums npm requires for OIDC publishing.
 - `actions/setup-node` sets `registry-url` so npm targets `https://registry.npmjs.org`.
-- The publish job references or injects no `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or `CARGO_REGISTRY_TOKEN`. If one appears there, the run is misconfigured; don't add a token fallback.
+- The publish jobs reference or inject no `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or `CARGO_REGISTRY_TOKEN`. If one appears there, the run is misconfigured; don't add a token fallback.
 - Publication runs `npm publish ... --provenance`, so every release carries a SLSA provenance attestation linked to the workflow run.
 
-What the repository side can't see: none of the checks above can inspect npm account settings. Before every release, open the package's trusted publisher configuration on npmjs.com and confirm each field in the table. Treat a publish failure with an OIDC or `E404`/`E403` message as an account-side mismatch first. npm doesn't let you edit the allowed action on an existing publisher; if the allowed action needs to change, delete the publisher and recreate it with the values above.
+What the repository side can't see: none of the checks above can inspect npm account settings. Before every release, open the trusted publisher configuration for `rtrt-agent` and each of the five platform packages on npmjs.com and confirm each field in the table. Treat a publish failure with an OIDC or `E404`/`E403` message as an account-side mismatch first. npm doesn't let you edit the allowed action on an existing publisher; if the allowed action needs to change, delete the publisher and recreate it with the values above.
 
 ### Cutting a release
 
 The release uses two tags on the same merged `main` commit. Push them together in one atomic push; the release workflow extracts the version body using the `REL-` marker.
 
 - `vX.Y.Z` triggers the `release.yml` validate-and-build job. It produces the per-platform Rust binaries and publishes them only as Actions artifacts; no GitHub Release is created on this run.
-- `REL-vX.Y.Z` re-runs the build, then runs the npm publish job (trusted publishing pushes `rtrt-agent` to npm), then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag.
+- `REL-vX.Y.Z` re-runs the build, then runs the npm publish jobs (trusted publishing publishes the five dashboard platform packages first, then `rtrt-agent`), then creates/updates the GitHub Release under `vX.Y.Z` and attaches the five per-platform binary archives plus their checksums. GitHub auto-generates the source archive from the `vX.Y.Z` tag.
 
 ```bash
 GIT_MASTER=1 git checkout main

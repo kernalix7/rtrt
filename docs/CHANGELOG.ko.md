@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-16
+
+### Highlights
+
+**RTRT 0.1.3은 `rtrt-agent`에서 native dashboard를 자동으로 사용할 수 있게 하면서 브라우저 실행은 명시적이고 로컬이며 credential-safe하게 유지합니다.**
+
+- OpenCode 플러그인을 로드하면 `PATH`, 미리 설치된 RTRT binary 또는 install script 없이 버전이 일치하는 loopback-only dashboard backend 하나를 시작합니다.
+- Native dashboard 실행 파일은 정확한 버전의 npm 플랫폼 패키지 5개로 제공하며 릴리스 워크플로가 `rtrt-agent`보다 먼저 게시하고 검증합니다.
+- 기존 `~/.rtrt` 데이터와 유효한 private credential은 보존하며 안전하지 않은 소유권, mode, symlink, 외부 listener는 거부합니다.
+
+### 추가
+
+- OpenCode가 플러그인을 로드하면 `rtrt-agent`가 버전이 일치하는 `rtrt-dashboard` backend를 loopback-only 사용자별 detached process로 예약합니다. install script, `PATH` 또는 미리 설치된 RTRT binary 없이 정확한 버전의 optional npm 플랫폼 패키지 5개가 native 실행 파일을 제공합니다.
+- 브라우저는 `rtrt-dashboard-open` 또는 인자가 없는 `rtrt_dashboard_open` 도구로 명시적으로만 엽니다. 두 경로 모두 기존 60초 HMAC bootstrap fragment를 사용하며 credential을 prompt나 command template에 넣지 않습니다.
+
+### 변경
+
+- 대시보드 시작은 fail-soft이며 정상 singleton을 재사용하고 유효한 private credential과 기존 `~/.rtrt` 데이터를 모두 보존합니다. 안전하지 않은 소유권, mode, symlink 또는 외부 listener는 거부합니다.
+- 쌍 태그 릴리스 워크플로는 대시보드 플랫폼 패키지 5개를 모두 게시·검증한 뒤 `rtrt-agent`를 게시하며 GitHub Release는 마지막 단계로 유지합니다.
+
 ## [0.1.2] - 2026-09-14
 
 ### Highlights

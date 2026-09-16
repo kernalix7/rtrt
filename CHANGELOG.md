@@ -9,6 +9,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-16
+
+### Highlights
+
+**RTRT 0.1.3 makes the native dashboard available automatically from `rtrt-agent` while keeping browser launch explicit, local, and credential-safe.**
+
+- OpenCode plugin load now starts one version-matched, loopback-only dashboard backend without requiring `PATH`, a preinstalled RTRT binary, or install scripts.
+- Native dashboard executables ship through five exact-version npm platform packages, with the release workflow publishing and verifying them before `rtrt-agent`.
+- Existing `~/.rtrt` data and valid private credentials are preserved; unsafe ownership, modes, symlinks, and foreign listeners are refused.
+
+### Added
+
+- `rtrt-agent` now schedules the version-matched `rtrt-dashboard` backend as a detached, loopback-only per-user process when OpenCode loads the plugin. Five exact-version optional npm packages provide the native executables without install scripts, `PATH`, or a preinstalled RTRT binary.
+- Browser launch is explicit through `rtrt-dashboard-open` or the argument-free `rtrt_dashboard_open` tool. Both use the existing 60-second HMAC bootstrap fragment and never place credentials in prompts or command templates.
+
+### Changed
+
+- Dashboard startup is fail-soft, reuses a healthy singleton, preserves valid private credentials and all existing `~/.rtrt` data, and refuses unsafe ownership, modes, symlinks, or foreign listeners.
+- The paired-tag release workflow publishes and verifies all five dashboard platform packages before publishing `rtrt-agent`; the GitHub Release remains last.
+
 ## [0.1.2] - 2026-09-14
 
 ### Highlights

@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.2.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.3.
 
 ## CLI
 
@@ -105,13 +105,13 @@ RTRT does not provide a team command, scheduler, roster, worker protocol, or `te
 
 ### OpenCode npm plugin and setup migration
 
-Install `rtrt-agent@0.1.2` with `npm install rtrt-agent@0.1.2` and register it directly with OpenCode's singular root `plugin` key:
+Install `rtrt-agent@0.1.3` with `npm install rtrt-agent@0.1.3` and register it directly with OpenCode's singular root `plugin` key:
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.2"] }
+{ "plugin": ["rtrt-agent@0.1.3"] }
 ```
 
-The npm package exports RTRT's provenance and permission hooks only; the TUI statusline is not shipped in npm and remains setup-managed.
+The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. The TUI statusline is not shipped in npm and remains setup-managed.
 
 For a complete installation, prefer:
 
@@ -119,7 +119,7 @@ For a complete installation, prefer:
 rtrt setup --agent opencode --apply
 ```
 
-Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.2` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package when it starts. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow is responsible for publishing the version-matched Rust artifacts and npm package; this documentation does not assert that publication has already completed.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.3` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow is responsible for publishing the version-matched Rust artifacts and npm packages; this documentation does not assert that publication has already completed.
 
 ### OpenCode persistent statusline
 

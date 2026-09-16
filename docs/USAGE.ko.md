@@ -2,7 +2,7 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 v0.1.2 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
+이 문서는 v0.1.3 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
 
 ## 빠른 차림표
 
@@ -113,13 +113,13 @@ RTRT는 team 명령, scheduler, roster, worker protocol 또는 `team_dispatch` M
 
 ### OpenCode npm 플러그인과 setup 마이그레이션
 
-`rtrt-agent@0.1.2`를 `npm install rtrt-agent@0.1.2`로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
+`rtrt-agent@0.1.3`을 `npm install rtrt-agent@0.1.3`으로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.2"] }
+{ "plugin": ["rtrt-agent@0.1.3"] }
 ```
 
-npm 패키지는 RTRT provenance 및 permission hook만 내보냅니다. TUI 스테이터스라인은 npm에 포함되지 않으며 계속 setup이 관리합니다.
+npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 일치하는 대시보드 backend를 loopback-only detached process로 시작합니다. 플러그인 초기화는 대시보드 준비를 기다리지 않으며 브라우저를 자동으로 열지 않습니다. 필요할 때 `rtrt-dashboard-open`을 실행하거나 에이전트에게 `rtrt_dashboard_open` 도구 사용을 명시적으로 요청합니다. TUI 스테이터스라인은 npm에 포함되지 않으며 계속 setup이 관리합니다.
 
 전체 설치에는 다음을 권장합니다.
 
@@ -127,7 +127,7 @@ npm 패키지는 RTRT provenance 및 permission hook만 내보냅니다. TUI 스
 rtrt setup --agent opencode --apply
 ```
 
-Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.2` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지는 OpenCode가 시작할 때 설치합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지 게시를 담당하며, 이 문서는 게시가 이미 완료되었다고 주장하지 않습니다.
+Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.3` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지 게시를 담당하며, 이 문서는 게시가 이미 완료되었다고 주장하지 않습니다.
 
 ### OpenCode 영구 스테이터스라인
 

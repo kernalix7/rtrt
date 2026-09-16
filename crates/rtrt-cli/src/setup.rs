@@ -5980,7 +5980,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             opencode_provenance_dry_run_status(&url),
-            "[dry-run] would register rtrt-agent@0.1.2 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
+            "[dry-run] would register rtrt-agent@0.1.3 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
         );
     }
 
@@ -5990,7 +5990,7 @@ mod tests {
             OPENCODE_NPM_PLUGIN_ID,
             concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.1.2");
+        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.1.3");
     }
 
     /// Writes an opencode config with a pre-existing `mcp.other` server to a

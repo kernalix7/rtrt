@@ -1,21 +1,31 @@
 {
   "name": "rtrt-agent",
-  "version": "0.1.2",
-  "description": "RTRT provenance and permission-broker plugin for OpenCode",
+  "version": "0.1.3",
+  "description": "RTRT provenance, permission-broker, and local dashboard plugin for OpenCode",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js"
   },
+  "bin": {
+    "rtrt-dashboard-open": "./bin/rtrt-dashboard-open.js"
+  },
   "files": [
     "index.js",
     "rtrt-provenance.js",
+    "bin/rtrt-dashboard-open.js",
+    "runtime/dashboard-binary.js",
+    "runtime/dashboard-files.js",
+    "runtime/dashboard-plugin.js",
+    "runtime/dashboard-process.js",
+    "runtime/dashboard-supervisor.js",
     "README.md",
     "README.ko.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test rtrt-provenance.test.mjs package.test.mjs tui/rtrt-statusline.test.mjs"
+    "test": "node --test rtrt-provenance.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs dashboard-supervisor.test.mjs package.test.mjs platform-package.test.mjs platform-publish.test.mjs tui/rtrt-statusline.test.mjs",
+    "sync:platforms": "node ../../packaging/npm/agent-contract.mjs --sync"
   },
   "engines": {
     "node": ">=20"
@@ -39,5 +49,12 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "1.15.13"
+  },
+  "optionalDependencies": {
+    "rtrt-dashboard-linux-x64": "0.1.3",
+    "rtrt-dashboard-linux-arm64": "0.1.3",
+    "rtrt-dashboard-darwin-x64": "0.1.3",
+    "rtrt-dashboard-darwin-arm64": "0.1.3",
+    "rtrt-dashboard-win32-x64": "0.1.3"
   }
 }

@@ -28,13 +28,18 @@ test("package publishes only the root provenance plugin surface", async () => {
 
   // Then: npm and OpenCode see the intended package and named plugin only.
   assert.equal(manifest.name, "rtrt-agent")
-  assert.equal(manifest.version, "0.1.2")
+  assert.equal(manifest.version, "0.1.3")
   assert.equal(manifest.type, "module")
   assert.equal(manifest.main, "./index.js")
   assert.deepEqual(manifest.exports, { ".": "./index.js" })
   assert.deepEqual(
     ["package.json", ...manifest.files].toSorted(),
-    ["LICENSE", "README.ko.md", "README.md", "index.js", "package.json", "rtrt-provenance.js"],
+    [
+      "LICENSE", "README.ko.md", "README.md", "bin/rtrt-dashboard-open.js", "index.js",
+      "package.json", "rtrt-provenance.js", "runtime/dashboard-binary.js",
+      "runtime/dashboard-files.js", "runtime/dashboard-plugin.js", "runtime/dashboard-process.js",
+      "runtime/dashboard-supervisor.js",
+    ],
   )
   assert.deepEqual(manifest.dependencies, { "@opencode-ai/sdk": "1.15.13" })
   assert.deepEqual(Object.keys(pluginModule), ["RtrtProvenance"])

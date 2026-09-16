@@ -197,6 +197,7 @@ for match in re.finditer(
 required = (
     "permissions:\n  contents: read",
     "workflow_dispatch:\n    inputs:\n      release_tag:",
+    "publish-platform-npm:\n",
     "publish-npm:\n",
     "release:\n",
     "contents: write",
@@ -236,8 +237,12 @@ for forbidden in (
 if re.search(r"\bcargo\s+publish\b", workflow):
     raise SystemExit("release workflow must not publish workspace crates")
 
-if workflow.index("publish-npm:\n") > workflow.index("release:\n"):
-    raise SystemExit("npm publication must precede the GitHub Release job")
+if not (
+    workflow.index("publish-platform-npm:\n")
+    < workflow.index("publish-npm:\n")
+    < workflow.index("release:\n")
+):
+    raise SystemExit("platform npm packages, rtrt-agent, and GitHub Release must run in order")
 
 def job_block(name: str) -> str:
     match = re.search(
@@ -255,10 +260,51 @@ if re.search(r"\bcargo\s+(?:package|publish)\b", preflight_job):
 if preflight_job.index("dtolnay/rust-toolchain@") > preflight_job.index("scripts/release-preflight.sh"):
     raise SystemExit("release preflight must select the pinned Rust toolchain before cargo metadata")
 
+platform_npm_job = job_block("publish-platform-npm")
 npm_job = job_block("publish-npm")
 npm_dependencies = npm_job.partition("steps:")[0]
-if re.search(r"(?m)^\s+needs:\s*(?:preflight|\[[^\]]*\bpreflight\b[^\]]*\])\s*$", npm_dependencies) is None:
-    raise SystemExit("npm publication must need release preflight")
+for dependency in ("preflight", "publish-platform-npm"):
+    if re.search(
+        rf"(?m)^\s+needs:\s*(?:{re.escape(dependency)}|\[[^\]]*\b{re.escape(dependency)}\b[^\]]*\])\s*$",
+        npm_dependencies,
+    ) is None:
+        raise SystemExit(f"npm publication must need {dependency}")
+
+platform_dependencies = platform_npm_job.partition("steps:")[0]
+for dependency in ("preflight", "build", "package-npm"):
+    if re.search(
+        rf"(?m)^\s+needs:\s*\[[^\]]*\b{re.escape(dependency)}\b[^\]]*\]\s*$",
+        platform_dependencies,
+    ) is None:
+        raise SystemExit(f"platform npm publication must need {dependency}")
+
+platform_header = platform_npm_job.partition("    steps:\n")[0]
+for setting in (
+    "if: needs.preflight.outputs.publish == 'true'",
+    "runs-on: ubuntu-latest",
+    "environment: npm-publish",
+):
+    if re.search(rf"(?m)^    {re.escape(setting)}$", platform_header) is None:
+        raise SystemExit(f"platform npm OIDC setting missing: {setting}")
+platform_permissions = re.findall(
+    r"(?m)^    permissions:\n((?:      [^\n]+\n)+)", platform_header
+)
+if len(platform_permissions) != 1 or sorted(platform_permissions[0].splitlines()) != [
+    "      contents: read", "      id-token: write",
+]:
+    raise SystemExit("platform npm permissions must be contents: read and id-token: write")
+for forbidden in ("self-hosted", "NPM_TOKEN", "NODE_AUTH_TOKEN", "secrets."):
+    if forbidden.lower() in platform_npm_job.lower():
+        raise SystemExit(f"platform npm trusted publication forbids: {forbidden}")
+for fragment in (
+    "platform: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64]",
+    "registry-url: https://registry.npmjs.org",
+    "npm install --global npm@11.11.0",
+    "bash packaging/npm/publish-package.sh",
+    '"./package/rtrt-dashboard-${NPM_PLATFORM}-${RELEASE_VERSION}.tgz"',
+):
+    if fragment not in platform_npm_job:
+        raise SystemExit(f"platform npm publication contract missing: {fragment}")
 local_tarball_publish = (
     'npm publish "./package/rtrt-agent-${RELEASE_VERSION}.tgz" --access public --provenance'
 )

@@ -73,18 +73,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             ext: tar.gz
+            npm_platform: linux-x64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             ext: tar.gz
+            npm_platform: linux-arm64
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             ext: tar.gz
+            npm_platform: darwin-x64
           - target: aarch64-apple-darwin
             runner: macos-latest
             ext: tar.gz
+            npm_platform: darwin-arm64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             ext: zip
+            npm_platform: win32-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -139,6 +144,33 @@ jobs:
             dist/${{ steps.package.outputs.asset }}.sha256
           if-no-files-found: error
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Pack exact dashboard platform artifact
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          NPM_PLATFORM: ${{ matrix.npm_platform }}
+        run: |
+          set -euo pipefail
+          source="target/${RELEASE_TARGET}/release/rtrt-dashboard"
+          if [ "$NPM_PLATFORM" = win32-x64 ]; then source="$source.exe"; fi
+          node packaging/npm/stage-dashboard.mjs "$RELEASE_TARGET" "$source" dist/npm
+          npm pack "./dist/npm/rtrt-dashboard-${NPM_PLATFORM}" --ignore-scripts --json --pack-destination dist
+          archive="dist/rtrt-dashboard-${NPM_PLATFORM}-${RELEASE_VERSION}.tgz"
+          test -s "$archive"
+          if [ "$NPM_PLATFORM" != win32-x64 ]; then
+            tar -tvf "$archive" package/bin/rtrt-dashboard | grep -q '^-rwxr-xr-x '
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-dashboard-${{ needs.preflight.outputs.version }}-${{ matrix.npm_platform }}
+          path: dist/rtrt-dashboard-${{ matrix.npm_platform }}-${{ needs.preflight.outputs.version }}.tgz
+          if-no-files-found: error
+
   package-npm:
     name: Test and package npm artifact
     needs: preflight
@@ -155,24 +187,73 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
-      - run: npm ci --ignore-scripts
+      - name: Install locked test dependencies without unpublished optional packages
+        run: |
+          set -euo pipefail
+          node ../../packaging/npm/stage-test-dependencies.mjs ../../.rtrt/tmp/npm-test-dependencies
+          npm ci --ignore-scripts --prefix ../../.rtrt/tmp/npm-test-dependencies
+          mv ../../.rtrt/tmp/npm-test-dependencies/node_modules ./node_modules
       - run: npm test
       - name: Pack exact npm artifact
         env:
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          archive=$(npm pack --ignore-scripts --json | jq -r '.[0].filename')
+          node ../../packaging/npm/agent-contract.mjs
+          node ../../packaging/npm/stage-agent.mjs ../../.rtrt/tmp/npm-agent
+          archive=$(npm pack --ignore-scripts --json ../../.rtrt/tmp/npm-agent --pack-destination . | jq -r '.[0].filename')
           test "$archive" = "rtrt-agent-${RELEASE_VERSION}.tgz"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package-${{ needs.preflight.outputs.version }}
           path: plugins/opencode/rtrt-agent-${{ needs.preflight.outputs.version }}.tgz
           if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-publish-tools-${{ needs.preflight.outputs.version }}
+          path: packaging/npm/publish-package.sh
+          if-no-files-found: error
+
+  publish-platform-npm:
+    name: Publish dashboard ${{ matrix.platform }}
+    needs: [preflight, build, package-npm]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-dashboard-${{ needs.preflight.outputs.version }}-${{ matrix.platform }}
+          path: package
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-publish-tools-${{ needs.preflight.outputs.version }}
+          path: packaging/npm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Pin npm CLI for trusted publication
+        run: npm install --global npm@11.11.0
+      - name: Publish and verify exact platform artifact with provenance
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          NPM_PLATFORM: ${{ matrix.platform }}
+        run: |
+          bash packaging/npm/publish-package.sh "rtrt-dashboard-${NPM_PLATFORM}" "$RELEASE_VERSION" \
+            "./package/rtrt-dashboard-${NPM_PLATFORM}-${RELEASE_VERSION}.tgz"
 
   publish-npm:
     name: Publish and verify npm
-    needs: [preflight, build, package-npm]
+    needs: [preflight, build, package-npm, publish-platform-npm]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: npm-publish

@@ -53,7 +53,7 @@ Examples:
 
 ```bash
 # Pin a release
-curl -fsSL .../install.sh | sh -s -- --version v0.1.2
+curl -fsSL .../install.sh | sh -s -- --version v0.1.3
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -115,7 +115,7 @@ Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP ser
 
 ## Pre-built binaries
 
-The v0.1.2 GitHub Release channel publishes:
+The v0.1.3 GitHub Release channel publishes:
 
 - `rtrt-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `rtrt-<version>-aarch64-unknown-linux-gnu.tar.gz`

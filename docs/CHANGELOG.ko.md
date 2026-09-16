@@ -28,6 +28,10 @@
 - 대시보드 시작은 fail-soft이며 정상 singleton을 재사용하고 유효한 private credential과 기존 `~/.rtrt` 데이터를 모두 보존합니다. 안전하지 않은 소유권, mode, symlink 또는 외부 listener는 거부합니다.
 - 쌍 태그 릴리스 워크플로는 대시보드 플랫폼 패키지 5개를 모두 게시·검증한 뒤 `rtrt-agent`를 게시하며 GitHub Release는 마지막 단계로 유지합니다.
 
+### 수정
+
+- `rustls`를 `0.23.45`로 갱신해 `RUSTSEC-2026-0285`를 해결하고 yanked `chacha20 0.10.0` lock entry를 `0.10.2`로 교체했습니다.
+
 ## [0.1.2] - 2026-09-14
 
 ### Highlights

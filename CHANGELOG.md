@@ -29,6 +29,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Dashboard startup is fail-soft, reuses a healthy singleton, preserves valid private credentials and all existing `~/.rtrt` data, and refuses unsafe ownership, modes, symlinks, or foreign listeners.
 - The paired-tag release workflow publishes and verifies all five dashboard platform packages before publishing `rtrt-agent`; the GitHub Release remains last.
 
+### Fixed
+
+- Updated `rustls` to `0.23.45` to address `RUSTSEC-2026-0285` and replaced the yanked `chacha20 0.10.0` lock entry with `0.10.2`.
+
 ## [0.1.2] - 2026-09-14
 
 ### Highlights

@@ -284,7 +284,24 @@ rtrt opencode sessions dry-run  # exact plan, no writes
 rtrt opencode sessions apply    # locked, atomic, idempotent migration
 ```
 
-Migration opens the original global database read-only with WAL visibility; it creates no full database/WAL snapshot and retains the source as backup. `session.directory` takes priority, then safe project metadata; canonical RTRT identity keeps linked worktrees together and same-basename repositories separate. Session IDs, parent/child graphs, messages, parts, todos, workspace/share/projection/event rows, explicit indexes, and other supported resume data are copied opaquely without inspecting prompt content. Duplicate rows in primary-key-less tables retain their exact multiplicity. Account, credential, control-account, and persistent permission/approval rows are excluded. Deleted or unattributable sessions are retained in private `legacy-global`; prompt-history JSONL remains separately preserved and is not claimed as project-attributable. Explicit `apply` is strict: conflicts roll back, and unsupported triggers/views fail closed rather than being omitted. Pre-launch incremental catch-up preserves conflicting private rows and copies safe missing rows, but every catch-up error or held lock produces only a content-free warning and never blocks an otherwise valid private launch. A content-free DB/WAL generation stamp skips unchanged source generations without missing later WAL growth.
+Migration opens the original global database read-only with WAL visibility; it creates no full database/WAL snapshot and never modifies the source. `session.directory` takes priority, then safe project metadata; canonical RTRT identity keeps linked worktrees together and same-basename repositories separate. Session IDs, parent/child graphs, messages, parts, todos, workspace/share/projection/event rows, explicit indexes, and other supported resume data are copied opaquely without inspecting prompt content. Duplicate rows in primary-key-less tables retain their exact multiplicity. Account, credential, control-account, and persistent permission/approval rows are excluded. Deleted or unattributable sessions are retained in private `legacy-global`; prompt-history JSONL remains separately preserved and is not claimed as project-attributable. Explicit `apply` is strict: conflicts roll back, and unsupported triggers/views fail closed rather than being omitted. Pre-launch incremental catch-up preserves conflicting private rows and copies safe missing rows, but every catch-up error or held lock produces only a content-free warning and never blocks an otherwise valid private launch. A content-free DB/WAL generation stamp skips unchanged source generations without missing later WAL growth.
+
+#### Session backup and restore
+
+Snapshot every session store this user owns, then restore any snapshot through `--source`:
+
+```bash
+rtrt opencode sessions backup                                      # ~/.rtrt/backups/opencode-sessions-<epoch>
+rtrt opencode sessions backup --out ./opencode-snapshot
+rtrt opencode sessions dry-run --source ./opencode-snapshot/global.sqlite
+rtrt opencode sessions apply   --source ./opencode-snapshot/global.sqlite
+```
+
+`backup` covers the global store and every RTRT-private project store, writing `global.sqlite`, `projects/<slug>.sqlite`, and a `manifest.json` that carries labels, paths, and row counts only — never session content. Discovery reads only the direct children of `~/.rtrt/projects` and rejects any name that could escape the backup root once used as a file name.
+
+Each snapshot is taken with SQLite's online backup API from a read-only handle, so in-flight WAL content is captured as one committed snapshot and the live store is never modified. Each source passes a structural `quick_check` first; full index verification is deliberately skipped because real stores reach tens of gigabytes, where it would cost more than the page copy itself. Sensitive tables — account, account state, credential, control account, permission, approval, and auth — keep their schema and lose every row, matching exactly what migration refuses to copy, so a restore reproduces the graph without carrying secrets. Each snapshot is then detached from WAL and vacuumed, leaving one self-contained file with no freed credential pages in its freelist.
+
+The backup root is created at mode `0700` and every file at `0600`. Only the root itself is created and hardened; a caller-supplied parent directory is never modified. `backup` refuses to write into an existing path rather than merging or overwriting, and the manifest is written last — a root without `manifest.json` is an incomplete backup. `status`, `dry-run`, and `apply` accept the same `--source` flag, so backup and restore form a closed loop around the otherwise one-way migration.
 
 Direct `opencode` remains globally stateful. Setup's `history_previous=none` and `history_next=none` disable TUI history navigation only; they do not stop global history writes. Inspect or explicitly quarantine only known prompt-history files:
 

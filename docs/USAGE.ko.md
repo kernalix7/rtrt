@@ -292,7 +292,24 @@ rtrt opencode sessions dry-run  # 정확한 계획, write 없음
 rtrt opencode sessions apply    # lock·atomic·idempotent migration
 ```
 
-Migration은 원본 global DB를 WAL visibility가 있는 read-only mode로 직접 열며 DB/WAL 전체 snapshot을 만들지 않고 원본을 backup으로 유지합니다. `session.directory`를 우선하고 안전한 project metadata를 fallback으로 사용합니다. Canonical RTRT identity로 linked worktree는 합치고 basename이 같은 독립 repository는 분리합니다. Session ID, parent/child graph, message, part, todo, workspace/share/projection/event row, explicit index와 지원되는 resume data를 prompt content 검사 없이 opaque copy합니다. Primary key가 없는 table의 duplicate row multiplicity도 정확히 유지합니다. Account, credential, control-account, persistent permission/approval row는 제외합니다. 삭제됐거나 귀속할 수 없는 session은 private `legacy-global`에 보존합니다. Prompt-history JSONL은 별도 보존 대상이며 project 귀속 data라고 주장하지 않습니다. 명시적 `apply`는 strict conflict 시 rollback하며 지원하지 않는 trigger/view를 누락하지 않고 fail closed합니다. Launch 전 incremental catch-up은 충돌한 private row를 유지하면서 안전한 missing row를 복사하지만, 모든 catch-up error와 lock contention은 content-free warning만 내고 유효한 private launch를 막지 않습니다. Content-free DB/WAL generation stamp로 변경 없는 source read를 생략하며 이후 WAL 증가는 놓치지 않습니다.
+Migration은 원본 global DB를 WAL visibility가 있는 read-only mode로 직접 열며 DB/WAL 전체 snapshot을 만들지 않고 원본을 수정하지 않습니다. `session.directory`를 우선하고 안전한 project metadata를 fallback으로 사용합니다. Canonical RTRT identity로 linked worktree는 합치고 basename이 같은 독립 repository는 분리합니다. Session ID, parent/child graph, message, part, todo, workspace/share/projection/event row, explicit index와 지원되는 resume data를 prompt content 검사 없이 opaque copy합니다. Primary key가 없는 table의 duplicate row multiplicity도 정확히 유지합니다. Account, credential, control-account, persistent permission/approval row는 제외합니다. 삭제됐거나 귀속할 수 없는 session은 private `legacy-global`에 보존합니다. Prompt-history JSONL은 별도 보존 대상이며 project 귀속 data라고 주장하지 않습니다. 명시적 `apply`는 strict conflict 시 rollback하며 지원하지 않는 trigger/view를 누락하지 않고 fail closed합니다. Launch 전 incremental catch-up은 충돌한 private row를 유지하면서 안전한 missing row를 복사하지만, 모든 catch-up error와 lock contention은 content-free warning만 내고 유효한 private launch를 막지 않습니다. Content-free DB/WAL generation stamp로 변경 없는 source read를 생략하며 이후 WAL 증가는 놓치지 않습니다.
+
+#### Session backup과 복원
+
+이 사용자가 소유한 session store를 모두 snapshot으로 뜨고, `--source`로 어느 snapshot이든 복원합니다.
+
+```bash
+rtrt opencode sessions backup                                      # ~/.rtrt/backups/opencode-sessions-<epoch>
+rtrt opencode sessions backup --out ./opencode-snapshot
+rtrt opencode sessions dry-run --source ./opencode-snapshot/global.sqlite
+rtrt opencode sessions apply   --source ./opencode-snapshot/global.sqlite
+```
+
+`backup`은 global store와 RTRT-private project store를 모두 포함하며 `global.sqlite`, `projects/<slug>.sqlite`, 그리고 label·경로·row count만 담고 session content는 담지 않는 `manifest.json`을 씁니다. 탐색은 `~/.rtrt/projects`의 직계 child만 읽고, file name으로 썼을 때 backup root를 벗어날 수 있는 이름은 거부합니다.
+
+각 snapshot은 read-only handle에서 SQLite online backup API로 뜨므로 진행 중인 WAL 내용도 하나의 commit된 snapshot으로 담기고 실행 중인 store를 수정하지 않습니다. 각 source는 먼저 구조 검사인 `quick_check`를 통과해야 합니다. 전체 index 검증은 의도적으로 생략합니다. 실제 store가 수십 GB에 이르면 그 비용이 page 복사보다 커지기 때문입니다. account, account state, credential, control account, permission, approval, auth 등 민감 table은 schema를 유지한 채 row를 모두 제거하며, 이는 migration이 복사를 거부하는 집합과 정확히 같습니다. 따라서 복원 시 secret 없이 graph만 재현됩니다. 이후 각 snapshot은 WAL에서 분리하고 vacuum하므로, 해제된 credential page가 freelist에 남지 않는 자기완결 단일 file이 됩니다.
+
+Backup root는 mode `0700`, 모든 file은 `0600`으로 만듭니다. Root 자체만 생성·강화하며 caller가 지정한 상위 directory는 수정하지 않습니다. `backup`은 기존 경로에 병합하거나 덮어쓰지 않고 거부하며, manifest는 마지막에 씁니다. 즉 `manifest.json`이 없는 root는 미완성 backup입니다. `status`, `dry-run`, `apply`도 같은 `--source` flag를 받으므로, 단방향이던 migration에 backup과 복원이 닫힌 loop를 만듭니다.
 
 직접 `opencode` 실행은 계속 global state를 사용합니다. Setup의 `history_previous=none`, `history_next=none`은 TUI history navigation만 끄며 global history write를 막지 않습니다. 알려진 prompt-history file만 확인하거나 명시적으로 quarantine할 수 있습니다.
 

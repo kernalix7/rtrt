@@ -9,6 +9,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-21
+
+### Highlights
+
+**RTRT 0.1.4 closes the loop on OpenCode session migration: `rtrt opencode sessions backup` snapshots every session store this user owns without carrying secrets, and `--source` restores any snapshot through the existing migration path.**
+
+- `rtrt opencode sessions backup` writes `global.sqlite`, `projects/<slug>.sqlite`, and a content-free `manifest.json` into one private `0700` root, and refuses existing, traversing, or symlinked output paths.
+- Snapshots use SQLite's online backup API from a read-only handle, so the live store is never modified and in-flight WAL content is captured as one committed snapshot.
+- Credential-bearing tables keep their schema and lose every row; copied triggers and views fail closed before scrubbing, and each snapshot is detached from WAL and vacuumed so no freed secret pages remain.
+- `status`, `dry-run`, and `apply` accept `--source <db>`, so session migration is no longer one-way.
+
+### Added
+
+- `rtrt opencode sessions backup` snapshots the global OpenCode store and every RTRT-private project store into one private backup root (`global.sqlite`, `projects/<slug>.sqlite`, `manifest.json`). Snapshots are taken with SQLite's online backup API from a read-only handle, so WAL content is captured as one committed snapshot and the live store is never modified. Sensitive tables keep their schema and lose every row, matching the exclusion set migration already enforces, and each snapshot is detached from WAL and vacuumed so no freed credential pages remain. The root is mode `0700`, files are `0600`, an existing path is refused instead of merged, and the manifest is written last as the completeness marker.
+- `rtrt opencode sessions status|dry-run|apply` accept `--source <db>`, so a backup can be restored through the existing migration path and session migration is no longer one-way.
+
+### Fixed
+
+- Documented session migration accurately: it never modifies the source database, rather than retaining it "as backup".
+
 ## [0.1.3] - 2026-09-16
 
 ### Highlights

@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-21
+
+### Highlights
+
+**RTRT 0.1.4는 OpenCode session migration의 loop를 닫습니다. `rtrt opencode sessions backup`이 이 사용자가 소유한 모든 session store를 secret 없이 snapshot하고, `--source`로 어떤 snapshot이든 기존 migration 경로로 복원합니다.**
+
+- `rtrt opencode sessions backup`은 `global.sqlite`, `projects/<slug>.sqlite`, session content가 없는 `manifest.json`을 하나의 private `0700` root에 쓰며 기존 경로, traversal, symlink output을 거부합니다.
+- Snapshot은 read-only handle에서 SQLite online backup API로 뜨므로 실행 중인 store를 수정하지 않고 진행 중인 WAL 내용도 하나의 commit된 snapshot으로 담깁니다.
+- Credential table은 schema를 유지한 채 row를 모두 잃습니다. 복사된 trigger와 view는 scrub 전에 fail closed하며, 각 snapshot은 WAL에서 분리 후 vacuum하므로 해제된 secret page가 남지 않습니다.
+- `status`, `dry-run`, `apply`가 `--source <db>`를 받아 session migration이 더 이상 단방향이 아닙니다.
+
+### 추가
+
+- `rtrt opencode sessions backup`은 global OpenCode store와 RTRT-private project store를 모두 하나의 private backup root(`global.sqlite`, `projects/<slug>.sqlite`, `manifest.json`)로 snapshot합니다. Snapshot은 read-only handle에서 SQLite online backup API로 뜨므로 WAL 내용이 하나의 commit된 snapshot으로 담기고 실행 중인 store를 수정하지 않습니다. 민감 table은 schema를 유지한 채 row를 모두 잃으며 이는 migration이 이미 적용하는 제외 집합과 같고, 각 snapshot은 WAL에서 분리 후 vacuum하므로 해제된 credential page가 남지 않습니다. Root는 mode `0700`, file은 `0600`이며 기존 경로는 병합하지 않고 거부하고, manifest는 완결성 표식으로 마지막에 씁니다.
+- `rtrt opencode sessions status|dry-run|apply`가 `--source <db>`를 받습니다. 기존 migration 경로로 backup을 복원할 수 있어 session migration이 더 이상 단방향이 아닙니다.
+
+### 수정
+
+- Session migration 문서를 정확히 고쳤습니다. 원본을 "backup으로 유지"하는 것이 아니라 원본을 수정하지 않습니다.
+
 ## [0.1.3] - 2026-09-16
 
 ### Highlights

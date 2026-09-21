@@ -11,8 +11,8 @@ use std::net::{TcpListener, TcpStream};
 /// A `rtrt` command with HOME isolated to `home`.
 /// Canonical only where it matters. macOS reaches the temp dir through
 /// `/var -> /private/var`, which breaks comparisons against canonical paths.
-/// Windows canonicalization instead yields a `\\?\` verbatim path, which the
-/// production code rejects, so the plain temp path is the correct fixture there.
+/// Windows canonicalization instead yields a `\\?\` verbatim path, so retaining
+/// the plain temp path keeps command arguments and expected paths stable.
 fn canonical_for_tests(path: &std::path::Path) -> std::path::PathBuf {
     #[cfg(unix)]
     {
@@ -228,9 +228,12 @@ fn opencode_session_backup_covers_every_store_drops_credentials_and_restores() {
         .stdout(predicate::str::contains(
             "store=global path=global.sqlite sessions=1 messages=1 emptied=credential",
         ))
-        .stdout(predicate::str::contains(
-            "store=demo-slug path=projects/demo-slug.sqlite sessions=1 messages=1",
-        ));
+        .stdout(predicate::str::contains(format!(
+            "store=demo-slug path={} sessions=1 messages=1",
+            std::path::Path::new("projects")
+                .join("demo-slug.sqlite")
+                .display()
+        )));
 
     assert_eq!(std::fs::read(&global).unwrap(), before);
     assert!(backup.join("manifest.json").is_file());

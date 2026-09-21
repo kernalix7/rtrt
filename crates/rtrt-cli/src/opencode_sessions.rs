@@ -59,6 +59,11 @@ const MAX_SCHEMA_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROJECT_CACHE_BYTES: u64 = 128;
 const RUNTIME_CHECKPOINT_VERSION: u64 = 1;
 const MAX_RUNTIME_CHECKPOINT_BYTES: u64 = 4096;
+const BACKUP_MANIFEST: &str = "manifest.json";
+const BACKUP_MANIFEST_VERSION: u64 = 1;
+const BACKUP_GLOBAL_LABEL: &str = "global";
+const BACKUP_GLOBAL_FILE: &str = "global.sqlite";
+const BACKUP_PROJECTS_DIR: &str = "projects";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationMode {
@@ -91,6 +96,33 @@ pub struct MigrationReport {
     pub archived_event_forks: usize,
     pub up_to_date: bool,
     pub skipped_locked: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BackupOptions {
+    pub home: PathBuf,
+    /// Backup root. Must not already exist. `None` picks a timestamped
+    /// directory under `~/.rtrt/backups`.
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BackupReport {
+    pub root: PathBuf,
+    pub entries: Vec<BackupEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupEntry {
+    /// `global`, or the RTRT project slug of a private store.
+    pub label: String,
+    pub source: PathBuf,
+    /// Location inside the backup root; never absolute.
+    pub relative: PathBuf,
+    pub sessions: usize,
+    pub messages: usize,
+    /// Sensitive tables kept as empty schema so a restore still matches.
+    pub scrubbed: Vec<String>,
 }
 
 /// Result of validating and repairing one already-prepared private OpenCode DB.
@@ -291,6 +323,358 @@ pub fn migrate(options: &MigrationOptions) -> Result<MigrationReport> {
     write_manifest(&root, &source, &generation, &report)?;
     drop(lock);
     Ok(report)
+}
+
+/// Snapshot every OpenCode session store this user owns into one private
+/// backup root: the global store plus every RTRT-private project store.
+///
+/// Credential-bearing tables keep their schema and lose every row, matching
+/// exactly what [`migrate`] refuses to copy, so a snapshot restores through
+/// `--source` without carrying secrets. The manifest is written last; a root
+/// without one is an incomplete backup.
+pub fn backup(options: &BackupOptions) -> Result<BackupReport> {
+    let root = match &options.out {
+        Some(path) => path.clone(),
+        None => default_backup_root(&options.home)?,
+    };
+    let root = if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    inspect_backup_path(&root)?;
+    let parent = root.parent().context("backup path has no parent")?;
+    let name = root.file_name().context("backup path has no file name")?;
+    let root = fs::canonicalize(parent)
+        .with_context(|| format!("resolve backup parent: {}", parent.display()))?
+        .join(name);
+    // Only the root itself is created and hardened. A caller-supplied parent is
+    // never chmod-ed, because it may be an ordinary working directory.
+    create_backup_directory(&root)?;
+
+    let mut entries = Vec::new();
+    if let Some(source) = discover_global_source(&options.home)? {
+        entries.push(snapshot_database(
+            &source,
+            BACKUP_GLOBAL_LABEL,
+            &root,
+            Path::new(BACKUP_GLOBAL_FILE),
+        )?);
+    }
+    let private = discover_private_sources(&options.home)?;
+    if !private.is_empty() {
+        create_backup_directory(&root.join(BACKUP_PROJECTS_DIR))?;
+    }
+    for (slug, source) in private {
+        let relative = Path::new(BACKUP_PROJECTS_DIR).join(format!("{slug}.sqlite"));
+        entries.push(snapshot_database(&source, &slug, &root, &relative)?);
+    }
+    write_backup_manifest(&root, &entries)?;
+    Ok(BackupReport { root, entries })
+}
+
+fn default_backup_root(home: &Path) -> Result<PathBuf> {
+    let root = home.join(".rtrt/backups");
+    for directory in [home.join(".rtrt"), root.clone()] {
+        match inspect_backup_path(&directory)? {
+            Some(_) => super::ensure_private_directory(&directory)?,
+            None => create_backup_directory(&directory)?,
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    Ok(root.join(format!("opencode-sessions-{stamp}")))
+}
+
+fn create_backup_directory(path: &Path) -> Result<()> {
+    inspect_backup_path(path)?;
+    let builder = &mut fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "refusing to write into an existing backup path: {}",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {}", path.display()));
+        }
+    }
+    let parent = path.parent().context("backup directory has no parent")?;
+    sync_directory(parent).with_context(|| format!("sync backup parent: {}", parent.display()))?;
+    Ok(())
+}
+
+/// Inspect every existing component before accepting absence; a dangling link
+/// or inaccessible ancestor must never disguise an unsafe store as missing.
+fn inspect_backup_path(path: &Path) -> Result<Option<fs::Metadata>> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!(
+            "backup path contains a parent-directory component: {}",
+            path.display()
+        )
+    }
+    let mut current = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect {} for backup path {}",
+                        current.display(),
+                        path.display()
+                    )
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("backup path contains a symlink: {}", current.display())
+        }
+        if components.peek().is_none() {
+            return Ok(Some(metadata));
+        }
+        if !metadata.is_dir() {
+            bail!(
+                "backup path component is not a directory: {}",
+                current.display()
+            )
+        }
+    }
+    bail!("backup path is empty")
+}
+
+/// Enumerate RTRT-private OpenCode stores. Discovery never descends past the
+/// direct children of `~/.rtrt/projects` and rejects any name that could
+/// escape the backup root once used as a file name.
+fn discover_private_sources(home: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let projects = home.join(".rtrt/projects");
+    if inspect_backup_path(&projects)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let listing = match fs::read_dir(&projects) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", projects.display()));
+        }
+    };
+    let mut found = BTreeMap::new();
+    for entry in listing {
+        let entry = entry.with_context(|| format!("read {}", projects.display()))?;
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("inspect {}", entry.path().display()))?;
+        if kind.is_symlink() {
+            bail!(
+                "private OpenCode project path is a symlink: {}",
+                entry.path().display()
+            )
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !safe_backup_slug(&slug) {
+            continue;
+        }
+        let db = destination_db(home, &slug);
+        match inspect_backup_path(&db)
+            .with_context(|| format!("inspect private OpenCode store: {}", db.display()))?
+        {
+            Some(_) => {
+                validate_source(&db).with_context(|| {
+                    format!("validate private OpenCode store: {}", db.display())
+                })?;
+                found.insert(slug, db);
+            }
+            None => continue,
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// A slug becomes a backup file name, so `.`, `..`, separators, and anything
+/// outside a conservative ASCII set are rejected rather than sanitized.
+fn safe_backup_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 128
+        && !slug.starts_with('.')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Copy one database into the backup root, then drop every credential-bearing
+/// row. SQLite's online backup API is used instead of a file copy or
+/// `VACUUM INTO`: it reads in-flight WAL content as one committed snapshot and
+/// is the only variant that works from the read-only source handle this command
+/// requires, so a backup can never disturb a live store.
+fn snapshot_database(
+    source: &Path,
+    label: &str,
+    root: &Path,
+    relative: &Path,
+) -> Result<BackupEntry> {
+    validate_source(source)
+        .with_context(|| format!("validate OpenCode database for backup: {label}"))?;
+    let destination = root.join(relative);
+    let conn = open_source(source)?;
+    // `quick_check` rather than `integrity_check`: real stores reach tens of
+    // gigabytes, where full index verification costs more than the page copy
+    // itself and would make backing up a live store impractical.
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!(
+            "OpenCode database failed integrity check: {}",
+            source.display()
+        )
+    }
+    super::ensure_private_file(&destination)?;
+    let mut snapshot = Connection::open_with_flags(
+        &destination,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .with_context(|| format!("open backup snapshot: {}", destination.display()))?;
+    {
+        let copy = rusqlite::backup::Backup::new(&conn, &mut snapshot)
+            .with_context(|| format!("snapshot {} into backup", source.display()))?;
+        copy.run_to_completion(1024, std::time::Duration::ZERO, None)
+            .with_context(|| format!("snapshot {} into backup", source.display()))?;
+    }
+    drop(conn);
+    let scrubbed = scrub_sensitive_tables(&snapshot, &destination)?;
+    let (sessions, messages) = count_backup_rows(&snapshot)?;
+    drop(snapshot);
+    set_private_file(&destination)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&destination)?
+        .sync_all()?;
+    let parent = destination.parent().context("snapshot has no parent")?;
+    sync_directory(parent)
+        .with_context(|| format!("sync snapshot parent: {}", parent.display()))?;
+    Ok(BackupEntry {
+        label: label.to_string(),
+        source: source.to_path_buf(),
+        relative: relative.to_path_buf(),
+        sessions,
+        messages,
+        scrubbed,
+    })
+}
+
+/// Empty every sensitive table present in a snapshot while keeping its schema.
+/// The journal mode is forced off WAL so the backup stays one self-contained
+/// file, and the closing `VACUUM` rewrites it so freed credential pages leave
+/// no freelist residue.
+fn scrub_sensitive_tables(conn: &Connection, db: &Path) -> Result<Vec<String>> {
+    // Validate the copied schema, not an earlier source generation: triggers
+    // could exfiltrate OLD credentials or delete graph rows during scrubbing.
+    let (tables, _) = probe_schema(conn, false).with_context(|| {
+        format!(
+            "validate backup snapshot before scrubbing: {}",
+            db.display()
+        )
+    })?;
+    let mut scrubbed = Vec::new();
+    for table in tables {
+        let name = table.name;
+        if !SENSITIVE_TABLES.contains(&name.as_str()) {
+            continue;
+        }
+        conn.execute(&format!("DELETE FROM {}", quote(&name)), [])
+            .with_context(|| format!("scrub {name} in {}", db.display()))?;
+        scrubbed.push(name);
+    }
+    conn.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))
+        .with_context(|| format!("detach journal from backup snapshot: {}", db.display()))?;
+    conn.execute_batch("VACUUM")
+        .with_context(|| format!("compact backup snapshot: {}", db.display()))?;
+    Ok(scrubbed)
+}
+
+fn count_backup_rows(conn: &Connection) -> Result<(usize, usize)> {
+    let count = |table: &str| -> Result<usize> {
+        let present = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !present {
+            return Ok(0);
+        }
+        let total: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {}", quote(table)),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(total).unwrap_or(0))
+    };
+    Ok((count("session")?, count("message")?))
+}
+
+/// Written last, so its presence marks the backup complete. Carries counts and
+/// table names only, never session content.
+fn write_backup_manifest(root: &Path, entries: &[BackupEntry]) -> Result<()> {
+    let payload = json!({
+        "version": BACKUP_MANIFEST_VERSION,
+        "entries": entries
+            .iter()
+            .map(|entry| json!({
+                "label": entry.label,
+                "source": entry.source.to_string_lossy(),
+                "path": entry.relative.to_string_lossy(),
+                "sessions": entry.sessions,
+                "messages": entry.messages,
+                "scrubbed_tables": entry.scrubbed,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let path = root.join(BACKUP_MANIFEST);
+    let staging = root.join(format!(".manifest-{}.json", std::process::id()));
+    let mut payload = serde_json::to_vec_pretty(&payload)?;
+    payload.push(b'\n');
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&staging)
+        .with_context(|| format!("create backup manifest staging: {}", staging.display()))?;
+    file.write_all(&payload)
+        .context("write backup manifest staging")?;
+    file.sync_all().context("sync backup manifest staging")?;
+    drop(file);
+    fs::rename(&staging, &path)
+        .with_context(|| format!("publish backup manifest: {}", path.display()))?;
+    sync_directory(root).context("sync backup manifest directory")?;
+    Ok(())
 }
 
 /// Read OpenCode's own project selector from an already sandbox-validated
@@ -3055,6 +3439,474 @@ mod tests {
             .into_iter()
             .find(|index| index.name == name)
             .unwrap()
+    }
+
+    fn table_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {}", quote(table)),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn backup_rejects_copied_trigger_before_any_delete() {
+        // Given a schema validated before a concurrent writer installs a trigger.
+        let (_guard, temp) = canonical_tempdir();
+        let (source, _, _) = fixture(&temp);
+        let conn = Connection::open(&source).unwrap();
+        probe_schema(&conn, false).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER leak_credentials AFTER DELETE ON credential BEGIN
+                 INSERT INTO runtime_setting VALUES('exfiltrated', OLD.secret);
+                 DELETE FROM part;
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = fs::read(&source).unwrap();
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+
+        // When the online copy includes the newly installed trigger.
+        let result = snapshot_database(&source, "global", &root, Path::new("global.sqlite"));
+
+        // Then fail on the copied schema, before even earlier sensitive DELETEs.
+        assert!(format!("{:#}", result.unwrap_err()).contains("schema object type: trigger"));
+        let copy = Connection::open(root.join("global.sqlite")).unwrap();
+        for table in SENSITIVE_TABLES {
+            assert_eq!(
+                table_count(&copy, table),
+                1,
+                "{table} changed before rejection"
+            );
+        }
+        assert_eq!(table_count(&copy, "runtime_setting"), 1);
+        assert_eq!(table_count(&copy, "message"), 3);
+        assert_eq!(table_count(&copy, "part"), 3);
+        assert!(!root.join(BACKUP_MANIFEST).exists());
+        assert_eq!(fs::read(source).unwrap(), before);
+    }
+
+    #[test]
+    fn backup_rejects_copied_view_before_any_delete() {
+        // Given a snapshot containing a credential-bearing view.
+        let (_guard, temp) = canonical_tempdir();
+        let (source, _, _) = fixture(&temp);
+        Connection::open(&source)
+            .unwrap()
+            .execute_batch("CREATE VIEW credential_view AS SELECT secret FROM credential")
+            .unwrap();
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+
+        // When backing up that schema.
+        let result = snapshot_database(&source, "global", &root, Path::new("global.sqlite"));
+
+        // Then no sensitive rows have been scrubbed or completion published.
+        assert!(format!("{:#}", result.unwrap_err()).contains("schema object type: view"));
+        let copy = Connection::open(root.join("global.sqlite")).unwrap();
+        for table in SENSITIVE_TABLES {
+            assert_eq!(table_count(&copy, table), 1);
+        }
+        assert!(!root.join(BACKUP_MANIFEST).exists());
+    }
+
+    #[test]
+    fn backup_manifest_refuses_existing_staging_file() {
+        // Given a previous incomplete private staging file.
+        let (_guard, root) = canonical_tempdir();
+        let staging = root.join(format!(".manifest-{}.json", std::process::id()));
+        fs::write(&staging, b"incomplete").unwrap();
+
+        // When publishing the completion marker.
+        let result = write_backup_manifest(&root, &[]);
+
+        // Then create_new fails without publishing or overwriting anything.
+        assert!(result.is_err());
+        assert!(!root.join(BACKUP_MANIFEST).exists());
+        assert_eq!(fs::read(staging).unwrap(), b"incomplete");
+    }
+
+    #[test]
+    fn backup_manifest_keeps_complete_private_staging_when_rename_fails() {
+        // Given a destination that cannot be replaced by a file.
+        let (_guard, root) = canonical_tempdir();
+        fs::create_dir(root.join(BACKUP_MANIFEST)).unwrap();
+
+        // When publication fails at rename.
+        let result = write_backup_manifest(&root, &[]);
+
+        // Then staging already contains the complete manifest, privately.
+        assert!(result.is_err());
+        let staging = root.join(format!(".manifest-{}.json", std::process::id()));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staging).unwrap()).unwrap();
+        assert_eq!(payload["version"], BACKUP_MANIFEST_VERSION);
+        assert_eq!(payload["entries"], json!([]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(staging).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_manifest_replaces_atomically_instead_of_truncating() {
+        // Given a reader holding the old completion file open.
+        let (_guard, root) = canonical_tempdir();
+        let path = root.join(BACKUP_MANIFEST);
+        fs::write(&path, b"old manifest").unwrap();
+        set_private_file(&path).unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+
+        // When publishing a new manifest.
+        write_backup_manifest(&root, &[]).unwrap();
+
+        // Then the old inode is untouched and new readers see complete JSON.
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old manifest");
+        let payload: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(payload["version"], BACKUP_MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn backup_out_rejects_parent_components_before_creation() {
+        // Given an existing parent reached via '..'.
+        let (_guard, temp) = canonical_tempdir();
+        fs::create_dir(temp.join("parent")).unwrap();
+        let out = temp.join("parent/../backup");
+
+        // When creating the output directory through the shared path validator.
+        let result = create_backup_directory(&out);
+
+        // Then rejection precedes directory creation and store discovery.
+        assert!(result.is_err());
+        assert!(!temp.join("backup").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_out_rejects_symlink_components_before_creation() {
+        // Given an existing parent reached through a symlink.
+        let (_guard, temp) = canonical_tempdir();
+        fs::create_dir(temp.join("parent")).unwrap();
+        std::os::unix::fs::symlink(temp.join("parent"), temp.join("link")).unwrap();
+
+        // When the output traverses that link.
+        let result = create_backup_directory(&temp.join("link/backup"));
+
+        // Then no output is created through it.
+        assert!(result.is_err());
+        assert!(!temp.join("parent/backup").exists());
+    }
+
+    #[test]
+    fn backup_private_discovery_ignores_absent_database() {
+        // Given an otherwise valid store tree with no database yet.
+        let (_guard, home) = canonical_tempdir();
+        let db = destination_db(&home, "alpha");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+
+        // When discovering stores.
+        let found = discover_private_sources(&home).unwrap();
+
+        // Then genuine absence remains ignorable.
+        assert!(found.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_directory_preserves_existing_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        // Given a caller-owned parent with intentionally non-private permissions.
+        let (_guard, temp) = canonical_tempdir();
+        let parent = temp.join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+        let root = parent.join("backup");
+
+        // When creating a backup directory.
+        create_backup_directory(&root).unwrap();
+
+        // Then only the new directory is private.
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn backup_private_discovery_rejects_irregular_database() {
+        // Given a directory where a private database should be.
+        let (_guard, home) = canonical_tempdir();
+        let db = destination_db(&home, "alpha");
+        fs::create_dir_all(&db).unwrap();
+
+        // When discovering stores.
+        let result = discover_private_sources(&home);
+
+        // Then it is an error with the store path, not an absent database.
+        assert!(format!("{:#}", result.unwrap_err()).contains(&db.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_private_discovery_rejects_dangling_database_symlink() {
+        // Given a dangling database symlink (metadata following it says missing).
+        let (_guard, home) = canonical_tempdir();
+        let db = destination_db(&home, "alpha");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.join("missing"), &db).unwrap();
+
+        // When discovering stores.
+        let result = discover_private_sources(&home);
+
+        // Then the unsafe path is not silently omitted.
+        assert!(format!("{:#}", result.unwrap_err()).contains(&db.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_private_discovery_rejects_symlinked_store_directory() {
+        // Given a store whose intermediate directory is a dangling symlink.
+        let (_guard, home) = canonical_tempdir();
+        let store = home.join(".rtrt/projects/alpha");
+        fs::create_dir_all(&store).unwrap();
+        let link = store.join("opencode");
+        std::os::unix::fs::symlink(home.join("missing"), &link).unwrap();
+
+        // When discovering stores.
+        let result = discover_private_sources(&home);
+
+        // Then even a missing descendant cannot conceal the unsafe ancestor.
+        assert!(format!("{:#}", result.unwrap_err()).contains(&link.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_private_discovery_propagates_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        // Given an inaccessible discovered store (root bypasses mode bits).
+        if super::super::unsafe_geteuid() == 0 {
+            return;
+        }
+        let (_guard, home) = canonical_tempdir();
+        let db = destination_db(&home, "alpha");
+        let parent = db.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::write(&db, b"private store").unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // When discovery attempts to inspect the database.
+        let result = discover_private_sources(&home);
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Then preserve PermissionDenied with path context.
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(format!("{error:#}").contains(&db.display().to_string()));
+    }
+
+    #[test]
+    fn snapshot_keeps_graph_rows_and_empties_every_sensitive_table() {
+        let (_temp_guard, temp) = canonical_tempdir();
+        let (source, _first, _second) = fixture(&temp);
+        let before = fs::read(&source).unwrap();
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+
+        let entry =
+            snapshot_database(&source, "global", &root, Path::new("global.sqlite")).unwrap();
+
+        assert_eq!((entry.sessions, entry.messages), (4, 3));
+        assert_eq!(fs::read(&source).unwrap(), before);
+        let snapshot = Connection::open(root.join("global.sqlite")).unwrap();
+        assert_eq!(
+            snapshot
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        for table in SENSITIVE_TABLES {
+            assert!(table_exists(&snapshot, table), "{table} schema dropped");
+            assert_eq!(table_count(&snapshot, table), 0, "{table} kept rows");
+            assert!(entry.scrubbed.iter().any(|name| name == table));
+        }
+        assert_eq!(table_count(&snapshot, "session"), 4);
+        assert_eq!(table_count(&snapshot, "message"), 3);
+        assert_eq!(table_count(&snapshot, "part"), 3);
+        assert_eq!(table_count(&snapshot, "runtime_setting"), 1);
+    }
+
+    #[test]
+    fn snapshot_leaves_no_credential_bytes_in_the_backup_file() {
+        const MARKER: &[u8] = b"credential-marker-must-not-survive";
+
+        let (_temp_guard, temp) = canonical_tempdir();
+        let (source, _first, _second) = fixture(&temp);
+        let seeded = Connection::open(&source).unwrap();
+        seeded
+            .execute(
+                "INSERT INTO credential VALUES('marker',?1)",
+                [std::str::from_utf8(MARKER).unwrap()],
+            )
+            .unwrap();
+        drop(seeded);
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+
+        snapshot_database(&source, "global", &root, Path::new("global.sqlite")).unwrap();
+
+        let raw = fs::read(root.join("global.sqlite")).unwrap();
+        assert!(
+            !raw.windows(MARKER.len()).any(|window| window == MARKER),
+            "credential bytes survived in freelist pages"
+        );
+        let session_marker = b"opaque prompt";
+        assert!(
+            raw.windows(session_marker.len())
+                .any(|window| window == session_marker),
+            "session content must still be backed up"
+        );
+    }
+
+    #[test]
+    fn backup_directory_refuses_to_reuse_an_existing_path() {
+        let (_temp_guard, temp) = canonical_tempdir();
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+
+        assert!(
+            create_backup_directory(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to write into an existing backup path")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_root_is_private_and_snapshots_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp_guard, temp) = canonical_tempdir();
+        let (source, _first, _second) = fixture(&temp);
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+        snapshot_database(&source, "global", &root, Path::new("global.sqlite")).unwrap();
+        write_backup_manifest(&root, &[]).unwrap();
+
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["global.sqlite", BACKUP_MANIFEST] {
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{name} is not owner-only"
+            );
+        }
+    }
+
+    #[test]
+    fn private_discovery_lists_real_stores_and_rejects_unsafe_names() {
+        let (_temp_guard, temp) = canonical_tempdir();
+        let home = temp.join("home");
+        let (source, _first, _second) = fixture(&temp);
+        for slug in ["alpha", "beta", ".hidden"] {
+            let db = destination_db(&home, slug);
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::copy(&source, &db).unwrap();
+        }
+        fs::create_dir_all(home.join(".rtrt/projects/no-store")).unwrap();
+
+        let found = discover_private_sources(&home).unwrap();
+
+        assert_eq!(
+            found
+                .iter()
+                .map(|(slug, _)| slug.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(found[0].1, destination_db(&home, "alpha"));
+    }
+
+    #[test]
+    fn private_discovery_is_empty_without_a_projects_root() {
+        let (_temp_guard, temp) = canonical_tempdir();
+        assert!(
+            discover_private_sources(&temp.join("home"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn slug_validation_rejects_traversal_and_separators() {
+        for slug in ["alpha", "a-b_c.1", "00g-rtrt--3a228c8f"] {
+            assert!(safe_backup_slug(slug), "{slug} should be accepted");
+        }
+        let overlong = "x".repeat(129);
+        for slug in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a b",
+            overlong.as_str(),
+        ] {
+            assert!(!safe_backup_slug(slug), "{slug} should be rejected");
+        }
+    }
+
+    #[test]
+    fn manifest_records_counts_without_session_content() {
+        let (_temp_guard, temp) = canonical_tempdir();
+        let (source, _first, _second) = fixture(&temp);
+        let root = temp.join("backup");
+        create_backup_directory(&root).unwrap();
+        let entry =
+            snapshot_database(&source, "global", &root, Path::new("global.sqlite")).unwrap();
+
+        write_backup_manifest(&root, std::slice::from_ref(&entry)).unwrap();
+
+        let raw = fs::read_to_string(root.join(BACKUP_MANIFEST)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["version"], BACKUP_MANIFEST_VERSION);
+        assert_eq!(parsed["entries"][0]["label"], "global");
+        assert_eq!(parsed["entries"][0]["path"], "global.sqlite");
+        assert_eq!(parsed["entries"][0]["sessions"], 4);
+        assert_eq!(parsed["entries"][0]["messages"], 3);
+        assert!(!raw.contains("opaque"));
     }
 
     #[test]

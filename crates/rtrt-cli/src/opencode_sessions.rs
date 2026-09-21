@@ -429,6 +429,11 @@ fn inspect_backup_path(path: &Path) -> Result<Option<fs::Metadata>> {
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
         current.push(component);
+        // A Windows drive prefix (including `\\?\C:`) is not independently
+        // inspectable; the rooted path formed by the next component is.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

@@ -3,7 +3,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 export const TOKEN = "0123456789abcdef".repeat(4)
-export const VERSION = "0.1.3"
+export const VERSION = "0.1.4"
 export const PACKAGE = "rtrt-dashboard-linux-x64"
 
 export async function fixture(t) {

@@ -193,6 +193,107 @@ fn opencode_session_status_and_dry_run_are_cwd_independent_and_read_only() {
 }
 
 #[test]
+fn opencode_session_backup_covers_every_store_drops_credentials_and_restores() {
+    const SCHEMA: &str = "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT);
+         CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+         CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, data TEXT);
+         CREATE TABLE credential(id TEXT PRIMARY KEY, secret TEXT);
+         INSERT INTO session VALUES('lost','/deleted');
+         INSERT INTO message VALUES('m1','lost','opaque');
+         INSERT INTO credential VALUES('c1','top-secret-value');";
+
+    let home = CanonicalHome::new();
+    let data = home.path().join("xdg-data");
+    std::fs::create_dir_all(data.join("opencode")).unwrap();
+    let global = data.join("opencode/opencode.db");
+    let private = home
+        .path()
+        .join(".rtrt/projects/demo-slug/opencode/data/opencode/opencode.db");
+    std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+    for db in [&global, &private] {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+    }
+    let before = std::fs::read(&global).unwrap();
+    let backup = home.path().join("backup");
+
+    rtrt(home.path())
+        .env("XDG_DATA_HOME", &data)
+        .current_dir(home.path())
+        .args(["opencode", "sessions", "backup"])
+        .arg("--out")
+        .arg(&backup)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "store=global path=global.sqlite sessions=1 messages=1 emptied=credential",
+        ))
+        .stdout(predicate::str::contains(
+            "store=demo-slug path=projects/demo-slug.sqlite sessions=1 messages=1",
+        ));
+
+    assert_eq!(std::fs::read(&global).unwrap(), before);
+    assert!(backup.join("manifest.json").is_file());
+    for relative in ["global.sqlite", "projects/demo-slug.sqlite"] {
+        let snapshot = rusqlite::Connection::open(backup.join(relative)).unwrap();
+        assert_eq!(
+            snapshot
+                .query_row("SELECT count(*) FROM credential", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{relative} kept credential rows"
+        );
+        assert_eq!(
+            snapshot
+                .query_row("SELECT count(*) FROM session", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "{relative} lost session rows"
+        );
+    }
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(backup.join("global.sqlite")).unwrap())
+            .contains("top-secret-value")
+    );
+
+    rtrt(home.path())
+        .env("XDG_DATA_HOME", &data)
+        .current_dir(home.path())
+        .args(["opencode", "sessions", "backup"])
+        .arg("--out")
+        .arg(&backup)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to write into an existing backup path",
+        ));
+
+    rtrt(home.path())
+        .env("XDG_DATA_HOME", &data)
+        .current_dir(home.path())
+        .args(["opencode", "sessions", "apply"])
+        .arg("--source")
+        .arg(backup.join("global.sqlite"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sessions=1"));
+
+    let restored = home
+        .path()
+        .join(".rtrt/projects/legacy-global/opencode/data/opencode/opencode.db");
+    let connection = rusqlite::Connection::open(&restored).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM session", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn compress_ultra_preserves_paths_and_negations() {
     let home = CanonicalHome::new();
     rtrt(home.path())

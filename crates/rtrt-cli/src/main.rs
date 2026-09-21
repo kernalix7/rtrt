@@ -653,11 +653,31 @@ enum OpenCodeAction {
 #[derive(Debug, Subcommand)]
 enum OpenCodeSessionsAction {
     /// Probe and report; never writes.
-    Status,
+    Status {
+        /// Read this database instead of the discovered global store.
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
     /// Plan migration; never writes.
-    DryRun,
+    DryRun {
+        /// Read this database instead of the discovered global store.
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
     /// Migrate every attributable graph and archive the remainder.
-    Apply,
+    Apply {
+        /// Restore from this database instead of the discovered global store.
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+    /// Snapshot the global and every private session store into a backup
+    /// directory, keeping credential tables empty.
+    Backup {
+        /// Backup root. Must not already exist. Defaults to a timestamped
+        /// directory under `~/.rtrt/backups`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3480,6 +3500,59 @@ fn quarantine_prompt_history(_source: &Path, _destination: &Path) -> Result<bool
     bail!("secure prompt-history quarantine is unsupported on this platform")
 }
 
+fn run_opencode_sessions_backup(out: Option<PathBuf>) -> Result<()> {
+    let report = opencode_sessions::backup(&opencode_sessions::BackupOptions {
+        home: setup::dirs_home()?,
+        out,
+    })?;
+    println!("root={}", report.root.display());
+    for entry in &report.entries {
+        println!(
+            "store={} path={} sessions={} messages={} emptied={}",
+            entry.label,
+            entry.relative.display(),
+            entry.sessions,
+            entry.messages,
+            if entry.scrubbed.is_empty() {
+                "-".to_string()
+            } else {
+                entry.scrubbed.join(",")
+            }
+        );
+    }
+    if report.entries.is_empty() {
+        println!("no OpenCode database found to back up");
+    }
+    Ok(())
+}
+
+fn run_opencode_sessions_migration(
+    mode: opencode_sessions::MigrationMode,
+    source: Option<PathBuf>,
+) -> Result<()> {
+    let report = opencode_sessions::migrate(&opencode_sessions::MigrationOptions {
+        home: setup::dirs_home()?,
+        source,
+        mode,
+    })?;
+    match report.source {
+        Some(source) => println!(
+            "source={} sessions={} projects={} archived={} skipped_malformed={} rows={} changed={} private_preserved_conflicts={} archived_event_forks={}",
+            source.display(),
+            report.sessions,
+            report.projects,
+            report.archived_sessions,
+            report.skipped_malformed_sessions,
+            report.rows,
+            report.changed_rows,
+            report.private_preserved_conflicts,
+            report.archived_event_forks
+        ),
+        None => println!("no supported global OpenCode database found"),
+    }
+    Ok(())
+}
+
 fn run_opencode_history(apply: Option<bool>) -> Result<()> {
     let home = setup::dirs_home()?;
     for path in global_prompt_history_paths(&home) {
@@ -3876,34 +3949,21 @@ async fn run(command: Cmd) -> Result<()> {
             action,
             args,
         } => match action {
-            Some(OpenCodeAction::Sessions { command }) => {
-                let mode = match command {
-                    OpenCodeSessionsAction::Status => opencode_sessions::MigrationMode::Status,
-                    OpenCodeSessionsAction::DryRun => opencode_sessions::MigrationMode::DryRun,
-                    OpenCodeSessionsAction::Apply => opencode_sessions::MigrationMode::Apply,
-                };
-                let report = opencode_sessions::migrate(&opencode_sessions::MigrationOptions {
-                    home: setup::dirs_home()?,
-                    source: None,
-                    mode,
-                })?;
-                if let Some(source) = report.source {
-                    println!(
-                        "source={} sessions={} projects={} archived={} skipped_malformed={} rows={} changed={} private_preserved_conflicts={} archived_event_forks={}",
-                        source.display(),
-                        report.sessions,
-                        report.projects,
-                        report.archived_sessions,
-                        report.skipped_malformed_sessions,
-                        report.rows,
-                        report.changed_rows,
-                        report.private_preserved_conflicts,
-                        report.archived_event_forks
-                    );
-                } else {
-                    println!("no supported global OpenCode database found");
-                }
-            }
+            Some(OpenCodeAction::Sessions { command }) => match command {
+                OpenCodeSessionsAction::Backup { out } => run_opencode_sessions_backup(out)?,
+                OpenCodeSessionsAction::Status { source } => run_opencode_sessions_migration(
+                    opencode_sessions::MigrationMode::Status,
+                    source,
+                )?,
+                OpenCodeSessionsAction::DryRun { source } => run_opencode_sessions_migration(
+                    opencode_sessions::MigrationMode::DryRun,
+                    source,
+                )?,
+                OpenCodeSessionsAction::Apply { source } => run_opencode_sessions_migration(
+                    opencode_sessions::MigrationMode::Apply,
+                    source,
+                )?,
+            },
             Some(OpenCodeAction::HistoryStatus) => run_opencode_history(None)?,
             Some(OpenCodeAction::HistoryQuarantine { apply }) => run_opencode_history(Some(apply))?,
             None => run_opencode_launcher(project, args)?,

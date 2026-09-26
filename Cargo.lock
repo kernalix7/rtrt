@@ -3212,10 +3212,13 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "axum",
  "clap",
+ "dirs 5.0.1",
  "fs2",
  "futures-util",
  "predicates",
+ "reqwest",
  "rtrt-compress",
  "rtrt-core",
  "rtrt-memory",
@@ -3224,12 +3227,15 @@ dependencies = [
  "rtrt-security",
  "rtrt-templates",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

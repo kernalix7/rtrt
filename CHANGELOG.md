@@ -9,6 +9,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- Added `rtrt collector serve`, an authenticated `POST /v1/events` ingestion endpoint for consolidating container or remote guest memory events into explicitly mapped host projects. The collector rejects browser `Origin` requests, bounds request bodies, derives every destination from a host-controlled project path, and deduplicates retries by stable event id.
+- Added `rtrt forward enqueue|flush` with a private durable SQLite spool, bounded exponential retry scheduling, stable event ids, and bearer-authenticated delivery. Failed deliveries remain queued and can be retried without creating duplicate host memory rows.
+
 ## [0.1.4] - 2026-09-21
 
 ### Highlights

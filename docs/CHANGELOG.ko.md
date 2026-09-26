@@ -8,6 +8,11 @@
 
 ## [Unreleased]
 
+### 추가
+
+- 컨테이너 또는 원격 guest의 memory event를 명시적으로 매핑한 host project에 통합하는 authenticated `POST /v1/events` endpoint인 `rtrt collector serve`를 추가했습니다. Collector는 browser `Origin` 요청을 거부하고 request body를 제한하며, host가 제어하는 project path에서만 destination을 파생하고 stable event id로 retry를 dedup합니다.
+- private durable SQLite spool, bounded exponential retry scheduling, stable event id, bearer-authenticated delivery를 제공하는 `rtrt forward enqueue|flush`를 추가했습니다. 실패한 delivery는 queue에 남고 host memory row를 중복 생성하지 않고 다시 시도할 수 있습니다.
+
 ## [0.1.4] - 2026-09-21
 
 ### Highlights

@@ -17,7 +17,7 @@
 - `rtrt collector serve`는 container 또는 원격 guest의 memory event를 host project로 통합하는 authenticated `POST /v1/events` endpoint입니다. Collector는 모든 browser `Origin` 요청을 request body를 읽지 않고 거부하고, 없는 bearer와 잘못된 bearer도 request body를 읽지 않고 거부하며, 각 request body를 1 MiB로 제한하고, host가 제어하는 project path에서만 destination을 파생하므로 guest는 자기 target을 선택할 수 없습니다.
 - `rtrt forward enqueue|flush`는 모든 event를 delivery 시도 전에 private durable SQLite spool에 기록합니다. Spool은 crash에서도 살아남고 bounded exponential backoff로 재시도하며 host collector가 acknowledge한 경우에만 event를 비우므로 retry가 host memory row를 중복 생성하지 않습니다.
 - Host collector는 새 `MemoryStore::ingest_forwarded` idempotent forward-ingest 경로로 각 `(guest, project, event id)` delivery를 정확히 한 번만 저장하며 이 경로는 schema v9 위에 올라갑니다. 이미 받은 tuple의 redelivery는 쓰지 않고 acknowledge합니다. 같은 tuple이 다른 host project에 오는 것은 별개의 delivery이며 거기서 row를 삽입합니다.
-- Guest spool의 path-validation 및 operator-owned guard는 이제 지원되는 모든 Unix target에서 균일하게 적용됩니다(spool subsystem 자체는 Unix-only이며 Windows는 회귀된 것이 아니라 의도적으로 범위 밖입니다). 직속 spool directory는 operator-owned + mode `0700`, spool file은 operator-owned + mode `0600`이어야 하며, parent, intermediate directory, file path 자체를 포함한 모든 symlink된 path component는 그를 통해 무엇이든 쓰기 전에 거부됩니다.
+- Guest spool의 경로 검증과 Unix 소유권 검사는 지원되는 Unix 환경에 적용되며, Windows에서도 forward spool은 동작하지만 Unix 전용 소유권·mode 검사는 적용되지 않습니다. Unix에서는 직속 spool directory가 operator-owned + mode `0700`, spool file이 operator-owned + mode `0600`이어야 합니다. Symlink된 경로 구성 요소는 해당 경로를 통해 쓰기 전에 거부됩니다.
 - CI는 이제 OpenCode 테스트 의존성을 `npm ci` 실행 전에 `.rtrt/tmp/npm-test-dependencies` 아래에 stage하므로 optional platform package나 다른 통제되지 않은 transitive dependency가 OpenCode plugin의 lockfile-gated test job을 망가뜨리지 않습니다.
 
 ### 추가
@@ -31,7 +31,7 @@
 
 ### 수정
 
-- Guest forward spool이 지원되는 모든 Unix platform에서 path-validation 및 operator-owned guard를 균일하게 적용합니다. Ownership 검사는 Linux와 Android에서는 `/proc/self/status`를, 다른 Unix platform에서는 `id -u`로 effective UID를 읽습니다(spool subsystem 전체는 Unix-only이며 Windows는 의도적으로 범위 밖입니다). 직속 spool directory는 operator-owned + mode `0700`, spool file은 operator-owned + mode `0600`이어야 하며, parent, intermediate directory, file path 자체를 포함한 모든 symlink된 path component는 directory를 만들거나 file을 열기 전에 거부되므로 이 코드가 symlink된 target을 populate하는 일은 없습니다.
+- Guest forward spool이 지원되는 모든 Unix platform에서 경로 검증과 소유권 검사를 균일하게 적용합니다. Linux와 Android에서는 `/proc/self/status`를, 다른 Unix platform에서는 `id -u`로 effective UID를 읽습니다(Windows에서도 spool은 동작하지만 Unix 소유권·mode 검사는 적용되지 않습니다). 직속 spool directory는 operator-owned + mode `0700`, spool file은 operator-owned + mode `0600`이어야 하며 symlink된 경로 구성 요소를 거부합니다. 직속 spool directory가 없으면 `open_spool()`의 `private_parent()`가 먼저 mode `0700`으로 생성할 수 있고, 그 후에 파일 경로의 symlink 여부를 검사합니다. 이 코드는 symlink 대상에 쓰지 않습니다.
 
 ### CI
 

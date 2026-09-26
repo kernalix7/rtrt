@@ -452,6 +452,41 @@ rtrt new dev ./hello \
 
 버전과 워크스페이스 크레이트 목록을 출력합니다.
 
+## Collector와 forwarder
+
+컨테이너 또는 원격 guest의 명시적 memory event를 host 소유 project store로 통합할 때 collector를 사용합니다. Host는 각 `(guest_id, remote project)` 쌍을 실제 host project directory에 매핑해 승인합니다. Guest가 보낸 path는 받지 않습니다.
+
+```bash
+# Host: Docker bridge address에 bind합니다(기본값은 loopback).
+export RTRT_COLLECTOR_TOKEN="$(openssl rand -hex 32)"
+rtrt collector serve --bind 172.17.0.1:7313 \
+  --map guest-a:app=/srv/projects/app \
+  --map guest-b:worker=/srv/projects/worker
+```
+
+각 guest는 delivery 시도 전에 event를 durable queue에 저장합니다:
+
+```bash
+export RTRT_COLLECTOR_URL=http://172.17.0.1:7313
+export RTRT_COLLECTOR_TOKEN='<host와 같은 token>'
+
+printf '%s' 'deployment completed' | rtrt forward enqueue \
+  --guest-id guest-a --project app --kind deployment \
+  --session-id session-42 --metadata '{"source":"container-hook"}'
+
+# ~/.rtrt/forward-spool.sqlite에 남은 due event를 다시 시도합니다.
+rtrt forward flush
+```
+
+`enqueue`는 stable event id를 출력합니다. Collector가 unavailable이면 stderr warning을 출력하지만 event는 private spool에 남습니다. `flush` delivery가 계속 실패하면 non-zero로 종료합니다. Host collector가 각 `(guest, project, event id)` 전달을 정확히 한 번만 저장하므로 성공한 retry는 idempotent합니다.
+
+보안 경계:
+
+- 두 command 모두 `RTRT_COLLECTOR_TOKEN`이 필수입니다. Secret이 shell history나 process argument에 들어가지 않도록 `--token`보다 environment injection을 권장합니다.
+- Collector 기본 bind는 `127.0.0.1:7313`이며 `Origin` header가 있는 요청을 모두 거부하고 request당 최대 1 MiB만 받습니다.
+- 가능하면 특정 private bridge address에 bind합니다. 신뢰할 수 있는 host-local network 밖으로 나가는 traffic은 reverse proxy에서 TLS를 종료해야 합니다. Collector는 TLS를 직접 구현하지 않습니다.
+- Guest 기본 spool은 `~/.rtrt/forward-spool.sqlite`입니다. Unix directory/file은 `0700`/`0600`으로 제한하며 symlink path를 거부합니다.
+
 ## 게이트웨이 (`rtrt gateway serve`)
 
 OpenAI 호환 클라이언트를 `http://127.0.0.1:7412/v1`에 연결하면, rtrt가 감지된

@@ -496,6 +496,41 @@ rtrt benchmark                    # cargo bench -p rtrt-compress --bench compres
 rtrt benchmark --extra '--quick'
 ```
 
+## Collector and forwarder
+
+Use the collector when containerized or remote guests must consolidate explicit memory events into host-owned project stores. The host authorizes each `(guest_id, remote project)` pair by mapping it to a real host project directory; guest-supplied paths are never accepted.
+
+```bash
+# Host: bind the Docker bridge address (loopback is the default).
+export RTRT_COLLECTOR_TOKEN="$(openssl rand -hex 32)"
+rtrt collector serve --bind 172.17.0.1:7313 \
+  --map guest-a:app=/srv/projects/app \
+  --map guest-b:worker=/srv/projects/worker
+```
+
+Each guest durably queues an event before attempting delivery:
+
+```bash
+export RTRT_COLLECTOR_URL=http://172.17.0.1:7313
+export RTRT_COLLECTOR_TOKEN='<same token as host>'
+
+printf '%s' 'deployment completed' | rtrt forward enqueue \
+  --guest-id guest-a --project app --kind deployment \
+  --session-id session-42 --metadata '{"source":"container-hook"}'
+
+# Retry due events left in ~/.rtrt/forward-spool.sqlite.
+rtrt forward flush
+```
+
+`enqueue` prints the stable event id. An unavailable collector produces a stderr warning but leaves the event in the private spool; `flush` returns non-zero if a delivery still fails. Successful retries are idempotent at the host because the collector stores each `(guest, project, event id)` delivery exactly once.
+
+Security boundaries:
+
+- `RTRT_COLLECTOR_TOKEN` is required for both commands. Prefer environment injection instead of `--token` so the secret does not enter shell history or process arguments.
+- The collector defaults to `127.0.0.1:7313`, rejects every request carrying an `Origin` header, and accepts at most 1 MiB per request.
+- Bind a specific private bridge address where possible. For traffic leaving a trusted host-local network, terminate TLS in a reverse proxy; the collector does not implement TLS.
+- The default guest spool is `~/.rtrt/forward-spool.sqlite`; Unix directories/files are restricted to `0700`/`0600`, and symlinked paths are rejected.
+
 ## Gateway (`rtrt gateway serve`)
 
 Point any OpenAI-compatible client at `http://127.0.0.1:7412/v1` and rtrt

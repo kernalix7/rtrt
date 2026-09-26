@@ -3208,14 +3208,17 @@ dependencies = [
 
 [[package]]
 name = "rtrt-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "axum",
  "clap",
+ "dirs 5.0.1",
  "fs2",
  "futures-util",
  "predicates",
+ "reqwest",
  "rtrt-compress",
  "rtrt-core",
  "rtrt-memory",
@@ -3224,17 +3227,20 @@ dependencies = [
  "rtrt-security",
  "rtrt-templates",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "rtrt-compress"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "criterion",
@@ -3257,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3273,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-dashboard"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3306,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-eval"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3322,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3347,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-memory"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "criterion",
@@ -3368,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-providers"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3388,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-proxy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "once_cell",
  "regex",
@@ -3398,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-security"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -3413,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "rtrt-templates"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",

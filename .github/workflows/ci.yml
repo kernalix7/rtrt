@@ -110,7 +110,12 @@ jobs:
           cache-dependency-path: |
             plugins/opencode/package-lock.json
             plugins/opencode/test-fixtures/omo-4.19.4/package-lock.json
-      - run: npm ci --ignore-scripts
+      - name: Install locked test dependencies without optional platform packages
+        run: |
+          set -euo pipefail
+          node ../../packaging/npm/stage-test-dependencies.mjs ../../.rtrt/tmp/npm-test-dependencies
+          npm ci --ignore-scripts --prefix ../../.rtrt/tmp/npm-test-dependencies
+          mv ../../.rtrt/tmp/npm-test-dependencies/node_modules ./node_modules
       - name: Create invalid managed-agent state fixture
         run: |
           config_dir="$RUNNER_TEMP/invalid-opencode-config"

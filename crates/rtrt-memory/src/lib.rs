@@ -53,7 +53,7 @@ pub struct ProjectStorePin {
 }
 
 const STORE_IDENTITY_SCHEMA_VERSION: i64 = 1;
-const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 8;
+const CURRENT_DATABASE_SCHEMA_VERSION: i64 = 9;
 
 /// Identity and compatibility metadata read from an existing project store.
 ///
@@ -998,6 +998,106 @@ pub struct InvocationProvenance {
     pub target: Option<String>,
     pub model: Option<String>,
     pub created_at: i64,
+}
+
+/// One memory event forwarded by a collector on another machine (the
+/// "guest") into this store.
+///
+/// `event_id` is the guest-assigned, delivery-stable identity:
+/// [`MemoryStore::ingest_forwarded`] keys idempotency on the full
+/// `(source_guest, source_project, event_id)` tuple, so the same event
+/// redelivered over a flaky link — even with a mutated body — resolves to
+/// the row the first delivery created instead of duplicating it, while the
+/// same `event_id` arriving from a different guest or project is a
+/// genuinely distinct event that gets its own memory row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedEvent<'a> {
+    pub event_id: &'a str,
+    pub source_guest: &'a str,
+    pub source_project: &'a str,
+    pub kind: &'a str,
+    pub body: &'a str,
+    pub metadata: &'a std::collections::BTreeMap<String, String>,
+    pub session_id: Option<&'a str>,
+}
+
+/// Result of [`MemoryStore::ingest_forwarded`].
+///
+/// `inserted = false` means the same `(source_guest, source_project,
+/// event_id)` tuple was already known: `memory_id` names the row the
+/// original delivery created and nothing was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestOutcome {
+    pub memory_id: i64,
+    pub inserted: bool,
+}
+
+/// The memory row a forwarded-event receipt points at, or `None` when the
+/// event has never been ingested. Shared by the idempotency gate and the
+/// concurrent-delivery fallback of [`MemoryStore::ingest_forwarded`].
+/// Receipt identity is the `(source_guest, source_project, event_id)`
+/// tuple: a duplicate is only a redelivery from the same source.
+fn forwarded_receipt_memory_id(
+    conn: &Connection,
+    event: &ForwardedEvent<'_>,
+) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT memory_id FROM forwarded_event_receipts \
+         WHERE event_id = ?1 AND source_guest = ?2 AND source_project = ?3",
+        rusqlite::params![event.event_id, event.source_guest, event.source_project],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| Error::Memory(e.to_string()))
+}
+
+/// Rowset half of [`MemoryStore::ingest_forwarded`]: memory row, FTS5
+/// mirror, and delivery receipt, all written through one borrowed
+/// transaction so the caller commits or rolls them back as one unit.
+fn insert_forwarded_rows(
+    tx: &rusqlite::Transaction<'_>,
+    event: &ForwardedEvent<'_>,
+    project: &str,
+    metadata_raw: &str,
+    sha: &str,
+    created_at: i64,
+) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO memories \
+             (project, kind, body, created_at, scope, metadata, session_id, body_sha) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            project,
+            event.kind,
+            event.body,
+            created_at,
+            MemoryScope::Project.as_str(),
+            metadata_raw,
+            event.session_id,
+            sha,
+        ],
+    )
+    .map_err(|e| Error::Memory(e.to_string()))?;
+    let memory_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO memories_fts(rowid, body) VALUES (?1, ?2)",
+        rusqlite::params![memory_id, event.body],
+    )
+    .map_err(|e| Error::Memory(e.to_string()))?;
+    tx.execute(
+        "INSERT INTO forwarded_event_receipts \
+             (event_id, source_guest, source_project, memory_id, received_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            event.event_id,
+            event.source_guest,
+            event.source_project,
+            memory_id,
+            created_at,
+        ],
+    )
+    .map_err(|e| Error::Memory(e.to_string()))?;
+    Ok(memory_id)
 }
 
 /// A clusterable row: a [`MemNode`] paired with its salient-[`token_set`].
@@ -2019,6 +2119,36 @@ impl MemoryStore {
                 )
                 .map_err(|e| Error::Memory(e.to_string()))?;
         }
+        // v9: delivery receipts for forwarded memory events. A guest-side
+        // collector assigns each event a stable event_id; this table records
+        // which memory row the FIRST delivery created, so redeliveries
+        // (flaky links, collector retries) resolve to the original row
+        // instead of duplicating it. Receipt identity is the
+        // (source_guest, source_project, event_id) tuple, so an event id
+        // reused by a different guest or project is a distinct event. The
+        // receipt cascades with its memory: once a memory is consolidated
+        // away, a redelivery of the same event may be ingested afresh — a
+        // dangling receipt would hand callers a memory_id that no longer
+        // exists.
+        if v < 9 {
+            self.conn
+                .execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS forwarded_event_receipts (
+                        event_id       TEXT NOT NULL,
+                        source_guest   TEXT NOT NULL,
+                        source_project TEXT NOT NULL,
+                        memory_id      INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                        received_at    INTEGER NOT NULL,
+                        PRIMARY KEY (event_id, source_guest, source_project)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_forwarded_receipts_memory
+                        ON forwarded_event_receipts(memory_id);
+                    PRAGMA user_version = 9;
+                    "#,
+                )
+                .map_err(|e| Error::Memory(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -2195,6 +2325,93 @@ impl MemoryStore {
             )
             .optional()
             .map_err(|e| Error::Memory(e.to_string()))
+    }
+
+    /// Persist one forwarded memory event, exactly once.
+    ///
+    /// The first delivery of a `(source_guest, source_project, event_id)`
+    /// tuple atomically writes the memory row, its FTS5 mirror, the merged
+    /// metadata (caller keys plus `source_guest` / `source_project`
+    /// provenance), the `session_id` / `body_sha` tags, and the
+    /// `forwarded_event_receipts` row — all inside a single SQLite
+    /// transaction, so a crash can never leave a memory without its
+    /// receipt (which would let a redelivery duplicate it) or a receipt
+    /// without its memory. A redelivery of the same tuple returns the
+    /// original `memory_id` with `inserted = false` and writes nothing,
+    /// even when the redelivery carries a mutated body; the same `event_id`
+    /// from a different guest or project is a distinct event and inserts.
+    ///
+    /// Project placement follows the store: a strictly project-bound store
+    /// files the row under its pinned slug and `source_project` is recorded
+    /// in metadata only; legacy/admin/in-memory stores keep the event's
+    /// `source_project` as the row's project. Rows are ingested without an
+    /// embedding; the existing backlog sweeps embed them when an embedder is
+    /// attached, keeping model inference off the write transaction.
+    pub fn ingest_forwarded(&self, event: &ForwardedEvent<'_>) -> Result<IngestOutcome> {
+        if event.event_id.is_empty()
+            || event.source_guest.is_empty()
+            || event.source_project.is_empty()
+        {
+            return Err(Error::Memory(
+                "forwarded event requires a non-empty event_id, source_guest, and \
+                 source_project"
+                    .to_string(),
+            ));
+        }
+        let project = self.project_slug().unwrap_or(event.source_project);
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Memory(e.to_string()))?;
+
+        // Idempotency gate: a committed receipt for this source identity
+        // means the original delivery owns this event — resolve to its
+        // memory and write nothing.
+        if let Some(memory_id) = forwarded_receipt_memory_id(&tx, event)? {
+            return Ok(IngestOutcome {
+                memory_id,
+                inserted: false,
+            });
+        }
+
+        let mut metadata = event.metadata.clone();
+        metadata.insert("source_guest".to_owned(), event.source_guest.to_owned());
+        metadata.insert("source_project".to_owned(), event.source_project.to_owned());
+        let metadata_raw = serde_json::to_string(&metadata)
+            .map_err(|e| Error::Memory(format!("forwarded metadata encode: {e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| Error::Memory(e.to_string()))?
+            .as_secs() as i64;
+        let sha = Self::body_sha(event.body);
+
+        let attempt = insert_forwarded_rows(&tx, event, project, &metadata_raw, &sha, now)
+            .and_then(move |memory_id| {
+                tx.commit()
+                    .map_err(|e| Error::Memory(e.to_string()))
+                    .map(|()| memory_id)
+            });
+
+        match attempt {
+            Ok(memory_id) => Ok(IngestOutcome {
+                memory_id,
+                inserted: true,
+            }),
+            Err(error) => {
+                // A concurrent delivery of the same event may have won the
+                // race: the receipt PK rejected this transaction's inserts,
+                // everything rolled back, and the winner's committed receipt
+                // is now visible to a fresh read.
+                if let Some(memory_id) = forwarded_receipt_memory_id(&self.conn, event)? {
+                    return Ok(IngestOutcome {
+                        memory_id,
+                        inserted: false,
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Transcript-captured rows that may need (re)attribution — purely by
@@ -7078,7 +7295,7 @@ mod tests {
         assert_eq!(inspected.memory_root, identity.memory_root());
         assert_eq!(inspected.label, identity.label());
         assert_eq!(inspected.identity_schema_version, 1);
-        assert_eq!(inspected.database_schema_version, 8);
+        assert_eq!(inspected.database_schema_version, 9);
         assert!(inspected.database_schema_compatible);
         assert!(inspected.integrity_ok);
         assert_eq!(directory_snapshot(&store_dir), before);
@@ -7378,6 +7595,103 @@ mod tests {
         let stored = store.invocation_provenance("child-1").unwrap().unwrap();
         assert_eq!(stored, provenance);
         assert!(store.invocation_provenance("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn ingest_forwarded_keys_idempotency_on_event_id_not_body() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+
+        // Two distinct events carrying an identical body are two deliveries.
+        let first = store
+            .ingest_forwarded(&forwarded_event("evt-distinct", "shared body", &extra))
+            .unwrap();
+        let second = store
+            .ingest_forwarded(&forwarded_event("evt-other", "shared body", &extra))
+            .unwrap();
+        assert!(first.inserted);
+        assert!(second.inserted);
+        assert_ne!(second.memory_id, first.memory_id);
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn ingest_forwarded_rejects_empty_guest_and_project_and_writes_nothing() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+
+        let mut event = forwarded_event("evt-x", "anything", &extra);
+        event.source_guest = "";
+        assert!(store.ingest_forwarded(&event).is_err());
+        let mut event = forwarded_event("evt-x", "anything", &extra);
+        event.source_project = "";
+        assert!(store.ingest_forwarded(&event).is_err());
+
+        // Rejected events persisted nothing.
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM forwarded_event_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 0);
+    }
+
+    #[test]
+    fn forwarded_receipts_migration_is_additive_and_idempotent() {
+        // Simulate a legacy v8 database: rewind the version marker, drop the
+        // v9 table, then re-run migrate() exactly like a fresh open would.
+        let store = MemoryStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA user_version = 8;")
+            .unwrap();
+        store
+            .conn
+            .execute("DROP TABLE forwarded_event_receipts", [])
+            .unwrap();
+        store.migrate().unwrap();
+
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_DATABASE_SCHEMA_VERSION);
+        assert_eq!(version, 9);
+
+        // Re-running the migration is a no-op (CREATE IF NOT EXISTS).
+        store.migrate().unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+
+        // The recreated table is live end to end.
+        let extra = std::collections::BTreeMap::new();
+        let outcome = store
+            .ingest_forwarded(&forwarded_event("evt-migrated", "migrated body", &extra))
+            .unwrap();
+        assert!(outcome.inserted);
+        let memory_id: i64 = store
+            .conn
+            .query_row(
+                "SELECT memory_id FROM forwarded_event_receipts WHERE event_id = ?1",
+                rusqlite::params!["evt-migrated"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_id, outcome.memory_id);
     }
 
     #[test]
@@ -10035,5 +10349,252 @@ mod tests {
         assert_eq!(root(a1), root(a2));
         assert_eq!(root(b1), root(b2));
         assert_ne!(root(a1), root(b1));
+    }
+
+    fn forwarded_event<'a>(
+        event_id: &'a str,
+        body: &'a str,
+        metadata: &'a std::collections::BTreeMap<String, String>,
+    ) -> ForwardedEvent<'a> {
+        ForwardedEvent {
+            event_id,
+            source_guest: "guest-a",
+            source_project: "proj-src",
+            kind: "note",
+            body,
+            metadata,
+            session_id: Some("sess-1"),
+        }
+    }
+
+    #[test]
+    fn ingest_forwarded_first_event_persists_memory_fts_metadata_and_receipt() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra =
+            std::collections::BTreeMap::from([("topic".to_string(), "routing".to_string())]);
+        let event = forwarded_event("evt-1", "forwarded fact about token budgets", &extra);
+        let out = store.ingest_forwarded(&event).unwrap();
+        assert!(out.inserted);
+        assert!(out.memory_id > 0);
+
+        let hits = store.recall_bm25("proj-src", "token budgets", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, out.memory_id);
+        assert_eq!(hits[0].project, "proj-src");
+        assert_eq!(hits[0].kind, "note");
+
+        let meta = store.get_metadata(out.memory_id).unwrap();
+        assert_eq!(meta.get("topic").map(String::as_str), Some("routing"));
+        assert_eq!(
+            meta.get("source_guest").map(String::as_str),
+            Some("guest-a")
+        );
+        assert_eq!(
+            meta.get("source_project").map(String::as_str),
+            Some("proj-src")
+        );
+
+        let (session_id, body_sha, receipts): (Option<String>, Option<String>, i64) = store
+            .conn
+            .query_row(
+                "SELECT m.session_id, m.body_sha, \
+                        (SELECT COUNT(*) FROM forwarded_event_receipts r WHERE r.memory_id = m.id) \
+                   FROM memories m WHERE m.id = ?1",
+                rusqlite::params![out.memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            body_sha.as_deref(),
+            Some(MemoryStore::body_sha("forwarded fact about token budgets").as_str())
+        );
+        assert_eq!(receipts, 1);
+    }
+
+    #[test]
+    fn ingest_forwarded_duplicate_event_id_returns_original_and_writes_nothing() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let event = forwarded_event("evt-dup", "duplicate delivery body", &extra);
+        let first = store.ingest_forwarded(&event).unwrap();
+        assert!(first.inserted);
+
+        // Redelivery — even with a mutated body — maps to the original memory.
+        let mut redelivered = event;
+        redelivered.body = "changed body on redelivery";
+        let second = store.ingest_forwarded(&redelivered).unwrap();
+        assert_eq!(second.memory_id, first.memory_id);
+        assert!(!second.inserted);
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM forwarded_event_receipts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 1);
+
+        // The persisted body is the original delivery's, not the redelivery's.
+        let body: String = store
+            .conn
+            .query_row(
+                "SELECT body FROM memories WHERE id = ?1",
+                rusqlite::params![first.memory_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "duplicate delivery body");
+    }
+
+    #[test]
+    fn ingest_forwarded_scopes_duplicate_idempotency_by_source_identity() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+
+        // The same event id from a different guest is a distinct event.
+        let mut other_guest = forwarded_event("evt-shared", "guest-b body", &extra);
+        other_guest.source_guest = "guest-b";
+        let first = store
+            .ingest_forwarded(&forwarded_event("evt-shared", "guest-a body", &extra))
+            .unwrap();
+        let second = store.ingest_forwarded(&other_guest).unwrap();
+        assert!(first.inserted);
+        assert!(second.inserted);
+        assert_ne!(second.memory_id, first.memory_id);
+
+        // The same event id differing only by project is distinct too.
+        let mut other_project = forwarded_event("evt-shared", "other project body", &extra);
+        other_project.source_project = "proj-other";
+        let third = store.ingest_forwarded(&other_project).unwrap();
+        assert!(third.inserted);
+        assert_ne!(third.memory_id, first.memory_id);
+
+        // Same-source replay is idempotent and returns the original row.
+        let replay = store
+            .ingest_forwarded(&forwarded_event("evt-shared", "guest-a body", &extra))
+            .unwrap();
+        assert!(!replay.inserted);
+        assert_eq!(replay.memory_id, first.memory_id);
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM forwarded_event_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 3);
+    }
+
+    #[test]
+    fn ingest_forwarded_on_pinned_store_writes_pinned_project_and_records_source() {
+        let temp = TestDir::new("ingest-pinned");
+        let identity = project_identity(temp.path(), "repo");
+        let home = private_home(temp.path());
+        let store = MemoryStore::open_project_in(&identity, &home).unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let mut event = forwarded_event("evt-pin", "pinned store body", &extra);
+        event.source_project = "other-project";
+        event.source_guest = "guest-b";
+        let out = store.ingest_forwarded(&event).unwrap();
+        assert!(out.inserted);
+
+        // The memory lands in the pinned project, never the event's source.
+        let project: String = store
+            .conn
+            .query_row(
+                "SELECT project FROM memories WHERE id = ?1",
+                rusqlite::params![out.memory_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, identity.slug());
+
+        // Provenance still records where the event came from.
+        let meta = store.get_metadata(out.memory_id).unwrap();
+        assert_eq!(
+            meta.get("source_project").map(String::as_str),
+            Some("other-project")
+        );
+        assert_eq!(
+            meta.get("source_guest").map(String::as_str),
+            Some("guest-b")
+        );
+    }
+
+    #[test]
+    fn forwarded_receipts_migration_is_additive_and_survives_reopen() {
+        let temp = TestDir::new("ingest-migrate");
+        let db = temp.path().join("memory.sqlite");
+        {
+            let store = MemoryStore::open(&db).unwrap();
+            let version: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 9);
+            let extra = std::collections::BTreeMap::new();
+            let event = forwarded_event("evt-m", "migration body", &extra);
+            assert!(store.ingest_forwarded(&event).unwrap().inserted);
+        }
+        {
+            let store = MemoryStore::open(&db).unwrap();
+            let extra = std::collections::BTreeMap::new();
+            let event = forwarded_event("evt-m", "migration body", &extra);
+            let out = store.ingest_forwarded(&event).unwrap();
+            assert!(!out.inserted, "receipts must survive a reopen");
+            let rows: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+    }
+
+    #[test]
+    fn ingest_forwarded_rejects_empty_event_id_and_writes_nothing() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let event = forwarded_event("", "body without an id", &extra);
+        let err = store.ingest_forwarded(&event).unwrap_err();
+        assert!(err.to_string().contains("event_id"), "{err}");
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn ingest_forwarded_after_memory_delete_ingests_fresh_again() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let event = forwarded_event("evt-cascade", "cascade body", &extra);
+        let first = store.ingest_forwarded(&event).unwrap();
+        assert!(first.inserted);
+
+        assert!(store.delete_row(first.memory_id).unwrap());
+        // FK cascade: the receipt died with the memory, so a redelivery of the
+        // same event id is no longer a duplicate.
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM forwarded_event_receipts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipts, 0);
+        let second = store.ingest_forwarded(&event).unwrap();
+        assert!(second.inserted);
+        assert_ne!(second.memory_id, first.memory_id);
     }
 }

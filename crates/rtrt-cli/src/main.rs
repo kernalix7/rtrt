@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+mod collector;
 mod doctor;
+mod forward;
 pub mod opencode_sessions;
 mod proxy_stats;
 mod sandbox;
@@ -51,7 +53,7 @@ const CLI_AFTER_HELP: &str = "\
 Command groups (run `rtrt <command> --help` for details):
   Savings & Analytics  compress, stats, gain, proxy, proxy-run, discover,
                        benchmark, repo-map, run, context
-  Memory               memory
+  Memory               memory, collector, forward
   Routing & Providers  provider, call, route, usage, diagnose
   Project              templates, new, init, migrate, project, opencode, docs,
                        security
@@ -76,6 +78,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Receive explicitly mapped forwarded memory events.
+    #[command(hide = true)]
+    Collector {
+        #[command(subcommand)]
+        cmd: CollectorCmd,
+    },
+    /// Queue and deliver guest events to an authenticated collector.
+    #[command(hide = true)]
+    Forward {
+        #[command(subcommand)]
+        cmd: ForwardCmd,
+    },
     /// Launch OpenCode with project-private data and state.
     #[command(hide = true)]
     Opencode {
@@ -694,6 +708,56 @@ enum GatewayCmd {
         /// by default. `/healthz` is always open.
         #[arg(long, env = "RTRT_GATEWAY_TOKEN")]
         token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectorCmd {
+    /// Start authenticated event ingestion (loopback by default).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7313")]
+        bind: std::net::SocketAddr,
+        #[arg(long, env = "RTRT_COLLECTOR_TOKEN")]
+        token: String,
+        /// Repeat `--map guest:remote_project=HOST_PROJECT_PATH` for each authorized project.
+        #[arg(long = "map", required = true)]
+        mappings: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ForwardCmd {
+    /// Durably queue one event and immediately try delivery.
+    Enqueue {
+        #[arg(long, env = "RTRT_COLLECTOR_URL")]
+        endpoint: String,
+        #[arg(long, env = "RTRT_COLLECTOR_TOKEN")]
+        token: String,
+        #[arg(long, env = "RTRT_FORWARD_SPOOL")]
+        spool: Option<PathBuf>,
+        #[arg(long)]
+        guest_id: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        event_id: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        metadata: Option<String>,
+        /// Event text. Reads stdin when omitted.
+        body: Option<String>,
+    },
+    /// Retry queued events whose bounded backoff has elapsed.
+    Flush {
+        #[arg(long, env = "RTRT_COLLECTOR_URL")]
+        endpoint: String,
+        #[arg(long, env = "RTRT_COLLECTOR_TOKEN")]
+        token: String,
+        #[arg(long, env = "RTRT_FORWARD_SPOOL")]
+        spool: Option<PathBuf>,
     },
 }
 
@@ -3944,6 +4008,65 @@ fn run_cli() -> Result<()> {
 /// Dispatch a parsed subcommand.
 async fn run(command: Cmd) -> Result<()> {
     match command {
+        Cmd::Collector { cmd } => match cmd {
+            CollectorCmd::Serve {
+                bind,
+                token,
+                mappings,
+            } => collector::serve(bind, &token, mappings).await?,
+        },
+        Cmd::Forward { cmd } => match cmd {
+            ForwardCmd::Enqueue {
+                endpoint,
+                token,
+                spool,
+                guest_id,
+                project,
+                kind,
+                event_id,
+                session_id,
+                metadata,
+                body,
+            } => {
+                let body = match body {
+                    Some(body) => body,
+                    None => {
+                        if std::io::stdin().is_terminal() {
+                            bail!("forward enqueue requires a body argument or piped stdin");
+                        }
+                        let mut body = String::new();
+                        std::io::stdin()
+                            .take(u64::try_from(collector::MAX_BODY_BYTES + 1)?)
+                            .read_to_string(&mut body)?;
+                        body
+                    }
+                };
+                let id = forward::enqueue_and_deliver(forward::EnqueueArgs {
+                    endpoint,
+                    token,
+                    spool: spool.map(Ok).unwrap_or_else(forward::default_spool_path)?,
+                    guest_id,
+                    project,
+                    kind,
+                    body,
+                    event_id,
+                    session_id,
+                    metadata,
+                })
+                .await?;
+                println!("{id}");
+            }
+            ForwardCmd::Flush {
+                endpoint,
+                token,
+                spool,
+            } => {
+                let spool = spool.map(Ok).unwrap_or_else(forward::default_spool_path)?;
+                let client = forward::delivery_client()?;
+                let sent = forward::flush(&spool, &client, &endpoint, &token, false).await?;
+                println!("{sent} event(s) delivered");
+            }
+        },
         Cmd::Opencode {
             project,
             action,

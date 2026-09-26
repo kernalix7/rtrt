@@ -8,10 +8,34 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-26
+
+### Highlights
+
+**RTRT 0.1.5는 컨테이너와 원격 guest가 host 소유 project에 명시적인 memory event를 단방향 · bearer-authenticated ingest loop으로 쓸 수 있게 합니다. Host는 `rtrt collector serve`를 명시적인 `(guest_id, project)` map과 함께 실행하고, guest는 `rtrt forward enqueue`로 event를 private durable spool에 적재한 뒤 `rtrt forward flush`가 host collector가 정확히 한 번 저장할 때까지 bounded exponential backoff로 재시도합니다.**
+
+- `rtrt collector serve`는 container 또는 원격 guest의 memory event를 host project로 통합하는 authenticated `POST /v1/events` endpoint입니다. Collector는 모든 browser `Origin` 요청을 request body를 읽지 않고 거부하고, 없는 bearer와 잘못된 bearer도 request body를 읽지 않고 거부하며, 각 request body를 1 MiB로 제한하고, host가 제어하는 project path에서만 destination을 파생하므로 guest는 자기 target을 선택할 수 없습니다.
+- `rtrt forward enqueue|flush`는 모든 event를 delivery 시도 전에 private durable SQLite spool에 기록합니다. Spool은 crash에서도 살아남고 bounded exponential backoff로 재시도하며 host collector가 acknowledge한 경우에만 event를 비우므로 retry가 host memory row를 중복 생성하지 않습니다.
+- Host collector는 새 `MemoryStore::ingest_forwarded` idempotent forward-ingest 경로로 각 `(guest, project, event id)` delivery를 정확히 한 번만 저장하며 이 경로는 schema v9 위에 올라갑니다. 이미 받은 tuple의 redelivery는 쓰지 않고 acknowledge합니다. 같은 tuple이 다른 host project에 오는 것은 별개의 delivery이며 거기서 row를 삽입합니다.
+- Guest spool의 path-validation 및 operator-owned guard는 이제 지원되는 모든 Unix target에서 균일하게 적용됩니다(spool subsystem 자체는 Unix-only이며 Windows는 회귀된 것이 아니라 의도적으로 범위 밖입니다). 직속 spool directory는 operator-owned + mode `0700`, spool file은 operator-owned + mode `0600`이어야 하며, parent, intermediate directory, file path 자체를 포함한 모든 symlink된 path component는 그를 통해 무엇이든 쓰기 전에 거부됩니다.
+- CI는 이제 OpenCode 테스트 의존성을 `npm ci` 실행 전에 `.rtrt/tmp/npm-test-dependencies` 아래에 stage하므로 optional platform package나 다른 통제되지 않은 transitive dependency가 OpenCode plugin의 lockfile-gated test job을 망가뜨리지 않습니다.
+
 ### 추가
 
-- 컨테이너 또는 원격 guest의 memory event를 명시적으로 매핑한 host project에 통합하는 authenticated `POST /v1/events` endpoint인 `rtrt collector serve`를 추가했습니다. Collector는 browser `Origin` 요청을 거부하고 request body를 제한하며, host가 제어하는 project path에서만 destination을 파생하고 stable event id로 retry를 dedup합니다.
-- private durable SQLite spool, bounded exponential retry scheduling, stable event id, bearer-authenticated delivery를 제공하는 `rtrt forward enqueue|flush`를 추가했습니다. 실패한 delivery는 queue에 남고 host memory row를 중복 생성하지 않고 다시 시도할 수 있습니다.
+- `rtrt collector serve`는 container 또는 원격 guest의 memory event를 명시적으로 매핑한 host project로 통합하는 authenticated `POST /v1/events` endpoint입니다. Authorization middleware는 모든 `Origin` 요청, 없는 bearer, 잘못된 bearer를 `FORBIDDEN` / `UNAUTHORIZED`로 거부하며 그렇게 할 때 body를 절대 buffer하지 않고, 받아들인 각 request는 1 MiB로 cap된 뒤 JSON으로 파싱됩니다. 모든 destination은 host가 제어하는 project path에서 파생되므로 guest가 보낸 path는 받지 않으며 retry는 stable event id로 dedup됩니다. Server는 `127.0.0.1:7313`이 기본이고 모든 request에 `RTRT_COLLECTOR_TOKEN`이 필요합니다. host-local network 밖으로 나가는 traffic은 reverse proxy에서 TLS를 종료해야 하며(collector는 TLS를 직접 구현하지 않음) 가능하면 private bridge address에 bind합니다.
+- `rtrt forward enqueue`는 명시적인 memory event를 `~/.rtrt/forward-spool.sqlite`에 적재하고 `rtrt forward flush`는 due event를 bounded exponential backoff로 재시도합니다. 각 event는 stable id를 가지며 bearer-authenticated POST로 delivery되고 host collector의 유효한 acknowledgement가 확인된 경우에만 queue에서 제거됩니다. 실패한 delivery는 queue에 남고 host memory row를 중복 생성하지 않고 다시 시도할 수 있습니다.
+
+### 변경
+
+- `MemoryStore::ingest_forwarded`가 이제 host의 유일한 forward-ingest 경로입니다. `(source_guest, source_project, event_id)`로 idempotency를 키잉하고 memory row, FTS5 mirror, merged metadata(발신자 키에 더해 `source_guest` / `source_project` provenance), `session_id` / `body_sha`, `forwarded_event_receipts` row를 단일 SQLite transaction에서 commit하므로 crash가 receipt 없는 memory 또는 memory 없는 receipt를 남길 수 없습니다. Redelivery는 원본 `memory_id`와 `inserted = false`를 반환합니다. 같은 `event_id`를 가진 fresh tuple이라도 다른 guest 또는 remote project에서 오면 별개의 delivery로 보고 그 row에 삽입합니다. Wire shape(`WireEvent` / `ForwardedEvent`)은 그대로입니다.
+
+### 수정
+
+- Guest forward spool이 지원되는 모든 Unix platform에서 path-validation 및 operator-owned guard를 균일하게 적용합니다. Ownership 검사는 Linux와 Android에서는 `/proc/self/status`를, 다른 Unix platform에서는 `id -u`로 effective UID를 읽습니다(spool subsystem 전체는 Unix-only이며 Windows는 의도적으로 범위 밖입니다). 직속 spool directory는 operator-owned + mode `0700`, spool file은 operator-owned + mode `0600`이어야 하며, parent, intermediate directory, file path 자체를 포함한 모든 symlink된 path component는 directory를 만들거나 file을 열기 전에 거부되므로 이 코드가 symlink된 target을 populate하는 일은 없습니다.
+
+### CI
+
+- OpenCode plugin CI는 `.rtrt/tmp/npm-test-dependencies` 아래에 locked test dependency를 stage한 뒤 `npm ci --ignore-scripts`를 실행하므로, optional platform package나 다른 통제되지 않은 transitive dependency가 OpenCode plugin의 lockfile-gated test job을 망가뜨리지 않습니다. Stage된 `node_modules`는 test working directory로 옮겨지며 기존 fixture 동작은 그대로입니다.
 
 ## [0.1.4] - 2026-09-21
 

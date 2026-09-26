@@ -9,10 +9,34 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-26
+
+### Highlights
+
+**RTRT 0.1.5 lets containerized and remote guests write explicit memory events into host-owned projects through a one-way, bearer-authenticated ingest loop: the host runs `rtrt collector serve` with an explicit `(guest_id, project)` map, the guest enqueues into a private durable spool with `rtrt forward enqueue`, and `rtrt forward flush` retries with bounded exponential backoff until the host collector stores the event exactly once.**
+
+- `rtrt collector serve` exposes an authenticated `POST /v1/events` endpoint that consolidates container or remote-guest memory events into host projects. The collector refuses every browser `Origin` request without reading the request body, refuses missing and wrong bearer tokens without reading the request body, caps each request body at 1 MiB, and derives every destination from a host-controlled project path so a guest cannot pick its own target.
+- `rtrt forward enqueue|flush` writes every event into a private durable SQLite spool before any delivery attempt. The spool survives crashes, retries with bounded exponential backoff, and only drops an event when the host collector acknowledges it, so retries never create duplicate host memory rows.
+- The host collector stores each `(guest, project, event id)` delivery exactly once through the new `MemoryStore::ingest_forwarded` idempotent forward-ingest path, which lives on schema v9; redeliveries of an already-received tuple are acknowledged without writing again. The same tuple in another host project is a distinct delivery and inserts there.
+- The guest spool's path-validation and operator-owned guards now apply uniformly on every supported Unix target (the spool subsystem itself is Unix-only; Windows is intentionally out of scope rather than regressed): the immediate spool directory must be operator-owned with mode `0700`, the spool file must be operator-owned with mode `0600`, and every symlinked path component — parents, intermediate directories, the file path itself — is rejected before anything is written through it.
+- CI now stages OpenCode test dependencies under `.rtrt/tmp/npm-test-dependencies` before running `npm ci`, so optional platform packages and other uncontrolled transitive deps no longer fail the OpenCode plugin's lockfile-gated test job.
+
 ### Added
 
-- Added `rtrt collector serve`, an authenticated `POST /v1/events` ingestion endpoint for consolidating container or remote guest memory events into explicitly mapped host projects. The collector rejects browser `Origin` requests, bounds request bodies, derives every destination from a host-controlled project path, and deduplicates retries by stable event id.
-- Added `rtrt forward enqueue|flush` with a private durable SQLite spool, bounded exponential retry scheduling, stable event ids, and bearer-authenticated delivery. Failed deliveries remain queued and can be retried without creating duplicate host memory rows.
+- `rtrt collector serve` is an authenticated `POST /v1/events` ingestion endpoint for consolidating container or remote-guest memory events into explicitly mapped host projects. The authorization middleware refuses every `Origin` request, missing bearer, and wrong bearer with `FORBIDDEN` / `UNAUTHORIZED` and never buffers the body when it does so; each accepted request is then capped at 1 MiB and parsed as JSON. Every destination is derived from a host-controlled project path so guest-supplied paths are never accepted, and retries are deduplicated by stable event id. The server defaults to `127.0.0.1:7313` and requires `RTRT_COLLECTOR_TOKEN` on every request. Bind a private bridge address and terminate TLS in a reverse proxy when traffic leaves the host-local network; the collector does not implement TLS.
+- `rtrt forward enqueue` queues an explicit memory event into `~/.rtrt/forward-spool.sqlite` and `rtrt forward flush` retries due events with bounded exponential backoff. Each event carries a stable id; delivery uses bearer-authenticated POST and only removes the queued row after a valid collector acknowledgement. Failed deliveries remain queued and can be retried without creating duplicate host memory rows.
+
+### Changed
+
+- `MemoryStore::ingest_forwarded` is now the host's only forward-ingest path. It keys idempotency on `(source_guest, source_project, event_id)` and commits the memory row, its FTS5 mirror, the merged metadata (caller keys plus `source_guest` / `source_project` provenance), `session_id` / `body_sha`, and the `forwarded_event_receipts` row in a single SQLite transaction so a crash can never leave a memory without its receipt (which would let a redelivery duplicate it) or a receipt without its memory. A redelivery returns the original `memory_id` with `inserted = false`; a fresh tuple with the same `event_id` from a different guest or remote project is treated as a distinct delivery and inserts in its own row. The wire shape (`WireEvent` / `ForwardedEvent`) is unchanged.
+
+### Fixed
+
+- The guest forward spool applies the path-validation and operator-owned guards uniformly on every supported Unix platform. Ownership checks read the effective UID through `/proc/self/status` on Linux and Android and through `id -u` on other Unix platforms (the spool subsystem as a whole remains Unix-only and Windows is intentionally out of scope). The immediate spool directory must be operator-owned with mode `0700`, the spool file must be operator-owned with mode `0600`, and every symlinked path component — parents, intermediate directories, the file path itself — is rejected before any directory is created or any file is opened, so no symlinked target is ever populated by this code.
+
+### CI
+
+- OpenCode plugin CI stages locked test dependencies under `.rtrt/tmp/npm-test-dependencies` before running `npm ci --ignore-scripts`, so optional platform packages and other uncontrolled transitive dependencies no longer break the OpenCode plugin's lockfile-gated test job. The staged `node_modules` is then moved into the test working directory; existing fixture behavior is unchanged.
 
 ## [0.1.4] - 2026-09-21
 

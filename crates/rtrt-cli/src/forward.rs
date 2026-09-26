@@ -253,6 +253,17 @@ async fn flush_to_url(
 mod tests {
     use super::*;
 
+    fn test_root(dir: &tempfile::TempDir) -> PathBuf {
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(dir.path()).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            dir.path().to_path_buf()
+        }
+    }
+
     #[test]
     fn validates_wire_identifiers_when_controls_or_empty() {
         // Given malformed identifiers and a valid identifier.
@@ -296,27 +307,107 @@ mod tests {
 
         // Given a spool symlink pointing at a separate file.
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target.sqlite");
+        let root = test_root(&dir);
+        let target = root.join("target.sqlite");
         std::fs::write(&target, "do not touch").unwrap();
-        let spool = dir.path().join(".rtrt/forward.sqlite");
-        std::fs::create_dir(dir.path().join(".rtrt")).unwrap();
-        std::fs::set_permissions(
-            dir.path().join(".rtrt"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        let spool = root.join(".rtrt/forward.sqlite");
+        std::fs::create_dir(root.join(".rtrt")).unwrap();
+        std::fs::set_permissions(root.join(".rtrt"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         std::os::unix::fs::symlink(&target, &spool).unwrap();
         // When the spool is opened.
         // Then it is rejected without touching the target.
-        assert!(open_spool(&spool).is_err());
+        assert!(
+            open_spool(&spool)
+                .unwrap_err()
+                .to_string()
+                .contains("spool must be a regular file, not a symlink")
+        );
         assert_eq!(std::fs::read_to_string(target).unwrap(), "do not touch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_rejects_symlinked_directory_without_populating_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Given a symlink at the spool directory pointing to a separate private directory.
+        let home = tempfile::tempdir().unwrap();
+        let root = test_root(&home);
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.join(".rtrt");
+        std::os::unix::fs::symlink(&target, &directory).unwrap();
+        let path = directory.join("forward.sqlite");
+
+        // When the spool is opened through the directory symlink.
+        // Then the symlink is rejected and the target directory stays empty.
+        assert!(
+            open_spool(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("spool path contains symlink")
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_rejects_symlinked_intermediate_directory_without_populating_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Given a symlink above the spool directory pointing to a separate directory.
+        let home = tempfile::tempdir().unwrap();
+        let root = test_root(&home);
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let intermediate = root.join("link");
+        std::os::unix::fs::symlink(&target, &intermediate).unwrap();
+        let path = intermediate.join(".rtrt/forward.sqlite");
+
+        // When the spool is opened through the intermediate symlink.
+        // Then the symlink is rejected before creating any target subdirectory.
+        assert!(
+            open_spool(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("spool path contains symlink")
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_rejects_directory_at_file_path_without_populating_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Given a directory where the spool file would be created.
+        let home = tempfile::tempdir().unwrap();
+        let root = test_root(&home);
+        let directory = root.join(".rtrt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("forward.sqlite");
+        std::fs::create_dir(&path).unwrap();
+
+        // When the spool is opened at the directory path.
+        // Then opening is rejected without writing into the directory.
+        assert!(
+            open_spool(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("spool must be a regular file, not a symlink")
+        );
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
     }
 
     #[test]
     fn spool_preserves_event_id_when_reopened() {
         // Given a private spool and a queued event.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         let event = WireEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             guest_id: "guest-a".into(),
@@ -340,7 +431,7 @@ mod tests {
     fn spool_rejects_duplicate_event_id_with_different_payload() {
         // Given a queued event.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         let event = WireEvent {
             event_id: "evt-same".into(),
             guest_id: "guest-a".into(),
@@ -371,14 +462,20 @@ mod tests {
 
         // Given an operator-owned spool directory whose mode is not exactly 0700.
         let home = tempfile::tempdir().unwrap();
-        let dir = home.path().join(".rtrt");
+        let dir = test_root(&home).join(".rtrt");
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("forward-spool.sqlite");
         for mode in [0o755, 0o701, 0o1700, 0o600, 0o000] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
             // When the spool is opened.
             // Then every mode other than 0700 is rejected without creating the file.
-            assert!(open_spool(&path).is_err(), "mode {mode:o} must be rejected");
+            assert!(
+                open_spool(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("spool directory must be operator-owned with mode 0700"),
+                "mode {mode:o} must be rejected"
+            );
         }
         assert!(!path.exists());
     }
@@ -390,13 +487,19 @@ mod tests {
 
         // Given a created private spool file.
         let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(".rtrt/forward-spool.sqlite");
+        let path = test_root(&home).join(".rtrt/forward-spool.sqlite");
         drop(open_spool(&path).unwrap());
         for mode in [0o644, 0o400, 0o4600, 0o2600, 0o700] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             // When the spool is reopened.
             // Then every mode other than 0600, including special bits, is rejected.
-            assert!(open_spool(&path).is_err(), "mode {mode:o} must be rejected");
+            assert!(
+                open_spool(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("spool file must be operator-owned with mode 0600"),
+                "mode {mode:o} must be rejected"
+            );
         }
     }
 
@@ -407,7 +510,7 @@ mod tests {
 
         // Given a missing spool directory nested below a private home.
         let home = tempfile::tempdir().unwrap();
-        let path = home.path().join(".rtrt/forward-spool.sqlite");
+        let path = test_root(&home).join(".rtrt/forward-spool.sqlite");
         // When the spool is opened.
         let conn = open_spool(&path).unwrap();
         drop(conn);
@@ -417,11 +520,11 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode()
-                & 0o777,
+                & 0o7777,
             0o700
         );
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             0o600
         );
     }
@@ -430,7 +533,7 @@ mod tests {
     async fn flush_preserves_event_when_endpoint_refuses_delivery() {
         // Given a pending event and an unreachable collector endpoint.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         let event = WireEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             guest_id: "guest-a".into(),
@@ -493,7 +596,7 @@ mod tests {
     async fn flush_retains_event_when_acknowledgement_json_is_invalid() {
         // Given a queued event and a collector that answers 200 with non-JSON.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         spool_with_queued_event(&path);
         let endpoint =
             collector_returning(reqwest::StatusCode::OK, "this is not an acknowledgement").await;
@@ -513,7 +616,7 @@ mod tests {
         // Given a queued event and a collector that answers 200 with JSON
         // missing the inserted field.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         spool_with_queued_event(&path);
         let endpoint = collector_returning(reqwest::StatusCode::OK, r#"{"memory_id": 1}"#).await;
         let client = delivery_client().unwrap();
@@ -539,7 +642,7 @@ mod tests {
             r#"{"memory_id": -1, "inserted": true}"#,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(".rtrt/forward.sqlite");
+            let path = test_root(&dir).join(".rtrt/forward.sqlite");
             spool_with_queued_event(&path);
             let endpoint = collector_returning(reqwest::StatusCode::OK, body).await;
             let client = delivery_client().unwrap();
@@ -561,7 +664,7 @@ mod tests {
     async fn flush_retains_event_when_collector_answers_non_2xx() {
         // Given a queued event and a collector answering 500.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         spool_with_queued_event(&path);
         let endpoint = collector_returning(reqwest::StatusCode::INTERNAL_SERVER_ERROR, r#""#).await;
         let client = delivery_client().unwrap();
@@ -583,7 +686,7 @@ mod tests {
         // Given a queued event and a collector that redirects delivery to
         // another endpoint which would acknowledge a followed request.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         spool_with_queued_event(&path);
         let app = axum::Router::new()
             .route(
@@ -621,7 +724,7 @@ mod tests {
     async fn flush_removes_event_when_collector_reports_duplicate_success() {
         // Given a queued event and a collector returning duplicate success.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".rtrt/forward.sqlite");
+        let path = test_root(&dir).join(".rtrt/forward.sqlite");
         let event = WireEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             guest_id: "guest-a".into(),

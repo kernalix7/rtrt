@@ -20,6 +20,51 @@ fn now_millis() -> Result<i64> {
     )?)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_effective_uid(status: &str) -> Result<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .context("cannot parse effective uid from /proc/self/status")
+}
+
+#[cfg(unix)]
+fn effective_uid() -> Result<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let status = fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
+        parse_effective_uid(&status)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let command = if Path::new("/usr/bin/id").is_file() {
+            "/usr/bin/id"
+        } else {
+            "/bin/id"
+        };
+        let output = std::process::Command::new(command)
+            .arg("-u")
+            .output()
+            .context("run id -u")?;
+        if !output.status.success() {
+            bail!("id -u failed");
+        }
+        let uid = std::str::from_utf8(&output.stdout).context("id -u output is not UTF-8")?;
+        uid.trim()
+            .parse::<u32>()
+            .context("cannot parse uid from id -u")
+    }
+}
+
+#[cfg(unix)]
+fn owned_with_mode(metadata: &fs::Metadata, uid: u32, mode: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    metadata.permissions().mode() & 0o7777 == mode && metadata.uid() == uid
+}
+
 fn private_parent(path: &Path) -> Result<()> {
     let parent = path.parent().context("spool path needs parent directory")?;
     let mut current = std::path::PathBuf::new();
@@ -32,12 +77,15 @@ fn private_parent(path: &Path) -> Result<()> {
             Ok(metadata) if !metadata.is_dir() => bail!("spool path parent is not a directory"),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
                 let mut builder = fs::DirBuilder::new();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
                     builder.mode(0o700);
                 }
+                #[cfg(not(unix))]
+                let builder = fs::DirBuilder::new();
                 builder
                     .create(&current)
                     .with_context(|| format!("create {}", current.display()))?;
@@ -45,13 +93,10 @@ fn private_parent(path: &Path) -> Result<()> {
             Err(error) => return Err(error).context("inspect spool directory"),
         }
     }
-    let metadata = fs::symlink_metadata(parent)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o7777 != 0o700
-            || metadata.uid() != crate::unsafe_geteuid()
-        {
+        let metadata = fs::symlink_metadata(parent)?;
+        if !owned_with_mode(&metadata, effective_uid()?, 0o700) {
             bail!("spool directory must be operator-owned with mode 0700");
         }
     }
@@ -67,10 +112,7 @@ pub(super) fn open_spool(path: &Path) -> Result<Connection> {
         Ok(metadata) => {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                if metadata.permissions().mode() & 0o7777 != 0o600
-                    || metadata.uid() != crate::unsafe_geteuid()
-                {
+                if !owned_with_mode(&metadata, effective_uid()?, 0o600) {
                     bail!("spool file must be operator-owned with mode 0600");
                 }
             }
@@ -85,7 +127,15 @@ pub(super) fn open_spool(path: &Path) -> Result<Connection> {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            options.open(path).context("create private spool")?;
+            let file = options.open(path).context("create private spool")?;
+            #[cfg(unix)]
+            {
+                let metadata = file.metadata().context("inspect new spool")?;
+                if !owned_with_mode(&metadata, effective_uid()?, 0o600) {
+                    bail!("spool file must be operator-owned with mode 0600");
+                }
+            }
+            drop(file);
         }
         Err(error) => return Err(error).context("inspect spool"),
     }
@@ -166,4 +216,63 @@ pub(super) fn retry(conn: &Connection, event_id: &str, attempts: u32) -> Result<
         params![event_id, attempts, next],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn effective_uid_parser_selects_effective_field_when_real_uid_differs() {
+        // Given distinct real, effective, saved and filesystem UIDs.
+        let status = "Name:\trtrt\nUid:\t1000\t1001\t1002\t1003\nGid:\t1000\t1000\t1000\t1000\n";
+        // When the status is parsed.
+        // Then ownership uses the effective UID, not the first or last field.
+        assert_eq!(parse_effective_uid(status).unwrap(), 1001);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn effective_uid_parser_rejects_missing_or_malformed_effective_field() {
+        // Given missing, incomplete and invalid Uid fields.
+        for status in [
+            "Name:\trtrt\nGid:\t1000\t1000\n",
+            "Uid:\t1000\n",
+            "Uid:\t1000\tbad\t1002\t1003\n",
+            "Uid:\t1000\t-1\t1002\t1003\n",
+            "Uid:\t1000\t4294967296\t1002\t1003\n",
+        ] {
+            // When the status is parsed.
+            // Then there is no fallback to a guessed UID.
+            assert!(parse_effective_uid(status).is_err(), "{status:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_mode_predicate_rejects_mismatched_uid_and_special_bits() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // Given an operator-owned file with mode 0600.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let uid = metadata.uid();
+
+        // When checking owner and exact mode without changing ownership.
+        // Then only a matching owner and mode are accepted.
+        assert!(owned_with_mode(&metadata, uid, 0o600));
+        assert!(!owned_with_mode(&metadata, uid.wrapping_add(1), 0o600));
+        assert!(!owned_with_mode(&metadata, uid, 0o700));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4600)).unwrap();
+        assert!(!owned_with_mode(
+            &std::fs::metadata(&path).unwrap(),
+            uid,
+            0o600
+        ));
+    }
 }

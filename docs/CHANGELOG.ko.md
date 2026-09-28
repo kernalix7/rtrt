@@ -8,6 +8,49 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-28
+
+### Highlights
+
+**RTRT 0.1.6은 v0.1.5 감사에서 확인된 문제를 pair별 collector 인증, 서드파티 고지 포함, 모바일 프로젝트 선택, CI 검증 확대로 보완합니다.**
+
+- `rtrt collector serve`는 이제 per-map `--credentials` 파일을 통해 각 `(guest_id, project)` 매핑을 자체 bearer credential에 묶고, `forward flush` 경로에 대응되는 `--guest-id` / `--project` 필터를 추가해 한 token이 무관한 host store에 더는 쓸 수 없게 합니다. 단일 `--token` 형식은 매핑이 정확히 하나일 때만 유지됩니다.
+- 대시보드 모바일 레이아웃은 `≤720px`에서 전체 sidebar를 숨기는 대신 project picker를 계속 보여주며, 폭이 넓은 overview 콘텐츠는 페이지 대신 카드 내부에서 스크롤됩니다.
+- 새 CI 잡은 옵트인 feature 표면(`embeddings`, `onnx`, `bertscore`, `chains`)을 `cargo check --locked` 깊이로 점검해 모델 다운로드가 허용되지 않는 상황에서도 미래의 빌드 회귀를 잡습니다. 테스트 매트릭스에 `macos-15-intel` 러너가 추가됩니다.
+- 새 `THIRD_PARTY_NOTICES/` 디렉터리에 대시보드 번들에서 누락된 MIT 고지와 일부 Rust 의존성의 버전 고정 고지를 포함합니다. `THIRD_PARTY_LICENSES.md`도 해석된 버전에 맞게 정정했지만 법적 의무의 완전한 충족을 인증하지는 않습니다.
+- Live-key, WSL, macOS x64 커버리지를 정직하게 명시합니다. live 프로바이더 키는 여전히 사전 태그 전용 `scripts/smoke.sh` 단계이며, WSL은 전용 CI lane이 없고, `macos-15-intel`은 `macos-latest` arm64 전용 실행에 의존하지 않고 이 릴리스에서 매트릭스에 합류합니다.
+
+### 추가
+
+- `rtrt collector serve`는 한 bearer token을 한 `(guest_id, project)` 매핑과 짝지우는 `--credentials <TOML>` 파일을 받으며, 여러 매핑에서 공유 bearer를 거부합니다. 파일은 운영자 소유의 mode `0600`이어야 하고 경로의 심볼릭 링크를 검사하며, 열린 파일의 신원·소유자·mode를 다시 확인합니다. 비-Unix 타깃에서는 이러한 검사의 의미가 이식되지 않아 credential 파일을 거부합니다. `--token`은 단일 매핑에만 허용하고 두 인증 출처를 결합할 수 없습니다.
+- 인증 미들웨어는 모든 binding에 대해 constant-time bearer를 검증하고 token 없이 `AuthorizedBinding { pair, identity }`를 요청 extension에 넣습니다. Ingest handler는 `guest_id` 또는 `project`가 다르면 저장 전에 거부하므로 한 pair의 token으로 다른 매핑을 승인할 수 없습니다. 바이너리 통합 테스트는 A의 token이 B에 대해 `403`을 받고 B의 SQLite store를 만들지 않는지 확인합니다.
+- `rtrt forward flush --guest-id <id> --project <name>`은 delivery 전에 spool을 한 쌍으로 필터링해 guest가 자신의 queue만 비울 수 있게 합니다. 새 `Selection` enum이 기존 `pending(limit, force)` helper를 대체합니다. 필터링 selection은 전체 rowid 스트림을 스캔하지만 due row의 전달 가능 배치를 100개로 제한해 foreign row가 매칭 row를 starvation하지 못하게 하고, 잘못되었거나 key와 불일치한 payload에 대해서는 spool 검증이 queue를 변경하지 않고 fail closed를 유지합니다. 필터 없는 flush는 여전히 mixed-pair spool을 거부하는데, 어떤 단일 token도 양쪽 host store에 대한 delivery를 인증할 수 없기 때문입니다.
+- `THIRD_PARTY_NOTICES/INDEX.md`에는 임베드된 JavaScript와 `ring`, `subtle`, `webpki-roots`, `option-ext`를 포함한 일부 Rust 의존성의 버전별 소스 아카이브와 SHA-256이 기록됩니다. 다섯 바이너리 아카이브, 다섯 플랫폼 npm 패키지, `rtrt-agent`에 같은 고지 트리를 넣습니다. 이는 표적 인벤토리이며 법적 인증이나 MPL-2.0 소스 제공 의무 검토의 대체물이 아닙니다.
+
+### 변경
+
+- `MemoryStore::ingest_forwarded`와 wire shape(`WireEvent` / `ForwardedEvent`)는 그대로입니다. Collector의 authorization은 이제 ingest handler가 body를 읽기 전에 token을 특정 `(guest_id, project)` pair에 묶어, 기존 `(source_guest, source_project, event_id)` idempotency 보장은 대체가 아닌 강화로 유지됩니다.
+- `THIRD_PARTY_LICENSES.md`는 이제 resolved 버전을 정확히 기록합니다. `ring@0.17.14`는 번들된 BoringSSL 분할을 가진 ISC/Apache-2.0으로, `subtle@2.6.1`은 BSD-3-Clause로, `webpki-roots@0.26.11`과 `webpki-roots@1.0.7`은 CDLA-Permissive-2.0으로, `option-ext@0.2.0`은 MPL-2.0으로 표기됩니다. v0.1.5 기록의 webpki-roots 오기 MPL-2.0 항목과 ring license 혼합은 제거됩니다.
+- 대시보드 모바일 레이아웃은 project picker를 계속 노출합니다. sidebar의 `mode-nav` 그룹은 `≤720px`에서 숨겨지지만 `project-picker` 행은 그대로 보이고 main column의 min-width가 `minmax(0, 1fr)`로 내려가 긴 slug가 가로 스크롤바를 강제하지 않으며, overview 카드와 savings hero는 `overflow-wrap: anywhere`를 받아 긴 셀이 잘리지 않고 줄바꿈됩니다.
+- 한·영 설치 문서에 v0.1.6 고정 예시와 릴리스 아카이브 이름을 명시합니다. 소스 트리의 Homebrew formula는 실제 checksum을 채우고 별도 tap 변경을 게시하기 전까지 템플릿입니다.
+
+### 수정
+
+- v0.1.5 감사에서 시연한 collector 공유 token 위조 경로를 빌드된 CLI 통합 경로에서 차단합니다. `crates/rtrt-cli/tests/collector_auth.rs`는 두 독립 project와 고유 token으로 실제 collector 바이너리를 실행해 A의 token으로 B에 쓰면 B store 생성 없이 `403`이 반환되고, A의 flush가 B의 queue를 변경하지 않는지 검증합니다.
+- 대시보드는 이제 `720px` 이하에서 유일한 project selector를 더 이상 숨기지 않습니다. `.project-picker` 규칙은 작은 viewport에서 하단 경계를 제거하고 `.savings-hero`와 overview 카드는 긴 토큰을 제한해, 모바일 세션은 창 크기를 조정하지 않고도 선택된 프로젝트를 바꿀 수 있습니다.
+- OpenCode CI 플러그인의 `npm test` 잡은 이제 `notices-package.test.mjs`를 포함합니다. 이 테스트는 `THIRD_PARTY_NOTICES/INDEX.md`의 모든 항목이 packed `rtrt-agent` tarball에 존재하고 각 `LICENSE`가 INDEX에 기록된 SHA-256과 일치하는지 단언해, notice를 드롭하거나 수정하는 미래의 bump가 게시 전에 CI에서 실패하게 만듭니다.
+
+### CI
+
+- 새 `feature-lanes` 잡은 `ORT_SKIP_DOWNLOAD=1`로 `cargo check --locked -p rtrt-memory --features embeddings`, `cargo check --locked -p rtrt-compress --features onnx`, `cargo check --locked -p rtrt-eval --features bertscore`, `cargo check --locked -p rtrt-templates --features chains`를 실행합니다. 각 lane은 compile-only이므로 ONNX 모델 다운로드나 live 프로바이더 호출이 필요 없습니다. 이 잡은 모든 옵트인 feature가 모든 기본 바이너리로 컴파일된다고 주장하지 않습니다 — v0.1.5 audit record가 이미 그 광범위한 주장을 정정한 바 있습니다 — 회귀가 잡힐 수 있도록 feature 당 하나의 한정된 compile lane을 추가합니다.
+- 테스트 매트릭스는 기존 `ubuntu-latest` x64/arm64, `macos-latest` arm64, `windows-latest`, `beta`-toolchain Linux x64 lane과 함께 `macos-15-intel` 러너 항목을 새로 받습니다. macOS x64는 이전에 빌드만 되고 CI에서 테스트되지는 않았는데, 이번 릴리스는 arm64 실행에 의존하지 않고 매트릭스에 추가합니다.
+- Live Anthropic / OpenAI / OpenAI 호환 검사는 CI lane이 아닌 `scripts/smoke.sh` 사전 태그 게이트로 남아 있습니다 — CI 환경에 프로바이더 키가 없기 때문입니다. WSL 런타임 또한 전용 CI lane이 없습니다. 기존 러너 레이블에 깔끔하게 맞지 않기 때문입니다. 두 한계는 묵인하지 않고 audit follow-up에 문서화됩니다.
+
+### Notes
+
+- 실제 프로바이더 키가 필요한 smoke는 CI에 포함되지 않고, WSL 런타임도 전용 CI 잡이 없습니다. 추가된 옵트인 feature 잡은 모델 다운로드 없이 컴파일하며 macOS Intel 테스트가 매트릭스에 포함됩니다.
+- Homebrew formula의 SHA-256은 여전히 0으로 된 템플릿이므로 설치 가능한 tap 릴리스가 아닙니다. 고지 트리는 법률 준수를 인증하지 않으며 고지 배치와 MPL-2.0 소스 제공 의무는 적격 법률 자문의 검토 대상입니다.
+
 ## [0.1.5] - 2026-09-26
 
 ### Highlights

@@ -718,7 +718,13 @@ enum CollectorCmd {
         #[arg(long, default_value = "127.0.0.1:7313")]
         bind: std::net::SocketAddr,
         #[arg(long, env = "RTRT_COLLECTOR_TOKEN")]
-        token: String,
+        token: Option<String>,
+        #[arg(
+            long,
+            env = "RTRT_COLLECTOR_CREDENTIALS_FILE",
+            conflicts_with = "token"
+        )]
+        credentials: Option<PathBuf>,
         /// Repeat `--map guest:remote_project=HOST_PROJECT_PATH` for each authorized project.
         #[arg(long = "map", required = true)]
         mappings: Vec<String>,
@@ -758,6 +764,10 @@ enum ForwardCmd {
         token: String,
         #[arg(long, env = "RTRT_FORWARD_SPOOL")]
         spool: Option<PathBuf>,
+        #[arg(long, requires = "project")]
+        guest_id: Option<String>,
+        #[arg(long, requires = "guest_id")]
+        project: Option<String>,
     },
 }
 
@@ -4012,8 +4022,9 @@ async fn run(command: Cmd) -> Result<()> {
             CollectorCmd::Serve {
                 bind,
                 token,
+                credentials,
                 mappings,
-            } => collector::serve(bind, &token, mappings).await?,
+            } => collector::serve(bind, token.as_deref(), credentials.as_deref(), mappings).await?,
         },
         Cmd::Forward { cmd } => match cmd {
             ForwardCmd::Enqueue {
@@ -4060,10 +4071,27 @@ async fn run(command: Cmd) -> Result<()> {
                 endpoint,
                 token,
                 spool,
+                guest_id,
+                project,
             } => {
                 let spool = spool.map(Ok).unwrap_or_else(forward::default_spool_path)?;
                 let client = forward::delivery_client()?;
-                let sent = forward::flush(&spool, &client, &endpoint, &token, false).await?;
+                let sent = match (guest_id, project) {
+                    (Some(guest_id), Some(project)) => {
+                        forward::flush_pair(
+                            &spool,
+                            &client,
+                            &endpoint,
+                            &token,
+                            collector::GuestProject { guest_id, project },
+                        )
+                        .await?
+                    }
+                    (None, None) => {
+                        forward::flush(&spool, &client, &endpoint, &token, false).await?
+                    }
+                    _ => bail!("forward flush requires --guest-id and --project together"),
+                };
                 println!("{sent} event(s) delivered");
             }
         },

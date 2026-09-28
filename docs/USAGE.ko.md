@@ -2,7 +2,7 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 v0.1.5 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
+이 문서는 v0.1.6 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
 
 ## 빠른 차림표
 
@@ -113,10 +113,10 @@ RTRT는 team 명령, scheduler, roster, worker protocol 또는 `team_dispatch` M
 
 ### OpenCode npm 플러그인과 setup 마이그레이션
 
-`rtrt-agent@0.1.5`을 `npm install rtrt-agent@0.1.5`으로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
+`rtrt-agent@0.1.6`을 `npm install rtrt-agent@0.1.6`으로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.5"] }
+{ "plugin": ["rtrt-agent@0.1.6"] }
 ```
 
 npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 일치하는 대시보드 backend를 loopback-only detached process로 시작합니다. 플러그인 초기화는 대시보드 준비를 기다리지 않으며 브라우저를 자동으로 열지 않습니다. 필요할 때 `rtrt-dashboard-open`을 실행하거나 에이전트에게 `rtrt_dashboard_open` 도구 사용을 명시적으로 요청합니다. TUI 스테이터스라인은 npm에 포함되지 않으며 계속 setup이 관리합니다.
@@ -127,7 +127,7 @@ npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 �
 rtrt setup --agent opencode --apply
 ```
 
-Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.5` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지 게시를 담당하며, 이 문서는 게시가 이미 완료되었다고 주장하지 않습니다.
+Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.6` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지를 게시합니다.
 
 ### OpenCode 영구 스테이터스라인
 
@@ -457,35 +457,76 @@ rtrt new dev ./hello \
 컨테이너 또는 원격 guest의 명시적 memory event를 host 소유 project store로 통합할 때 collector를 사용합니다. Host는 각 `(guest_id, remote project)` 쌍을 실제 host project directory에 매핑해 승인합니다. Guest가 보낸 path는 받지 않습니다.
 
 ```bash
-# Host: Docker bridge address에 bind합니다(기본값은 loopback).
+# Host, 단일 mapping: bearer 하나가 이 pair만 승인합니다.
 export RTRT_COLLECTOR_TOKEN="$(openssl rand -hex 32)"
 rtrt collector serve --bind 172.17.0.1:7313 \
+  --map guest-a:app=/srv/projects/app
+```
+
+승인된 pair를 둘 이상 호스팅하면 collector는 `--token`만으로는 시작하지 않습니다. pair마다 고유 token을 발행하고, operator 소유 모드 `0600` (symlink 없는 Unix 전용) TOML 파일에 넣은 뒤 `--credentials` (또는 `RTRT_COLLECTOR_CREDENTIALS_FILE`) 로 전달하세요. 파일에는 `--map`마다 정확히 하나의 record가 있어야 하고, 누락/중복/공유 token은 listener가 bind되기 전에 모두 거부됩니다.
+
+```bash
+# Host, 다중 mapping: --credentials 필수, token은 pair마다 고유.
+chmod 0600 /etc/rtrt/collector-credentials.toml    # operator 소유, symlink 없음
+unset RTRT_COLLECTOR_TOKEN                           # 두 인증 출처를 함께 쓰지 않음
+rtrt collector serve --bind 172.17.0.1:7313 \
+  --credentials /etc/rtrt/collector-credentials.toml \
   --map guest-a:app=/srv/projects/app \
   --map guest-b:worker=/srv/projects/worker
 ```
 
-각 guest는 delivery 시도 전에 event를 durable queue에 저장합니다:
+`/etc/rtrt/collector-credentials.toml` (`--map`마다 한 record, token은 파일 안에서 모두 달라야 함):
+
+```toml
+[[credential]]
+guest_id = "guest-a"
+project = "app"
+token = "<첫번째-pair-token>"   # 32바이트 hex, host에서 생성
+
+[[credential]]
+guest_id = "guest-b"
+project = "worker"
+token = "<두번째-pair-token>"  # 다른 record와 달라야 함
+```
+
+각 guest는 delivery 시도 전에 event를 durable queue에 저장합니다. 보낸 token은 **pair 전용** token이며 host-wide shared bearer가 아닙니다. 다른 guest와 token을 절대 재사용하지 마세요.
 
 ```bash
+# Guest A: (guest-a, app) 전용 token.
 export RTRT_COLLECTOR_URL=http://172.17.0.1:7313
-export RTRT_COLLECTOR_TOKEN='<host와 같은 token>'
+export RTRT_COLLECTOR_TOKEN='<첫번째-pair-token>'
 
 printf '%s' 'deployment completed' | rtrt forward enqueue \
   --guest-id guest-a --project app --kind deployment \
   --session-id session-42 --metadata '{"source":"container-hook"}'
 
-# ~/.rtrt/forward-spool.sqlite에 남은 due event를 다시 시도합니다.
-rtrt forward flush
+# 기존 spool에 다른 pair가 있어도 이 pair의 due event만 다시 시도합니다.
+rtrt forward flush --guest-id guest-a --project app
 ```
 
-`enqueue`는 stable event id를 출력합니다. Collector가 unavailable이면 stderr warning을 출력하지만 event는 private spool에 남습니다. `flush` delivery가 계속 실패하면 non-zero로 종료합니다. Host collector가 각 `(guest, project, event id)` 전달을 정확히 한 번만 저장하므로 성공한 retry는 idempotent합니다.
+`enqueue`는 stable event id를 출력합니다. Collector가 unavailable이면 stderr warning을 출력하지만 event는 private spool에 남습니다. `flush` delivery가 계속 실패하면 non-zero로 종료합니다. 필터 없는 `rtrt forward flush`는 단일 pair spool에서만 동작하며, 여러 pair가 섞인 spool은 어떤 row도 전달하지 않고 거부합니다. 각 pair의 token과 두 필터 flag를 함께 사용해 flush하세요. Host collector가 각 `(guest, project, event id)` 전달을 정확히 한 번만 저장하므로 성공한 retry는 idempotent합니다.
 
-보안 경계:
+### 보안 경계
 
-- 두 command 모두 `RTRT_COLLECTOR_TOKEN`이 필수입니다. Secret이 shell history나 process argument에 들어가지 않도록 `--token`보다 environment injection을 권장합니다.
+- `RTRT_COLLECTOR_TOKEN`은 `forward enqueue`와 `forward flush` 모두에서 필수입니다. Secret이 shell history나 process argument에 들어가지 않도록 `--token`보다 environment injection을 권장합니다.
+- Host는 `--map`이 정확히 하나일 때만 `--token`을 받습니다. 둘 이상의 mapping이 `--token` (또는 `RTRT_COLLECTOR_TOKEN` env) 만으로 들어오면 시작 시 `multiple mappings require --credentials with unique per-pair tokens` 오류로 실패합니다. `RTRT_COLLECTOR_TOKEN`과 `RTRT_COLLECTOR_CREDENTIALS_FILE`을 동시에 설정하거나 `--token`과 `--credentials`를 함께 주지 마세요. 두 출처는 결합할 수 없습니다.
+- `--credentials` 파일은 operator 소유 모드 `0600`, 모든 path component에 symlink가 없어야 하며, `--map`마다 정확히 한 record이고 token은 파일 안에서 모두 달라야 합니다. record 누락, `(guest_id, project)` 중복, 공유 token은 listener가 bind되기 전에 모두 거절됩니다.
+- `--credentials`는 **Unix 전용**입니다. Windows에서는 `0600` 소유권 검사를 그대로 적용할 수 없어 flag 자체를 거부합니다. Windows에서는 pair마다 별도의 단일 mapping collector listener와 token을 쓰거나, 다중 mapping collector를 Unix host에서 실행하세요.
 - Collector 기본 bind는 `127.0.0.1:7313`이며 `Origin` header가 있는 요청을 모두 거부하고 request당 최대 1 MiB만 받습니다.
 - 가능하면 특정 private bridge address에 bind합니다. 신뢰할 수 있는 host-local network 밖으로 나가는 traffic은 reverse proxy에서 TLS를 종료해야 합니다. Collector는 TLS를 직접 구현하지 않습니다.
-- Guest 기본 spool은 `~/.rtrt/forward-spool.sqlite`입니다. Unix directory/file은 `0700`/`0600`으로 제한하며 symlink path를 거부합니다.
+- Guest 기본 spool은 `~/.rtrt/forward-spool.sqlite`입니다. Unix directory/file은 `0700`/`0600`으로 제한하며 spool directory와 중간 directory를 포함한 모든 component에서 symlink path를 거부합니다.
+- `rtrt forward flush`는 `--guest-id` + `--project`를 pair filter로 받습니다 (두 flag는 함께 줘야 함). guest는 자기 queue만 빼서 다른 guest의 token으로 cross-delivery 하지 않습니다.
+
+### 기존 v0.1.5 배포 업그레이드
+
+이전 release는 `--map` 개수와 무관하게 단일 `RTRT_COLLECTOR_TOKEN`을 받았습니다. v0.1.6은 그 구멍을 닫았으므로 기존에 두 개 이상의 mapping을 단일 bearer로 띄우던 host는 boot을 거부합니다. 마이그레이션 절차:
+
+1. Host의 `--map` 목록을 확인하고 `(guest_id, remote project)` pair마다 새 token을 하나씩 발행합니다. 모든 pair에서 기존 shared token을 교체하고 pair 사이에 token을 재사용하지 마세요.
+2. Linux / macOS host에서는 operator 소유 `chmod 0600` 파일 (path 어디에도 symlink 없음) 에 record를 적고 `--credentials <path>` (또는 `RTRT_COLLECTOR_CREDENTIALS_FILE`) 로 전달합니다. 두 출처를 동시에 켜두지 않도록 host 환경에서 `RTRT_COLLECTOR_TOKEN`은 제거합니다.
+3. Windows에서는 credentials-file flag를 쓸 수 없습니다. Pair마다 별도의 단일 mapping collector listener와 token을 쓰거나 다중 mapping collector를 Unix host로 옮기세요.
+4. 새 per-pair token을 각 guest에 배포하고 `RTRT_COLLECTOR_TOKEN`으로 export 하도록 합니다. 기존 shared token을 어떤 credential record에도 남기지 않고 collector를 재시작해야 옛 token이 폐기됩니다.
+
+이 guard를 우회하는 `--force` 같은 flag는 없습니다. host는 재구성해야만 다시 시작합니다.
 
 ## 게이트웨이 (`rtrt gateway serve`)
 

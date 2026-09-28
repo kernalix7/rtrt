@@ -3,7 +3,10 @@
 RTRT is MIT-licensed (see [LICENSE](LICENSE)). This document lists selected
 (not exhaustive) third-party Rust crates RTRT depends on at runtime or in
 development, together with their upstream licenses. The complete resolved
-dependency graph remains authoritative for compliance. The OpenCode SDK is
+dependency graph remains authoritative for review, not a certification of
+compliance. Exact version-pinned texts for identified bundled JavaScript and
+Rust dependencies accompany distributions in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md).
+The OpenCode SDK is
 host-supplied and used by the host plugin; it is not bundled or redistributed
 by RTRT and is not a RTRT dependency entry.
 
@@ -67,8 +70,11 @@ user approval or install consent.
 `reqwest` is configured with the `rustls-tls` feature and `default-features = false`, so RTRT does **not** link against system OpenSSL or platform native-tls. The TLS stack at runtime is:
 
 - [rustls](https://crates.io/crates/rustls) — Apache-2.0 OR ISC OR MIT
-- [webpki-roots](https://crates.io/crates/webpki-roots) — MPL-2.0
-- [ring](https://crates.io/crates/ring) — ISC + OpenSSL + custom (see crate's README)
+- [webpki-roots@0.26.11](https://crates.io/crates/webpki-roots/0.26.11) and [webpki-roots@1.0.7](https://crates.io/crates/webpki-roots/1.0.7) — CDLA-Permissive-2.0 (certificate data; both versions resolved)
+- [ring@0.17.14](https://crates.io/crates/ring/0.17.14) — Apache-2.0 AND ISC in different files, including BoringSSL-derived code; see its upstream `LICENSE`, `LICENSE-BoringSSL`, `LICENSE-other-bits`, and bundled subpart notices in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md)
+- [subtle@2.6.1](https://crates.io/crates/subtle/2.6.1) — BSD-3-Clause
+
+Other identified transitive dependency: [option-ext@0.2.0](https://crates.io/crates/option-ext/0.2.0) — MPL-2.0. Its [versioned source archive](https://static.crates.io/crates/option-ext/option-ext-0.2.0.crate) and license text are linked/provided, but whether that URL and distribution satisfy MPL-2.0 source-availability requirements needs qualified counsel review. These notices do not establish what code survives linking or settle distribution obligations for a particular binary.
 
 ## Development-only dependencies
 

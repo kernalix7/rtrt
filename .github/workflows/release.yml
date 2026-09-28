@@ -125,6 +125,7 @@ jobs:
             cp "$source" "$stage/"
           done
           cp LICENSE README.md CHANGELOG.md "$stage/"
+          cp -R THIRD_PARTY_NOTICES "$stage/"
           (
             cd dist
             if [ "$RELEASE_EXT" = zip ]; then

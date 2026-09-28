@@ -39,12 +39,12 @@ allow = [
 ]
 confidence-threshold = 0.93
 
-# Permit `ring` specifically. Its license is OpenSSL + ISC + a custom clause
-# that crates.io classifies as a non-standard expression. The terms themselves
-# are permissive but the SPDX expression is not, hence the per-crate exception.
+# `ring` 0.17.14 declares Apache-2.0 AND ISC. Apache-2.0 is allowed globally;
+# permit its ISC component specifically. Bundled subpart notices are shipped in
+# THIRD_PARTY_NOTICES rather than inferred from the crate's SPDX expression.
 [[licenses.exceptions]]
 name = "ring"
-allow = ["ISC", "MIT", "OpenSSL"]
+allow = ["ISC"]
 
 # ---------- advisories ----------
 [advisories]

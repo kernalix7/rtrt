@@ -9,6 +9,49 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-28
+
+### Highlights
+
+**RTRT 0.1.6 addresses the v0.1.5 audit findings with pair-scoped collector credentials, bundled third-party notices, mobile project selection, and broader CI coverage.**
+
+- `rtrt collector serve` now binds each `(guest_id, project)` mapping to its own bearer credential through a per-map `--credentials` file, and the `forward flush` path has a matching `--guest-id` / `--project` filter so one token can no longer write to an unrelated host store. The single `--token` form is retained only when exactly one mapping is configured.
+- The dashboard's mobile layout keeps the project picker visible at `≤720px` instead of hiding the entire sidebar, and wide overview content scrolls within its card rather than widening the page.
+- A new CI job exercises the optional feature surfaces (`embeddings`, `onnx`, `bertscore`, `chains`) at `cargo check --locked` depth so a future build-time regression in any of them is caught even when no model download is permitted. A `macos-15-intel` runner is added to the test matrix.
+- A new `THIRD_PARTY_NOTICES/` directory ships the identified missing MIT notices for embedded dashboard bundles and pinned texts for selected Rust dependencies. `THIRD_PARTY_LICENSES.md` now matches their resolved versions; legal completeness is not certified.
+- Live-key, WSL, and macOS x64 coverage is documented honestly: live provider keys remain a pre-tag-only `scripts/smoke.sh` step, WSL has no dedicated CI lane, and `macos-15-intel` joins the matrix in this release rather than relying on a `macos-latest` arm64-only run.
+
+### Added
+
+- `rtrt collector serve` accepts a `--credentials <TOML>` file that pairs one bearer token with one `(guest_id, project)` mapping, and refuses a shared bearer across mappings. The file must be operator-owned with mode `0600`; path components are checked for symlinks, and the opened file's identity, owner, and mode are checked again. On non-Unix targets, credential files are refused because the ownership and mode checks have no portable meaning. The `--token` form remains available for one mapping; the two auth sources cannot be combined.
+- The authorization middleware resolves the constant-time bearer against every binding and injects `AuthorizedBinding { pair, identity }` without the token into the request extension. The ingest handler refuses events whose `guest_id` or `project` differs from that binding, so one pair's token cannot authorize another mapping. A binary integration test confirms that A's token receives `403` for B without creating B's SQLite store.
+- `rtrt forward flush --guest-id <id> --project <name>` filters the spool to a single pair before delivery so a guest can drain only its own queue. The new `Selection` enum replaces the prior `pending(limit, force)` helper; filtered selection scans the full rowid stream but limits the deliverable batch to 100 due rows so a foreign row cannot starve a matching one, and the spool-side validation still fails closed on malformed or mismatched payloads without mutating the queue. Unfiltered flush still rejects mixed-pair spools because no single token could authorize delivery to both host stores.
+- `THIRD_PARTY_NOTICES/INDEX.md` records versioned source archives and SHA-256 digests for the identified bundled JavaScript and selected Rust dependency license texts, including `ring`, `subtle`, `webpki-roots`, and `option-ext`. The five binary archives, five platform npm packages, and `rtrt-agent` include the same notice tree. This is a targeted inventory, not a legal certification or a substitute for reviewing MPL-2.0 source availability.
+
+### Changed
+
+- `MemoryStore::ingest_forwarded` and the wire shape (`WireEvent` / `ForwardedEvent`) are unchanged. The collector's authorization now binds a token to a specific `(guest_id, project)` pair before the ingest handler ever reads the body, so the existing idempotency guarantee on `(source_guest, source_project, event_id)` is reinforced rather than replaced.
+- `THIRD_PARTY_LICENSES.md` now records the resolved versions accurately: `ring@0.17.14` is described as ISC/Apache-2.0 with the bundled BoringSSL split, `subtle@2.6.1` is BSD-3-Clause, `webpki-roots@0.26.11` and `webpki-roots@1.0.7` are CDLA-Permissive-2.0, and `option-ext@0.2.0` is MPL-2.0. The mislabeled MPL-2.0 entry for webpki-roots and the stale ring license mix from the v0.1.5 record are removed.
+- The dashboard's mobile layout keeps the project picker in view: the sidebar's `mode-nav` group hides at `≤720px` while the `project-picker` row stays visible, the main column min-width drops to `minmax(0, 1fr)` to stop long slugs from forcing a horizontal scrollbar, and the overview card plus savings hero get `overflow-wrap: anywhere` so long cells wrap instead of clip.
+- Paired install docs show the v0.1.6 pin and describe the release archive names. The in-source Homebrew formula remains a placeholder until its checksum is replaced and a separate tap change is published.
+
+### Fixed
+
+- The collector shared-token impersonation path demonstrated in the v0.1.5 audit is closed in the built CLI integration path. `crates/rtrt-cli/tests/collector_auth.rs` starts the actual collector binary with two projects and distinct tokens, checks that A's token receives `403` for B without creating B's store, and verifies that flushing A's events leaves B's queued rows unchanged.
+- The dashboard no longer hides the only project selector below `720px`. A `.project-picker` rule removes its bottom border on small viewports and the `.savings-hero` plus overview card constrain long tokens; mobile sessions can now change the selected project without resizing the window.
+- The OpenCode CI plugin's `npm test` job now includes `notices-package.test.mjs`, which asserts that every entry in `THIRD_PARTY_NOTICES/INDEX.md` is present in the packed `rtrt-agent` tarball and that each `LICENSE` matches the INDEX-recorded SHA-256, so a future bump that drops or edits a notice fails CI before publish.
+
+### CI
+
+- A new `feature-lanes` job runs `cargo check --locked -p rtrt-memory --features embeddings` with `ORT_SKIP_DOWNLOAD=1`, `cargo check --locked -p rtrt-compress --features onnx`, `cargo check --locked -p rtrt-eval --features bertscore`, and `cargo check --locked -p rtrt-templates --features chains`. Each is compile-only so the lane never needs an ONNX model download or a live provider call. This does not claim that every optional feature compiles into every default binary — the v0.1.5 audit record already corrected that blanket assertion — it adds one bounded compile lane per feature so a future regression is caught.
+- The test matrix gains a `macos-15-intel` runner entry alongside the existing `ubuntu-latest` x64/arm64, `macos-latest` arm64, `windows-latest`, and `beta`-toolchain Linux x64 lanes. macOS x64 was previously built but not tested in CI; it is now part of the matrix rather than relying on the arm64 run.
+- Live Anthropic / OpenAI / OpenAI-compatible checks remain a `scripts/smoke.sh` pre-tag gate, not a CI lane, because the CI environment does not hold provider keys; the WSL runtime also has no dedicated CI lane because the WSL image does not fit cleanly into the existing runner labels. Both are documented in the audit follow-up rather than papered over.
+
+### Notes
+
+- Live-provider smoke requires user-supplied keys and is not a CI lane; WSL has no dedicated runtime job. The added optional-feature jobs compile without model downloads, while macOS Intel is now tested in CI.
+- The Homebrew formula retains an all-zero SHA-256 placeholder and is not an installable tap release. The notice tree does not certify legal compliance; notice placement and MPL-2.0 source-availability obligations remain for qualified counsel review.
+
 ## [0.1.5] - 2026-09-26
 
 ### Highlights

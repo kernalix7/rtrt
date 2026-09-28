@@ -1,4 +1,4 @@
-mod spool;
+pub(crate) mod spool;
 
 use std::{
     collections::BTreeMap,
@@ -6,9 +6,12 @@ use std::{
     time::Duration,
 };
 
+use crate::collector::GuestProject;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use spool::{Pending, delivered, enqueue, open_spool, pending, retry};
+#[cfg(test)]
+use spool::pending;
+use spool::{Pending, Selection, delivered, enqueue, open_spool, retry, select};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WireEvent {
@@ -141,7 +144,15 @@ pub(super) async fn enqueue_and_deliver(args: EnqueueArgs) -> Result<String> {
         .await
         .context("join spool writer")??;
     let client = delivery_client()?;
-    if let Err(error) = flush_to_url(&spool, &client, &url, &args.token, true).await {
+    if let Err(error) = flush_to_url(
+        &spool,
+        &client,
+        &url,
+        &args.token,
+        Selection::EventId(id.clone()),
+    )
+    .await
+    {
         eprintln!("collector delivery deferred; event remains queued: {error}");
     }
     Ok(id)
@@ -156,7 +167,44 @@ pub(super) async fn flush(
 ) -> Result<usize> {
     crate::collector::validate_token(token)?;
     let url = collector_url(endpoint)?;
-    flush_to_url(spool, client, &url, token, force).await
+    flush_to_url(
+        spool,
+        client,
+        &url,
+        token,
+        Selection::Due {
+            pair: None,
+            limit: if force { 1 } else { 100 },
+            force,
+        },
+    )
+    .await
+}
+
+pub(super) async fn flush_pair(
+    spool: &Path,
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    pair: GuestProject,
+) -> Result<usize> {
+    crate::collector::validate_token(token)?;
+    if !valid_identifier(&pair.guest_id) || !valid_identifier(&pair.project) {
+        bail!("forward filter requires valid guest and project identifiers");
+    }
+    let url = collector_url(endpoint)?;
+    flush_to_url(
+        spool,
+        client,
+        &url,
+        token,
+        Selection::Due {
+            pair: Some(pair),
+            limit: 100,
+            force: false,
+        },
+    )
+    .await
 }
 
 async fn send_one(
@@ -201,11 +249,10 @@ async fn flush_to_url(
     client: &reqwest::Client,
     url: &str,
     token: &str,
-    force: bool,
+    selection: Selection,
 ) -> Result<usize> {
     let path = spool.to_path_buf();
-    let limit = if force { 1 } else { 100 };
-    let batch = tokio::task::spawn_blocking(move || pending(&open_spool(&path)?, limit, force))
+    let batch = tokio::task::spawn_blocking(move || select(&open_spool(&path)?, selection))
         .await
         .context("read forward spool")??;
     let mut sent = 0;

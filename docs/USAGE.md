@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.5.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.6.
 
 ## CLI
 
@@ -105,10 +105,10 @@ RTRT does not provide a team command, scheduler, roster, worker protocol, or `te
 
 ### OpenCode npm plugin and setup migration
 
-Install `rtrt-agent@0.1.5` with `npm install rtrt-agent@0.1.5` and register it directly with OpenCode's singular root `plugin` key:
+Install `rtrt-agent@0.1.6` with `npm install rtrt-agent@0.1.6` and register it directly with OpenCode's singular root `plugin` key:
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.5"] }
+{ "plugin": ["rtrt-agent@0.1.6"] }
 ```
 
 The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. The TUI statusline is not shipped in npm and remains setup-managed.
@@ -119,7 +119,7 @@ For a complete installation, prefer:
 rtrt setup --agent opencode --apply
 ```
 
-Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.5` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow is responsible for publishing the version-matched Rust artifacts and npm packages; this documentation does not assert that publication has already completed.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.6` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
 
 ### OpenCode persistent statusline
 
@@ -501,35 +501,76 @@ rtrt benchmark --extra '--quick'
 Use the collector when containerized or remote guests must consolidate explicit memory events into host-owned project stores. The host authorizes each `(guest_id, remote project)` pair by mapping it to a real host project directory; guest-supplied paths are never accepted.
 
 ```bash
-# Host: bind the Docker bridge address (loopback is the default).
+# Host, single mapping: one bearer authorizes this pair only.
 export RTRT_COLLECTOR_TOKEN="$(openssl rand -hex 32)"
 rtrt collector serve --bind 172.17.0.1:7313 \
+  --map guest-a:app=/srv/projects/app
+```
+
+When the host serves more than one authorized pair, the collector refuses to start with `--token` alone — every pair must carry a unique token. Mint one token per pair, drop them into a `0600` operator-owned TOML file (no symlinks, Unix-only check), and pass it via `--credentials` (or `RTRT_COLLECTOR_CREDENTIALS_FILE`). The file must list one record per `--map`; missing, extra, or duplicate tokens are rejected before the listener binds.
+
+```bash
+# Host, multiple mappings: --credentials required, tokens unique per pair.
+chmod 0600 /etc/rtrt/collector-credentials.toml    # operator-owned, no symlinks
+unset RTRT_COLLECTOR_TOKEN                           # do not combine both auth sources
+rtrt collector serve --bind 172.17.0.1:7313 \
+  --credentials /etc/rtrt/collector-credentials.toml \
   --map guest-a:app=/srv/projects/app \
   --map guest-b:worker=/srv/projects/worker
 ```
 
-Each guest durably queues an event before attempting delivery:
+`/etc/rtrt/collector-credentials.toml` (one record per `--map`, tokens unique):
+
+```toml
+[[credential]]
+guest_id = "guest-a"
+project = "app"
+token = "<first-pair-token>"   # 32-byte hex, generated on the host
+
+[[credential]]
+guest_id = "guest-b"
+project = "worker"
+token = "<second-pair-token>"  # different from every other record
+```
+
+Each guest durably queues an event before attempting delivery. The token it sends is the **pair-specific** token, not a host-wide shared bearer; never reuse a token across guests.
 
 ```bash
+# Guest A: pair-specific token, scoped to (guest-a, app).
 export RTRT_COLLECTOR_URL=http://172.17.0.1:7313
-export RTRT_COLLECTOR_TOKEN='<same token as host>'
+export RTRT_COLLECTOR_TOKEN='<first-pair-token>'
 
 printf '%s' 'deployment completed' | rtrt forward enqueue \
   --guest-id guest-a --project app --kind deployment \
   --session-id session-42 --metadata '{"source":"container-hook"}'
 
-# Retry due events left in ~/.rtrt/forward-spool.sqlite.
-rtrt forward flush
+# Retry only this pair's due events, even if an older spool holds other pairs.
+rtrt forward flush --guest-id guest-a --project app
 ```
 
-`enqueue` prints the stable event id. An unavailable collector produces a stderr warning but leaves the event in the private spool; `flush` returns non-zero if a delivery still fails. Successful retries are idempotent at the host because the collector stores each `(guest, project, event id)` delivery exactly once.
+`enqueue` prints the stable event id. An unavailable collector produces a stderr warning but leaves the event in the private spool; `flush` returns non-zero if a delivery still fails. Unfiltered `rtrt forward flush` works for a single-pair spool but refuses a mixed-pair spool without delivering any rows; flush each pair with its own token and both filter flags. Successful retries are idempotent at the host because the collector stores each `(guest, project, event id)` delivery exactly once.
 
-Security boundaries:
+### Security boundaries
 
-- `RTRT_COLLECTOR_TOKEN` is required for both commands. Prefer environment injection instead of `--token` so the secret does not enter shell history or process arguments.
+- `RTRT_COLLECTOR_TOKEN` is required for both `forward enqueue` and `forward flush`. Prefer environment injection instead of `--token` so the secret does not enter shell history or process arguments.
+- The host accepts `--token` **only** when exactly one `--map` is supplied. Two or more mappings with `--token` (or with `RTRT_COLLECTOR_TOKEN` set) fail at startup with `multiple mappings require --credentials with unique per-pair tokens`. Do not set both `RTRT_COLLECTOR_TOKEN` and `RTRT_COLLECTOR_CREDENTIALS_FILE` (or pass `--token` with `--credentials`): the two sources cannot be combined.
+- A `--credentials` file must be operator-owned with mode `0600`, must not contain a symlink at any path component, and must list one record per `--map` with a token that is unique across the file. Missing records, duplicate `(guest_id, project)` records, or shared tokens are refused before the listener binds.
+- `--credentials` is **Unix-only**. On Windows, the collector rejects the flag because the `0600` ownership check is not portable; use a separate single-map collector listener and token per pair, or run the multi-map collector on a Unix host.
 - The collector defaults to `127.0.0.1:7313`, rejects every request carrying an `Origin` header, and accepts at most 1 MiB per request.
 - Bind a specific private bridge address where possible. For traffic leaving a trusted host-local network, terminate TLS in a reverse proxy; the collector does not implement TLS.
-- The default guest spool is `~/.rtrt/forward-spool.sqlite`; Unix directories/files are restricted to `0700`/`0600`, and symlinked paths are rejected.
+- The default guest spool is `~/.rtrt/forward-spool.sqlite`; Unix directories/files are restricted to `0700`/`0600`, and symlinked paths are rejected at every component (including the spool directory and any intermediate directory).
+- `rtrt forward flush` exposes `--guest-id` + `--project` as a pair filter (both flags must be supplied at once) so a guest can drain only its own queue without cross-delivering other guests' tokens.
+
+### Upgrading an existing v0.1.5 deployment
+
+Earlier releases accepted a single `RTRT_COLLECTOR_TOKEN` for any number of `--map` entries. v0.1.6 closes that hole: a host whose existing config starts two or more mappings with one bearer now refuses to boot. To migrate:
+
+1. Inventory the host's `--map` list and mint one fresh token per `(guest_id, remote project)` pair. Rotate the old shared token for every pair; never reuse a token across pairs.
+2. On Linux / macOS hosts, write the records to an operator-owned file at `chmod 0600` with no symlink in the path, and pass `--credentials <path>` (or set `RTRT_COLLECTOR_CREDENTIALS_FILE`). Remove `RTRT_COLLECTOR_TOKEN` from the host environment so the two sources cannot both be set.
+3. On Windows, the credentials-file flag is unavailable. Run a separate single-map collector listener and token per pair, or move the multi-map collector to a Unix host.
+4. Distribute the new per-pair tokens to each guest and have it export them as `RTRT_COLLECTOR_TOKEN`. Restart the collector without the old shared token in any credential record to revoke it.
+
+There is no `--force` flag to override the new guard; the host must be reconfigured before it will start.
 
 ## Gateway (`rtrt gateway serve`)
 

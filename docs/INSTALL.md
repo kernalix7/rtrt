@@ -52,8 +52,8 @@ On Windows, the installed task uses `%LOCALAPPDATA%\Programs\rtrt\rtrt-dashboard
 Examples:
 
 ```bash
-# Pin a release
-curl -fsSL .../install.sh | sh -s -- --version v0.1.5
+# Pin the v0.1.6 release
+curl -fsSL .../install.sh | sh -s -- --version v0.1.6
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -115,7 +115,7 @@ Repeat for `crates/rtrt-mcp` and `crates/rtrt-dashboard` if you want the MCP ser
 
 ## Pre-built binaries
 
-The v0.1.5 GitHub Release channel publishes:
+The GitHub Release channel supplies these versioned archives after the paired-tag release workflow completes:
 
 - `rtrt-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - `rtrt-<version>-aarch64-unknown-linux-gnu.tar.gz`

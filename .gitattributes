@@ -19,3 +19,4 @@ crates/rtrt-proxy/tests/fixtures/git_diff_crlf.txt -text
 
 # Vendored upstream files keep the bytes they were published with.
 crates/rtrt-dashboard/ui/vendor/** -text
+THIRD_PARTY_NOTICES/** -text whitespace=-blank-at-eol

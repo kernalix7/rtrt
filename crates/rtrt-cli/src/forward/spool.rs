@@ -8,10 +8,20 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use super::WireEvent;
+use crate::collector::GuestProject;
 
 pub(super) struct Pending {
     pub event: WireEvent,
     pub attempts: u32,
+}
+
+pub(super) enum Selection {
+    Due {
+        pair: Option<GuestProject>,
+        limit: usize,
+        force: bool,
+    },
+    EventId(String),
 }
 
 fn now_millis() -> Result<i64> {
@@ -31,7 +41,7 @@ fn parse_effective_uid(status: &str) -> Result<u32> {
 }
 
 #[cfg(unix)]
-fn effective_uid() -> Result<u32> {
+pub(crate) fn effective_uid() -> Result<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let status = fs::read_to_string("/proc/self/status").context("read /proc/self/status")?;
@@ -59,7 +69,7 @@ fn effective_uid() -> Result<u32> {
 }
 
 #[cfg(unix)]
-fn owned_with_mode(metadata: &fs::Metadata, uid: u32, mode: u32) -> bool {
+pub(crate) fn owned_with_mode(metadata: &fs::Metadata, uid: u32, mode: u32) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     metadata.permissions().mode() & 0o7777 == mode && metadata.uid() == uid
@@ -183,6 +193,7 @@ pub(super) fn enqueue(conn: &Connection, event: &WireEvent) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn pending(conn: &Connection, limit: usize, force: bool) -> Result<Vec<Pending>> {
     let mut stmt = conn.prepare(
         "SELECT payload, attempts FROM forward_spool
@@ -201,6 +212,75 @@ pub(super) fn pending(conn: &Connection, limit: usize, force: bool) -> Result<Ve
         })
     })
     .collect()
+}
+
+pub(super) fn select(conn: &Connection, selection: Selection) -> Result<Vec<Pending>> {
+    if let Selection::EventId(event_id) = selection {
+        let payload: Option<(String, u32)> = conn
+            .query_row(
+                "SELECT payload, attempts FROM forward_spool WHERE event_id = ?1",
+                [&event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        return payload
+            .map(|(payload, attempts)| {
+                let event: WireEvent =
+                    serde_json::from_str(&payload).context("invalid stored forward event")?;
+                event.validate()?;
+                if event.event_id != event_id {
+                    bail!("stored event id differs from spool key");
+                }
+                Ok(vec![Pending { event, attempts }])
+            })
+            .unwrap_or_else(|| Ok(Vec::new()));
+    }
+    let Selection::Due { pair, limit, force } = selection else {
+        unreachable!();
+    };
+    let now = now_millis()?;
+    let mut stmt = conn.prepare(
+        "SELECT event_id, payload, attempts, next_attempt_ms FROM forward_spool ORDER BY rowid ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut batch = Vec::new();
+    let mut first_pair: Option<GuestProject> = None;
+    for row in rows {
+        let (key, payload, attempts, next_attempt_ms) = row?;
+        let event: WireEvent =
+            serde_json::from_str(&payload).context("invalid stored forward event")?;
+        event.validate()?;
+        if event.event_id != key {
+            bail!("stored event id differs from spool key");
+        }
+        let event_pair = GuestProject {
+            guest_id: event.guest_id.clone(),
+            project: event.project.clone(),
+        };
+        if pair.is_none() {
+            match &first_pair {
+                Some(first) if first != &event_pair => {
+                    bail!("mixed spool requires --guest-id and --project");
+                }
+                None => first_pair = Some(event_pair.clone()),
+                Some(_) => {}
+            }
+        }
+        if (force || next_attempt_ms <= now)
+            && pair.as_ref().is_none_or(|selected| selected == &event_pair)
+            && batch.len() < limit
+        {
+            batch.push(Pending { event, attempts });
+        }
+    }
+    Ok(batch)
 }
 
 pub(super) fn delivered(conn: &Connection, event_id: &str) -> Result<()> {
@@ -222,6 +302,148 @@ pub(super) fn retry(conn: &Connection, event_id: &str, attempts: u32) -> Result<
 mod tests {
     #[cfg(unix)]
     use super::*;
+
+    #[cfg(unix)]
+    fn queued(conn: &Connection, id: &str, guest: &str, project: &str) {
+        enqueue(
+            conn,
+            &WireEvent {
+                event_id: id.to_string(),
+                guest_id: guest.to_string(),
+                project: project.to_string(),
+                kind: "note".into(),
+                body: "payload".into(),
+                session_id: None,
+                metadata: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filtered_selection_skips_101_foreign_rows_before_matching_first_due_row() {
+        // Given foreign rows before one matching row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE forward_spool (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0)").unwrap();
+        for i in 0..101 {
+            queued(&conn, &format!("b-{i}"), "b", "p");
+        }
+        queued(&conn, "a-first", "a", "p");
+        // When filtering the full rowid stream.
+        let selected = select(
+            &conn,
+            Selection::Due {
+                pair: Some(GuestProject {
+                    guest_id: "a".into(),
+                    project: "p".into(),
+                }),
+                limit: 100,
+                force: false,
+            },
+        )
+        .unwrap();
+        // Then the matching row is not starved.
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].event.event_id, "a-first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filtered_selection_caps_oldest_100_matching_rows() {
+        // Given 150 due rows for one pair.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE forward_spool (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0)").unwrap();
+        for i in 0..150 {
+            queued(&conn, &format!("a-{i}"), "a", "p");
+        }
+        // When selecting a bounded batch.
+        let selected = select(
+            &conn,
+            Selection::Due {
+                pair: Some(GuestProject {
+                    guest_id: "a".into(),
+                    project: "p".into(),
+                }),
+                limit: 100,
+                force: false,
+            },
+        )
+        .unwrap();
+        // Then the first 100 rowids win.
+        assert_eq!(selected.len(), 100);
+        assert_eq!(selected[0].event.event_id, "a-0");
+        assert_eq!(selected[99].event.event_id, "a-99");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_unfiltered_and_corrupt_filtered_selection_fail_before_writes() {
+        // Given mixed pairs, a deferred foreign row, and a malformed payload.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE forward_spool (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0)").unwrap();
+        queued(&conn, "a", "a", "p");
+        queued(&conn, "b", "b", "p");
+        conn.execute(
+            "UPDATE forward_spool SET next_attempt_ms = ?1 WHERE event_id = 'b'",
+            [i64::MAX],
+        )
+        .unwrap();
+        // When unfiltered classification sees both pairs.
+        assert!(
+            select(
+                &conn,
+                Selection::Due {
+                    pair: None,
+                    limit: 100,
+                    force: false
+                }
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE forward_spool SET payload = ?1 WHERE event_id = 'b'",
+            ["not json"],
+        )
+        .unwrap();
+        // Then even filtered selection fails on corrupt foreign payload without changing rows.
+        assert!(
+            select(
+                &conn,
+                Selection::Due {
+                    pair: Some(GuestProject {
+                        guest_id: "a".into(),
+                        project: "p".into()
+                    }),
+                    limit: 100,
+                    force: false
+                }
+            )
+            .is_err()
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM forward_spool WHERE event_id = 'b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immediate_selection_uses_event_id_not_newest_row() {
+        // Given an older queued event and a newer sibling.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE forward_spool (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0)").unwrap();
+        queued(&conn, "older", "a", "p");
+        queued(&conn, "newer", "b", "p");
+        // When immediate delivery targets older's PK.
+        let selected = select(&conn, Selection::EventId("older".into())).unwrap();
+        // Then the sibling is not substituted.
+        assert_eq!(selected[0].event.event_id, "older");
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]

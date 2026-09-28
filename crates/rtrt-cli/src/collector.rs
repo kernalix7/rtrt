@@ -1,9 +1,16 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+#[cfg(unix)]
+use std::{fs, io::Read};
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Extension, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -11,7 +18,7 @@ use axum::{
 };
 use rtrt_core::ProjectIdentity;
 use rtrt_memory::{ForwardedEvent, MemoryStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::forward::{WireEvent, valid_identifier};
 
@@ -19,8 +26,40 @@ pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct CollectorState {
+    bindings: Vec<Binding>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct GuestProject {
+    pub guest_id: String,
+    pub project: String,
+}
+
+#[derive(Clone)]
+struct Binding {
+    pair: GuestProject,
+    identity: ProjectIdentity,
     token: String,
-    projects: HashMap<(String, String), ProjectIdentity>,
+}
+
+#[derive(Clone)]
+struct AuthorizedBinding {
+    pair: GuestProject,
+    identity: ProjectIdentity,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialFile {
+    credential: Vec<CredentialRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialRecord {
+    guest_id: String,
+    project: String,
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -36,7 +75,7 @@ pub(super) fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_mapping(value: &str) -> Result<((String, String), ProjectIdentity)> {
+fn parse_mapping(value: &str) -> Result<(GuestProject, ProjectIdentity)> {
     let (guest, rest) = value
         .split_once(':')
         .context("mapping must have syntax guest:remote_project=HOST_PROJECT_PATH")?;
@@ -51,11 +90,71 @@ fn parse_mapping(value: &str) -> Result<((String, String), ProjectIdentity)> {
         bail!("mapped host project must be an existing directory");
     }
     let identity = ProjectIdentity::derive(&path).context("derive mapped host project identity")?;
-    Ok(((guest.to_string(), remote.to_string()), identity))
+    Ok((
+        GuestProject {
+            guest_id: guest.to_string(),
+            project: remote.to_string(),
+        },
+        identity,
+    ))
 }
 
+#[cfg(test)]
 pub(super) fn router(token: &str, mappings: impl IntoIterator<Item = String>) -> Result<Router> {
-    validate_token(token)?;
+    router_with_credentials(Some(token), None, mappings)
+}
+
+#[cfg(unix)]
+fn read_credentials(path: &Path) -> Result<CredentialFile> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).context("inspect credentials path")?;
+        if metadata.file_type().is_symlink() {
+            bail!("credentials path contains symlink");
+        }
+    }
+    let before = fs::symlink_metadata(path).context("inspect credentials file")?;
+    if !before.is_file()
+        || !crate::forward::spool::owned_with_mode(
+            &before,
+            crate::forward::spool::effective_uid()?,
+            0o600,
+        )
+    {
+        bail!("credentials file must be operator-owned with mode 0600");
+    }
+    let mut file = fs::File::open(path).context("open credentials file")?;
+    let opened = file.metadata().context("inspect opened credentials file")?;
+    if !opened.is_file()
+        || opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || !crate::forward::spool::owned_with_mode(
+            &opened,
+            crate::forward::spool::effective_uid()?,
+            0o600,
+        )
+    {
+        bail!("credentials file changed during open");
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .context("read credentials file")?;
+    toml::from_str(&contents).map_err(|_| anyhow::anyhow!("invalid credentials file"))
+}
+
+#[cfg(not(unix))]
+fn read_credentials(_path: &Path) -> Result<CredentialFile> {
+    bail!("credentials file requires Unix file ownership and permissions")
+}
+
+pub(super) fn router_with_credentials(
+    token: Option<&str>,
+    credentials: Option<&Path>,
+    mappings: impl IntoIterator<Item = String>,
+) -> Result<Router> {
     let mut projects = HashMap::new();
     for mapping in mappings {
         let (key, project) = parse_mapping(&mapping)?;
@@ -66,10 +165,55 @@ pub(super) fn router(token: &str, mappings: impl IntoIterator<Item = String>) ->
     if projects.is_empty() {
         bail!("collector requires at least one explicit --map mapping");
     }
-    let state = CollectorState {
-        token: token.to_string(),
-        projects,
+    if token.is_some() && credentials.is_some() {
+        bail!("--token and --credentials cannot be combined");
+    }
+    let bindings = match credentials {
+        Some(path) => {
+            let file = read_credentials(path)?;
+            if file.credential.len() != projects.len() {
+                bail!("credentials must match mappings one-to-one");
+            }
+            let mut bindings = Vec::with_capacity(projects.len());
+            for record in file.credential {
+                validate_token(&record.token)?;
+                let pair = GuestProject {
+                    guest_id: record.guest_id,
+                    project: record.project,
+                };
+                let identity = projects
+                    .remove(&pair)
+                    .context("credentials must match mappings one-to-one")?;
+                if bindings.iter().any(|binding: &Binding| {
+                    constant_time_equal(binding.token.as_bytes(), record.token.as_bytes())
+                }) {
+                    bail!("duplicate credentials token");
+                }
+                bindings.push(Binding {
+                    pair,
+                    identity,
+                    token: record.token,
+                });
+            }
+            bindings
+        }
+        None => {
+            let token = token.context("collector requires --token or --credentials")?;
+            validate_token(token)?;
+            if projects.len() != 1 {
+                bail!("multiple mappings require --credentials with unique per-pair tokens");
+            }
+            projects
+                .into_iter()
+                .map(|(pair, identity)| Binding {
+                    pair,
+                    identity,
+                    token: token.to_string(),
+                })
+                .collect()
+        }
     };
+    let state = CollectorState { bindings };
     Ok(Router::new()
         .route("/v1/events", post(ingest))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -88,7 +232,11 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 /// Authorization gate mounted in front of the ingest handler so a request
 /// is refused before any of its body is buffered: rejects every Origin
 /// header outright and requires a constant-time bearer match.
-async fn authorize(State(state): State<CollectorState>, request: Request, next: Next) -> Response {
+async fn authorize(
+    State(state): State<CollectorState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     if request.headers().contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -97,26 +245,36 @@ async fn authorize(State(state): State<CollectorState>, request: Request, next: 
         .get(header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer "));
-    if !constant_time_equal(
-        bearer.unwrap_or_default().as_bytes(),
-        state.token.as_bytes(),
-    ) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let mut matched = None;
+    for binding in &state.bindings {
+        let equal = constant_time_equal(
+            bearer.unwrap_or_default().as_bytes(),
+            binding.token.as_bytes(),
+        );
+        if equal {
+            matched = Some(AuthorizedBinding {
+                pair: binding.pair.clone(),
+                identity: binding.identity.clone(),
+            });
+        }
     }
+    let Some(binding) = matched else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    request.extensions_mut().insert(binding);
     next.run(request).await
 }
 
 async fn ingest(
-    State(state): State<CollectorState>,
+    Extension(binding): Extension<AuthorizedBinding>,
     event: std::result::Result<Json<WireEvent>, axum::extract::rejection::JsonRejection>,
 ) -> std::result::Result<Json<IngestResponse>, StatusCode> {
     let Json(event) = event.map_err(|error| error.status())?;
     event.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let identity = state
-        .projects
-        .get(&(event.guest_id.clone(), event.project.clone()))
-        .cloned()
-        .ok_or(StatusCode::FORBIDDEN)?;
+    if event.guest_id != binding.pair.guest_id || event.project != binding.pair.project {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let identity = binding.identity;
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
@@ -143,8 +301,13 @@ async fn ingest(
     }))
 }
 
-pub(super) async fn serve(bind: SocketAddr, token: &str, mappings: Vec<String>) -> Result<()> {
-    let app = router(token, mappings)?;
+pub(super) async fn serve(
+    bind: SocketAddr,
+    token: Option<&str>,
+    credentials: Option<&Path>,
+    mappings: Vec<String>,
+) -> Result<()> {
+    let app = router_with_credentials(token, credentials, mappings)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind collector to {bind}"))?;
@@ -157,6 +320,23 @@ mod tests {
     use axum::{body::Body, http::Request};
     use clap::Parser;
     use tower::ServiceExt;
+
+    #[test]
+    fn authorized_binding_carries_only_pair_and_identity() {
+        // Given a resolved project identity and its authorized guest pair.
+        let identity = ProjectIdentity::derive(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let authorized = AuthorizedBinding {
+            pair: GuestProject {
+                guest_id: "guest".into(),
+                project: "remote".into(),
+            },
+            identity,
+        };
+        // When the request extension is destructured without an omitted field.
+        let AuthorizedBinding { pair, identity: _ } = authorized;
+        // Then its type admits no credential field.
+        assert_eq!(pair.guest_id, "guest");
+    }
 
     #[test]
     fn cli_parses_collector_mapping_when_explicit() {
@@ -195,6 +375,101 @@ mod tests {
         assert!(validate_token("  ").is_err());
         assert!(validate_token("one\ntwo").is_err());
         assert!(validate_token("valid-secret").is_ok());
+    }
+
+    #[test]
+    fn router_rejects_shared_bearer_for_distinct_projects_before_bind() {
+        // Given two independently rooted projects mapped under one bearer.
+        let temp_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let home = tempfile::Builder::new()
+            .prefix("collector-shared-token-")
+            .tempdir_in(temp_root)
+            .unwrap();
+        let project_a = home.path().join("project-a");
+        let project_b = home.path().join("project-b");
+        std::fs::create_dir_all(project_a.join(".git")).unwrap();
+        std::fs::create_dir_all(project_b.join(".git")).unwrap();
+        assert_ne!(
+            ProjectIdentity::derive(&project_a).unwrap().fingerprint(),
+            ProjectIdentity::derive(&project_b).unwrap().fingerprint()
+        );
+
+        // When constructing the router (before a network listener is bound).
+        let result = router(
+            "shared",
+            [
+                format!("guest-a:remote-a={}", project_a.display()),
+                format!("guest-b:remote-b={}", project_b.display()),
+            ],
+        );
+
+        // Then one bearer cannot authorize writes to both host projects.
+        assert!(
+            result.is_err(),
+            "shared bearer accepted distinct project mappings"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_requires_exact_pairs_and_distinct_tokens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Given two independent mapped repositories and a private credential file.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
+        fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir_in(root).unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir_all(a.join(".git")).unwrap();
+        fs::create_dir_all(b.join(".git")).unwrap();
+        let mappings = || {
+            [
+                format!("a:p={}", a.display()),
+                format!("b:p={}", b.display()),
+            ]
+        };
+        let path = temp.path().join("credentials.toml");
+        let write = |contents: &str| {
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // When records are missing, extra, duplicated or share a bearer.
+        for contents in [
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='first'\n",
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='first'\n[[credential]]\nguest_id='b'\nproject='p'\ntoken='second'\n[[credential]]\nguest_id='c'\nproject='p'\ntoken='third'\n",
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='first'\n[[credential]]\nguest_id='c'\nproject='p'\ntoken='other'\n",
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='first'\n[[credential]]\nguest_id='a'\nproject='p'\ntoken='other'\n",
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='shared'\n[[credential]]\nguest_id='b'\nproject='p'\ntoken='shared'\n",
+        ] {
+            write(contents);
+            assert!(router_with_credentials(None, Some(&path), mappings()).is_err());
+        }
+        write(
+            "[[credential]]\nguest_id='a'\nproject='p'\ntoken='first'\n[[credential]]\nguest_id='b'\nproject='p'\ntoken='second'\n",
+        );
+        // Then only a bijection starts, and argv token cannot accompany it.
+        assert!(router_with_credentials(None, Some(&path), mappings()).is_ok());
+        assert!(router_with_credentials(Some("first"), Some(&path), mappings()).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(router_with_credentials(None, Some(&path), mappings()).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = temp.path().join("credentials-link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(router_with_credentials(None, Some(&link), mappings()).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn credential_file_is_refused_without_opening_on_non_unix() {
+        // Given a nonexistent credentials path.
+        // When the non-Unix reader is called.
+        let error = read_credentials(Path::new("absent-credential-file"))
+            .err()
+            .unwrap();
+        // Then unsupported ACLs reject before filesystem access.
+        assert!(error.to_string().contains("Unix"));
     }
 
     #[tokio::test]

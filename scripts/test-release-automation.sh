@@ -115,17 +115,28 @@ git clone --quiet --no-tags "$ROOT" "$recovery_fixture/repo"
         exit 1
     fi
 
-    # When: the default branch requests recovery for the validated REL tag.
-    # Then: preflight switches to the paired tag commit and enables publication.
+    # When: the default branch requests publication recovery for a REL tag.
+    # Then: preflight refuses before the tag checkout because npm-publish allows tag refs only.
     recovery_output="$recovery_fixture/recovery-output"
-    RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
+    if RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
         RELEASE_RECOVERY_TAG="$release_tag" RELEASE_WORKFLOW_REF=refs/heads/main \
+        RELEASE_DEFAULT_BRANCH_REF=refs/heads/main GITHUB_OUTPUT="$recovery_output" \
+        "$PREFLIGHT" >"$recovery_fixture/preflight-output" 2>&1; then
+        echo 'release preflight accepted main-dispatched REL publication' >&2
+        exit 1
+    fi
+    grep -Fx 'release-preflight: REL publication recovery requires rerunning the tag run' \
+        "$recovery_fixture/preflight-output" >/dev/null
+    [ "$(git rev-parse HEAD)" = "$workflow_sha" ]
+
+    RELEASE_EVENT=workflow_dispatch RELEASE_REF_NAME=main RELEASE_SHA="$workflow_sha" \
+        RELEASE_RECOVERY_TAG="$version_tag" RELEASE_WORKFLOW_REF=refs/heads/main \
         RELEASE_DEFAULT_BRANCH_REF=refs/heads/main GITHUB_OUTPUT="$recovery_output" \
         "$PREFLIGHT" >/dev/null
     [ "$(git rev-parse HEAD)" = "$release_sha" ]
     grep -Fx "version=$release_version" "$recovery_output" >/dev/null
     grep -Fx "version_tag=$version_tag" "$recovery_output" >/dev/null
-    grep -Fx 'publish=true' "$recovery_output" >/dev/null
+    grep -Fx 'publish=false' "$recovery_output" >/dev/null
     grep -Fx "source_sha=$release_sha" "$recovery_output" >/dev/null
 
     # Given: validated release metadata in an isolated clone, not the real worktree.
@@ -362,6 +373,9 @@ def validate_npm_job(job: str) -> None:
 
 
 validate_npm_job(npm_job)
+for fragment in ('for attempt in $(seq 1 60); do', '[ "$attempt" -eq 60 ] || sleep 10'):
+    if fragment not in npm_job:
+        raise SystemExit(f"agent npm visibility contract missing: {fragment}")
 
 # Given: compliant OIDC settings and the exact supported minimum versions.
 minimum_job = re.sub(r"node-version: \S+", "node-version: 22.14.0", npm_job)

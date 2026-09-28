@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing paired tag (REL-vX.Y.Z publishes; vX.Y.Z builds only)'
+        description: 'Existing vX.Y.Z tag for build-only recovery; rerun the original REL tag run for publication'
         required: false
         type: string
 
@@ -319,7 +319,7 @@ jobs:
         run: |
           set -euo pipefail
           url="https://registry.npmjs.org/rtrt-agent/${RELEASE_VERSION}"
-           for attempt in $(seq 1 12); do
+           for attempt in $(seq 1 60); do
              status=$(curl --silent --show-error --output npm-version.json --write-out '%{http_code}' "$url" || true)
              if [ "$status" = 200 ] \
                && jq -e --arg version "$RELEASE_VERSION" '.version == $version' npm-version.json >/dev/null; then
@@ -341,7 +341,7 @@ jobs:
                echo '::error::published npm package has no supported dist.integrity or dist.shasum' >&2
                exit 1
              fi
-            [ "$attempt" -eq 12 ] || sleep 10
+             [ "$attempt" -eq 60 ] || sleep 10
           done
           echo "::error::rtrt-agent@${RELEASE_VERSION} did not become visible" >&2
           exit 1

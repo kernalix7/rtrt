@@ -67,8 +67,11 @@ if [ "$event" = workflow_dispatch ]; then
         }
         version=$(stable_tag_version "$recovery_tag")
         version_tag="v$version"
+        if [[ "$recovery_tag" == REL-v* ]]; then
+            echo 'release-preflight: REL publication recovery requires rerunning the tag run' >&2
+            exit 1
+        fi
         publish=false
-        [[ "$recovery_tag" == REL-v* ]] && publish=true
         source_sha=$(release_commit_for_tag "$recovery_tag")
         validate_paired_tags "$version_tag" "$source_sha"
         git checkout --quiet --detach "$source_sha"

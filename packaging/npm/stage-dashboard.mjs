@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { chmod, copyFile, lstat, mkdir, writeFile } from "node:fs/promises"
+import { chmod, copyFile, cp, lstat, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { agentContract, platforms } from "./agent-contract.mjs"
 
@@ -21,6 +21,8 @@ await mkdir(path.join(directory, "bin"))
 await copyFile(source, path.join(directory, binary))
 await chmod(path.join(directory, binary), 0o755)
 await copyFile(new URL("../../plugins/opencode/LICENSE", import.meta.url), path.join(directory, "LICENSE"))
+await cp(new URL("../../THIRD_PARTY_NOTICES", import.meta.url), path.join(directory, "THIRD_PARTY_NOTICES"), { recursive: true })
+const notices = agent.files.filter((file) => file.startsWith("THIRD_PARTY_NOTICES/"))
 await writeFile(path.join(directory, "package.json"), `${JSON.stringify({
   name,
   version: agent.version,
@@ -29,5 +31,5 @@ await writeFile(path.join(directory, "package.json"), `${JSON.stringify({
   repository: { ...agent.repository, directory: "packaging/npm" },
   os: [os],
   cpu: [cpu],
-  files: [binary, "LICENSE"],
+  files: [binary, "LICENSE", ...notices],
 }, null, 2)}\n`)

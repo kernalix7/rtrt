@@ -56,7 +56,8 @@ for (const [target, os, cpu] of targets) {
     const archive = path.join(cwd, packed[0].filename)
     const metadata = JSON.parse(execFileSync("tar", ["-xOf", archive, "package/package.json"]))
     // Then: filters, bytes and POSIX execute bits survive the actual tarball.
-    const files = ["LICENSE", "package.json", `bin/${binary}`].sort()
+    const files = ["LICENSE", "package.json", `bin/${binary}`,
+      ...manifest.files.filter((file) => file.startsWith("THIRD_PARTY_NOTICES/"))].sort()
     assert.deepEqual(dry[0].files.map((file) => file.path).sort(), files)
     assert.deepEqual(packed[0].files.map((file) => file.path).sort(), files)
     assert.equal(metadata.name, `rtrt-dashboard-${os}-${cpu}`)

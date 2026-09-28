@@ -145,7 +145,7 @@ Vector and hybrid recall require an `Embedder`. The default is `all-MiniLM-L6-v2
 
 ```toml
 [dependencies]
-rtrt-memory = { version = "0.1.6", features = ["embeddings"] }
+rtrt-memory = { version = "0.1.7", features = ["embeddings"] }
 ```
 
 Usage:

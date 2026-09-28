@@ -28,18 +28,28 @@ test("package publishes only the root provenance plugin surface", async () => {
 
   // Then: npm and OpenCode see the intended package and named plugin only.
   assert.equal(manifest.name, "rtrt-agent")
-  assert.equal(manifest.version, "0.1.5")
+  assert.equal(manifest.version, "0.1.6")
   assert.equal(manifest.type, "module")
   assert.equal(manifest.main, "./index.js")
   assert.deepEqual(manifest.exports, { ".": "./index.js" })
+  const noticeFiles = [
+    "INDEX.md",
+    ...["cytoscape-fcose@2.2.0", "cytoscape-cola@2.5.1", "cose-base@2.2.0",
+      "layout-base@2.0.1", "webcola@3.4.0", "cytoscape@3.30.2", "subtle@2.6.1",
+      "webpki-roots@0.26.11", "webpki-roots@1.0.7"].map((name) => `${name}/LICENSE`),
+    "ring@0.17.14/LICENSE", "ring@0.17.14/LICENSE-BoringSSL",
+    "ring@0.17.14/LICENSE-other-bits", "ring@0.17.14/src/polyfill/once_cell/LICENSE-APACHE",
+    "ring@0.17.14/src/polyfill/once_cell/LICENSE-MIT", "ring@0.17.14/third_party/fiat/LICENSE",
+    "option-ext@0.2.0/LICENSE.txt",
+  ].map((file) => `THIRD_PARTY_NOTICES/${file}`)
   assert.deepEqual(
     ["package.json", ...manifest.files].toSorted(),
     [
       "LICENSE", "README.ko.md", "README.md", "bin/rtrt-dashboard-open.js", "index.js",
       "package.json", "rtrt-provenance.js", "runtime/dashboard-binary.js",
       "runtime/dashboard-files.js", "runtime/dashboard-plugin.js", "runtime/dashboard-process.js",
-      "runtime/dashboard-supervisor.js",
-    ],
+      "runtime/dashboard-supervisor.js", ...noticeFiles,
+    ].toSorted(),
   )
   assert.deepEqual(manifest.dependencies, { "@opencode-ai/sdk": "1.15.13" })
   assert.deepEqual(Object.keys(pluginModule), ["RtrtProvenance"])

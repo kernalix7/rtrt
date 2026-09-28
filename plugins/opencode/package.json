@@ -1,6 +1,6 @@
 {
   "name": "rtrt-agent",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "RTRT provenance, permission-broker, and local dashboard plugin for OpenCode",
   "type": "module",
   "main": "./index.js",
@@ -68,10 +68,10 @@
     "@opencode-ai/sdk": "1.15.13"
   },
   "optionalDependencies": {
-    "rtrt-dashboard-linux-x64": "0.1.6",
-    "rtrt-dashboard-linux-arm64": "0.1.6",
-    "rtrt-dashboard-darwin-x64": "0.1.6",
-    "rtrt-dashboard-darwin-arm64": "0.1.6",
-    "rtrt-dashboard-win32-x64": "0.1.6"
+    "rtrt-dashboard-linux-x64": "0.1.7",
+    "rtrt-dashboard-linux-arm64": "0.1.7",
+    "rtrt-dashboard-darwin-x64": "0.1.7",
+    "rtrt-dashboard-darwin-arm64": "0.1.7",
+    "rtrt-dashboard-win32-x64": "0.1.7"
   }
 }

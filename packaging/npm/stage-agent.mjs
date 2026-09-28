@@ -12,7 +12,8 @@ for (const file of agent.files) {
   assert.ok(!path.isAbsolute(file) && !file.split(/[\\/]/).includes(".."), "package file must be relative")
   const destination = path.join(directory, file)
   await mkdir(path.dirname(destination), { recursive: true })
-  await copyFile(new URL(`../../plugins/opencode/${file}`, import.meta.url), destination)
+  const source = file.startsWith("THIRD_PARTY_NOTICES/") ? `../../${file}` : `../../plugins/opencode/${file}`
+  await copyFile(new URL(source, import.meta.url), destination)
 }
 for (const binary of Object.values(agent.bin)) {
   assert.ok(agent.files.includes(binary.replace(/^\.\//, "")), "bin must be a declared package file")

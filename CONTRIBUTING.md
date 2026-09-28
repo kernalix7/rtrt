@@ -164,13 +164,9 @@ GIT_MASTER=1 git push --atomic origin vX.Y.Z REL-vX.Y.Z
 
 ### Recovering a failed release run
 
-If a tag run fails after the tags are already pushed (for example, the trusted publisher was misconfigured), don't move or re-push the tags and don't add a token fallback. Fix the account-side setting, then re-run the workflow by hand:
+The protected `npm-publish` environment accepts `REL-v*` tag refs, not `main`. A `workflow_dispatch` from `main` cannot publish, while dispatching from a tag fails the preflight's default-branch requirement. Do not use `workflow_dispatch` to recover a `REL-` publication.
 
-1. Open **Actions → Release → Run workflow** on the `main` branch.
-2. Set `release_tag` to the existing paired tag. `REL-vX.Y.Z` rebuilds, publishes to npm, and creates/updates the GitHub Release; `vX.Y.Z` only rebuilds and uploads Actions artifacts.
-3. The dispatched run checks out that tag's commit, so the tag must already exist on `origin` and both tags must still point at the same commit.
-
-The manual run uses the same `npm-publish` environment and OIDC exchange as a tag push, so the publisher table above applies unchanged.
+If a tag run fails, first check which npm versions exist. Compare each published package's `dist.integrity` (SHA-512 SRI) with the **exact tarball** uploaded by the failed run, not with an archive checksum or a rebuilt tarball. If no package was accepted, fix the external cause and re-run the original tag run. If a package was accepted but its exact upload is unavailable or a rebuild differs, stop and prepare a new patch version: npm versions are immutable, and a full rerun may create different binaries. Never move the paired tags, disable integrity checks, or add a token fallback. Build-only `vX.Y.Z` recovery does not publish npm packages.
 
 ### Crediting contributors in Highlights
 

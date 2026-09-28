@@ -37,7 +37,7 @@ case "$status" in
 esac
 
 # Visibility plus identity/integrity is the dependency barrier for rtrt-agent.
-for attempt in {1..12}; do
+for attempt in {1..60}; do
   status=$(curl --silent --show-error --connect-timeout 10 --max-time 60 \
     --output "$metadata" --write-out '%{http_code}' "$url" || true)
   case "$status" in
@@ -45,7 +45,7 @@ for attempt in {1..12}; do
     404|429|5??|000) ;;
     *) echo "npm registry returned HTTP $status" >&2; exit 1 ;;
   esac
-  [ "$attempt" -eq 12 ] || sleep 10
+  [ "$attempt" -eq 60 ] || sleep 10
 done
 echo "${name}@${version} did not become visible" >&2
 exit 1

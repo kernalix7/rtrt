@@ -55,6 +55,26 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  feature-lanes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check fastembed embeddings (compile-only; skip ORT binary download)
+        env:
+          ORT_SKIP_DOWNLOAD: "1"
+        run: timeout 600s cargo check --locked -p rtrt-memory --features embeddings
+      - name: Check ONNX compression (compile-only; no model load)
+        run: timeout 600s cargo check --locked -p rtrt-compress --features onnx
+      - name: Check BERTScore evaluation (compile-only; no model load)
+        run: timeout 600s cargo check --locked -p rtrt-eval --features bertscore
+      - name: Check template chains (compile-only; no provider calls)
+        run: timeout 600s cargo check --locked -p rtrt-templates --features chains
+
   test:
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -72,6 +92,8 @@ jobs:
             runner: "ubuntu-24.04-arm"
           - toolchain: "stable"
             runner: "macos-latest"
+          - toolchain: "stable"
+            runner: "macos-15-intel"
           - toolchain: "stable"
             runner: "windows-latest"
     steps:

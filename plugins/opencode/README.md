@@ -7,14 +7,14 @@ the local dashboard available in the background.
 ## Install
 
 ```sh
-npm install rtrt-agent@0.1.5
+npm install rtrt-agent@0.1.6
 ```
 
 Register the package in the singular `plugin` array in `opencode.json`:
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.1.5"]
+  "plugin": ["rtrt-agent@0.1.6"]
 }
 ```
 
@@ -43,19 +43,19 @@ Existing `~/.rtrt` data is preserved.
 
 `rtrt setup --agent opencode --apply` manages the full RTRT integration but performs no
 npm installation; OpenCode installs the configured package at startup. Setup first writes
-the exact `rtrt-agent@0.1.5` registration and every replacement managed asset. Only after
+the exact `rtrt-agent@0.1.6` registration and every replacement managed asset. Only after
 those writes succeed does it remove a recognized legacy RTRT plugin; an earlier failure
 preserves the legacy runtime. Setup owns exact bare, pinned, ranged, tuple, and object forms
-of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.1.5"` string. Old
+of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.1.6"` string. Old
 unpublished `rtrt` and draft `rtrt-opencode` package specs are foreign and retain their
-order. The direct registration above and `opencode plugin rtrt-agent@0.1.5 --global`
+order. The direct registration above and `opencode plugin rtrt-agent@0.1.6 --global`
 remain valid.
 
 Managed-agent ownership state is read from the first nonempty root in this order:
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`.
 Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither
 is a future-version guarantee. The unified RTRT release workflow publishes the exact
-five exact-version dashboard platform packages before `rtrt-agent@0.1.5`, then publishes
+five exact-version dashboard platform packages before `rtrt-agent@0.1.6`, then publishes
 the matching Rust release artifacts.
 
 ## License

@@ -54,6 +54,7 @@ fn rtrt(home: &std::path::Path) -> Command {
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("RTRT_CONFIG", home.join(".rtrt").join("config.toml"))
+        .env_remove("RTRT_PARENT_PROJECT")
         .env_remove("RTRT_MEMORY_PATH")
         .env_remove("RTRT_CLAUDE_RATE_LIMIT_CACHE")
         .env_remove("RTRT_CLAUDE_RATE_LIMIT_MAX_AGE_SEC")

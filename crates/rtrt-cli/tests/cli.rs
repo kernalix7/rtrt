@@ -1633,7 +1633,7 @@ codex_check_timeout_ms = 1
             "--width",
             "80",
             "--budget-ms",
-            "120",
+            "5000",
             "--no-git",
         ])
         .env(
@@ -1652,7 +1652,10 @@ codex_check_timeout_ms = 1
         String::from_utf8_lossy(&output.stderr)
     );
     let status = parse_statusline_json(&output.stdout);
-    assert_eq!(status["data"]["quota"]["source"], "claude_statusline");
+    assert_eq!(
+        status["data"]["quota"]["source"], "claude_statusline",
+        "statusline={status}"
+    );
     assert_eq!(status["data"]["quota"]["fresh"], true);
     assert_eq!(
         status["data"]["quota"]["windows"]["five_hour"]["used_percentage"],

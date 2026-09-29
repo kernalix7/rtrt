@@ -9,6 +9,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-28
+
+### Highlights
+
+**RTRT 0.1.7 prepares a separate release after the partial v0.1.6 publication, with a longer bounded wait for npm registry visibility.**
+
+- After `npm publish`, platform verification now waits for up to 60 registry checks at 10-second intervals and accepts only a matching package name, version, and SHA-512 SRI. A mismatch still fails closed; a timed-out publish must not be followed by a blind rebuild of an already accepted version.
+- The `rtrt-agent` visibility check uses the same bounded window. A `main`-dispatched `REL-` publication recovery is refused before building because the protected `npm-publish` environment allows tag refs only.
+
 ## [0.1.6] - 2026-09-28
 
 ### Highlights
@@ -51,6 +60,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - Live-provider smoke requires user-supplied keys and is not a CI lane; WSL has no dedicated runtime job. The added optional-feature jobs compile without model downloads, while macOS Intel is now tested in CI.
 - The Homebrew formula retains an all-zero SHA-256 placeholder and is not an installable tap release. The notice tree does not certify legal compliance; notice placement and MPL-2.0 source-availability obligations remain for qualified counsel review.
+
+### Publication outcome (factual addendum)
+
+- The paired tags `v0.1.6` and `REL-v0.1.6` both point at commit `31bdd0f` and remain on `origin`; they were not moved and the SHA is unchanged.
+- GitHub Actions run `36374328637` attempt 2 failed on the immutable Windows SRI calculation; the `main`-branch `workflow_dispatch` recovery run `36383130874` was rejected by the `npm-publish` environment's tag-only policy.
+- All five `rtrt-dashboard-<platform>` npm package versions at `0.1.6` were published successfully (`200` from the npm registry for each). `rtrt-agent@0.1.6` and the GitHub Release for `v0.1.6` were never published.
+- The partial state cannot be repaired by moving the immutable tags or by republishing the existing `0.1.6` platform package versions. The five `rtrt-dashboard-*@0.1.6` packages are not a completed release; `rtrt-agent@0.1.6` does not exist on the npm registry.
 
 ## [0.1.5] - 2026-09-26
 

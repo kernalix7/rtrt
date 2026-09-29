@@ -52,8 +52,8 @@ On Windows, the installed task uses `%LOCALAPPDATA%\Programs\rtrt\rtrt-dashboard
 Examples:
 
 ```bash
-# Pin the v0.1.6 release
-curl -fsSL .../install.sh | sh -s -- --version v0.1.6
+# Pin the v0.1.7 release
+curl -fsSL .../install.sh | sh -s -- --version v0.1.7
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh

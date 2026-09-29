@@ -141,13 +141,9 @@ GIT_MASTER=1 git push --atomic origin vX.Y.Z REL-vX.Y.Z
 
 ### 실패한 릴리스 run 복구
 
-태그를 이미 push한 뒤 run이 실패하면 (예: trusted publisher 설정 오류), 태그를 옮기거나 다시 push하지 말고 토큰 fallback도 추가하지 마세요. 계정 쪽 설정을 고친 뒤 워크플로를 수동으로 다시 실행합니다.
+보호된 `npm-publish` 환경은 `main`이 아닌 `REL-v*` 태그 참조만 허용합니다. `main`의 `workflow_dispatch`는 게시할 수 없고, 태그 참조에서 dispatch하면 사전검사의 기본 브랜치 요구 조건에 걸립니다. `REL-` 게시 복구에 `workflow_dispatch`를 사용하지 마세요.
 
-1. `main` 브랜치에서 **Actions → Release → Run workflow**를 엽니다.
-2. `release_tag`에 기존 쌍 태그를 입력합니다. `REL-vX.Y.Z`는 다시 빌드하고 npm에 게시한 뒤 GitHub Release를 생성/갱신합니다. `vX.Y.Z`는 다시 빌드해 Actions artifact만 올립니다.
-3. dispatch된 run은 해당 태그의 커밋을 checkout하므로, 태그가 이미 `origin`에 있어야 하고 두 태그가 여전히 같은 커밋을 가리켜야 합니다.
-
-수동 run도 태그 push와 같은 `npm-publish` 환경과 OIDC 교환을 사용하므로 위 publisher 표가 그대로 적용됩니다.
+태그 실행이 실패하면 먼저 게시된 npm 버전을 확인하세요. 각 패키지의 `dist.integrity`(SHA-512 SRI)를 실패한 실행에서 업로드한 **정확한 tarball**과 비교해야 합니다. 아카이브 체크섬이나 재빌드한 tarball과 비교하지 마세요. 게시가 접수된 패키지가 없다면 외부 원인을 해결한 뒤 원래 태그 실행을 다시 돌릴 수 있습니다. 이미 접수된 패키지의 정확한 업로드가 남아 있지 않거나 재빌드 결과가 다르면 중단하고 새 패치 버전을 준비하세요. npm 버전은 변경할 수 없고 전체 재실행에서 다른 바이너리가 나올 수 있습니다. 쌍 태그를 옮기거나 무결성 검사를 끄거나 토큰 폴백을 추가하지 마세요. `vX.Y.Z` 빌드 전용 복구는 npm 패키지를 게시하지 않습니다.
 
 ### 외부 기여자 크레딧
 

@@ -2,7 +2,9 @@
 
 This directory hosts the formula in-source. To publish it as a real tap:
 
-> **0.1.6 note:** Homebrew is not an automated release channel. The in-source formula's all-zero checksum is a template; do not publish or install it until the real source-tarball checksum is available and a separate tap PR is merged. The paired-tag workflow publishes versioned npm packages and GitHub binary archives, while workspace crates remain source-only and are not on crates.io.
+> **0.1.7 note:** Homebrew is not an automated release channel. The in-source formula's all-zero checksum is a template; do not publish or install it until the real source-tarball checksum is available and a separate tap PR is merged. The paired-tag workflow publishes versioned npm packages and GitHub binary archives, while workspace crates remain source-only and are not on crates.io.
+>
+> The five `rtrt-dashboard-*@0.1.6` npm packages that were published during the v0.1.6 attempt do not make Homebrew installable: there is no `rtrt-agent@0.1.6` on the npm registry, no GitHub Release for `v0.1.6`, and this formula's placeholder checksum is unchanged. Treat the formula above as a template only; never present it as installable.
 
 1. Create a separate GitHub repo named `homebrew-tap` under the same owner
    (e.g. `kernalix7/homebrew-tap`).

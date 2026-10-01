@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.1.7.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.2.0.
 
 ## CLI
 
@@ -105,13 +105,13 @@ RTRT does not provide a team command, scheduler, roster, worker protocol, or `te
 
 ### OpenCode npm plugin and setup migration
 
-Install `rtrt-agent@0.1.7` with `npm install rtrt-agent@0.1.7` and register it directly with OpenCode's singular root `plugin` key:
+Install `rtrt-agent@0.2.0` with `npm install rtrt-agent@0.2.0` and register it directly with OpenCode's singular root `plugin` key:
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.7"] }
+{ "plugin": ["rtrt-agent@0.2.0"] }
 ```
 
-The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. The TUI statusline is not shipped in npm and remains setup-managed.
+The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. The legacy v1 `app_bottom` statusline remains setup-managed; the separate native v2 footer is included in the npm package and is not registered by v1 setup.
 
 For a complete installation, prefer:
 
@@ -119,9 +119,11 @@ For a complete installation, prefer:
 rtrt setup --agent opencode --apply
 ```
 
-Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.1.7` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.2.0` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
 
-### OpenCode persistent statusline
+> **Native v2 source vs. legacy v1 setup-managed integration.** The published v1 package root is the named export `RtrtProvenance` only — its name is unchanged for v0.2.0. The source pack additionally includes an unpublished native v2 entry: a `Plugin.Definition` default export at `./server` constructed by the `createNativeServer` factory with `{ id: "rtrt-agent", setup }`, plus `./server` and `./tui` single-element arrays in `package.json` `exports`. The v2 native `rtrt-statusline.tsx` lives under `tui/v2/` and only runs under OpenCode 2.x; it is a separate surface from the v1 `app_bottom` statusline below, which remains setup-managed. The setup-managed v1 wiring in this section does not install or register the native v2 entries — `rtrt setup --agent opencode --apply` still writes v1 configuration, and the staged native plugin, footer, and forwarding adapter are not activated by default.
+
+### OpenCode persistent statusline (legacy v1 setup-managed `app_bottom`)
 
 ```bash
 rtrt setup --agent opencode --apply
@@ -141,7 +143,7 @@ It also adds one tuple to the active OpenCode TUI config's `plugin` array:
 
 The config resolver prefers an existing `tui.json` under that root, then an existing `tui.jsonc`, and creates `tui.json` there when neither exists. Setup parses and merges the document instead of replacing the plugin array: foreign plugins, unrelated keys, and existing non-`bin` options on the RTRT tuple survive. Repeated setup is idempotent. An unrecognized pre-existing file at either managed TUI path is not overwritten.
 
-The plugin registers one persistent `app_bottom` surface at the bottom of the application. It deliberately does not register `session_prompt_right`: keeping the statusline outside OpenCode's prompt render path prevents streaming updates from delaying keyboard input or interrupt handling.
+This is the legacy v1 `app_bottom` statusline, kept as a separate setup-managed surface from the unpublished native v2 `rtrt-statusline.tsx` under `tui/v2/`. The plugin registers one persistent `app_bottom` surface at the bottom of the application. It deliberately does not register `session_prompt_right`: keeping the statusline outside OpenCode's prompt render path prevents streaming updates from delaying keyboard input or interrupt handling.
 
 The line refreshes immediately at startup, after scoped project and session lifecycle/status events (750 ms burst debounce), and every 15 seconds. Session events refresh only the active application line. Session economics are read as non-reactive snapshots during those scoped events; high-volume file and message-part updates neither rerender the statusline nor spawn statusline work. Refreshes never overlap. TUI plugins load at OpenCode process startup, so restart OpenCode after installation or upgrade; already-running processes do not acquire the statusline.
 

@@ -9,6 +9,25 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-01
+
+### Highlights
+
+**RTRT 0.2.0 adds native OpenCode 2.0.20 integration alongside the existing v1 integration.**
+
+- The npm agent includes a native `./server` plugin definition and a `./tui` prompt-footer statusline. The v1 named `RtrtProvenance` root export and legacy setup-managed statusline remain separate and compatible.
+- Native hooks preserve RTRT tool provenance, dashboard lifecycle, explicit dashboard opening, and permission denials. External Claude CLI permission brokerage, per-call shell identity, and provider-limit recovery remain unsupported because the 2.0.20 public API does not expose those surfaces.
+
+### Fixed
+
+- Dashboard `/api/*` Origin validation now rejects present malformed or repeated headers instead of treating them as absent. Deliberately absent-Origin bearer clients remain supported, and bootstrap still requires an allowed Origin.
+- Published npm staging omits repository-only development scripts while preserving runtime files, executable permissions, exports, and exact-version platform dependencies.
+
+### Distribution
+
+- Distributions include the complete, unchanged `option-ext@0.2.0` MPL-covered source archive with a pinned SHA-256 and local extraction instructions. The existing targeted license notices remain intact; this is not a legal certification or an exhaustive dependency inventory.
+- Existing `0.1.7` tags and published packages remain unchanged. This release does not publish Docker images or activate an operational collector, sandbox, or global configuration.
+
 ## [0.1.7] - 2026-09-28
 
 ### Highlights

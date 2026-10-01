@@ -8,6 +8,25 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-01
+
+### Highlights
+
+**RTRT 0.2.0은 기존 v1 통합과 함께 native OpenCode 2.0.20 통합을 추가합니다.**
+
+- npm agent에 native `./server` plugin definition과 `./tui` prompt-footer statusline을 포함합니다. v1 이름 있는 `RtrtProvenance` root export와 legacy setup-managed statusline은 별도 경로로 유지하며 호환성을 보존합니다.
+- Native hook은 RTRT tool provenance, dashboard lifecycle, 명시적 dashboard 열기, permission deny를 보존합니다. 외부 Claude CLI permission brokerage, per-call shell identity, provider-limit recovery는 2.0.20 public API에 해당 표면이 없어 지원되지 않습니다.
+
+### 수정
+
+- Dashboard `/api/*`의 Origin 검증은 기존처럼 없는 헤더로 처리하지 않고, 존재하지만 잘못되었거나 반복된 헤더를 거부합니다. 의도적으로 Origin이 없는 bearer client는 유지하며 bootstrap은 계속 허용된 Origin을 요구합니다.
+- npm 게시 staging에서 저장소 전용 개발 scripts를 제외하고 runtime 파일, 실행 권한, exports, exact-version 플랫폼 의존성을 보존합니다.
+
+### 배포
+
+- 완전하고 변경되지 않은 `option-ext@0.2.0` MPL covered source archive를 고정 SHA-256 및 로컬 추출 안내와 함께 포함합니다. 기존 targeted license notice는 유지하며 법적 인증이나 전체 의존성 inventory를 의미하지 않습니다.
+- 기존 `0.1.7` 태그와 게시 패키지는 그대로입니다. 이번 릴리즈는 Docker 이미지를 게시하거나 운영 collector, sandbox, 전역 설정을 활성화하지 않습니다.
+
 ## [0.1.7] - 2026-09-28
 
 ### Highlights

@@ -1,10 +1,11 @@
 # Version-pinned distribution notices
 
 These are unmodified LICENSE files extracted from the specified public npm and
-crates.io archives. `LICENSE` at the distribution root remains RTRT's own MIT
-license. This directory accompanies the source, the five GitHub binary archives,
-the five dashboard platform npm packages, and `rtrt-agent`. It is a targeted
-notice set, not an exhaustive dependency inventory or a legal certification.
+crates.io archives, plus the complete unmodified `option-ext@0.2.0` source crate.
+`LICENSE` at the distribution root remains RTRT's own MIT license. This directory
+accompanies the source, the five GitHub binary archives, the five dashboard
+platform npm packages, and `rtrt-agent`. It is a targeted notice set, not an
+exhaustive dependency inventory or a legal certification.
 
 The five MIT JS bundles `cytoscape-fcose`, `cytoscape-cola`, `cose-base`,
 `layout-base`, and `webcola` are embedded in the dashboard without their upstream
@@ -32,9 +33,11 @@ the matching `https://registry.npmjs.org/<name>/<version>` `dist.integrity`
 | webpki-roots@1.0.7 | https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.7.crate | `52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d` |
 | option-ext@0.2.0 | https://static.crates.io/crates/option-ext/option-ext-0.2.0.crate | `04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d` |
 
-Paths below are relative to this directory; SHA-256 is of the extracted file,
-not the archive. For npm, the upstream path is `package/LICENSE`. For crates,
-the upstream path is `<name>-<version>/<path below>`.
+Paths below are relative to this directory; SHA-256 is of the distributed local
+file. LICENSE rows hash extracted files, not their upstream archives. For npm,
+the upstream path is `package/LICENSE`. For crates, the upstream license path
+is `<name>-<version>/<path below>`. The `SOURCE.crate` row instead hashes the
+unmodified complete upstream archive bytes (also listed in the archive table).
 
 | Extracted file | SHA-256 |
 |---|---|
@@ -54,10 +57,20 @@ the upstream path is `<name>-<version>/<path below>`.
 | `webpki-roots@0.26.11/LICENSE` | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
 | `webpki-roots@1.0.7/LICENSE` | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
 | `option-ext@0.2.0/LICENSE.txt` | `66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172` |
+| `option-ext@0.2.0/SOURCE.crate` | `04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d` |
 
 `ring`'s top-level LICENSE explains its ISC/Apache-2.0 BoringSSL split and
 points to the included once_cell subpart texts. The included fiat subpart
-license is copied from the same crate. `option-ext` is MPL-2.0: this notice
-alone is not a substitute for assessment of source-code availability under
-MPL-2.0 section 3.2; the versioned source is available from the crate URL
-above, but counsel should assess whether additional delivery is required.
+license is copied from the same crate. `option-ext@0.2.0` is MPL-2.0: its
+complete, unchanged upstream source archive is bundled at
+`THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate` inside each of the five
+GitHub binary archives, five dashboard platform npm packages, and the
+`rtrt-agent` npm package. It is the same version and SHA-256 as `Cargo.lock`;
+recipients need no network download. From the distribution root, run
+`mkdir option-ext-source && tar -xzf THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate -C option-ext-source`
+to read the original `option-ext-0.2.0/src/`, `Cargo.toml`, `Cargo.toml.orig`,
+`README.md`, and `LICENSE.txt` beneath `option-ext-source/`. The URL above is
+an additional upstream retrieval option, not the only source offer. This
+source-code copy applies only to the MPL-covered `option-ext` component; it
+does not relicense RTRT. Qualified counsel should assess any remaining
+distribution obligations, including MPL-2.0 section 3.2.

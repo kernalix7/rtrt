@@ -19,6 +19,7 @@ const noticeFiles = [
   "ring@0.17.14/src/polyfill/once_cell/LICENSE-MIT",
   "ring@0.17.14/third_party/fiat/LICENSE",
   "option-ext@0.2.0/LICENSE.txt",
+  "option-ext@0.2.0/SOURCE.crate",
 ].map((file) => `THIRD_PARTY_NOTICES/${file}`).sort()
 const targets = [
   ["x86_64-unknown-linux-gnu", "linux-x64", "rtrt-dashboard"],
@@ -27,6 +28,26 @@ const targets = [
   ["aarch64-apple-darwin", "darwin-arm64", "rtrt-dashboard"],
   ["x86_64-pc-windows-msvc", "win32-x64", "rtrt-dashboard.exe"],
 ]
+
+test("option-ext source archive contains the pinned complete upstream crate", async () => {
+  // Given: the locally bundled crate and the resolved dependency lock.
+  const file = path.join(root, "THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate")
+  const lock = await readFile(path.join(root, "Cargo.lock"), "utf8")
+
+  // When: a recipient verifies the source archive and enumerates its members.
+  const digest = createHash("sha256").update(await readFile(file)).digest("hex")
+  const members = execFileSync("tar", ["-tzf", file], { encoding: "utf8" }).trim().split("\n")
+
+  // Then: exact upstream bytes include package metadata, license, and all source files.
+  assert.equal(digest, "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d")
+  assert.match(lock, /name = "option-ext"\nversion = "0\.2\.0"\nsource = "registry\+https:\/\/github\.com\/rust-lang\/crates\.io-index"\nchecksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"/)
+  assert.deepEqual(members.sort(), [
+    ".cargo_vcs_info.json", ".gitignore", "Cargo.toml", "Cargo.toml.orig",
+    "LICENSE.txt", "README.md", "src/impl.rs", "src/lib.rs",
+  ].map((member) => `option-ext-0.2.0/${member}`).sort())
+  assert.deepEqual(execFileSync("tar", ["-xOzf", file, "option-ext-0.2.0/LICENSE.txt"]),
+    await readFile(path.join(root, "THIRD_PARTY_NOTICES/option-ext@0.2.0/LICENSE.txt")))
+})
 
 test("indexed notice digests match the distributed source files", async () => {
   const index = await readFile(path.join(root, "THIRD_PARTY_NOTICES/INDEX.md"), "utf8")

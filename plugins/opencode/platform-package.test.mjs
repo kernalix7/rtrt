@@ -110,6 +110,19 @@ test("agent pack includes all declared runtime files and an executable opener", 
   const opener = execFileSync("tar", ["-tvf", archive, "package/bin/rtrt-dashboard-open.js"], { encoding: "utf8" })
   assert.match(opener, /^-rwxr-xr-x\s/)
   const metadata = JSON.parse(execFileSync("tar", ["-xOf", archive, "package/package.json"]))
+  // Then: the published manifest exposes no development-only scripts. The source
+  // declares only `test` and `sync:platforms`, and neither install nor packing needs
+  // a lifecycle hook, so the whole `scripts` key must be absent from the tarball.
+  assert.equal(metadata.scripts, undefined)
+  // And: staging is a pure projection — the source manifest keeps its dev scripts.
+  const source = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"))
+  assert.deepEqual(source.scripts, manifest.scripts)
+  assert.ok(Object.hasOwn(manifest.scripts, "test"), "source test script preserved")
+  assert.ok(Object.hasOwn(manifest.scripts, "sync:platforms"), "source sync script preserved")
+  // Runtime contract fields stay byte-identical between source and staged manifest.
+  assert.deepEqual(metadata.bin, manifest.bin)
+  assert.deepEqual(metadata.exports, manifest.exports)
+  assert.deepEqual(metadata.dependencies, manifest.dependencies)
   assert.deepEqual(metadata.optionalDependencies, manifest.optionalDependencies)
 })
 

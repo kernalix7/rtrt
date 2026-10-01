@@ -2,7 +2,7 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 v0.1.7 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
+이 문서는 v0.2.0 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
 
 ## 빠른 차림표
 
@@ -113,13 +113,13 @@ RTRT는 team 명령, scheduler, roster, worker protocol 또는 `team_dispatch` M
 
 ### OpenCode npm 플러그인과 setup 마이그레이션
 
-`rtrt-agent@0.1.7`을 `npm install rtrt-agent@0.1.7`으로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
+`rtrt-agent@0.2.0`을 `npm install rtrt-agent@0.2.0`으로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
 
 ```json
-{ "plugin": ["rtrt-agent@0.1.7"] }
+{ "plugin": ["rtrt-agent@0.2.0"] }
 ```
 
-npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 일치하는 대시보드 backend를 loopback-only detached process로 시작합니다. 플러그인 초기화는 대시보드 준비를 기다리지 않으며 브라우저를 자동으로 열지 않습니다. 필요할 때 `rtrt-dashboard-open`을 실행하거나 에이전트에게 `rtrt_dashboard_open` 도구 사용을 명시적으로 요청합니다. TUI 스테이터스라인은 npm에 포함되지 않으며 계속 setup이 관리합니다.
+npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 일치하는 대시보드 backend를 loopback-only detached process로 시작합니다. 플러그인 초기화는 대시보드 준비를 기다리지 않으며 브라우저를 자동으로 열지 않습니다. 필요할 때 `rtrt-dashboard-open`을 실행하거나 에이전트에게 `rtrt_dashboard_open` 도구 사용을 명시적으로 요청합니다. Legacy v1 `app_bottom` statusline은 계속 setup이 관리하며, 별도의 native v2 footer는 npm 패키지에 포함되지만 v1 setup으로 등록하지 않습니다.
 
 전체 설치에는 다음을 권장합니다.
 
@@ -127,9 +127,11 @@ npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 �
 rtrt setup --agent opencode --apply
 ```
 
-Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.1.7` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지를 게시합니다.
+Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.2.0` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지를 게시합니다.
 
-### OpenCode 영구 스테이터스라인
+> **Native v2 소스 vs. legacy v1 setup-managed 통합.** 게시된 v1 패키지 root는 이름 있는 export `RtrtProvenance` 하나이며 이름은 v0.2.0에서 그대로입니다. 소스 팩은 추가로 미게시 native v2 진입점을 포함합니다: `createNativeServer` 팩토리가 만드는 `{ id: "rtrt-agent", setup }` 형태의 `Plugin.Definition` default export를 `./server`에 두고, `package.json` `exports`에 `./server`와 `./tui` single-element 배열을 추가합니다. v2 native `rtrt-statusline.tsx`는 `tui/v2/` 아래에 있고 2.x에서만 동작하며, 아래 setup-managed v1 `app_bottom` statusline과 분리된 표면입니다. 이 절의 setup-managed v1 배선은 native v2 진입점을 설치·등록하지 않습니다 — `rtrt setup --agent opencode --apply`는 여전히 v1 설정을 기록하며 staged native plugin·footer·forwarding adapter는 기본으로 활성화되지 않습니다.
+
+### OpenCode 영구 스테이터스라인 (legacy v1 setup-managed `app_bottom`)
 
 ```bash
 rtrt setup --agent opencode --apply
@@ -149,7 +151,7 @@ Setup은 해석된 OpenCode config root 아래에 관리 대상 TUI file 두 개
 
 Config resolver는 해당 root 아래 기존 `tui.json`을 우선하고, 없으면 기존 `tui.jsonc`, 둘 다 없으면 그곳에 새 `tui.json`을 선택합니다. Setup은 plugin 배열을 교체하지 않고 document를 parse/merge하므로 외부 plugin, 관련 없는 key, RTRT tuple의 기존 `bin` 외 option을 보존합니다. 반복 setup은 idempotent합니다. 관리 대상 TUI 경로에 인식할 수 없는 기존 file이 있으면 덮어쓰지 않습니다.
 
-Plugin은 application 아래쪽의 영구 `app_bottom` surface 하나만 등록합니다. `session_prompt_right`는 의도적으로 등록하지 않습니다. statusline을 OpenCode prompt 렌더링 경로 밖에 두어 streaming update가 키 입력이나 interrupt 처리를 지연하지 않게 합니다.
+이 statusline은 legacy v1 `app_bottom` 통합으로, 미게시 native v2 `rtrt-statusline.tsx`(`tui/v2/` 아래)와 분리된 setup-managed 표면입니다. Plugin은 application 아래쪽의 영구 `app_bottom` surface 하나만 등록합니다. `session_prompt_right`는 의도적으로 등록하지 않습니다. statusline을 OpenCode prompt 렌더링 경로 밖에 두어 streaming update가 키 입력이나 interrupt 처리를 지연하지 않게 합니다.
 
 Line은 시작 즉시, 범위가 지정된 project 및 session lifecycle/status event 후(연속 event는 750 ms debounce), 그리고 15초마다 갱신됩니다. Session event는 활성 application line만 갱신합니다. Session economics는 이 범위 이벤트에서 비반응형 snapshot으로 읽으므로, 빈도가 높은 file 및 message-part update는 statusline을 다시 render하거나 statusline 작업을 실행하지 않습니다. Refresh는 겹쳐 실행되지 않습니다. TUI plugin은 OpenCode process 시작 시 load되므로 설치 또는 upgrade 후 OpenCode를 재시작해야 합니다. 이미 실행 중인 process에는 statusline이 추가되지 않습니다.
 

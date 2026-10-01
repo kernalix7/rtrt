@@ -19,19 +19,25 @@ const createTestProvenance = (context) =>
     managedAgentStatePath: path.join(tmpdir(), `rtrt-opencode-managed-${randomUUID()}.json`),
   })
 
-test("package publishes only the root provenance plugin surface", async () => {
-  // Given: the package manifest and its self-referenced root export.
+test("package retains classic root and exposes separate native server and TUI", async () => {
+  // Given: the package manifest and its self-referenced entrypoints.
   const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"))
 
   // When: a consumer imports the package by name.
   const pluginModule = await import("rtrt-agent")
+  const native = await import("rtrt-agent/server")
+  const tuiEntry = import.meta.resolve("rtrt-agent/tui")
 
-  // Then: npm and OpenCode see the intended package and named plugin only.
+  // Then: OpenCode sees separate native entrypoints, while root stays named-only.
   assert.equal(manifest.name, "rtrt-agent")
-  assert.equal(manifest.version, "0.1.7")
+  assert.equal(manifest.version, "0.2.0")
   assert.equal(manifest.type, "module")
   assert.equal(manifest.main, "./index.js")
-  assert.deepEqual(manifest.exports, { ".": "./index.js" })
+  assert.deepEqual(manifest.exports, {
+    ".": "./index.js",
+    "./server": ["./server.js"],
+    "./tui": ["./tui/v2/rtrt-statusline.tsx"],
+  })
   const noticeFiles = [
     "INDEX.md",
     ...["cytoscape-fcose@2.2.0", "cytoscape-cola@2.5.1", "cose-base@2.2.0",
@@ -41,19 +47,66 @@ test("package publishes only the root provenance plugin surface", async () => {
     "ring@0.17.14/LICENSE-other-bits", "ring@0.17.14/src/polyfill/once_cell/LICENSE-APACHE",
     "ring@0.17.14/src/polyfill/once_cell/LICENSE-MIT", "ring@0.17.14/third_party/fiat/LICENSE",
     "option-ext@0.2.0/LICENSE.txt",
+    "option-ext@0.2.0/SOURCE.crate",
   ].map((file) => `THIRD_PARTY_NOTICES/${file}`)
   assert.deepEqual(
     ["package.json", ...manifest.files].toSorted(),
     [
       "LICENSE", "README.ko.md", "README.md", "bin/rtrt-dashboard-open.js", "index.js",
-      "package.json", "rtrt-provenance.js", "runtime/dashboard-binary.js",
-      "runtime/dashboard-files.js", "runtime/dashboard-plugin.js", "runtime/dashboard-process.js",
-      "runtime/dashboard-supervisor.js", ...noticeFiles,
+       "package.json", "rtrt-provenance.js", "server.js", "v2/permissions.js", "runtime/dashboard-binary.js",
+       "runtime/dashboard-files.js", "runtime/dashboard-plugin.js", "runtime/dashboard-process.js",
+       "runtime/dashboard-supervisor.js", "tui/index.js", "tui/rtrt-statusline-core.mjs",
+       "tui/rtrt-statusline-core.d.mts",
+       "tui/v2/native-runtime.mjs", "tui/v2/native-state.mjs", "tui/v2/rtrt-statusline.tsx",
+       ...noticeFiles,
     ].toSorted(),
   )
   assert.deepEqual(manifest.dependencies, { "@opencode-ai/sdk": "1.15.13" })
+  assert.deepEqual(manifest.peerDependencies, {
+    "@opencode/plugin": ">=1.18.33 <3", "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.0",
+  })
+  assert.deepEqual(manifest.peerDependenciesMeta, {
+    "@opencode/plugin": { optional: true }, "@opentui/core": { optional: true },
+    "@opentui/solid": { optional: true }, "solid-js": { optional: true },
+  })
   assert.deepEqual(Object.keys(pluginModule), ["RtrtProvenance"])
   assert.equal(typeof pluginModule.RtrtProvenance, "function")
+  assert.equal(Object.values(pluginModule).every((entry) => typeof entry === "function"), true)
+  assert.deepEqual(Object.keys(native), ["createNativeServer", "default"])
+  assert.equal(typeof native.default.setup, "function")
+  assert.equal(tuiEntry.endsWith("/tui/v2/rtrt-statusline.tsx"), true)
+  assert.equal(manifest.scripts.test.includes("native-v2-lifecycle.test.mjs"), true)
+  assert.equal(manifest.scripts.test.includes("v2/permissions-security.test.mjs"), true)
+})
+
+test("dependency-only lock keeps host peers but excludes unpublished platforms", async () => {
+  // Given: npm's generated source lock and package manifest.
+  const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"))
+  const lock = JSON.parse(await readFile(new URL("./package-lock.json", import.meta.url), "utf8"))
+
+  // When: the release test stage consumes the root lock entry.
+  const root = lock.packages[""]
+
+  // Then: the SDK and peer metadata remain, without platform resolution during npm ci.
+  assert.deepEqual(root.dependencies, manifest.dependencies)
+  assert.deepEqual(root.peerDependencies, manifest.peerDependencies)
+  assert.equal(root.optionalDependencies, undefined)
+  assert.equal(Object.keys(lock.packages).some((name) => name.startsWith("node_modules/rtrt-dashboard-")), false)
+})
+
+test("native subpaths stay outside v1.18.33 resolver's string/object export forms", async () => {
+  // Given: v1.18.33 extractExportValue accepts strings and import/default objects, not arrays.
+  const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"))
+
+  // When: the manifest is prepared for both v1 and v2 hosts.
+  const nativeServer = manifest.exports["./server"]
+  const nativeTui = manifest.exports["./tui"]
+
+  // Then: v1 server falls back to classic main; v2 can select native first entries.
+  assert.equal(manifest.main, "./index.js")
+  assert.deepEqual(nativeServer, ["./server.js"])
+  assert.deepEqual(nativeTui, ["./tui/v2/rtrt-statusline.tsx"])
 })
 
 test("provenance and a sentinel plugin run sequentially in both orders", async (t) => {

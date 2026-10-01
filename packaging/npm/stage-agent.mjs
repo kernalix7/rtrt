@@ -19,4 +19,9 @@ for (const binary of Object.values(agent.bin)) {
   assert.ok(agent.files.includes(binary.replace(/^\.\//, "")), "bin must be a declared package file")
   await chmod(path.join(directory, binary), 0o755)
 }
-await writeFile(path.join(directory, "package.json"), `${JSON.stringify(agent, null, 2)}\n`)
+// The source manifest's only scripts are dev-only (`test`, `sync:platforms`) and no
+// lifecycle hook is needed at install or pack time, so the published manifest omits
+// `scripts` entirely. Shallow-copy first so the agentContract source object is untouched.
+const published = { ...agent }
+delete published.scripts
+await writeFile(path.join(directory, "package.json"), `${JSON.stringify(published, null, 2)}\n`)

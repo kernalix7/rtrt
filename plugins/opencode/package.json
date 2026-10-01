@@ -1,11 +1,13 @@
 {
   "name": "rtrt-agent",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "RTRT provenance, permission-broker, and local dashboard plugin for OpenCode",
   "type": "module",
   "main": "./index.js",
   "exports": {
-    ".": "./index.js"
+    ".": "./index.js",
+    "./server": ["./server.js"],
+    "./tui": ["./tui/v2/rtrt-statusline.tsx"]
   },
   "bin": {
     "rtrt-dashboard-open": "./bin/rtrt-dashboard-open.js"
@@ -13,12 +15,20 @@
   "files": [
     "index.js",
     "rtrt-provenance.js",
+    "server.js",
+    "v2/permissions.js",
     "bin/rtrt-dashboard-open.js",
     "runtime/dashboard-binary.js",
     "runtime/dashboard-files.js",
     "runtime/dashboard-plugin.js",
     "runtime/dashboard-process.js",
     "runtime/dashboard-supervisor.js",
+    "tui/index.js",
+    "tui/rtrt-statusline-core.mjs",
+    "tui/rtrt-statusline-core.d.mts",
+    "tui/v2/native-runtime.mjs",
+    "tui/v2/native-state.mjs",
+    "tui/v2/rtrt-statusline.tsx",
     "README.md",
     "README.ko.md",
     "LICENSE",
@@ -38,10 +48,11 @@
     "THIRD_PARTY_NOTICES/subtle@2.6.1/LICENSE",
     "THIRD_PARTY_NOTICES/webpki-roots@0.26.11/LICENSE",
     "THIRD_PARTY_NOTICES/webpki-roots@1.0.7/LICENSE",
-    "THIRD_PARTY_NOTICES/option-ext@0.2.0/LICENSE.txt"
+    "THIRD_PARTY_NOTICES/option-ext@0.2.0/LICENSE.txt",
+    "THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate"
   ],
   "scripts": {
-    "test": "node --test rtrt-provenance.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs dashboard-supervisor.test.mjs package.test.mjs notices-package.test.mjs platform-package.test.mjs platform-publish.test.mjs tui/rtrt-statusline.test.mjs",
+    "test": "node --test rtrt-provenance.test.mjs native-v2.test.mjs native-v2-lifecycle.test.mjs v2/permissions-security.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs dashboard-supervisor.test.mjs package.test.mjs notices-package.test.mjs platform-package.test.mjs platform-publish.test.mjs tui/rtrt-statusline.test.mjs tui/v2/native-runtime.test.mjs tui/v2/native-state.test.mjs",
     "sync:platforms": "node ../../packaging/npm/agent-contract.mjs --sync"
   },
   "engines": {
@@ -67,11 +78,23 @@
   "dependencies": {
     "@opencode-ai/sdk": "1.15.13"
   },
+  "peerDependencies": {
+    "@opencode/plugin": ">=1.18.33 <3",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": { "optional": true },
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
+  },
   "optionalDependencies": {
-    "rtrt-dashboard-linux-x64": "0.1.7",
-    "rtrt-dashboard-linux-arm64": "0.1.7",
-    "rtrt-dashboard-darwin-x64": "0.1.7",
-    "rtrt-dashboard-darwin-arm64": "0.1.7",
-    "rtrt-dashboard-win32-x64": "0.1.7"
+    "rtrt-dashboard-linux-x64": "0.2.0",
+    "rtrt-dashboard-linux-arm64": "0.2.0",
+    "rtrt-dashboard-darwin-x64": "0.2.0",
+    "rtrt-dashboard-darwin-arm64": "0.2.0",
+    "rtrt-dashboard-win32-x64": "0.2.0"
   }
 }

@@ -390,15 +390,18 @@ fn validate_origin<B>(
     if !request.uri().path().starts_with("/api/") {
         return Ok(());
     }
-    let origin = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    match origin {
-        None if request.uri().path() == "/api/auth/bootstrap" => Err(StatusCode::FORBIDDEN),
-        None => Ok(()), // Explicit non-browser bearer client.
-        Some(origin) if allowed_origins.contains(origin) => Ok(()),
-        Some(_) => Err(StatusCode::FORBIDDEN),
+    let mut origins = request.headers().get_all(header::ORIGIN).iter();
+    match (origins.next(), origins.next()) {
+        (None, None) if request.uri().path() == "/api/auth/bootstrap" => Err(StatusCode::FORBIDDEN),
+        (None, None) => Ok(()), // Explicit non-browser bearer client.
+        (Some(origin), None)
+            if origin
+                .to_str()
+                .is_ok_and(|value| allowed_origins.contains(value)) =>
+        {
+            Ok(())
+        }
+        _ => Err(StatusCode::FORBIDDEN),
     }
 }
 

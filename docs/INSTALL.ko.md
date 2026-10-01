@@ -52,8 +52,8 @@ Windows에서는 현재 `rtrt service` 관리/open을 지원하지 않습니다.
 예시:
 
 ```bash
-# v0.1.7 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.1.7
+# v0.2.0 릴리스 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.0
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh

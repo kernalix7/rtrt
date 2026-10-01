@@ -1160,6 +1160,58 @@ async fn browser_origin_cannot_follow_attacker_host() {
 }
 
 #[tokio::test]
+async fn origin_exact_allowed_value_is_accepted() {
+    // Given an authenticated request with the configured origin.
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let mut req = get("/api/stats");
+    req.headers_mut().insert(
+        header::ORIGIN,
+        axum::http::HeaderValue::from_static("http://localhost:7311"),
+    );
+
+    // When the API receives it, then the exact origin is accepted.
+    assert_eq!(call(app, req).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn origin_repeated_allowed_values_are_rejected() {
+    // Given an authenticated request with two otherwise-allowed Origin fields.
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let mut req = get("/api/stats");
+    req.headers_mut().append(
+        header::ORIGIN,
+        axum::http::HeaderValue::from_static("http://localhost:7311"),
+    );
+    req.headers_mut().append(
+        header::ORIGIN,
+        axum::http::HeaderValue::from_static("http://localhost:7311"),
+    );
+
+    // When the API receives it, then repeated fields are rejected.
+    assert_eq!(call(app, req).await.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn origin_present_with_invalid_text_is_rejected() {
+    // Given an authenticated request with a present non-UTF-8 Origin field.
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let mut req = get("/api/stats");
+    req.headers_mut().insert(
+        header::ORIGIN,
+        axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+
+    // When the API receives it, then the invalid value is rejected.
+    assert_eq!(call(app, req).await.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn explicit_bearer_client_without_origin_is_accepted() {
     let tmp = CanonicalTempDir::new();
     let _g = EnvGuard::new(tmp.path());
@@ -1228,6 +1280,22 @@ fn bootstrap_request(body: String, origin: bool) -> Request<Body> {
         builder = builder.header(header::ORIGIN, "http://127.0.0.1:7311");
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn origin_repeated_on_bootstrap_is_rejected() {
+    // Given a bootstrap request with two allowed Origin fields.
+    let tmp = CanonicalTempDir::new();
+    let _g = EnvGuard::new(tmp.path());
+    let app = router(test_state(tmp.path()), None);
+    let mut req = bootstrap_request("{}".into(), true);
+    req.headers_mut().append(
+        header::ORIGIN,
+        axum::http::HeaderValue::from_static("http://127.0.0.1:7311"),
+    );
+
+    // When bootstrap receives it, then the repeated fields are rejected before body parsing.
+    assert_eq!(call(app, req).await.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

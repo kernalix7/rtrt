@@ -145,8 +145,8 @@ let hits = store.recall_bm25("my-project", "rust", 5)?;
 
 ```toml
 [dependencies]
-# 워크스페이스 크레이트는 crates.io에 없습니다 — v0.2.0 태그(또는 로컬 클론)를 가리키세요.
-rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.0", features = ["embeddings"] }
+# 워크스페이스 크레이트는 crates.io에 없습니다 — v0.2.1 태그(또는 로컬 클론)를 가리키세요.
+rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.1", features = ["embeddings"] }
 # rtrt-memory = { path = "../rtrt/crates/rtrt-memory", features = ["embeddings"] }
 ```
 

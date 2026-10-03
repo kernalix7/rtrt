@@ -47,13 +47,15 @@ Linux/WSL에서 기존 OpenCode config/managed state 또는 안전한 absolute `
 
 Linux/macOS 직접 관리: `~/.local/bin/rtrt service install|uninstall|status` (기본 dry-run, `--apply`로 실행). Windows task 생성은 installer가 담당합니다. Unix uninstall과 `install.ps1 -Uninstall`은 확인된 owned service/task definition만 제거하고, 명시적 purge 전에는 machine token과 project DB를 보존합니다.
 
-Windows에서는 현재 `rtrt service` 관리/open을 지원하지 않습니다. <http://127.0.0.1:7311/>을 열고 dashboard bootstrap prompt에만 token을 입력하세요. Token을 command, URL, task definition에 넣지 마세요.
+Windows에서는 `rtrt service` 관리와 open이 거부됩니다. <http://127.0.0.1:7311/>을 열고 dashboard bootstrap prompt에만 token을 입력하세요. Token을 command, URL, task definition에 넣지 마세요.
+
+npm 패키지의 Windows dashboard supervisor(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL 적용, binary trust)는 `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증됩니다. supervisor test는 Unix에서 같은 표면을 검증하며 실제 Windows CI lane에 포함되지 않고, 실제 Windows 실행은 아직 기록되어 있지 않습니다. npm 패키지의 Windows 동작 인정은 **`dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`의 Windows-only skip이 0개인 실제 `windows-latest` CI 실행**에 좌우되며, 본 문서는 그 gate가 이미 통과했다고 기록되어 있지 않다고 밝힙니다. 기존 unsafe Windows state(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` 중 private credential 또는 state file에 대한 비-owner write ACE이거나 상속된 permissive ACE)는 시작을 거부하며 자동으로 ACL 복구되거나 삭제되지 않습니다. 공개 대시보드 binary에 적용되는 SYSTEM/Admins 및 trusted-OS-binary 면제는 private credential 또는 state ACL까지 확장되지 않습니다. 다가오는 `v0.2.1` 후보 remediation은 fresh-state 강화와 unsafe 기존 state 거절을 추가한 것이지 painless rename-and-migrate 단계를 추가한 것이 아닙니다. 이미 게시된 `v0.2.0` npm release는 immutable이고 이 수정도 포함하지 않습니다.
 
 예시:
 
 ```bash
-# v0.2.0 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+# v0.2.1 릴리스 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.1
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -90,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 
 필요한 도구:
 
-- 러스트 stable 1.85+ (edition 2024). 없으면 `rustup install stable`.
+- 러스트 stable 1.88+ (edition 2024). 없으면 `rustup install stable`.
 - `rusqlite` 번들 SQLite 빌드용 C 툴체인 (`gcc` 또는 `clang`).
 
 ```bash

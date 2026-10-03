@@ -47,13 +47,15 @@ By default the installer starts one per-user, machine-scope `rtrt-dashboard`, ma
 
 Manage Linux/macOS directly with `~/.local/bin/rtrt service install|uninstall|status` (dry-run by default, pass `--apply`). Windows task generation belongs to the installer. Unix uninstall and `install.ps1 -Uninstall` remove only recognized owned service/task definitions; machine token and project databases remain unless explicit purge is selected.
 
-On Windows, the installed task uses `%LOCALAPPDATA%\Programs\rtrt\rtrt-dashboard.exe`. Windows `rtrt service` management/opening is not currently supported; open <http://127.0.0.1:7311/> and enter the token only in the dashboard's bootstrap prompt. Never put the token in a command, URL, or task definition.
+On Windows, the installed task uses `%LOCALAPPDATA%\Programs\rtrt\rtrt-dashboard.exe`. Windows `rtrt service` management and opening are refused; open <http://127.0.0.1:7311/> and enter the token only in the dashboard's bootstrap prompt. Never put the token in a command, URL, or task definition.
+
+The npm package's Windows dashboard supervisor (`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL enforcement, binary trust) is exercised by `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`. The supervisor test exercises the same surfaces on Unix and is not in the selected Windows CI lane; the actual Windows run is not yet recorded. Acceptance of the npm package's Windows behavior is **subject to a real `windows-latest` CI run with zero Windows-only skips** in `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`; the documentation does not claim that gate has already been recorded as passed. Existing unsafe Windows state (any non-owner write ACE or an inherited permissive ACE on private credential or state files in `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, or `bootstrap.html`) refuses startup and is not silently ACL-repaired or deleted; the SYSTEM/Admins and trusted-OS-binary exemptions used for the public dashboard binary do not extend to private credential or state ACLs. The upcoming `v0.2.1` candidate remediation adds fresh-state hardening plus refusal of unsafe existing state, with no painless rename-and-migrate step; the already-published `v0.2.0` npm release is immutable and does not contain these fixes.
 
 Examples:
 
 ```bash
-# Pin the v0.2.0 release
-curl -fsSL .../install.sh | sh -s -- --version v0.2.0
+# Pin the v0.2.1 release
+curl -fsSL .../install.sh | sh -s -- --version v0.2.1
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -90,7 +92,7 @@ Both uninstallers also support interactive local use. Compatibility shims preser
 
 Requires:
 
-- Rust stable 1.85+ (edition 2024). `rustup install stable` if missing.
+- Rust stable 1.88+ (edition 2024). `rustup install stable` if missing.
 - A C toolchain for the `rusqlite` bundled SQLite build (`gcc` or `clang`).
 
 ```bash

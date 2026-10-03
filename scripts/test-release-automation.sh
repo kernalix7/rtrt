@@ -202,8 +202,8 @@ for match in re.finditer(
     ci_workflow,
 ):
     body = match.group("body")
-    if "toolchain: stable" not in body and "toolchain: ${{ matrix.toolchain }}" not in body:
-        raise SystemExit("every pinned CI Rust toolchain step must select stable or the matrix toolchain")
+    if not any(f"toolchain: {choice}" in body for choice in ("stable", "1.88.0", "${{ matrix.toolchain }}")):
+        raise SystemExit("every pinned CI Rust toolchain step must select stable, MSRV, or the matrix toolchain")
 
 required = (
     "permissions:\n  contents: read",
@@ -215,7 +215,8 @@ required = (
     "scripts/release-preflight.sh",
     "npm ci --ignore-scripts",
     "npm pack --ignore-scripts --json",
-    "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3",
+    "validate-github-assets:\n",
+    'node scripts/stage-release-archive.mjs "$RELEASE_VERSION" "$stage/README.md"',
 )
 for fragment in required:
     if fragment not in workflow:
@@ -231,8 +232,8 @@ for fragment in recovery_required:
     if fragment not in workflow:
         raise SystemExit(f"release recovery contract missing: {fragment}")
 source_checkout = "ref: ${{ needs.preflight.outputs.source_sha }}"
-if workflow.count(source_checkout) != 3:
-    raise SystemExit("build, npm package, and release jobs must checkout validated release source")
+if workflow.count(source_checkout) != 5:
+    raise SystemExit("inventory, build, npm package, asset validation, and release jobs must checkout validated release source")
 if "ref: ${{ inputs.release_tag" in workflow:
     raise SystemExit("unvalidated release input must not be passed to checkout")
 
@@ -282,7 +283,7 @@ for dependency in ("preflight", "publish-platform-npm"):
         raise SystemExit(f"npm publication must need {dependency}")
 
 platform_dependencies = platform_npm_job.partition("steps:")[0]
-for dependency in ("preflight", "build", "package-npm"):
+for dependency in ("preflight", "build", "package-npm", "validate-github-assets"):
     if re.search(
         rf"(?m)^\s+needs:\s*\[[^\]]*\b{re.escape(dependency)}\b[^\]]*\]\s*$",
         platform_dependencies,
@@ -410,6 +411,15 @@ for old, new in (
     raise SystemExit(f"npm publication contract accepted invalid fixture: {new}")
 
 release_job = job_block("release")
+asset_job = job_block("validate-github-assets")
+if "needs: [preflight, license-inventory, build]" not in asset_job or "node scripts/release-assets.mjs check" not in asset_job:
+    raise SystemExit("existing GitHub assets must be checked after building and before npm publication")
+if "GH_TOKEN: ${{ github.token }}" not in asset_job or "sha256sum -c" not in asset_job:
+    raise SystemExit("prepublication asset read must use job token and verified checksums")
+if "node scripts/release-assets.mjs publish" not in release_job or "GH_TOKEN: ${{ github.token }}" not in release_job:
+    raise SystemExit("GitHub release must recheck assets and tags immediately before append-only upload")
+if "overwrite_files: true" in release_job or "--clobber" in release_job:
+    raise SystemExit("GitHub release must never clobber existing assets")
 release_dependencies = release_job.partition("steps:")[0]
 for dependency in ("build", "publish-npm"):
     needs_dependency = re.search(
@@ -531,6 +541,8 @@ for fragment in ("trap 'exit 130' INT", "trap 'exit 143' TERM"):
     if fragment not in smoke:
         raise SystemExit(f"smoke signal status contract missing: {fragment}")
 PY
+
+node --test "$ROOT/plugins/opencode/ci-license.test.mjs"
 
 python3 - "$SMOKE" <<'PY'
 import os

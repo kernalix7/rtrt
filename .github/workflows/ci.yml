@@ -36,6 +36,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
         with:
           toolchain: stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: runner.os != 'Windows'
+        with:
+          node-version: 24
+          package-manager-cache: false
       - name: Test release checksum portability
         if: runner.os == 'Windows'
         shell: bash
@@ -74,6 +79,19 @@ jobs:
         run: timeout 600s cargo check --locked -p rtrt-eval --features bertscore
       - name: Check template chains (compile-only; no provider calls)
         run: timeout 600s cargo check --locked -p rtrt-templates --features chains
+
+  msrv:
+    # The 1.88 floor is set by the transitive rmcp -> darling 0.23 requirement,
+    # not by optional features. This lane compiles that floor so the promise is
+    # proven by the compiler rather than asserted in prose.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo check --workspace --all-targets --locked
 
   test:
     runs-on: ${{ matrix.runner }}
@@ -118,6 +136,30 @@ jobs:
       - name: Run cargo-audit
         run: cargo audit
 
+  license-inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Fetch locked release target crates
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            cargo fetch --locked --target "$target"
+          done
+      - name: Check release graph and notice inventory
+        run: node packaging/licenses/notice-inventory.mjs
+
   opencode:
     runs-on: ubuntu-latest
     defaults:
@@ -125,6 +167,18 @@ jobs:
         working-directory: plugins/opencode
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Fetch locked release target crates for offline npm tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            cargo fetch --locked --target "$target"
+          done
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
@@ -153,3 +207,100 @@ jobs:
           RTRT_OMO_PACKAGE_DIR: ${{ github.workspace }}/plugins/opencode/test-fixtures/omo-4.19.4/node_modules/oh-my-openagent
         run: node --test --test-name-pattern="provenance, sentinel, and oh-my-openagent 4.19.4 coexist in both orders" package.test.mjs
       - run: npm pack --dry-run --json --ignore-scripts
+
+  windows-dashboard-acl:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          package-manager-cache: false
+      - name: Build production dashboard executable
+        shell: pwsh
+        run: cargo build --locked -p rtrt-dashboard
+      - name: Pin absolute dashboard executable path
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path -LiteralPath 'target\debug\rtrt-dashboard.exe' -ErrorAction Stop).Path
+          if (-not [System.IO.Path]::IsPathRooted($exe)) { throw "RTRT_TEST_DASHBOARD_EXE must be absolute, got: $exe" }
+          "RTRT_TEST_DASHBOARD_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Assert dashboard executable is present
+        shell: pwsh
+        run: |
+          if (-not $env:RTRT_TEST_DASHBOARD_EXE) { throw 'RTRT_TEST_DASHBOARD_EXE must be set by the previous step' }
+          if (-not [System.IO.Path]::IsPathRooted($env:RTRT_TEST_DASHBOARD_EXE)) { throw 'RTRT_TEST_DASHBOARD_EXE must be an absolute path' }
+          if (-not (Test-Path -LiteralPath $env:RTRT_TEST_DASHBOARD_EXE -PathType Leaf)) { throw "dashboard executable is missing: $env:RTRT_TEST_DASHBOARD_EXE" }
+      - name: Run Windows dashboard machine-startup regression
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = cargo test --locked -p rtrt-dashboard tests::machine_startup_accepts_plain_home_override_only_with_private_token -- --exact --nocapture 2>&1 | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -ne 0) { throw "dashboard machine-startup regression failed ($LASTEXITCODE)" }
+          if ($output -notmatch 'test result: ok. 1 passed') { throw 'selected dashboard test did not run (zero-test green run)' }
+      - name: Run Windows core private-state ACL regression
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = cargo test --locked -p rtrt-core windows_acl::tests::private_state_accepts_owner_only_and_rejects_inherited_acl -- --exact --nocapture 2>&1 | Out-String
+          Write-Host $output
+          if ($LASTEXITCODE -ne 0) { throw "core private-state ACL regression failed ($LASTEXITCODE)" }
+          if ($output -notmatch 'test result: ok. 1 passed') { throw 'selected core ACL test did not run (zero-test green run)' }
+      - name: Verify Windows credential, executable, and open acceptance fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tap = Join-Path $env:RUNNER_TEMP 'windows-acceptance.tap'
+          node --test --test-reporter=tap --test-name-pattern=Windows plugins/opencode/dashboard-acl.test.mjs plugins/opencode/dashboard-binary.test.mjs plugins/opencode/dashboard-open.test.mjs 2>&1 | Tee-Object -FilePath $tap
+          $code = $LASTEXITCODE
+          node plugins/opencode/windows-ci-tap-guard.mjs $tap $code 24
+          if ($LASTEXITCODE -ne 0) { throw "Windows acceptance TAP guard failed ($LASTEXITCODE)" }
+      - name: Exercise system-drive binary resolver from a copied project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:RTRT_TEST_DASHBOARD_EXE) { throw 'RTRT_TEST_DASHBOARD_EXE must be set before the system-drive step' }
+          if (-not [System.IO.Path]::IsPathRooted($env:RTRT_TEST_DASHBOARD_EXE)) { throw 'RTRT_TEST_DASHBOARD_EXE must remain absolute for the system-drive step' }
+          $preservedExe = $env:RTRT_TEST_DASHBOARD_EXE
+
+          # Read-only record of the system-drive root owner and effective Allow ACEs.
+          # Deliberately not asserted: the root owner is runner-dependent.
+          $driveRoot = [System.IO.Path]::GetPathRoot($env:SystemDrive + '\')
+          $rootAcl = Get-Acl -LiteralPath $driveRoot
+          Write-Host "SYSTEM_DRIVE_ROOT=$driveRoot"
+          Write-Host "SYSTEM_DRIVE_ROOT_OWNER=$($rootAcl.Owner)"
+          foreach ($ace in $rootAcl.Access) {
+            Write-Host "SYSTEM_DRIVE_ROOT_ACE=$($ace.AccessControlType)|$($ace.IdentityReference)|$($ace.FileSystemRights)|$($ace.IsInherited)"
+          }
+
+          $fixtureProject = Join-Path $driveRoot ('rtrt-win-ci-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path (Join-Path $fixtureProject 'plugins') -Force | Out-Null
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode') -Destination (Join-Path $fixtureProject 'plugins') -Recurse -Force
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') -Destination (Join-Path $fixtureProject 'install.ps1') -Force
+          $copiedProject = Join-Path $fixtureProject 'plugins\opencode'
+          $tap = Join-Path $env:RUNNER_TEMP 'windows-system-drive-binary.tap'
+          $guard = Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode\windows-ci-tap-guard.mjs'
+          $pushed = $false
+          try {
+            Push-Location $copiedProject
+            $pushed = $true
+            node --test --test-reporter=tap --test-name-pattern=Windows dashboard-binary.test.mjs 2>&1 | Tee-Object -FilePath $tap
+            $code = $LASTEXITCODE
+            if ($env:RTRT_TEST_DASHBOARD_EXE -cne $preservedExe) { throw 'the copied-project run replaced RTRT_TEST_DASHBOARD_EXE' }
+            node $guard $tap $code 18
+            if ($LASTEXITCODE -ne 0) { throw "system-drive binary resolver TAP guard failed ($LASTEXITCODE)" }
+          } finally {
+            if ($pushed) { Pop-Location }
+            if ($fixtureProject -like ($driveRoot + 'rtrt-win-ci-*') -and (Test-Path -LiteralPath $fixtureProject)) {
+              Write-Host "Removing fixture project $fixtureProject"
+              Remove-Item -LiteralPath $fixtureProject -Recurse -Force
+            }
+          }

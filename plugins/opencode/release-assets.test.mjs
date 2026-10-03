@@ -1,17 +1,19 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { resolve, join } from 'node:path'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { expectedNames, reconcile } from '../../scripts/release-assets.mjs'
 
 const version = '0.2.0'
 const tag = `v${version}`
 const sha = 'a'.repeat(40)
 const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
-const assetRoot = resolve('.rtrt/tmp')
+const assetRoot = fileURLToPath(new URL('../../.rtrt/tmp/', import.meta.url))
 
 async function fixture(state) {
+  await mkdir(assetRoot, { recursive: true })
   const dir = await mkdtemp(join(assetRoot, 'release-assets-'))
   const names = expectedNames(version)
   const bytes = new Map()

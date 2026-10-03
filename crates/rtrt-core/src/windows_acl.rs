@@ -35,6 +35,29 @@ mod tests {
 
     #[test]
     fn private_state_accepts_owner_only_and_rejects_inherited_acl() {
+        // Given: a PowerShell 7 module path inherited by the Rust test process.
+        if std::env::var_os("RTRT_TEST_WINDOWS_ACL_CHILD").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "windows_acl::tests::private_state_accepts_owner_only_and_rejects_inherited_acl",
+                    "--nocapture",
+                ])
+                .env("PSModulePath", r"C:\Program Files\PowerShell\7\Modules")
+                .env("RTRT_TEST_WINDOWS_ACL_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed"),
+                "Windows ACL fixture failed under PS7 module path: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         // Given: an isolated private fixture, never an operator profile.
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
         std::fs::create_dir_all(&parent).unwrap();
@@ -51,6 +74,8 @@ mod tests {
         let powershell = Path::new(&root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let create = Command::new(&powershell)
             .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .env_clear()
+            .env("SystemRoot", &root)
             .env("RTRT_ACL_PATH", &fixture)
             .env("RTRT_ACL_ACTION", "private-create")
             .status()
@@ -60,6 +85,8 @@ mod tests {
         std::fs::File::create(&token).unwrap();
         let protect_token = Command::new(&powershell)
             .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .env_clear()
+            .env("SystemRoot", &root)
             .env("RTRT_ACL_PATH", &token)
             .env("RTRT_ACL_ACTION", "private-create")
             .status()
@@ -73,6 +100,8 @@ mod tests {
                 "-NoProfile", "-NonInteractive", "-Command",
                 "$a=Get-Acl -LiteralPath $env:RTRT_ACL_PATH; $a.SetAccessRuleProtection($false,$true); Set-Acl -LiteralPath $env:RTRT_ACL_PATH -AclObject $a",
             ])
+            .env_clear()
+            .env("SystemRoot", &root)
             .env("RTRT_ACL_PATH", &token)
             .status()
             .unwrap();

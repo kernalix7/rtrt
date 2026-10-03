@@ -296,6 +296,28 @@ fn machine_startup_requires_exact_private_state_and_redacts_token() {
 fn machine_startup_accepts_plain_home_override_only_with_private_token() {
     use std::process::Command;
 
+    // Given: a PowerShell 7 module path inherited by the Rust test process.
+    if std::env::var_os("RTRT_TEST_WINDOWS_ACL_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::machine_startup_accepts_plain_home_override_only_with_private_token",
+                "--nocapture",
+            ])
+            .env("PSModulePath", r"C:\Program Files\PowerShell\7\Modules")
+            .env("RTRT_TEST_WINDOWS_ACL_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "Windows ACL fixture failed under PS7 module path: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     // Given: a private fixture in the project scratch area, not USERPROFILE.
     let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -307,8 +329,9 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
     let home = tmp.path();
     let state = home.join(".rtrt/dashboard");
     std::fs::create_dir_all(&state).unwrap();
-    let powershell = std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let system_root = std::env::var_os("SystemRoot").unwrap();
+    let powershell =
+        std::path::Path::new(&system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     let protect = |path: &std::path::Path| {
         assert!(
             Command::new(&powershell)
@@ -318,6 +341,8 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
                     "-Command",
                     include_str!("../../../plugins/opencode/runtime/dashboard-acl.ps1")
                 ])
+                .env_clear()
+                .env("SystemRoot", &system_root)
                 .env("RTRT_ACL_PATH", path)
                 .env("RTRT_ACL_ACTION", "private-create")
                 .status()
@@ -365,6 +390,8 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
     assert!(Command::new(&powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command",
             "$a=Get-Acl -LiteralPath $env:RTRT_ACL_PATH; $a.SetAccessRuleProtection($false,$true); Set-Acl -LiteralPath $env:RTRT_ACL_PATH -AclObject $a"])
+        .env_clear()
+        .env("SystemRoot", &system_root)
         .env("RTRT_ACL_PATH", &token).status().unwrap().success());
     // Then: it is refused before its content can be used.
     assert!(crate::MachineStartup::parse(args()).is_err());

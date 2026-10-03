@@ -6,7 +6,7 @@ RTRT에 기여해 주셔서 감사합니다! 이 문서는 빠른 시작 가이�
 
 ## 사전 준비
 
-- 러스트 stable 1.85+ (edition 2024). CI는 `stable`과 `beta`를 게이트합니다.
+- 러스트 stable 1.88+ (edition 2024). CI는 `stable`과 `beta`, 그리고 전용 `1.88.0` MSRV 레인을 게이트합니다.
 - `rusqlite` 번들 SQLite용 C 툴체인(`gcc` 또는 `clang`).
 - 소스 관리용 `git`.
 

@@ -20,7 +20,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
 license = "MIT"
 repository = "https://github.com/kernalix7/rtrt"

@@ -158,12 +158,12 @@ pub fn list_profiles() -> Vec<String> {
         .iter()
         .map(|(n, _)| n.to_string())
         .collect();
-    if let Some(dir) = user_profile_dir() {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_string());
-                }
+    if let Some(dir) = user_profile_dir()
+        && let Ok(rd) = std::fs::read_dir(&dir)
+    {
+        for entry in rd.flatten() {
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                names.push(stem.to_string());
             }
         }
     }

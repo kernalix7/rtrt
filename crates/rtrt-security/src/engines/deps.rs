@@ -70,19 +70,19 @@ impl Engine for DepsEngine {
                     .map(|p| (p, "Cargo.lock"))
                     .chain(npm_pkgs.iter().map(|p| (p, "package-lock.json")))
                 {
-                    if let Some(src) = &p.source {
-                        if src.starts_with("git+") {
-                            findings.push(mk(
-                                rule,
-                                lockfile,
-                                format!(
-                                    "git dependency `{}` ({}) bypasses registry review",
-                                    p.name, src
-                                ),
-                                format!("{} {} = {}", p.name, p.version, src),
-                                "Pin to a published release instead of a git source.",
-                            ));
-                        }
+                    if let Some(src) = &p.source
+                        && src.starts_with("git+")
+                    {
+                        findings.push(mk(
+                            rule,
+                            lockfile,
+                            format!(
+                                "git dependency `{}` ({}) bypasses registry review",
+                                p.name, src
+                            ),
+                            format!("{} {} = {}", p.name, p.version, src),
+                            "Pin to a published release instead of a git source.",
+                        ));
                     }
                 }
                 // Path dependencies surface as sourceless lock entries plus a
@@ -131,23 +131,22 @@ impl Engine for DepsEngine {
                 .param_str("db")
                 .map(|d| d == "rustsec")
                 .unwrap_or(false)
+                && let Some(dir) = advisory_db_dir()
             {
-                if let Some(dir) = advisory_db_dir() {
-                    let advisories = load_advisories(&dir);
-                    for p in &cargo_pkgs {
-                        for adv in &advisories {
-                            if adv.package == p.name && adv.affects(&p.version) {
-                                findings.push(mk(
-                                    rule,
-                                    "Cargo.lock",
-                                    format!(
-                                        "{} {} affected by {}: {}",
-                                        p.name, p.version, adv.id, adv.title
-                                    ),
-                                    format!("{} {} <= {}", p.name, p.version, adv.id),
-                                    "Upgrade to a patched release listed in the advisory.",
-                                ));
-                            }
+                let advisories = load_advisories(&dir);
+                for p in &cargo_pkgs {
+                    for adv in &advisories {
+                        if adv.package == p.name && adv.affects(&p.version) {
+                            findings.push(mk(
+                                rule,
+                                "Cargo.lock",
+                                format!(
+                                    "{} {} affected by {}: {}",
+                                    p.name, p.version, adv.id, adv.title
+                                ),
+                                format!("{} {} <= {}", p.name, p.version, adv.id),
+                                "Upgrade to a patched release listed in the advisory.",
+                            ));
                         }
                     }
                 }
@@ -467,10 +466,10 @@ fn load_advisories(dir: &Path) -> Vec<Advisory> {
         if !(name.starts_with("RUSTSEC-") && name.ends_with(".md")) {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(entry.path()) {
-            if let Some(adv) = parse_advisory(&text) {
-                out.push(adv);
-            }
+        if let Ok(text) = std::fs::read_to_string(entry.path())
+            && let Some(adv) = parse_advisory(&text)
+        {
+            out.push(adv);
         }
     }
     out

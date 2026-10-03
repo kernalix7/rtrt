@@ -153,10 +153,10 @@ impl Engine for PatternsEngine {
                 if !extension_matches(&rel_str, &c.extensions) {
                     continue;
                 }
-                if let Some(glob) = &c.path_glob {
-                    if !rel_str.contains(glob.as_str()) {
-                        continue;
-                    }
+                if let Some(glob) = &c.path_glob
+                    && !rel_str.contains(glob.as_str())
+                {
+                    continue;
                 }
                 for (idx, line) in lines.iter().enumerate() {
                     if c.regex.is_match(line) {

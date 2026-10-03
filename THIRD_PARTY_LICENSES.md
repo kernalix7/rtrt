@@ -1,11 +1,17 @@
 # Third-Party Licenses
 
-RTRT is MIT-licensed (see [LICENSE](LICENSE)). This document lists selected
-(not exhaustive) third-party Rust crates RTRT depends on at runtime or in
-development, together with their upstream licenses. The complete resolved
-dependency graph remains authoritative for review, not a certification of
-compliance. Exact version-pinned texts for identified bundled JavaScript and
-Rust dependencies accompany distributions in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md).
+RTRT is MIT-licensed (see [LICENSE](LICENSE)). The tables below are selected
+examples; the conservative default/release normal+build inventory for each of
+the three product roots on five targets is [INVENTORY.json](THIRD_PARTY_NOTICES/INVENTORY.json).
+It maps locked version/checksum/SPDX/upstream source and original notice bytes.
+[INDEX.md](THIRD_PARTY_NOTICES/INDEX.md) and
+[SUPPLEMENTS.json](THIRD_PARTY_NOTICES/SUPPLEMENTS.json) explain interpretation,
+checksum-pinned VCS commits, full-text supplements for the eight crate archives
+that contain no license file, and the separate embedded JS notices. A
+`Cargo.toml` manifest is evidence of the declared SPDX expression, not full
+license terms. Supplements are original pin texts or, where no upstream text
+exists, the explicitly selected Apache-2.0 standard text. This is not a
+compiled or retained-code SBOM or a legal certification.
 The classic OpenCode plugin declares `@opencode-ai/sdk@1.15.13` as an npm
 dependency. RTRT's agent tarball does not copy the SDK's `node_modules` bytes;
 the package manager installs that dependency separately. Native OpenCode 2
@@ -76,6 +82,8 @@ user approval or install consent.
 - [webpki-roots@0.26.11](https://crates.io/crates/webpki-roots/0.26.11) and [webpki-roots@1.0.7](https://crates.io/crates/webpki-roots/1.0.7) — CDLA-Permissive-2.0 (certificate data; both versions resolved)
 - [ring@0.17.14](https://crates.io/crates/ring/0.17.14) — Apache-2.0 AND ISC in different files, including BoringSSL-derived code; see its upstream `LICENSE`, `LICENSE-BoringSSL`, `LICENSE-other-bits`, and bundled subpart notices in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md)
 - [subtle@2.6.1](https://crates.io/crates/subtle/2.6.1) — BSD-3-Clause
+- [matchit@0.8.4](https://crates.io/crates/matchit/0.8.4) — MIT **AND** BSD-3-Clause; both original license files shipped
+- [rustls-webpki@0.103.15](https://crates.io/crates/rustls-webpki/0.103.15) — ISC; upstream LICENSE shipped
 
 Other identified transitive dependency: [option-ext@0.2.0](https://crates.io/crates/option-ext/0.2.0) — MPL-2.0. The complete unmodified upstream source crate and its license text are bundled at `THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate` and `LICENSE.txt` in each of the five GitHub binary archives, five dashboard platform npm packages, and `rtrt-agent` npm package. [Notice index](THIRD_PARTY_NOTICES/INDEX.md) gives the checksum and local extraction instructions; the [versioned upstream archive](https://static.crates.io/crates/option-ext/option-ext-0.2.0.crate) is an additional option, not a required download. This source-code copy covers the MPL component only, not a relicensing of MIT-licensed RTRT. These targeted notices are not an exhaustive inventory or a legal certification; qualified counsel must assess remaining obligations and applicability to particular binaries.
 

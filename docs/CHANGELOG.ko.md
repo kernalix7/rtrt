@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-03
+
+v0.2.0 감사 항목을 수정합니다. 소스 빌드는 Rust 1.88이 필요하며 CI에서 해당 컴파일러 하한을 검증합니다.
+
+### 수정
+
+- 일반 npm·Unix CLI 브라우저 launcher는 capability URL 대신 owner-private `bootstrap.html` 경로를 받습니다. 명시적 `rtrt service open --print-bootstrap`은 유지하며 60초 HMAC, Origin, expiry, replay 통제는 변경하지 않습니다.
+- Windows credential/state ACL은 current-SID-only를 유지하고 unsafe 기존 state는 재작성하지 않고 거부합니다. Binary trust는 TrustedInstaller를 인식하고 generic rights를 확장하며 untrusted effective file write, delete-child, ACL·ownership 권한을 거부합니다. 16개 policy 회귀는 Windows-only입니다.
+- 없는 projects root는 phantom unsafe project가 아닌 빈 상태로 처리하며 unsafe 경로는 계속 거부합니다.
+- Offline Cargo sandbox 빌드는 host cache/index를 read-only로 유지하면서 private writable source에 캐시된 crate를 추출합니다.
+
+### 배포
+
+- 보수적인 notice coverage는 5개 타깃·3개 제품의 registry 컴포넌트 265개를 매핑합니다. 원본 archive 경로 470개에는 metadata manifest 8개가 포함되며, crate 8개의 full-text supplement 9개를 추가합니다. `matchit`의 MIT AND BSD-3-Clause 두 텍스트와 변경 없는 MPL `option-ext@0.2.0` source archive를 포함합니다. 최적화된 SBOM이나 법적 인증은 아닙니다.
+- Publisher는 existing-byte/paired-tag conflict를 거부하고 완전한 draft를 검증한 뒤 게시하며 asset을 덮어쓰지 않습니다. Archive README는 버전 고정 문서로 연결합니다. 게시된 0.2.0 npm 패키지 6개와 기존 태그는 변경하지 않습니다.
+- Native TUI 회귀는 server options와 별개로 `cli.json`을 설정하며 v1 계약은 변경하지 않습니다.
+
+### Notes
+
+- 게시 전 실제 Windows/system-drive acceptance가 필요하며 Linux skip은 Windows 검증이 아닙니다. Docker, collector, crates.io, Homebrew tap 활성화는 포함하지 않습니다.
+
 ## [0.2.0] - 2026-10-01
 
 ### Highlights

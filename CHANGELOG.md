@@ -9,6 +9,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-03
+
+Addresses the v0.2.0 audit. Source builds require Rust 1.88; CI verifies that compiler floor.
+
+### Fixed
+
+- Ordinary npm and Unix CLI browser launchers receive an owner-private `bootstrap.html` path instead of a capability URL. `rtrt service open --print-bootstrap` remains explicit; 60-second HMAC, Origin, expiry, and replay controls are unchanged.
+- Windows credential/state ACLs remain current-SID-only, with unsafe existing state refused rather than rewritten. Binary trust recognizes TrustedInstaller, expands generic rights, and rejects untrusted effective file writes, delete-child, ACL, and ownership rights. Sixteen policy regressions are Windows-only.
+- A missing projects root is empty state, not a phantom unsafe project; unsafe paths remain refused.
+- Offline Cargo sandbox builds extract cached crates into private writable sources while host cache/index stay read-only.
+
+### Distribution
+
+- Conservative notice coverage maps 265 registry components across five targets and three products: 470 original archive paths, including eight metadata manifests, plus nine full-text supplements for eight crates. Both `matchit` MIT AND BSD-3-Clause texts and the unchanged MPL `option-ext@0.2.0` source archive are included. This is not an optimized SBOM or legal certification.
+- Publishing rejects existing-byte/paired-tag conflicts, verifies completed drafts before publication, and never overwrites assets. Archive READMEs link to version-pinned documentation. All six published 0.2.0 npm packages and old tags remain unchanged.
+- Native TUI regressions configure `cli.json` independently from server options; v1 contracts remain unchanged.
+
+### Notes
+
+- Actual Windows/system-drive acceptance is required before publication; Linux skips are not Windows proof. No Docker, collector, crates.io, or Homebrew tap activation is included.
+
 ## [0.2.0] - 2026-10-01
 
 ### Highlights

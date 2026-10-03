@@ -12,7 +12,7 @@ export async function windowsAcl(target, action, { run = execute, systemRoot = p
   try {
     await run(binary, ["-NoProfile", "-NonInteractive", "-Command", script], {
       windowsHide: true,
-      timeout: 10_000,
+      timeout: 45_000,
       maxBuffer: 4096,
       env: { SystemRoot: systemRoot, RTRT_ACL_PATH: target, RTRT_ACL_ACTION: action },
     })

@@ -86,38 +86,70 @@ function assertWindowsDashboardContract(job) {
   assert.match(runOf(core), /--exact/, "the filter must select the exact full test path")
   assert.match(runOf(core), /test result: ok\. 1 passed/, "a zero-selected green run must fail")
 
-  const acceptance = findRunStep(job, "plugins/opencode/dashboard-open.test.mjs")
-  assert.ok(acceptance, "Node acceptance step is required")
-  const accepted = runOf(acceptance)
+  const systemDrive = job.steps.find((step) => runOf(step).includes("SystemDrive"))
+  assert.ok(systemDrive, "the system-drive resolver step is required")
+  assert.equal(job.steps.filter((step) => runOf(step).includes("--test-name-pattern=Windows")).length, 1,
+    "both selected suites must run in the same copied-project step")
+  const sd = runOf(systemDrive)
+  assert.match(sd, /\$driveRoot -cne 'C:\\'/, "copied-project fixture must use the C system drive")
+  const accepted = sd
   assert.match(accepted, /--test-name-pattern=Windows/, "only Windows cases may be selected")
   for (const file of NODE_FILES) {
-    assert.ok(accepted.includes(file), `node acceptance misses ${file}`)
+    assert.ok(accepted.includes(file.split("/").at(-1)), `node acceptance misses ${file}`)
   }
   assert.match(accepted, /--test-reporter=tap/, "acceptance must emit TAP for the guard")
-  assert.match(accepted, /Tee-Object -FilePath \$tap/, "native TAP output must be captured")
-  assert.match(accepted, /\$code = \$LASTEXITCODE/, "the native exit code must be captured")
-  assert.match(accepted, new RegExp(`${TAP_GUARD} \\$tap \\$code ${ACCEPTANCE_PASS}`), "the TAP guard must require every selected pass")
+  assert.match(accepted, /Tee-Object -FilePath \$acceptanceTap/, "acceptance TAP must be captured separately")
+  assert.match(accepted, /\$acceptanceCode = \$LASTEXITCODE/, "the acceptance native exit code must be captured immediately")
+  assert.match(accepted, new RegExp(`\\$guard \\$acceptanceTap \\$acceptanceCode ${ACCEPTANCE_PASS}`), "the acceptance TAP guard must require every selected pass")
   assert.match(accepted, /if \(\$LASTEXITCODE -ne 0\)/, "a failed guard must terminate the step")
   assert.doesNotMatch(accepted, /# skipped 0/, "the false Node20 '# skipped 0' total must stay removed")
 
-  const systemDrive = job.steps.find((step) => runOf(step).includes("SystemDrive"))
-  assert.ok(systemDrive, "the system-drive resolver step is required")
-  const sd = runOf(systemDrive)
   assert.match(sd, /\$env:SystemDrive/, "must resolve the actual system drive")
   assert.match(sd, new RegExp(`'${SYSTEM_DRIVE_PREFIX}' \\+ \\[guid\\]::NewGuid\\(\\)\\.ToString\\('N'\\)`), "fixture must use the fixed prefix plus a GUID")
   assert.match(sd, /Copy-Item -Path \(Join-Path \$env:GITHUB_WORKSPACE 'plugins\\opencode'\)/, "must copy plugins/opencode into the fixture")
   assert.match(sd, /Copy-Item -Path \(Join-Path \$env:GITHUB_WORKSPACE 'install\.ps1'\)/, "must copy install.ps1 into the fixture")
   assert.match(sd, /Push-Location \$copiedProject/, "the real tests must execute from the copied project")
+  assert.ok(sd.indexOf("try {") >= 0 && sd.indexOf("try {") < sd.indexOf("New-Item -ItemType Directory"), "creation must be inside try/finally")
+  assert.ok(sd.indexOf("try {") < sd.indexOf("Copy-Item -Path"), "partial copies must be cleaned up")
+  const acceptanceCall = "node --test --test-reporter=tap --test-name-pattern=Windows dashboard-acl.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs"
+  const binaryCall = "node --test --test-reporter=tap --test-name-pattern=Windows dashboard-binary.test.mjs"
+  assert.ok(sd.indexOf("Push-Location $copiedProject") < sd.indexOf(acceptanceCall), "acceptance must execute from the copied module")
+  assert.ok(sd.indexOf(acceptanceCall) < sd.indexOf(`$guard $acceptanceTap $acceptanceCode ${ACCEPTANCE_PASS}`), "acceptance must be guarded")
+  assert.ok(sd.indexOf(`$guard $acceptanceTap $acceptanceCode ${ACCEPTANCE_PASS}`) < sd.indexOf(binaryCall), "24 selected passes must precede the 18 binary passes")
+  assert.match(sd, /\$acceptanceTap = Join-Path \$env:RUNNER_TEMP 'windows-acceptance\.tap'/)
+  assert.match(sd, /\$binaryTap = Join-Path \$env:RUNNER_TEMP 'windows-system-drive-binary\.tap'/)
   assert.match(sd, /node --test --test-reporter=tap --test-name-pattern=Windows dashboard-binary\.test\.mjs/, "the real binary/resolver suite must run from the copy")
-  assert.match(sd, new RegExp(`\\$guard \\$tap \\$code ${SYSTEM_DRIVE_BINARY_PASS}`), "the copied-project TAP guard must require every selected binary pass")
+  assert.match(sd, /\$binaryCode = \$LASTEXITCODE/, "the binary native exit code must be captured immediately")
+  assert.equal((sd.match(/node --test --test-reporter=tap --test-name-pattern=Windows /g) ?? []).length, 2,
+    "only the original 24-case and 18-case calls may run")
+  assert.match(sd, new RegExp(`\\$guard \\$binaryTap \\$binaryCode ${SYSTEM_DRIVE_BINARY_PASS}`), "the copied-project TAP guard must require every selected binary pass")
   assert.match(sd, /Get-Acl -LiteralPath \$driveRoot/, "the system-drive root ACL must be read")
   assert.doesNotMatch(sd, /Set-Acl/, "the system-drive step must not mutate any ACL")
   assert.doesNotMatch(sd, /SYSTEM_DRIVE_ROOT_OWNER[^\n]*(?:-eq|-ne|-ceq|-cne|Assert)/, "the root owner must be recorded, not required to be uniform")
   assert.match(sd, /\$preservedExe = \$env:RTRT_TEST_DASHBOARD_EXE/, "the original absolute exe path must be preserved")
-  assert.match(sd, /-cne \$preservedExe/, "the copied run must not replace RTRT_TEST_DASHBOARD_EXE")
+  assert.equal((sd.match(/-cne \$preservedExe/g) ?? []).length, 2, "the executable path must be checked after each invocation")
   assert.match(sd, /Pop-Location/, "the working directory must be restored")
   assert.match(sd, /Remove-Item -LiteralPath \$fixtureProject -Recurse -Force/, "only the generated fixture project may be removed")
   assert.match(sd, new RegExp(`\\$fixtureProject -like \\(\\$driveRoot \\+ '${SYSTEM_DRIVE_PREFIX}\\*'\\)`), "cleanup must be scoped to the generated prefix")
+
+  const refusal = job.steps.find((step) => step.name === "Prove D-root binary owner refusal")
+  assert.ok(refusal, "the actual D-root refusal is mandatory and separate from both TAP counts")
+  assert.equal(refusal.shell, "pwsh")
+  assert.equal(refusal.if, undefined)
+  assert.ok(job.steps.indexOf(refusal) > job.steps.indexOf(systemDrive), "D-root proof must follow copied-project acceptance")
+  const proof = runOf(refusal)
+  assert.match(proof, /path\.win32\.parse\(checkout\)\.root\.toUpperCase\(\) !== "D:\\\\"/, "must require the actual checkout drive to be D")
+  assert.match(proof, /path\.join\(checkout, "plugins", "opencode", "runtime", "dashboard-acl\.ps1"\)/, "must execute unchanged production policy")
+  assert.match(proof, /RTRT_ACL_PATH: driveRoot, RTRT_ACL_ACTION: "binary-check"/, "must test the actual D root")
+  assert.match(proof, /env: \{ SystemRoot: process\.env\.SystemRoot, RTRT_ACL_PATH: driveRoot, RTRT_ACL_ACTION: "binary-check" \}/, "child must have exactly the three required environment keys")
+  assert.match(proof, /-NoProfile.*-NonInteractive.*-Command/, "PS5 child must not run a profile")
+  assert.match(proof, /timeout: 45000, maxBuffer: 4096/, "child must remain bounded")
+  assert.match(proof, /-ceq 'Untrusted binary owner'/, "only the exact policy exception proves refusal")
+  assert.match(proof, /\| Out-Null; \[Console\]::Out\.WriteLine\('ACCEPTED'\)/, "policy's item output must not masquerade as the refusal marker")
+  assert.match(proof, /D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER/, "refusal must have an explicit safe marker")
+  assert.match(proof, /stdout\.trim\(\) !== "D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER" \|\| stderr\.trim\(\) !== ""/, "unexpected acceptance, errors, or output must fail")
+  assert.match(proof, /if \(\$LASTEXITCODE -ne 0\) \{ throw/, "failed child/proof must fail the job")
+  assert.doesNotMatch(proof, /Set-Acl|New-Item|Copy-Item|Remove-Item|Tee-Object|windows-ci-tap-guard/, "D proof must be read-only and outside TAP counts")
 }
 
 function dropStepsWhere(job, predicate) {
@@ -206,10 +238,10 @@ test("each weakened Windows dashboard ACL job structure is rejected", () => {
     (job) => replaceInStep(job, " --exact", ""),
     (job) => replaceInStep(job, "test result: ok. 1 passed", "test result"),
     (job) => replaceInStep(job, "--test-name-pattern=Windows", "--test-name-pattern=."),
-    (job) => replaceInStep(job, "plugins/opencode/dashboard-open.test.mjs", ""),
-    (job) => replaceInStep(job, `${TAP_GUARD} $tap $code ${ACCEPTANCE_PASS}`, "true"),
+    (job) => replaceInStep(job, "dashboard-open.test.mjs", ""),
+    (job) => replaceInStep(job, `$guard $acceptanceTap $acceptanceCode ${ACCEPTANCE_PASS}`, "true"),
     (job) => {
-      const step = findRunStep(job, `${TAP_GUARD} $tap $code ${ACCEPTANCE_PASS}`)
+      const step = findRunStep(job, `$guard $acceptanceTap $acceptanceCode ${ACCEPTANCE_PASS}`)
       step.run += "\n          if ($output -notmatch '(?m)^# skipped 0') { throw 'weakened' }"
     },
     (job) => dropStepsWhere(job, (step) => runOf(step).includes("SystemDrive")),
@@ -217,7 +249,7 @@ test("each weakened Windows dashboard ACL job structure is rejected", () => {
     (job) => replaceInStep(job, "Remove-Item -LiteralPath $fixtureProject -Recurse -Force", "Write-Host 'no cleanup'"),
     (job) => replaceInStep(job, "Get-Acl -LiteralPath $driveRoot", "Write-Host 'no acl'"),
     (job) => replaceInStep(job, `'${SYSTEM_DRIVE_PREFIX}'`, "'fixture-'"),
-    (job) => replaceInStep(job, `$guard $tap $code ${SYSTEM_DRIVE_BINARY_PASS}`, `$guard $tap $code ${ACCEPTANCE_PASS}`),
+    (job) => replaceInStep(job, `$guard $binaryTap $binaryCode ${SYSTEM_DRIVE_BINARY_PASS}`, `$guard $binaryTap $binaryCode ${ACCEPTANCE_PASS}`),
     (job) => replaceInStep(job, "$preservedExe", "$env:RTRT_TEST_DASHBOARD_EXE"),
     (job) => {
       const step = findRunStep(job, "Remove-Item -LiteralPath $fixtureProject -Recurse -Force")
@@ -230,6 +262,41 @@ test("each weakened Windows dashboard ACL job structure is rejected", () => {
     const fixture = structuredClone(baseline)
     mutate(fixture)
     assert.throws(() => assertWindowsDashboardContract(fixture), "mutation escaped the contract")
+  }
+})
+
+test("copied-project order, cleanup, and D-root refusal cannot be weakened", () => {
+  // Given: one independently weakened safety boundary per cloned Windows job.
+  const baseline = ci.jobs[JOB]
+  const mutations = [
+    (job) => {
+      const step = findRunStep(job, "SystemDrive")
+      step.run = step.run.replace("try {\n", "")
+    },
+    (job) => replaceInStep(job, "Push-Location $copiedProject", "Push-Location $env:GITHUB_WORKSPACE"),
+    (job) => replaceInStep(job, "$guard $acceptanceTap $acceptanceCode 24", "Write-Host '24 skipped'"),
+    (job) => replaceInStep(job, "dashboard-acl.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs", "dashboard-binary.test.mjs"),
+    (job) => replaceInStep(job, "$acceptanceTap $acceptanceCode 24", "$binaryTap $binaryCode 18"),
+    (job) => replaceInStep(job, "$binaryCode = $LASTEXITCODE", "$binaryCode = 0"),
+    (job) => replaceInStep(job, "if ($env:RTRT_TEST_DASHBOARD_EXE -cne $preservedExe)", "if ($false)"),
+    (job) => dropStepsWhere(job, (step) => step.name === "Prove D-root binary owner refusal"),
+    (job) => replaceInStep(job, "D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER", "ACCEPT"),
+    (job) => replaceInStep(job, "-ceq 'Untrusted binary owner'", "-like '*'"),
+    (job) => {
+      const step = job.steps.find((candidate) => candidate.name === "Prove D-root binary owner refusal")
+      step.run = step.run.replace("timeout: 45000, maxBuffer: 4096", "timeout: 90000, maxBuffer: 4096")
+    },
+    (job) => replaceInStep(job, "RTRT_ACL_PATH: driveRoot", "RTRT_ACL_PATH: checkout"),
+    (job) => {
+      const step = job.steps.find((candidate) => candidate.name === "Prove D-root binary owner refusal")
+      step.run = step.run.replace("-NoProfile", "-Profile")
+    },
+  ]
+  // When / Then: each mutation must break the structural contract.
+  for (const [index, mutate] of mutations.entries()) {
+    const fixture = structuredClone(baseline)
+    mutate(fixture)
+    assert.throws(() => assertWindowsDashboardContract(fixture), `mutation ${index} escaped the copied-project/refusal contract`)
   }
 })
 

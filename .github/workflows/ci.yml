@@ -292,16 +292,7 @@ jobs:
           Write-Host $output
           if ($LASTEXITCODE -ne 0) { throw "core private-state ACL regression failed ($LASTEXITCODE)" }
           if ($output -notmatch 'test result: ok. 1 passed') { throw 'selected core ACL test did not run (zero-test green run)' }
-      - name: Verify Windows credential, executable, and open acceptance fixtures
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tap = Join-Path $env:RUNNER_TEMP 'windows-acceptance.tap'
-          node --test --test-reporter=tap --test-name-pattern=Windows plugins/opencode/dashboard-acl.test.mjs plugins/opencode/dashboard-binary.test.mjs plugins/opencode/dashboard-open.test.mjs 2>&1 | Tee-Object -FilePath $tap
-          $code = $LASTEXITCODE
-          node plugins/opencode/windows-ci-tap-guard.mjs $tap $code 24
-          if ($LASTEXITCODE -ne 0) { throw "Windows acceptance TAP guard failed ($LASTEXITCODE)" }
-      - name: Exercise system-drive binary resolver from a copied project
+      - name: Verify Windows acceptance and system-drive binary resolver from a copied project
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -312,6 +303,7 @@ jobs:
           # Read-only record of the system-drive root owner and effective Allow ACEs.
           # Deliberately not asserted: the root owner is runner-dependent.
           $driveRoot = [System.IO.Path]::GetPathRoot($env:SystemDrive + '\')
+          if ($driveRoot -cne 'C:\') { throw 'the copied-project fixture must run on the C system drive' }
           $rootAcl = Get-Acl -LiteralPath $driveRoot
           Write-Host "SYSTEM_DRIVE_ROOT=$driveRoot"
           Write-Host "SYSTEM_DRIVE_ROOT_OWNER=$($rootAcl.Owner)"
@@ -320,20 +312,26 @@ jobs:
           }
 
           $fixtureProject = Join-Path $driveRoot ('rtrt-win-ci-' + [guid]::NewGuid().ToString('N'))
-          New-Item -ItemType Directory -Path (Join-Path $fixtureProject 'plugins') -Force | Out-Null
-          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode') -Destination (Join-Path $fixtureProject 'plugins') -Recurse -Force
-          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') -Destination (Join-Path $fixtureProject 'install.ps1') -Force
           $copiedProject = Join-Path $fixtureProject 'plugins\opencode'
-          $tap = Join-Path $env:RUNNER_TEMP 'windows-system-drive-binary.tap'
+          $acceptanceTap = Join-Path $env:RUNNER_TEMP 'windows-acceptance.tap'
+          $binaryTap = Join-Path $env:RUNNER_TEMP 'windows-system-drive-binary.tap'
           $guard = Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode\windows-ci-tap-guard.mjs'
           $pushed = $false
           try {
+            New-Item -ItemType Directory -Path (Join-Path $fixtureProject 'plugins') -Force | Out-Null
+            Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode') -Destination (Join-Path $fixtureProject 'plugins') -Recurse -Force
+            Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') -Destination (Join-Path $fixtureProject 'install.ps1') -Force
             Push-Location $copiedProject
             $pushed = $true
-            node --test --test-reporter=tap --test-name-pattern=Windows dashboard-binary.test.mjs 2>&1 | Tee-Object -FilePath $tap
-            $code = $LASTEXITCODE
+            node --test --test-reporter=tap --test-name-pattern=Windows dashboard-acl.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs 2>&1 | Tee-Object -FilePath $acceptanceTap
+            $acceptanceCode = $LASTEXITCODE
             if ($env:RTRT_TEST_DASHBOARD_EXE -cne $preservedExe) { throw 'the copied-project run replaced RTRT_TEST_DASHBOARD_EXE' }
-            node $guard $tap $code 18
+            node $guard $acceptanceTap $acceptanceCode 24
+            if ($LASTEXITCODE -ne 0) { throw "Windows acceptance TAP guard failed ($LASTEXITCODE)" }
+            node --test --test-reporter=tap --test-name-pattern=Windows dashboard-binary.test.mjs 2>&1 | Tee-Object -FilePath $binaryTap
+            $binaryCode = $LASTEXITCODE
+            if ($env:RTRT_TEST_DASHBOARD_EXE -cne $preservedExe) { throw 'the copied-project run replaced RTRT_TEST_DASHBOARD_EXE' }
+            node $guard $binaryTap $binaryCode 18
             if ($LASTEXITCODE -ne 0) { throw "system-drive binary resolver TAP guard failed ($LASTEXITCODE)" }
           } finally {
             if ($pushed) { Pop-Location }
@@ -342,3 +340,32 @@ jobs:
               Remove-Item -LiteralPath $fixtureProject -Recurse -Force
             }
           }
+      - name: Prove D-root binary owner refusal
+        shell: pwsh
+        run: |
+          $script = @'
+          import { execFile } from "node:child_process"
+          import path from "node:path"
+          import { promisify } from "node:util"
+
+          const checkout = path.resolve(process.env.GITHUB_WORKSPACE)
+          const driveRoot = path.win32.parse(checkout).root
+          const policy = path.join(checkout, "plugins", "opencode", "runtime", "dashboard-acl.ps1")
+          const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+          const command = `$ErrorActionPreference='Stop'; try { & '${policy.replaceAll("'", "''")}' | Out-Null; [Console]::Out.WriteLine('ACCEPTED') } catch { if ($_.Exception.Message -ceq 'Untrusted binary owner') { [Console]::Out.WriteLine('D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER') } else { [Console]::Out.WriteLine('OTHER_POLICY_ERROR'); exit 1 } }`
+          try {
+            if (path.win32.parse(checkout).root.toUpperCase() !== "D:\\") throw new Error("checkout is not on D drive")
+            const { stdout, stderr } = await promisify(execFile)(powershell, ["-NoProfile", "-NonInteractive", "-Command", command], {
+              env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: driveRoot, RTRT_ACL_ACTION: "binary-check" },
+              timeout: 45000, maxBuffer: 4096,
+              windowsHide: true,
+            })
+            if (stdout.trim() !== "D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER" || stderr.trim() !== "") throw new Error("unexpected policy result")
+            console.log("D_ROOT_REFUSED_UNTRUSTED_BINARY_OWNER")
+          } catch {
+            console.error("D_ROOT_REFUSAL_PROOF_FAILED")
+            process.exitCode = 1
+          }
+          '@
+          node --input-type=module -e $script
+          if ($LASTEXITCODE -ne 0) { throw "D-root binary owner refusal failed ($LASTEXITCODE)" }

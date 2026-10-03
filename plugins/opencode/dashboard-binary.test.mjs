@@ -8,6 +8,74 @@ import { resolveDashboardBinary } from "./runtime/dashboard-binary.js"
 import { fixture, packageFixture, PACKAGE, VERSION } from "./test-fixtures/dashboard.mjs"
 import { windowsAcl } from "./runtime/dashboard-acl.js"
 
+// Observe one real, unmodified binary-check before each positive resolver assertion.
+// Only fixed policy labels and fixture-relative location metadata leave this process.
+async function diagnoseBinaryPolicy(t, manifest) {
+  const policy = await readFile(new URL("./runtime/dashboard-acl.ps1", import.meta.url), "utf8")
+  const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+  const harness = `
+$script:fixture = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($env:RTRT_ACL_PATH)))
+$script:lastAclRelation = 'none'
+$script:ancestorCount = 0
+function Get-Acl {
+  param([string] $LiteralPath)
+  if ($LiteralPath.Equals($script:fixture, [StringComparison]::OrdinalIgnoreCase) -or
+      $LiteralPath.StartsWith($script:fixture + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $script:lastAclRelation = 'inside-fixture'
+  } else {
+    $script:lastAclRelation = 'ancestor'
+    $script:ancestorCount++
+  }
+  Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $LiteralPath
+}
+try {
+${policy}
+  $decision = 'accept'
+} catch {
+  $decision = switch -Exact ($_.Exception.Message) {
+    'Untrusted binary owner' { 'Untrusted binary owner' }
+    'Untrusted binary writer' { 'Untrusted binary writer' }
+    'Reparse point refused' { 'Reparse point refused' }
+    'Invalid ACL path' { 'Invalid ACL path' }
+    'Invalid ACL operation' { 'Invalid ACL operation' }
+    default { 'other' }
+  }
+}
+[pscustomobject]@{ message = $decision; relation = $script:lastAclRelation; ancestors = $script:ancestorCount } | ConvertTo-Json -Compress
+`
+  const started = performance.now()
+  let error
+  let stdout
+  try {
+    ({ stdout } = await promisify(execFile)(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
+      windowsHide: true, timeout: 45_000, maxBuffer: 4096,
+      env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: manifest, RTRT_ACL_ACTION: "binary-check" },
+    }))
+  } catch (caught) {
+    error = caught
+  }
+  let decision
+  let outputState = "missing"
+  if (typeof stdout === "string") {
+    try { decision = JSON.parse(stdout); outputState = "parsed" } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause
+      outputState = "malformed"
+    }
+  }
+  const messages = ["accept", "Untrusted binary owner", "Untrusted binary writer", "Reparse point refused", "Invalid ACL path", "Invalid ACL operation", "other"]
+  const relations = ["none", "inside-fixture", "ancestor"]
+  const message = messages.includes(decision?.message) ? decision.message : "unknown"
+  const relation = relations.includes(decision?.relation) ? decision.relation : "unknown"
+  t.diagnostic(JSON.stringify({ probe: "binary-check-package-manifest", killed: Boolean(error?.killed),
+    signal: ["SIGTERM", "SIGKILL"].includes(error?.signal) ? error.signal : null,
+    code: Number.isInteger(error?.code) ? error.code : (error?.code === "ETIMEDOUT" ? "ETIMEDOUT" : error ? "other" : 0),
+    elapsedMs: Math.round(performance.now() - started), outputState, message, lastAclRelation: relation,
+    ancestorCount: Number.isSafeInteger(decision?.ancestors) && decision.ancestors >= 0 ? decision.ancestors : null,
+    environment: ["Untrusted binary owner", "Untrusted binary writer"].includes(message) && relation === "ancestor"
+      ? "unsafe-ancestor" : "undetermined",
+  }))
+}
+
 test("resolver selects exact-version platform npm package", { skip: process.platform === "win32" }, async (t) => {
   // Given
   const f = await fixture(t)
@@ -76,6 +144,7 @@ test("Windows binary trust permits public read but rejects untrusted write", { s
     "$a=Get-Acl -LiteralPath $env:RTRT_ACL_PATH; $sid=New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'; $r=New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @($sid,$env:RTRT_ACL_RIGHTS,'Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $env:RTRT_ACL_PATH -AclObject $a"],
   { env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: binary, RTRT_ACL_RIGHTS: rights } })
   await grant("ReadAndExecute")
+  await diagnoseBinaryPolicy(t, path.join(directory, "package.json"))
   // When
   const accepted = await resolveDashboardBinary({ home: f.home, platform: "win32", arch: "x64", version: VERSION, roots: [root] })
   // Then
@@ -102,6 +171,7 @@ test("Windows binary trust ignores inherit-only and creator-owner placeholders, 
     { env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: target, RTRT_ACL_SID: sid, RTRT_ACL_RIGHTS: rights, RTRT_ACL_FLAGS: flags, RTRT_ACL_PROP: propagation } })
   await grant(root, "S-1-5-32-545", "WriteData,AppendData") // parent create only; no delete-child
   await grant(root, "S-1-3-0", "FullControl", "ContainerInherit,ObjectInherit", "InheritOnly")
+  await diagnoseBinaryPolicy(t, path.join(directory, "package.json"))
   // When: effective ACL is checked for the executable and its ancestors.
   const accepted = await resolveDashboardBinary({ home: f.home, platform: "win32", arch: "x64", version: VERSION, roots: [root] })
   // Then: non-effective ACEs and ancestor creation alone do not block normal startup.

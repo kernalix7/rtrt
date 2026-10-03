@@ -137,6 +137,30 @@ test("windows-dashboard-acl executes the real Windows acceptance contract", () =
   assert.doesNotThrow(() => assertWindowsDashboardContract(job))
 })
 
+test("Windows PS5 installer parser gate runs read-only before the dashboard build", () => {
+  // Given: the job's checkout, Node setup, and costly Windows acceptance sequence.
+  const job = ci.jobs[JOB]
+  const nodeIndex = job.steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"))
+  const parseIndex = job.steps.findIndex((step) => step.name === "Parse installer with Windows PowerShell 5.1")
+  const buildIndex = job.steps.findIndex((step) => runOf(step).includes("cargo build --locked -p rtrt-dashboard"))
+  // When: the actual parser invocation and ordering are inspected.
+  // Then: it parses the original file in a bounded PS5 child without executing it.
+  assert.ok(nodeIndex >= 0 && parseIndex > nodeIndex && buildIndex > parseIndex)
+  const step = job.steps[parseIndex]
+  assert.equal(step.shell, "pwsh")
+  assert.equal(step.if, undefined)
+  const source = runOf(step)
+  assert.match(source, /path\.win32\.join\(process\.env\.SystemRoot, "System32", "WindowsPowerShell", "v1\.0", "powershell\.exe"\)/)
+  assert.match(source, /-NoProfile.*-NonInteractive.*-Command/)
+  assert.match(source, /path\.resolve\("install\.ps1"\)/)
+  assert.match(source, /env: \{ SystemRoot: process\.env\.SystemRoot, RTRT_INSTALL_PATH: installer \}/)
+  assert.match(source, /Parser\]::ParseFile\(\$env:RTRT_INSTALL_PATH,\[ref\]\$parseTokens,\[ref\]\$parseErrors\)/)
+  assert.match(source, /\$parseErrors\.Count/)
+  assert.match(source, /ErrorId.*StartLineNumber.*StartColumnNumber.*Message/)
+  assert.match(source, /timeout: 45000, maxBuffer: 4096/)
+  assert.doesNotMatch(source, /ParseInput|Invoke-Expression|Set-Acl|\.NET\.Encoding|ReadAllText/)
+})
+
 test("each weakened Windows dashboard ACL job structure is rejected", () => {
   // Given: the shipped job and one-contract-clause removals applied in turn.
   const baseline = ci.jobs[JOB]

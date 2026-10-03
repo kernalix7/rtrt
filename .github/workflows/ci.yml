@@ -237,6 +237,30 @@ jobs:
         with:
           node-version: 20
           package-manager-cache: false
+      - name: Parse installer with Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $script = @'
+          import { execFile } from "node:child_process"
+          import path from "node:path"
+          import { promisify } from "node:util"
+
+          const installer = path.resolve("install.ps1")
+          const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+          const command = "$parseTokens=$null; $parseErrors=$null; [System.Management.Automation.Language.Parser]::ParseFile($env:RTRT_INSTALL_PATH,[ref]$parseTokens,[ref]$parseErrors) | Out-Null; if ($parseErrors.Count) { $parseError=$parseErrors[0]; [Console]::Error.WriteLine(('{0}:{1}:{2}:{3}' -f $parseError.ErrorId,$parseError.Extent.StartLineNumber,$parseError.Extent.StartColumnNumber,$parseError.Message)); exit 1 }"
+          try {
+            await promisify(execFile)(powershell, ["-NoProfile", "-NonInteractive", "-Command", command], {
+              env: { SystemRoot: process.env.SystemRoot, RTRT_INSTALL_PATH: installer },
+              timeout: 45000, maxBuffer: 4096,
+            })
+            console.log("PS5 install.ps1 source ParseFile passed")
+          } catch (error) {
+            console.error(`PS5 install.ps1 source ParseFile failed: ${error.stderr || error.message}`)
+            process.exitCode = 1
+          }
+          '@
+          node --input-type=module -e $script
+          if ($LASTEXITCODE -ne 0) { throw "PS5 installer ParseFile gate failed ($LASTEXITCODE)" }
       - name: Build production dashboard executable
         shell: pwsh
         run: cargo build --locked -p rtrt-dashboard

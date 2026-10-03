@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
         .init();
 
     let startup = MachineStartup::from_process()?;
-    let cfg = rtrt_core::Config::load().unwrap_or_default();
+    let cfg = load_machine_config(&startup.home).unwrap_or_default();
     let bind = std::env::var("RTRT_DASHBOARD_BIND").unwrap_or_else(|_| cfg.dashboard.bind.clone());
     validate_loopback_bind(&bind)?;
     let token = startup.token;
@@ -89,14 +89,9 @@ async fn main() -> Result<()> {
     let (events_tx, _) = broadcast::channel::<String>(256);
     // Build the Ollama embedder when enabled in config / env.
     let embedder: Option<Arc<dyn Embedder>> = {
-        let ecfg = rtrt_core::Config::load().unwrap_or_default().embeddings;
+        let ecfg = cfg.embeddings.clone();
         if ecfg.is_enabled() {
-            let base_url = ecfg.resolved_base_url(
-                rtrt_core::Config::load()
-                    .ok()
-                    .and_then(|c| c.auto_compress.base_url)
-                    .as_deref(),
-            );
+            let base_url = ecfg.resolved_base_url(cfg.auto_compress.base_url.as_deref());
             let model = ecfg.effective_model();
             tracing::info!("embeddings enabled: model={model} base_url={base_url}");
             Some(Arc::new(rtrt_memory::OllamaEmbedder::new(base_url, model)))
@@ -138,6 +133,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_machine_config(home: &std::path::Path) -> Result<rtrt_core::Config> {
+    if let Some(path) = std::env::var_os("RTRT_CONFIG") {
+        let path = std::path::PathBuf::from(path);
+        anyhow::ensure!(path.is_absolute(), "invalid machine config path");
+        if path.exists() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "invalid machine config path"
+            );
+            let raw = std::fs::read_to_string(path)?;
+            return Ok(rtrt_core::Config::from_toml_str(&raw)?);
+        }
+        return Ok(rtrt_core::Config::default());
+    }
+    let path = home.join(".rtrt/config.toml");
+    if !path.exists() {
+        return Ok(rtrt_core::Config::default());
+    }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "invalid machine config path"
+    );
+    let raw = std::fs::read_to_string(path)?;
+    Ok(rtrt_core::Config::from_toml_str(&raw)?)
+}
+
 #[derive(Debug)]
 struct MachineStartup {
     home: std::path::PathBuf,
@@ -156,21 +179,41 @@ impl MachineStartup {
             args.len() == 3 && args[0] == "--machine" && args[1] == "--state-dir",
             "usage: rtrt-dashboard --machine --state-dir <home>/.rtrt/dashboard"
         );
-        let home =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot resolve operator home"))?;
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve operator home"))?;
+        anyhow::ensure!(home.is_absolute(), "invalid operator home");
         let home = std::fs::canonicalize(home)?;
         let expected = home.join(".rtrt/dashboard");
+        let supplied = std::path::Path::new(&args[2]);
+        #[cfg(windows)]
+        let matches_expected = supplied.is_absolute()
+            && supplied.as_os_str()
+                == supplied
+                    .components()
+                    .collect::<std::path::PathBuf>()
+                    .as_os_str()
+            && supplied
+                .components()
+                .skip(1)
+                .eq(expected.components().skip(1))
+            && std::fs::canonicalize(supplied).is_ok_and(|path| path == expected);
+        #[cfg(not(windows))]
+        let matches_expected = supplied == expected;
+        anyhow::ensure!(matches_expected, "invalid dashboard state directory");
+        let managed_root = supplied
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid dashboard state directory"))?;
+        validate_private_directory(managed_root)?;
+        validate_private_directory(supplied)?;
         anyhow::ensure!(
-            args[2].as_os_str() == expected.as_os_str(),
-            "invalid dashboard state directory"
-        );
-        validate_private_directory(&home.join(".rtrt"))?;
-        validate_private_directory(&expected)?;
-        anyhow::ensure!(
-            std::fs::canonicalize(&expected)? == expected,
+            std::fs::canonicalize(supplied)? == expected,
             "dashboard state directory must not traverse links"
         );
-        let env_path = expected.join("dashboard.env");
+        let env_path = supplied.join("dashboard.env");
         let metadata = std::fs::symlink_metadata(&env_path)
             .map_err(|_| anyhow::anyhow!("dashboard credential unavailable"))?;
         anyhow::ensure!(
@@ -178,6 +221,8 @@ impl MachineStartup {
             "dashboard credential unavailable"
         );
         validate_private_mode(&metadata, 0o600)?;
+        #[cfg(windows)]
+        rtrt_core::windows_acl::validate_private_path(&env_path)?;
         anyhow::ensure!(
             metadata.len() <= 16 * 1024,
             "dashboard credential unavailable"
@@ -207,7 +252,10 @@ fn validate_private_directory(path: &std::path::Path) -> Result<()> {
         metadata.is_dir() && !metadata.file_type().is_symlink(),
         "dashboard state directory must be a real directory"
     );
-    validate_private_mode(&metadata, 0o700)
+    validate_private_mode(&metadata, 0o700)?;
+    #[cfg(windows)]
+    rtrt_core::windows_acl::validate_private_path(path)?;
+    Ok(())
 }
 
 #[cfg(unix)]

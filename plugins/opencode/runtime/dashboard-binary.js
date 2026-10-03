@@ -2,6 +2,7 @@ import { lstat, readFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { readRegular, realPath, unavailable } from "./dashboard-files.js"
+import { windowsAcl } from "./dashboard-acl.js"
 
 const PACKAGES = new Map([
   ["linux-x64", "rtrt-dashboard-linux-x64"],
@@ -52,11 +53,15 @@ export async function resolveDashboardBinary({
         if (parent === ancestor) break
         ancestor = parent
       }
+      if (platform === "win32") await windowsAcl(path.join(directory, "package.json"), "binary-check")
       const manifest = JSON.parse(await readRegular(path.join(directory, "package.json"), validate))
       if (manifest.name !== name || manifest.version !== expected) continue
       const binary = path.join(directory, "bin", platform === "win32" ? "rtrt-dashboard.exe" : "rtrt-dashboard")
       await realPath(binary)
       validate(await lstat(path.dirname(binary)))
+      if (platform === "win32") {
+        await windowsAcl(binary, "binary-check")
+      }
       const stat = await lstat(binary)
       validate(stat)
       if (!stat.isFile() || stat.nlink !== 1 || (platform !== "win32" && (stat.mode & 0o111) === 0)) throw unavailable()

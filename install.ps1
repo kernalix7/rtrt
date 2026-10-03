@@ -171,6 +171,31 @@ function Set-PrivateDirectoryAcl([string] $Path) {
     Set-Acl -LiteralPath $Path -AclObject $security
 }
 
+function Assert-PrivateAcl([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "unsafe dashboard state path: $Path" }
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value -or
+        -not $acl.AreAccessRulesProtected) { throw "dashboard state owner or inheritance mismatch: $Path" }
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1) { throw "dashboard state ACE count mismatch: $Path" }
+    $rule = $rules[0]
+    if ($rule.IsInherited -or $rule.IdentityReference.Value -ne $CurrentSid.Value -or
+        $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        [int]$rule.FileSystemRights -ne [int][Security.AccessControl.FileSystemRights]::FullControl) {
+        throw "dashboard state ACE mismatch: $Path"
+    }
+    if ($item.PSIsContainer) {
+        if ($rule.InheritanceFlags -ne ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [Security.AccessControl.InheritanceFlags]::ObjectInherit) -or
+            $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
+            throw "dashboard state directory ACE mismatch: $Path"
+        }
+    } elseif ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None) {
+        throw "dashboard state file ACE mismatch: $Path"
+    }
+}
+
 function Assert-SafeDirectory([string] $Path) {
     $parent = Split-Path -LiteralPath $Path -Parent
     while ($parent) {
@@ -187,14 +212,14 @@ function Assert-SafeDirectory([string] $Path) {
         if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             throw "unsafe dashboard state path: $Path"
         }
+        Assert-PrivateAcl $Path
     } else {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        New-Item -ItemType Directory -Path $Path | Out-Null
         $item = Get-Item -LiteralPath $Path -Force
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "unsafe dashboard state path: $Path" }
+        Set-PrivateDirectoryAcl $Path
+        Assert-PrivateAcl $Path
     }
-    Set-PrivateDirectoryAcl $Path
-    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier])
-    if ($owner -ne $CurrentSid) { throw "dashboard state owner mismatch: $Path" }
 }
 
 function Protect-PrivateFile([string] $Path) {
@@ -214,7 +239,7 @@ function Ensure-MachineDashboardToken([string] $StateDir) {
     $existing = Get-Item -LiteralPath $envPath -Force -ErrorAction SilentlyContinue
     if ($existing) {
         if ($existing.PSIsContainer -or (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "unsafe dashboard token file: $envPath" }
-        Protect-PrivateFile $envPath
+        Assert-PrivateAcl $envPath
         $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
         if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
         return
@@ -235,7 +260,7 @@ function Ensure-MachineDashboardToken([string] $StateDir) {
             if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) { throw }
         }
     } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
-    Protect-PrivateFile $envPath
+    Assert-PrivateAcl $envPath
     $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
     if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
     $token = $null
@@ -256,7 +281,11 @@ function Install-DashboardTask {
     if ($existing -and -not (Test-OwnedDashboardTask $existing)) {
         throw "refusing foreign scheduled task: $DashboardTaskName"
     }
-    $stateDir = Join-Path $env:USERPROFILE ".rtrt\dashboard"
+    $dashboardHome = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    if (-not [IO.Path]::IsPathRooted($dashboardHome)) { throw "invalid dashboard home" }
+    $managedRoot = Join-Path $dashboardHome ".rtrt"
+    Assert-SafeDirectory $managedRoot
+    $stateDir = Join-Path $managedRoot "dashboard"
     Assert-SafeDirectory $stateDir
     Ensure-MachineDashboardToken $stateDir
     Write-Host ""

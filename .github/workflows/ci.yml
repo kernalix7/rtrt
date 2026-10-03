@@ -308,7 +308,7 @@ jobs:
           Write-Host "SYSTEM_DRIVE_ROOT=$driveRoot"
           Write-Host "SYSTEM_DRIVE_ROOT_OWNER=$($rootAcl.Owner)"
           foreach ($ace in $rootAcl.Access) {
-            Write-Host "SYSTEM_DRIVE_ROOT_ACE=$($ace.AccessControlType)|$($ace.IdentityReference)|$($ace.FileSystemRights)|$($ace.IsInherited)"
+            Write-Host "SYSTEM_DRIVE_ROOT_ACE=$($ace.AccessControlType)|$($ace.IdentityReference)|$($ace.FileSystemRights)|$($ace.IsInherited)|$($ace.InheritanceFlags)|$($ace.PropagationFlags)"
           }
 
           $fixtureProject = Join-Path $driveRoot ('rtrt-win-ci-' + [guid]::NewGuid().ToString('N'))

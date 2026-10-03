@@ -124,6 +124,7 @@ function assertWindowsDashboardContract(job) {
     "only the original 24-case and 18-case calls may run")
   assert.match(sd, new RegExp(`\\$guard \\$binaryTap \\$binaryCode ${SYSTEM_DRIVE_BINARY_PASS}`), "the copied-project TAP guard must require every selected binary pass")
   assert.match(sd, /Get-Acl -LiteralPath \$driveRoot/, "the system-drive root ACL must be read")
+  assert.match(sd, /SYSTEM_DRIVE_ROOT_ACE=.*\$\(\$ace\.InheritanceFlags\).*\$\(\$ace\.PropagationFlags\)/, "root ACE metadata must distinguish inherited-only from effective permissions")
   assert.doesNotMatch(sd, /Set-Acl/, "the system-drive step must not mutate any ACL")
   assert.doesNotMatch(sd, /SYSTEM_DRIVE_ROOT_OWNER[^\n]*(?:-eq|-ne|-ceq|-cne|Assert)/, "the root owner must be recorded, not required to be uniform")
   assert.match(sd, /\$preservedExe = \$env:RTRT_TEST_DASHBOARD_EXE/, "the original absolute exe path must be preserved")

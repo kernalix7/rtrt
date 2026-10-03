@@ -197,14 +197,14 @@ function Assert-PrivateAcl([string] $Path) {
 }
 
 function Assert-SafeDirectory([string] $Path) {
-    $parent = Split-Path -LiteralPath $Path -Parent
+    $parent = [IO.Path]::GetDirectoryName($Path.TrimEnd([IO.Path]::DirectorySeparatorChar))
     while ($parent) {
         $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
         if ($parentItem -and (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             throw "unsafe dashboard state ancestor: $parent"
         }
-        $next = Split-Path -LiteralPath $parent -Parent
-        if ($next -eq $parent) { break }
+        $next = [IO.Path]::GetDirectoryName($parent.TrimEnd([IO.Path]::DirectorySeparatorChar))
+        if (-not $next -or $next -eq $parent) { break }
         $parent = $next
     }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue

@@ -82,9 +82,9 @@ test("Windows inherited permissive fixture is refused without rewriting it", { s
   const handle = await open(f.envFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
   await handle.close()
   await windowsAcl(f.envFile, "private-create")
-  const script = "$p=$env:RTRT_ACL_PATH; $parent=Split-Path -LiteralPath $p -Parent; $a=Get-Acl -LiteralPath $parent; $sid=New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'; $r=New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @($sid,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $parent -AclObject $a; $a=Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($false,$true); Set-Acl -LiteralPath $p -AclObject $a"
+  const script = "$ErrorActionPreference='Stop'; $p=$env:RTRT_ACL_PATH; $parent=[IO.Path]::GetDirectoryName($p); if($parent -ine $env:RTRT_ACL_PARENT) { throw 'wrong state parent' }; $a=Get-Acl -LiteralPath $parent; $sid=New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'; $r=New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @($sid,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'); $a.AddAccessRule($r); Set-Acl -LiteralPath $parent -AclObject $a; $a=Get-Acl -LiteralPath $p; $a.SetAccessRuleProtection($false,$true); Set-Acl -LiteralPath $p -AclObject $a; $rules=@((Get-Acl -LiteralPath $parent).GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])); if(-not @($rules | Where-Object { $_.IdentityReference.Value -eq $sid.Value -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute -and ($_.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0 }).Count) { throw 'Users ACE missing from state parent' }"
   await run(path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-    ["-NoProfile", "-NonInteractive", "-Command", script], { env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: f.envFile } })
+    ["-NoProfile", "-NonInteractive", "-Command", script], { env: { SystemRoot: process.env.SystemRoot, RTRT_ACL_PATH: f.envFile, RTRT_ACL_PARENT: f.state } })
   const files = dashboardFiles({ home: f.home, platform: "win32" })
   // When / Then
   await assert.rejects(files.prepare())
@@ -98,13 +98,13 @@ test("Windows installer leaves existing unrelated parent untouched and creates o
   const parent = path.join(f.home, ".rtrt")
   const leaf = path.join(parent, "managed-fixture")
   const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-  const load = "$parseTokens=$null; $parseErrors=$null; $ast=[System.Management.Automation.Language.Parser]::ParseFile($env:RTRT_INSTALL_PATH,[ref]$parseTokens,[ref]$parseErrors); if($parseErrors.Count) { throw ('installer parse error: ' + (($parseErrors | ForEach-Object { '{0}:{1}:{2}:{3}' -f $_.ErrorId,$_.Extent.StartLineNumber,$_.Extent.StartColumnNumber,$_.Message }) -join '; ')) }; $CurrentSid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $names=@('Set-PrivateDirectoryAcl','Assert-PrivateAcl','Assert-SafeDirectory'); foreach($fn in $ast.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name},$true)) { Invoke-Expression $fn.Extent.Text }; "
-  const env = { SystemRoot: process.env.SystemRoot, RTRT_INSTALL_PATH: fileURLToPath(new URL("../../install.ps1", import.meta.url)), RTRT_ACL_PATH: parent, RTRT_ACL_LEAF: leaf }
-  const refused = "$before=(Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl; $rejected=$false; try { Assert-SafeDirectory $env:RTRT_ACL_PATH } catch { $rejected=$true }; if(-not $rejected -or $before -cne (Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl) { throw 'existing parent was changed' }"
+  const load = "$ErrorActionPreference='Stop'; $parseTokens=$null; $parseErrors=$null; $ast=[System.Management.Automation.Language.Parser]::ParseFile($env:RTRT_INSTALL_PATH,[ref]$parseTokens,[ref]$parseErrors); if($parseErrors.Count) { throw ('installer parse error: ' + (($parseErrors | ForEach-Object { '{0}:{1}:{2}:{3}' -f $_.ErrorId,$_.Extent.StartLineNumber,$_.Extent.StartColumnNumber,$_.Message }) -join '; ')) }; $CurrentSid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $names=@('Set-PrivateDirectoryAcl','Assert-PrivateAcl','Assert-SafeDirectory'); foreach($fn in $ast.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name},$true)) { Invoke-Expression $fn.Extent.Text }; $script:firstRead=$null; function Get-Item { [CmdletBinding()] param([string]$LiteralPath,[switch]$Force); if($LiteralPath -and -not $script:firstRead) { $script:firstRead=$LiteralPath }; Microsoft.PowerShell.Management\\Get-Item @PSBoundParameters }; "
+  const env = { SystemRoot: process.env.SystemRoot, RTRT_INSTALL_PATH: fileURLToPath(new URL("../../install.ps1", import.meta.url)), RTRT_ACL_PATH: parent, RTRT_ACL_LEAF: leaf, RTRT_ACL_EXPECTED_PARENT: path.win32.dirname(parent) }
+  const refused = "$before=(Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl; $rejected=$false; try { Assert-SafeDirectory $env:RTRT_ACL_PATH } catch { $rejected=$true }; if($script:firstRead -ine $env:RTRT_ACL_EXPECTED_PARENT) { throw 'first walked ancestor was not literal parent' }; if(-not $rejected -or $before -cne (Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl) { throw 'existing parent was changed' }"
   await run(powershell, ["-NoProfile", "-NonInteractive", "-Command", load + refused], { env })
   await windowsAcl(parent, "private-create")
   // When: the installer validates the owned managed parent and creates a new leaf.
-  const created = "$before=(Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl; Assert-SafeDirectory $env:RTRT_ACL_PATH; Assert-SafeDirectory $env:RTRT_ACL_LEAF; if($before -cne (Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl) { throw 'existing managed parent was rewritten' }; Assert-PrivateAcl $env:RTRT_ACL_LEAF"
+  const created = "$before=(Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl; Assert-SafeDirectory $env:RTRT_ACL_PATH; if($script:firstRead -ine $env:RTRT_ACL_EXPECTED_PARENT) { throw 'first walked ancestor was not literal parent' }; Assert-SafeDirectory $env:RTRT_ACL_LEAF; if($before -cne (Get-Acl -LiteralPath $env:RTRT_ACL_PATH).Sddl) { throw 'existing managed parent was rewritten' }; Assert-PrivateAcl $env:RTRT_ACL_LEAF"
   await run(powershell, ["-NoProfile", "-NonInteractive", "-Command", load + created], { env })
   // Then: the new directory satisfies the same private ACL policy as Node and Rust.
   await windowsAcl(leaf, "private-check")
@@ -121,19 +121,29 @@ test("Windows machine executable accepts plain Node state path and serves loopba
   const child = spawn(executable, ["--machine", "--state-dir", f.state], {
     env: machineEnv(f.home, port), windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
   })
+  let stderr = ""
+  let spawnError
+  child.stderr.on("data", (part) => { stderr = (stderr + part.toString("utf8")).slice(-8192) })
+  child.on("error", (error) => { spawnError = error })
   t.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, "exit") }
+    if (!spawnError && child.exitCode === null && child.signalCode === null) { child.kill(); await once(child, "exit") }
   })
   assert.deepEqual(child.spawnargs.slice(1), ["--machine", "--state-dir", f.state])
   let healthy = false
-  for (let attempt = 0; attempt < 80 && !healthy && child.exitCode === null; attempt++) {
+  let healthStatus = "no response"
+  const deadline = performance.now() + 140_000
+  while (!healthy && !spawnError && child.exitCode === null && child.signalCode === null && performance.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(500) })
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(Math.min(500, Math.max(1, deadline - performance.now()))) })
+      healthStatus = response.status
       healthy = response.status === 200 && await response.text() === "ok"
-    } catch { await new Promise((resolve) => setTimeout(resolve, 100)) }
+    } catch { healthStatus = "request unavailable" }
+    if (!healthy && child.exitCode === null && child.signalCode === null && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - performance.now()))))
+    }
   }
   // Then: health is served on the chosen loopback port; no real profile was used.
-  assert.equal(healthy, true)
+  assert.equal(healthy, true, `health=${healthStatus} exitCode=${child.exitCode} signalCode=${child.signalCode} spawnError=${spawnError?.message ?? "none"} stderr=${stderr.replaceAll(TOKEN, "[redacted]")}`)
   // And: the pinned prompt registry lives inside the fixture; the operator profile is untouched.
   assert.equal(await profileRtrtSnapshot(), profileBefore)
   assert.equal((await stat(path.join(f.home, ".rtrt", "prompts"))).isDirectory(), true)

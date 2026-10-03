@@ -162,42 +162,40 @@ pub(crate) async fn post_optimizer_level(
         .scope
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("global"));
-    if follow_global {
-        if let Some(path) = repo.as_deref() {
-            // Clear only the output_level field; load → set None → save_project.
-            // `save_project` re-serializes the whole ProjectConfig, so a
-            // coexisting `[statusline]` override is preserved (and the file is
-            // removed only when the ProjectConfig becomes entirely empty).
-            let mut project = match rtrt_core::Config::load_project(path) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
-                        .into_response();
-                }
-            };
-            project.output_level = None;
-            if let Err(e) = crate::util::write_project_config(path, &project) {
+    // No project to clear in the global scope — fall through to a normal write
+    // below, which keeps the existing global-level behaviour.
+    if follow_global && let Some(path) = repo.as_deref() {
+        // Clear only the output_level field; load → set None → save_project.
+        // `save_project` re-serializes the whole ProjectConfig, so a
+        // coexisting `[statusline]` override is preserved (and the file is
+        // removed only when the ProjectConfig becomes entirely empty).
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": e.to_string() })),
                 )
                     .into_response();
             }
-            let level = read_output_style_level_for(repo.as_deref());
-            return Json(serde_json::json!({
-                "level": level.as_str(),
-                "active": level.is_active(),
-                "scope": "global",
-                "custom": false,
-                "inherited": true,
-            }))
-            .into_response();
+        };
+        project.output_level = None;
+        if let Err(e) = crate::util::write_project_config(path, &project) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
         }
-        // No project to clear in the global scope — fall through to a normal
-        // write below, which keeps the existing global-level behaviour.
+        let level = read_output_style_level_for(repo.as_deref());
+        return Json(serde_json::json!({
+            "level": level.as_str(),
+            "active": level.is_active(),
+            "scope": "global",
+            "custom": false,
+            "inherited": true,
+        }))
+        .into_response();
     }
 
     let Some(Json(body)) = body else {
@@ -315,27 +313,25 @@ pub(crate) async fn post_compression_config(
     // "Follow global" action: CLEAR this project's `compression` override only,
     // preserving any coexisting overrides (statusline / output_level / providers
     // / agents) in the same `<repo>/.rtrt/config.toml`.
-    if follow_global {
-        if let Some(path) = repo.as_deref() {
-            let mut project = match rtrt_core::Config::load_project(path) {
-                Ok(p) => p,
-                Err(e) => return clear_field_error(e),
-            };
-            project.compression = None;
-            if let Err(e) = crate::util::write_project_config(path, &project) {
-                return clear_field_error(e);
-            }
-            let cfg = rtrt_core::Config::load_effective(Some(path)).unwrap_or_default();
-            return Json(serde_json::json!({
-                "level": compression_level_label(&cfg.compression),
-                "enabled": cfg.compression.enabled,
-                "scope": "global",
-                "custom": false,
-                "inherited": true,
-            }))
-            .into_response();
+    // No project to clear — fall through to a normal (global) write.
+    if follow_global && let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.compression = None;
+        if let Err(e) = crate::util::write_project_config(path, &project) {
+            return clear_field_error(e);
         }
-        // No project to clear — fall through to a normal (global) write.
+        let cfg = rtrt_core::Config::load_effective(Some(path)).unwrap_or_default();
+        return Json(serde_json::json!({
+            "level": compression_level_label(&cfg.compression),
+            "enabled": cfg.compression.enabled,
+            "scope": "global",
+            "custom": false,
+            "inherited": true,
+        }))
+        .into_response();
     }
 
     let Some(Json(body)) = body else {
@@ -455,26 +451,24 @@ pub(crate) async fn post_providers_config(
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("global"));
 
-    if follow_global {
-        if let Some(path) = repo.as_deref() {
-            let mut project = match rtrt_core::Config::load_project(path) {
-                Ok(p) => p,
-                Err(e) => return clear_field_error(e),
-            };
-            project.providers = None;
-            if let Err(e) = crate::util::write_project_config(path, &project) {
-                return clear_field_error(e);
-            }
-            let (active, providers) = effective_provider_tools(Some(path));
-            return Json(serde_json::json!({
-                "active": active,
-                "providers": providers,
-                "scope": "global",
-                "custom": false,
-                "inherited": true,
-            }))
-            .into_response();
+    if follow_global && let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.providers = None;
+        if let Err(e) = crate::util::write_project_config(path, &project) {
+            return clear_field_error(e);
         }
+        let (active, providers) = effective_provider_tools(Some(path));
+        return Json(serde_json::json!({
+            "active": active,
+            "providers": providers,
+            "scope": "global",
+            "custom": false,
+            "inherited": true,
+        }))
+        .into_response();
     }
 
     let Some(Json(body)) = body else {
@@ -627,24 +621,22 @@ pub(crate) async fn post_agents_config(
         .as_deref()
         .is_some_and(|s| s.eq_ignore_ascii_case("global"));
 
-    if follow_global {
-        if let Some(path) = repo.as_deref() {
-            let mut project = match rtrt_core::Config::load_project(path) {
-                Ok(p) => p,
-                Err(e) => return clear_field_error(e),
-            };
-            project.agents = None;
-            if let Err(e) = crate::util::write_project_config(path, &project) {
-                return clear_field_error(e);
-            }
-            return Json(serde_json::json!({
-                "agents": effective_agent_tools(Some(path)),
-                "scope": "global",
-                "custom": false,
-                "inherited": true,
-            }))
-            .into_response();
+    if follow_global && let Some(path) = repo.as_deref() {
+        let mut project = match rtrt_core::Config::load_project(path) {
+            Ok(p) => p,
+            Err(e) => return clear_field_error(e),
+        };
+        project.agents = None;
+        if let Err(e) = crate::util::write_project_config(path, &project) {
+            return clear_field_error(e);
         }
+        return Json(serde_json::json!({
+            "agents": effective_agent_tools(Some(path)),
+            "scope": "global",
+            "custom": false,
+            "inherited": true,
+        }))
+        .into_response();
     }
 
     let Some(Json(body)) = body else {

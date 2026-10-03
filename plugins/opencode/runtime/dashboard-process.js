@@ -48,12 +48,13 @@ export function launchDetached(binary, args, { spawnProcess = spawn, ...options 
   })
 }
 
-export async function openDashboardBrowser(url, { platform = process.platform, launch = launchDetached } = {}) {
-  // Never consult BROWSER or PATH. URL is generated locally, not supplied by a tool argument.
+export async function openDashboardBrowser(file, { platform = process.platform, launch = launchDetached } = {}) {
+  // Never consult BROWSER or PATH. Ordinary opener argv carries only a local file path.
+  if (!path.isAbsolute(file) || /:\/\/|#|bootstrap=/i.test(file)) throw unavailable()
   switch (platform) {
-    case "linux": return launch("/usr/bin/xdg-open", [url])
-    case "darwin": return launch("/usr/bin/open", [url])
-    case "win32": return launch("C:\\Windows\\System32\\rundll32.exe", ["url.dll,FileProtocolHandler", url])
+    case "linux": return launch("/usr/bin/xdg-open", [file])
+    case "darwin": return launch("/usr/bin/open", [file])
+    case "win32": return launch(path.win32.join(process.env.SystemRoot || "C:\\Windows", "System32", "rundll32.exe"), ["url.dll,FileProtocolHandler", file])
     default: throw unavailable()
   }
 }

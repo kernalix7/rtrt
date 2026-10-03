@@ -399,10 +399,10 @@ where
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut child = command.spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(&sample).await.is_err() || stdin.shutdown().await.is_err() {
-            return None;
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && (stdin.write_all(&sample).await.is_err() || stdin.shutdown().await.is_err())
+    {
+        return None;
     }
     let output = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait_with_output())
         .await

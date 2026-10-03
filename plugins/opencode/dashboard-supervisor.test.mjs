@@ -3,7 +3,22 @@ import { chmod, lstat, mkdir, readFile, symlink, writeFile } from "node:fs/promi
 import path from "node:path"
 import test from "node:test"
 import { createDashboardSupervisor } from "./runtime/dashboard-supervisor.js"
-import { fixture, TOKEN } from "./test-fixtures/dashboard.mjs"
+import { fixture as rawFixture, TOKEN } from "./test-fixtures/dashboard.mjs"
+import { windowsAcl } from "./runtime/dashboard-acl.js"
+
+async function fixture(t) {
+  const f = await rawFixture(t)
+  if (process.platform !== "win32") return f
+  await windowsAcl(path.join(f.home, ".rtrt"), "private-create")
+  await windowsAcl(f.state, "private-create")
+  return { ...f, saveToken: async () => {
+    const handle = await (await import("node:fs/promises")).open(f.envFile, "wx")
+    try {
+      await windowsAcl(f.envFile, "private-create")
+      await handle.writeFile(`RTRT_DASHBOARD_TOKEN=${TOKEN}\n`)
+    } finally { await handle.close() }
+  } }
+}
 
 function dependencies(f, overrides = {}) {
   return {
@@ -37,7 +52,7 @@ test("ensure probes again under lock and spawns only once for concurrent calls",
     probe: async () => { calls.push("probe"); return running ? "healthy" : "offline" },
     resolveBinary: async () => { calls.push("resolve"); return "/exact/npm/bin/rtrt-dashboard" },
     launch: async (binary, args, options) => {
-      assert.equal((await lstat(path.join(f.state, "startup.lock"))).mode & 0o777, 0o700)
+      if (process.platform !== "win32") assert.equal((await lstat(path.join(f.state, "startup.lock"))).mode & 0o777, 0o700)
       assert.match(await readFile(f.envFile, "utf8"), /^RTRT_DASHBOARD_TOKEN=[a-f0-9]{64}\n$/)
       calls.push({ binary, args, options })
       running = true

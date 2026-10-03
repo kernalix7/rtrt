@@ -179,11 +179,11 @@ fn check_hallucinated_imports(
             };
             let declared = cache.entry(crate_dir.clone()).or_insert_with(|| {
                 let mut set = ws_deps.clone();
-                if let Ok(text) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) {
-                    if let Ok(value) = text.parse::<toml::Value>() {
-                        collect_member_deps(&value, &mut set);
-                        collect_workspace_deps(&value, &mut set);
-                    }
+                if let Ok(text) = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
+                    && let Ok(value) = text.parse::<toml::Value>()
+                {
+                    collect_member_deps(&value, &mut set);
+                    collect_workspace_deps(&value, &mut set);
                 }
                 set
             });
@@ -306,13 +306,12 @@ fn workspace_root_deps(root: &Path) -> HashSet<String> {
     let mut cursor = Some(root);
     while let Some(dir) = cursor {
         let candidate = dir.join("Cargo.toml");
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            if let Ok(value) = text.parse::<toml::Value>() {
-                if value.get("workspace").is_some() {
-                    collect_workspace_deps(&value, &mut set);
-                    break;
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(&candidate)
+            && let Ok(value) = text.parse::<toml::Value>()
+            && value.get("workspace").is_some()
+        {
+            collect_workspace_deps(&value, &mut set);
+            break;
         }
         cursor = dir.parent();
     }

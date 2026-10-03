@@ -1,6 +1,7 @@
 import { constants } from "node:fs"
 import { lstat, mkdir, open, rmdir } from "node:fs/promises"
 import path from "node:path"
+import { windowsAcl } from "./dashboard-acl.js"
 
 export const unavailable = () => new Error("Dashboard unavailable.")
 
@@ -11,7 +12,8 @@ export async function realPath(candidate) {
   let current = path.parse(normalized).root
   for (const part of parts) {
     current = path.join(current, part)
-    if ((await lstat(current)).isSymbolicLink()) throw unavailable()
+    const stat = await lstat(current)
+    if (stat.isSymbolicLink()) throw unavailable()
   }
   return normalized
 }
@@ -48,6 +50,7 @@ export function dashboardFiles({ home, uid, platform }) {
     const stat = await lstat(candidate)
     privateMetadata(stat, identity, 0o700)
     if (!stat.isDirectory()) throw unavailable()
+    if (platform === "win32") await windowsAcl(candidate, "private-check")
   }
   const checkLock = async () => {
     try { await directory(lock) } catch (error) {
@@ -59,7 +62,10 @@ export function dashboardFiles({ home, uid, platform }) {
     const stat = await lstat(home)
     if (!stat.isDirectory() || (platform !== "win32" && (stat.uid !== uid || (stat.mode & 0o022) !== 0))) throw unavailable()
     for (const candidate of [path.dirname(state), state]) {
-      try { await mkdir(candidate, { mode: 0o700 }) } catch (error) {
+      try {
+        await mkdir(candidate, { mode: 0o700 })
+        if (platform === "win32") await windowsAcl(candidate, "private-create")
+      } catch (error) {
         if (error.code !== "EEXIST") throw error
       }
       await directory(candidate)
@@ -69,6 +75,13 @@ export function dashboardFiles({ home, uid, platform }) {
   const readToken = async () => {
     await realPath(state)
     let raw
+    if (platform === "win32") {
+      try { await lstat(credential) } catch (error) {
+        if (error.code === "ENOENT") return undefined
+        throw error
+      }
+      await windowsAcl(credential, "private-check")
+    }
     try { raw = await readRegular(credential, (stat) => privateMetadata(stat, identity, 0o600)) } catch (error) {
       if (error.code === "ENOENT") return undefined
       throw error
@@ -83,6 +96,7 @@ export function dashboardFiles({ home, uid, platform }) {
     if (!/^[a-fA-F0-9]{64}$/.test(token)) throw unavailable()
     const handle = await open(credential, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
     try {
+      if (platform === "win32") await windowsAcl(credential, "private-create")
       privateMetadata(await handle.stat(), identity, 0o600)
       await handle.writeFile(`RTRT_DASHBOARD_TOKEN=${token}\n`)
       await handle.sync()
@@ -91,7 +105,10 @@ export function dashboardFiles({ home, uid, platform }) {
     }
   }
   const acquire = async () => {
-    try { await mkdir(lock, { mode: 0o700 }) } catch (error) {
+    try {
+      await mkdir(lock, { mode: 0o700 })
+      if (platform === "win32") await windowsAcl(lock, "private-create")
+    } catch (error) {
       if (error.code !== "EEXIST") throw error
       await directory(lock)
       return undefined

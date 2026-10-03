@@ -22,7 +22,7 @@ await copyFile(source, path.join(directory, binary))
 await chmod(path.join(directory, binary), 0o755)
 await copyFile(new URL("../../plugins/opencode/LICENSE", import.meta.url), path.join(directory, "LICENSE"))
 await cp(new URL("../../THIRD_PARTY_NOTICES", import.meta.url), path.join(directory, "THIRD_PARTY_NOTICES"), { recursive: true })
-const notices = agent.files.filter((file) => file.startsWith("THIRD_PARTY_NOTICES/"))
+assert.ok(agent.files.includes("THIRD_PARTY_NOTICES"), "notices must be included in the package inventory")
 await writeFile(path.join(directory, "package.json"), `${JSON.stringify({
   name,
   version: agent.version,
@@ -31,5 +31,5 @@ await writeFile(path.join(directory, "package.json"), `${JSON.stringify({
   repository: { ...agent.repository, directory: "packaging/npm" },
   os: [os],
   cpu: [cpu],
-  files: [binary, "LICENSE", ...notices],
+  files: [binary, "LICENSE", "THIRD_PARTY_NOTICES"],
 }, null, 2)}\n`)

@@ -1190,6 +1190,32 @@ fn validated_scratch_mount(boundary: &ProjectBoundary) -> Result<&'static Path> 
     Ok(scratch)
 }
 
+#[cfg(target_os = "linux")]
+fn validated_registry_child(source: &Path, uid: u32) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect sandbox Cargo registry child {}", source.display())
+            });
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        bail!(
+            "sandbox Cargo registry child is unsafe: {}",
+            source.display()
+        );
+    }
+    Ok(true)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn run(_original: &str) -> Result<i32> {
     bail!("strict OpenCode sandbox is currently available only on Linux")
@@ -1288,6 +1314,22 @@ fn spawn_sandbox(
         .arg(PRIVATE_RUSTUP_HOME);
     let home = linux_home()?;
     for tool_path in tool_paths {
+        if tool_path == &home.join(".cargo/registry") {
+            command
+                .arg("--dir")
+                .arg(Path::new(PRIVATE_CARGO_HOME).join("registry"))
+                .arg("--dir")
+                .arg(Path::new(PRIVATE_CARGO_HOME).join("registry/src"));
+            for child in ["cache", "index"] {
+                let source = tool_path.join(child);
+                if !validated_registry_child(&source, current_linux_uid()?)? {
+                    continue;
+                }
+                let destination = Path::new(PRIVATE_CARGO_HOME).join("registry").join(child);
+                command.arg("--ro-bind").arg(source).arg(destination);
+            }
+            continue;
+        }
         let destination = tool_path
             .strip_prefix(home.join(".cargo"))
             .ok()
@@ -1463,6 +1505,25 @@ mod tests {
         let mut colliding_git = test_boundary(Path::new("/home/user/worktree"));
         colliding_git.git_writable = vec![PathBuf::from("/rtrt-tmp/repository/.git")];
         assert!(validated_scratch_mount(&colliding_git).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_child_validation_rejects_symlinks_and_writable_directories() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let fixture = tempfile::tempdir_in(workspace_scratch_dir()).unwrap();
+        let child = fixture.path().join("cache");
+        let uid = std::fs::metadata(fixture.path()).unwrap().uid();
+        assert!(!validated_registry_child(&child, uid).unwrap());
+        std::fs::create_dir(&child).unwrap();
+        assert!(validated_registry_child(&child, uid).unwrap());
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validated_registry_child(&child, uid).is_err());
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = fixture.path().join("index");
+        symlink(&child, &link).unwrap();
+        assert!(validated_registry_child(&link, uid).is_err());
     }
 
     // These fixtures need scratch space inside the workspace rather than the
@@ -1906,6 +1967,77 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn normal_cargo_mount_plan_keeps_host_registry_read_only_and_src_private() {
+        let fixture = tempfile::tempdir_in(workspace_scratch_dir()).unwrap();
+        let backend = fixture.path().join("capture-bwrap");
+        let recorded = fixture.path().join("mount-args");
+        std::fs::write(
+            &backend,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                shell_quote(&recorded)
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = linux_home().unwrap().join(".cargo/registry");
+        let tool_paths = validated_tool_paths().unwrap();
+        assert!(
+            tool_paths.contains(&registry),
+            "offline Cargo registry fixture is required"
+        );
+
+        // Given: the normal validated tool paths and a backend recording bwrap argv.
+        // When: the production sandbox launch builds its mount plan.
+        spawn_sandbox(
+            "true",
+            &backend,
+            &test_boundary(fixture.path()),
+            &tool_paths,
+        )
+        .unwrap();
+
+        // Then: only archive cache/index cross the host boundary; src is scratch-owned.
+        let args: Vec<_> = std::fs::read_to_string(recorded)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let mounts: Vec<_> = args
+            .windows(3)
+            .filter(|window| window[0] == "--ro-bind")
+            .collect();
+        let private_registry = format!("{PRIVATE_CARGO_HOME}/registry");
+        assert!(!mounts.iter().any(|mount| mount[2] == private_registry));
+        for child in ["cache", "index"] {
+            let source = registry.join(child);
+            if source.is_dir() {
+                assert!(mounts.iter().any(|mount| {
+                    mount[1] == source.to_string_lossy()
+                        && mount[2] == format!("{private_registry}/{child}")
+                }));
+            }
+        }
+        assert!(!mounts.iter().any(|mount| {
+            mount[1].starts_with(&registry.to_string_lossy().to_string())
+                && mount[1].contains("/src")
+        }));
+        assert!(!args.windows(3).any(|window| window[0] == "--bind"
+            && window[1].starts_with(&registry.to_string_lossy().to_string())));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--dir", &format!("{private_registry}/src")])
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("credentials.toml") || arg.contains("config.toml"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn approved_bwrap_runtime_scrubs_and_isolates() {
         let Ok(backend) = preflight_usable() else {
             // Host integration coverage is conditional on the operator-owned
@@ -1983,6 +2115,20 @@ mod tests {
         assert_sandbox_clause(
             "nested user namespaces are disabled",
             "! unshare -Ur true",
+            &backend,
+            &boundary,
+            &tool_paths,
+        );
+        assert_sandbox_clause(
+            "private Cargo registry src is writable for offline archive extraction",
+            "mkdir -p \"$CARGO_HOME/registry/src\" && test -w \"$CARGO_HOME/registry/src\"",
+            &backend,
+            &boundary,
+            &tool_paths,
+        );
+        assert_sandbox_clause(
+            "host Cargo archive cache stays read-only",
+            "test -d \"$CARGO_HOME/registry/cache\" && ! test -w \"$CARGO_HOME/registry/cache\"",
             &backend,
             &boundary,
             &tool_paths,

@@ -100,12 +100,11 @@ impl PromptRegistry {
             Err(e) => return Err(Error::Io(e)),
         };
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Some(s) = entry.file_name().to_str() {
-                    if validate_name(s).is_ok() {
-                        out.push(s.to_string());
-                    }
-                }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(s) = entry.file_name().to_str()
+                && validate_name(s).is_ok()
+            {
+                out.push(s.to_string());
             }
         }
         out.sort();

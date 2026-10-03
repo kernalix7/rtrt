@@ -561,10 +561,10 @@ fn first_cwd_in(jsonl: &Path) -> Option<String> {
         if !line.ends_with(b"\n") || line.len() - 1 > MAX_JSONL_LINE {
             continue;
         }
-        if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len() - 1]) {
-            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
-                return Some(c.to_string());
-            }
+        if let Ok(v) = serde_json::from_slice::<Value>(&line[..line.len() - 1])
+            && let Some(c) = v.get("cwd").and_then(|c| c.as_str())
+        {
+            return Some(c.to_string());
         }
     }
     None
@@ -595,13 +595,13 @@ fn extract_assistant_text(v: &Value) -> Option<String> {
         .and_then(|c| c.as_array())?;
     let mut text = String::new();
     for part in content {
-        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-            if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(s);
+        if part.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(s) = part.get("text").and_then(|t| t.as_str())
+        {
+            if !text.is_empty() {
+                text.push('\n');
             }
+            text.push_str(s);
         }
     }
     let text = text.trim();
@@ -633,13 +633,13 @@ fn extract_user_text(content: &Value) -> Option<String> {
             }
             let mut text = String::new();
             for part in parts {
-                if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(s);
+                if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(s) = part.get("text").and_then(|t| t.as_str())
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(s);
                 }
             }
             if text.is_empty() { None } else { Some(text) }

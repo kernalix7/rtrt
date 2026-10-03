@@ -2216,17 +2216,17 @@ fn drop_opencode_tui_config_at(path: &Path, apply: bool) -> Result<()> {
     backup_if_needed(path)?;
     std::fs::write(path, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("write {}", path.display()))?;
-    if let Some(state_path) = state_path {
-        if let Err(error) = std::fs::remove_file(&state_path) {
-            let rollback = std::fs::write(path, serde_json::to_string_pretty(&before)?);
-            if let Err(rollback) = rollback {
-                bail!(
-                    "remove {} failed ({error}); TUI config rollback also failed ({rollback})",
-                    state_path.display()
-                );
-            }
-            return Err(error).with_context(|| format!("remove {}", state_path.display()));
+    if let Some(state_path) = state_path
+        && let Err(error) = std::fs::remove_file(&state_path)
+    {
+        let rollback = std::fs::write(path, serde_json::to_string_pretty(&before)?);
+        if let Err(rollback) = rollback {
+            bail!(
+                "remove {} failed ({error}); TUI config rollback also failed ({rollback})",
+                state_path.display()
+            );
         }
+        return Err(error).with_context(|| format!("remove {}", state_path.display()));
     }
     println!(
         "removed OpenCode TUI statusline plugin from {}",
@@ -5980,7 +5980,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             opencode_provenance_dry_run_status(&url),
-            "[dry-run] would register rtrt-agent@0.2.0 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
+            "[dry-run] would register rtrt-agent@0.2.1 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
         );
     }
 
@@ -5990,7 +5990,7 @@ mod tests {
             OPENCODE_NPM_PLUGIN_ID,
             concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.2.0");
+        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.2.1");
     }
 
     /// Writes an opencode config with a pre-existing `mcp.other` server to a

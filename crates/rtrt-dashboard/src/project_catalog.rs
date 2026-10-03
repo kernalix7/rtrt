@@ -225,6 +225,9 @@ fn discover_children(root: &Path) -> (Vec<CatalogProjectView>, Vec<PathBuf>) {
     let mut diagnostics = Vec::new();
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (diagnostics, Vec::new());
+        }
         _ => {
             diagnostics.push(unavailable_view(
                 "catalog".into(),
@@ -315,8 +318,111 @@ pub(crate) fn valid_slug(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
+
+    #[test]
+    fn empty_catalog_when_projects_root_is_absent() {
+        // Given: a fresh home with no requested projects root.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".rtrt/projects");
+        let catalog = ProjectCatalog::new(home.path().to_path_buf(), root.clone());
+
+        // When: the catalog refreshes without creating its root.
+        catalog.refresh();
+
+        // Then: there is no phantom project, context, or created directory.
+        assert!(catalog.views().is_empty());
+        assert!(catalog.contexts().is_empty());
+        assert_eq!(
+            std::fs::symlink_metadata(root).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn empty_catalog_when_projects_root_is_empty() {
+        // Given: an initialized but empty projects root.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("projects");
+        std::fs::create_dir(&root).unwrap();
+        let catalog = ProjectCatalog::new(home.path().to_path_buf(), root);
+
+        // When: the catalog refreshes.
+        catalog.refresh();
+
+        // Then: no diagnostics or contexts are synthesized.
+        assert!(catalog.views().is_empty());
+        assert!(catalog.contexts().is_empty());
+    }
+
+    #[test]
+    fn unsafe_catalog_when_projects_root_is_a_file() {
+        // Given: an existing non-directory root.
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("projects");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let catalog = ProjectCatalog::new(home.path().to_path_buf(), root);
+
+        // When: the catalog refreshes.
+        catalog.refresh();
+
+        // Then: the invalid root remains visible as an unavailable diagnostic.
+        let views = catalog.views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].slug, "catalog");
+        assert!(!views[0].available);
+        assert_eq!(views[0].diagnostic, Some(DiagnosticCategory::UnsafePath));
+        assert!(catalog.contexts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_catalog_when_projects_root_is_a_symlink() {
+        // Given: a symlink to an otherwise valid directory.
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("actual");
+        std::fs::create_dir(&target).unwrap();
+        let root = home.path().join("projects");
+        std::os::unix::fs::symlink(target, &root).unwrap();
+        let catalog = ProjectCatalog::new(home.path().to_path_buf(), root);
+
+        // When: the catalog refreshes.
+        catalog.refresh();
+
+        // Then: the symlink remains an unavailable unsafe root.
+        let views = catalog.views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].slug, "catalog");
+        assert!(!views[0].available);
+        assert_eq!(views[0].diagnostic, Some(DiagnosticCategory::UnsafePath));
+        assert!(catalog.contexts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_catalog_when_projects_root_parent_is_a_file() {
+        // Given: traversal fails with NotADirectory, not NotFound.
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join("parent");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let root = parent.join("projects");
+        assert_eq!(
+            std::fs::symlink_metadata(&root).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        let catalog = ProjectCatalog::new(home.path().to_path_buf(), root);
+
+        // When: the catalog refreshes.
+        catalog.refresh();
+
+        // Then: an IO failure other than NotFound remains fail-closed.
+        let views = catalog.views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].slug, "catalog");
+        assert!(!views[0].available);
+        assert_eq!(views[0].diagnostic, Some(DiagnosticCategory::UnsafePath));
+        assert!(catalog.contexts().is_empty());
+    }
 
     /// Canonical only where it matters. macOS reaches the temp dir through
     /// `/var -> /private/var`, which breaks comparisons against canonical paths.

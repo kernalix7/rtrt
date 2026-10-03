@@ -119,7 +119,7 @@ fn decode_token(token: &str) -> Result<[u8; 32], BootstrapError> {
         return Err(BootstrapError::InvalidToken);
     }
     let mut key = [0_u8; 32];
-    for (index, pair) in token.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in token.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         key[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
     }
     Ok(key)

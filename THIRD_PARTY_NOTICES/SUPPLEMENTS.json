@@ -1,0 +1,148 @@
+{
+  "schema": 1,
+  "scope": "full-text supplements for registry crates whose checksum-pinned archive has no license file; not a compiled SBOM or legal certification",
+  "components": [
+    {
+      "name": "eventsource-stream",
+      "version": "0.2.3",
+      "crateChecksum": "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab",
+      "componentCommit": "3d46f1c758f9ee4681e9da0427556d24c53f9c01",
+      "licenseCommit": null,
+      "correspondence": "declared-standard",
+      "selectedSpdx": "Apache-2.0",
+      "files": [
+        {
+          "path": "eventsource-stream@0.2.3/DECLARED-APACHE-2.0.txt",
+          "sourcePath": "LICENSE-2.0.txt",
+          "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ]
+    },
+    {
+      "name": "instant-distance",
+      "version": "0.6.1",
+      "crateChecksum": "8c619cdaa30bb84088963968bee12a45ea5fbbf355f2c021bcd15589f5ca494a",
+      "componentCommit": "bbdc1b19bf3cdd372199e1d697bd0d7fd9a10ebb",
+      "licenseCommit": "bbdc1b19bf3cdd372199e1d697bd0d7fd9a10ebb",
+      "correspondence": "same-commit",
+      "selectedSpdx": "Apache-2.0",
+      "files": [
+        {
+          "path": "instant-distance@0.6.1/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/InstantDomain/instant-distance/bbdc1b19bf3cdd372199e1d697bd0d7fd9a10ebb/LICENSE",
+          "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+        }
+      ]
+    },
+    {
+      "name": "rmcp",
+      "version": "1.7.0",
+      "crateChecksum": "0810a9f717d9828f475fe1f629f4c305c8464b7f496c3a854b58d29e65f4058e",
+      "componentCommit": "3529c3675ff64db805bd947ca6ece6090809e43d",
+      "licenseCommit": "3529c3675ff64db805bd947ca6ece6090809e43d",
+      "correspondence": "same-commit",
+      "selectedSpdx": "Apache-2.0",
+      "files": [
+        {
+          "path": "rmcp@1.7.0/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/3529c3675ff64db805bd947ca6ece6090809e43d/LICENSE",
+          "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+        }
+      ]
+    },
+    {
+      "name": "rmcp-macros",
+      "version": "1.7.0",
+      "crateChecksum": "6aefac48c364756e97f04c0401ba3231e8607882c7c1d92da0437dc16307904d",
+      "componentCommit": "3529c3675ff64db805bd947ca6ece6090809e43d",
+      "licenseCommit": "3529c3675ff64db805bd947ca6ece6090809e43d",
+      "correspondence": "same-commit",
+      "selectedSpdx": "Apache-2.0",
+      "files": [
+        {
+          "path": "rmcp-macros@1.7.0/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/modelcontextprotocol/rust-sdk/3529c3675ff64db805bd947ca6ece6090809e43d/LICENSE",
+          "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a"
+        }
+      ]
+    },
+    {
+      "name": "sse-stream",
+      "version": "0.2.3",
+      "crateChecksum": "f3962b63f038885f15bce2c6e02c0e7925c072f1ac86bb60fd44c5c6b762fb72",
+      "componentCommit": "70fd1a9da602060069e9da6e337a17be4f496455",
+      "licenseCommit": "9b95874ca02cc337b9f86b54915ba6c6b27821d0",
+      "correspondence": "later-same-author",
+      "selectedSpdx": "Apache-2.0",
+      "files": [
+        {
+          "path": "sse-stream@0.2.3/LICENSE-APACHE",
+          "sourcePath": "LICENSE-APACHE",
+          "url": "https://raw.githubusercontent.com/4t145/sse-stream/9b95874ca02cc337b9f86b54915ba6c6b27821d0/LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "path": "sse-stream@0.2.3/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "url": "https://raw.githubusercontent.com/4t145/sse-stream/9b95874ca02cc337b9f86b54915ba6c6b27821d0/LICENSE-MIT",
+          "sha256": "049d23c7810a0723f186a193f841378dbc307f62be89bdba21c73126b0df2c52"
+        }
+      ]
+    },
+    {
+      "name": "tree-sitter-python",
+      "version": "0.23.6",
+      "crateChecksum": "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04",
+      "componentCommit": "bffb65a8cfe4e46290331dfef0dbf0ef3679de11",
+      "licenseCommit": "bffb65a8cfe4e46290331dfef0dbf0ef3679de11",
+      "correspondence": "same-commit",
+      "selectedSpdx": "MIT",
+      "files": [
+        {
+          "path": "tree-sitter-python@0.23.6/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-python/bffb65a8cfe4e46290331dfef0dbf0ef3679de11/LICENSE",
+          "sha256": "d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f"
+        }
+      ]
+    },
+    {
+      "name": "tree-sitter-typescript",
+      "version": "0.23.2",
+      "crateChecksum": "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff",
+      "componentCommit": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
+      "licenseCommit": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
+      "correspondence": "same-commit",
+      "selectedSpdx": "MIT",
+      "files": [
+        {
+          "path": "tree-sitter-typescript@0.23.2/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/f975a621f4e7f532fe322e13c4f79495e0a7b2e7/LICENSE",
+          "sha256": "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"
+        }
+      ]
+    },
+    {
+      "name": "whatlang",
+      "version": "0.16.4",
+      "crateChecksum": "471d1c1645d361eb782a1650b1786a8fb58dd625e681a04c09f5ff7c8764a7b0",
+      "componentCommit": "e599339cf9ad5fc29fc9d46dd4ad8d3f851c3143",
+      "licenseCommit": "e599339cf9ad5fc29fc9d46dd4ad8d3f851c3143",
+      "correspondence": "same-commit",
+      "selectedSpdx": "MIT",
+      "files": [
+        {
+          "path": "whatlang@0.16.4/LICENSE",
+          "sourcePath": "LICENSE",
+          "url": "https://raw.githubusercontent.com/greyblake/whatlang-rs/e599339cf9ad5fc29fc9d46dd4ad8d3f851c3143/LICENSE",
+          "sha256": "9fb62b415784b27e358a03677cac6b56de73425f4fdbb5f4ecf19650af5dfe0c"
+        }
+      ]
+    }
+  ]
+}

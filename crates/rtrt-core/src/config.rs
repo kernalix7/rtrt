@@ -215,20 +215,20 @@ impl EmbeddingsConfig {
     /// Resolve the effective base URL. Priority: `RTRT_EMBED_BASE_URL` env var
     /// → `self.base_url` → `compress_base_url` fallback → Ollama default.
     pub fn resolved_base_url(&self, compress_base_url: Option<&str>) -> String {
-        if let Ok(url) = std::env::var("RTRT_EMBED_BASE_URL") {
-            if !url.is_empty() {
-                return url;
-            }
+        if let Ok(url) = std::env::var("RTRT_EMBED_BASE_URL")
+            && !url.is_empty()
+        {
+            return url;
         }
-        if let Some(url) = &self.base_url {
-            if !url.is_empty() {
-                return url.clone();
-            }
+        if let Some(url) = &self.base_url
+            && !url.is_empty()
+        {
+            return url.clone();
         }
-        if let Some(url) = compress_base_url {
-            if !url.is_empty() {
-                return url.to_string();
-            }
+        if let Some(url) = compress_base_url
+            && !url.is_empty()
+        {
+            return url.to_string();
         }
         "http://127.0.0.1:11434".to_string()
     }

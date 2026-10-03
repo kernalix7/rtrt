@@ -291,6 +291,138 @@ fn machine_startup_requires_exact_private_state_and_redacts_token() {
     assert!(!error.contains("machine-secret"));
 }
 
+#[cfg(windows)]
+#[test]
+fn machine_startup_accepts_plain_home_override_only_with_private_token() {
+    use std::process::Command;
+
+    // Given: a PowerShell 7 module path inherited by the Rust test process.
+    if std::env::var_os("RTRT_TEST_WINDOWS_ACL_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::machine_startup_accepts_plain_home_override_only_with_private_token",
+                "--nocapture",
+            ])
+            .env("PSModulePath", r"C:\Program Files\PowerShell\7\Modules")
+            .env("RTRT_TEST_WINDOWS_ACL_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "Windows ACL fixture failed under PS7 module path: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // Given: a private fixture in the project scratch area, not USERPROFILE.
+    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    let scratch = project_root.join(".rtrt").join("tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("machine-windows-")
+        .tempdir_in(scratch)
+        .unwrap();
+    let _guard = EnvGuard::new(tmp.path());
+    let home = tmp.path();
+    let state = home.join(".rtrt").join("dashboard");
+    std::fs::create_dir_all(&state).unwrap();
+    let system_root = std::env::var_os("SystemRoot").unwrap();
+    let powershell =
+        std::path::Path::new(&system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let protect = |path: &std::path::Path| {
+        assert!(
+            Command::new(&powershell)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    include_str!("../../../plugins/opencode/runtime/dashboard-acl.ps1")
+                ])
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .env("RTRT_ACL_PATH", path)
+                .env("RTRT_ACL_ACTION", "private-create")
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    protect(&home.join(".rtrt"));
+    protect(&state);
+    let token = state.join("dashboard.env");
+    std::fs::File::create(&token).unwrap();
+    protect(&token);
+    std::fs::write(&token, "RTRT_DASHBOARD_TOKEN=fixture-only\n").unwrap();
+    let args = || {
+        [
+            "--machine".into(),
+            "--state-dir".into(),
+            state.clone().into_os_string(),
+        ]
+    };
+
+    // Given: a plain lexical path whose real target is the canonical private state.
+    let canonical_home = std::fs::canonicalize(home).unwrap();
+    let canonical_state = canonical_home.join(".rtrt").join("dashboard");
+    assert_eq!(std::fs::canonicalize(&state).unwrap(), canonical_state);
+    assert_eq!(
+        state.components().skip(1).collect::<Vec<_>>(),
+        canonical_state.components().skip(1).collect::<Vec<_>>()
+    );
+    // When: Node's normal (non-verbatim) state path is passed with HOME != USERPROFILE.
+    let startup = crate::MachineStartup::parse(args()).unwrap_or_else(|error| {
+        panic!(
+            "{error}; supplied={state:?}, supplied_components={:?}, canonical_home={canonical_home:?}, canonical_state={canonical_state:?}, canonical_components={:?}",
+            state.components().collect::<Vec<_>>(),
+            canonical_state.components().collect::<Vec<_>>()
+        )
+    });
+    // Then: this precise fixture is selected; no other home or token path is accepted.
+    assert_eq!(startup.home, std::fs::canonicalize(home).unwrap());
+    assert_eq!(startup.token, "fixture-only");
+    assert!(
+        crate::MachineStartup::parse([
+            "--machine".into(),
+            "--state-dir".into(),
+            home.join("other/dashboard").into_os_string()
+        ])
+        .is_err()
+    );
+    assert!(
+        crate::MachineStartup::parse([
+            "--machine".into(),
+            "--state-dir".into(),
+            home.join(".rtrt/./dashboard").into_os_string()
+        ])
+        .is_err()
+    );
+    assert!(
+        crate::MachineStartup::parse([
+            "--machine".into(),
+            "--state-dir".into(),
+            state.join("..").join("dashboard").into_os_string()
+        ])
+        .is_err()
+    );
+
+    // Given: a token with inherited permissions. When: the same startup is parsed.
+    assert!(Command::new(&powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            "$a=Get-Acl -LiteralPath $env:RTRT_ACL_PATH; $a.SetAccessRuleProtection($false,$true); Set-Acl -LiteralPath $env:RTRT_ACL_PATH -AclObject $a"])
+        .env_clear()
+        .env("SystemRoot", &system_root)
+        .env("RTRT_ACL_PATH", &token).status().unwrap().success());
+    // Then: it is refused before its content can be used.
+    assert!(crate::MachineStartup::parse(args()).is_err());
+}
+
 #[tokio::test]
 async fn project_bound_route_never_falls_back_without_selector() {
     let tmp = CanonicalTempDir::new();

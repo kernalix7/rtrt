@@ -445,13 +445,13 @@ fn explicit_route(
             tool.name
         )));
     }
-    if let Some(capability) = req.capability {
-        if !tool.capabilities.contains(&capability) {
-            return Err(Error::Provider(format!(
-                "route: target '{}' does not provide {:?}",
-                tool.name, capability
-            )));
-        }
+    if let Some(capability) = req.capability
+        && !tool.capabilities.contains(&capability)
+    {
+        return Err(Error::Provider(format!(
+            "route: target '{}' does not provide {:?}",
+            tool.name, capability
+        )));
     }
     let candidate = best_lane_for(req, usage, tool)?;
     // An explicit target normally means "this one, nothing else". Only when the

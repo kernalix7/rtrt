@@ -2264,10 +2264,8 @@ fn cargo_package_name(path: &Path) -> Option<String> {
             in_package = line == "[package]";
             continue;
         }
-        if in_package {
-            if let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
-                return parse_toml_string(value);
-            }
+        if in_package && let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
+            return parse_toml_string(value);
         }
     }
     None
@@ -2293,10 +2291,8 @@ fn python_project_name(root: &Path) -> Option<String> {
             in_project = line == "[project]" || line == "[tool.poetry]";
             continue;
         }
-        if in_project {
-            if let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
-                return parse_toml_string(value);
-            }
+        if in_project && let Some(value) = line.strip_prefix("name").and_then(toml_value_after_eq) {
+            return parse_toml_string(value);
         }
     }
     None
@@ -2336,10 +2332,9 @@ fn gradle_project_name(root: &Path) -> Option<String> {
         if let Some(value) = line.strip_prefix("rootProject.name").and_then(|rest| {
             rest.split_once('=')
                 .map(|(_, value)| value.trim().trim_matches('"').trim_matches('\''))
-        }) {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
+        }) && !value.is_empty()
+        {
+            return Some(value.to_string());
         }
     }
     None
@@ -4437,10 +4432,8 @@ async fn run(command: Cmd) -> Result<()> {
                 rtrt_proxy::errors_only(&combined, context)
             };
             print!("{filtered}");
-            if passthrough_status {
-                if let Some(code) = out.status.code() {
-                    std::process::exit(code);
-                }
+            if passthrough_status && let Some(code) = out.status.code() {
+                std::process::exit(code);
             }
         }
         Cmd::Docs {
@@ -5243,10 +5236,10 @@ fn scan_transcript_file(
             .and_then(|cwd| cwd.as_str())
             .map(rtrt_core::project_for_cwd_str)
             .filter(|name| !name.is_empty());
-        if let Some(wanted) = project_filter {
-            if project.as_deref() != Some(wanted) {
-                continue;
-            }
+        if let Some(wanted) = project_filter
+            && project.as_deref() != Some(wanted)
+        {
+            continue;
         }
         for command in extract_bash_commands(&value) {
             record_discovered_command(&command, averages, report);
@@ -5266,14 +5259,13 @@ fn entry_matches_since(value: &serde_json::Value, since: Option<&str>) -> bool {
 
 fn extract_bash_commands(value: &serde_json::Value) -> Vec<String> {
     let mut commands = Vec::new();
-    if value.get("tool_name").and_then(|name| name.as_str()) == Some("Bash") {
-        if let Some(command) = value
+    if value.get("tool_name").and_then(|name| name.as_str()) == Some("Bash")
+        && let Some(command) = value
             .get("tool_input")
             .and_then(|input| input.get("command"))
             .and_then(|command| command.as_str())
-        {
-            commands.push(command.to_string());
-        }
+    {
+        commands.push(command.to_string());
     }
     if let Some(blocks) = value
         .get("message")
@@ -5339,25 +5331,25 @@ fn scan_shell_history(
         if since.is_some() && timestamp.is_none() {
             continue;
         }
-        if let (Some(ts), Some(since)) = (timestamp, since) {
-            if ts < since {
-                continue;
-            }
+        if let (Some(ts), Some(since)) = (timestamp, since)
+            && ts < since
+        {
+            continue;
         }
         record_discovered_command(command, averages, report);
     }
 }
 
 fn parse_history_line(line: &str) -> (Option<&str>, &str) {
-    if let Some(rest) = line.strip_prefix(": ") {
-        if let Some((head, command)) = rest.split_once(';') {
-            let ts = head
-                .split(':')
-                .next()
-                .map(str::trim)
-                .filter(|ts| !ts.is_empty());
-            return (ts, command.trim());
-        }
+    if let Some(rest) = line.strip_prefix(": ")
+        && let Some((head, command)) = rest.split_once(';')
+    {
+        let ts = head
+            .split(':')
+            .next()
+            .map(str::trim)
+            .filter(|ts| !ts.is_empty());
+        return (ts, command.trim());
     }
     (None, line.trim())
 }
@@ -6701,15 +6693,15 @@ fn run_hook_capture(cmd: HookCmd) -> Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
             let sha = MemoryStore::body_sha(&redacted);
-            if window > 0 {
-                if let Ok(Some(seen_at)) = memory.body_seen_at(&project, &sha) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    if now.saturating_sub(seen_at) < window {
-                        return Ok(());
-                    }
+            if window > 0
+                && let Ok(Some(seen_at)) = memory.body_seen_at(&project, &sha)
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if now.saturating_sub(seen_at) < window {
+                    return Ok(());
                 }
             }
             let mut meta: BTreeMap<String, String> = BTreeMap::new();
@@ -8604,10 +8596,10 @@ fn render_statusline_template(
             break;
         };
         let key = &after[..end];
-        if enabled.contains(key) {
-            if let Some(value) = segments.get(key) {
-                out.push_str(value);
-            }
+        if enabled.contains(key)
+            && let Some(value) = segments.get(key)
+        {
+            out.push_str(value);
         }
         rest = &after[end + 1..];
     }

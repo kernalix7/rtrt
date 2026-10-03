@@ -6,7 +6,7 @@ Thank you for your interest in contributing to RTRT! This guide will help you ge
 
 ## Prerequisites
 
-- Rust stable 1.85+ (edition 2024). CI gates on `stable` and `beta`.
+- Rust stable 1.88+ (edition 2024). CI gates on `stable` and `beta`, plus a dedicated `1.88.0` MSRV lane.
 - A C toolchain for `rusqlite`'s bundled SQLite (`gcc` or `clang`).
 - `git` for source control.
 

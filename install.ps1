@@ -1,4 +1,4 @@
-# RTRT installer — Windows PowerShell.
+# RTRT installer - Windows PowerShell.
 #
 # One-liner install:
 #   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
@@ -14,7 +14,7 @@
 #   -InstallDir <path>    Install dir (default: $env:LOCALAPPDATA\Programs\rtrt).
 #   -SkipDeps             Skip toolchain check (fail early if missing).
 #                         (env: RTRT_SKIP_DEPS=1)
-#   -Uninstall            Compat shim — removes only an owned task + binaries.
+#   -Uninstall            Compat shim - removes only an owned task + binaries.
 #   -NoSetup              Disable agent setup. Linux strict OpenCode bootstrap
 #                         is unsupported on native Windows. (env: RTRT_NO_SETUP=1)
 #   -NoService            Don't register the rtrt-dashboard logon task.
@@ -36,7 +36,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Windows PowerShell 5.1 may default to TLS 1.0 — force TLS 1.2+ so the
+# Windows PowerShell 5.1 may default to TLS 1.0 - force TLS 1.2+ so the
 # GitHub API / release downloads don't fail the handshake.
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
@@ -139,7 +139,7 @@ function Show-InstallCheck {
     if (-not ($current.Split($pathSep) -contains $InstallDir)) {
         Write-Host ""
         Write-Warn "$InstallDir is not on `$env:PATH."
-        # NOT `setx PATH` — that flattens machine+user PATH into the user value
+        # NOT `setx PATH` - that flattens machine+user PATH into the user value
         # and truncates it at 1024 characters.
         Write-Warn "  Add it (user scope, new shells) via:"
         Write-Warn "    [Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path','User') + ';$InstallDir'), 'User')"
@@ -171,15 +171,40 @@ function Set-PrivateDirectoryAcl([string] $Path) {
     Set-Acl -LiteralPath $Path -AclObject $security
 }
 
+function Assert-PrivateAcl([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "unsafe dashboard state path: $Path" }
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $CurrentSid.Value -or
+        -not $acl.AreAccessRulesProtected) { throw "dashboard state owner or inheritance mismatch: $Path" }
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1) { throw "dashboard state ACE count mismatch: $Path" }
+    $rule = $rules[0]
+    if ($rule.IsInherited -or $rule.IdentityReference.Value -ne $CurrentSid.Value -or
+        $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        [int]$rule.FileSystemRights -ne [int][Security.AccessControl.FileSystemRights]::FullControl) {
+        throw "dashboard state ACE mismatch: $Path"
+    }
+    if ($item.PSIsContainer) {
+        if ($rule.InheritanceFlags -ne ([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [Security.AccessControl.InheritanceFlags]::ObjectInherit) -or
+            $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
+            throw "dashboard state directory ACE mismatch: $Path"
+        }
+    } elseif ($rule.InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None) {
+        throw "dashboard state file ACE mismatch: $Path"
+    }
+}
+
 function Assert-SafeDirectory([string] $Path) {
-    $parent = Split-Path -LiteralPath $Path -Parent
+    $parent = [IO.Path]::GetDirectoryName($Path.TrimEnd([IO.Path]::DirectorySeparatorChar))
     while ($parent) {
         $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
         if ($parentItem -and (($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             throw "unsafe dashboard state ancestor: $parent"
         }
-        $next = Split-Path -LiteralPath $parent -Parent
-        if ($next -eq $parent) { break }
+        $next = [IO.Path]::GetDirectoryName($parent.TrimEnd([IO.Path]::DirectorySeparatorChar))
+        if (-not $next -or $next -eq $parent) { break }
         $parent = $next
     }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -187,14 +212,14 @@ function Assert-SafeDirectory([string] $Path) {
         if (-not $item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             throw "unsafe dashboard state path: $Path"
         }
+        Assert-PrivateAcl $Path
     } else {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        New-Item -ItemType Directory -Path $Path | Out-Null
         $item = Get-Item -LiteralPath $Path -Force
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "unsafe dashboard state path: $Path" }
+        Set-PrivateDirectoryAcl $Path
+        Assert-PrivateAcl $Path
     }
-    Set-PrivateDirectoryAcl $Path
-    $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier])
-    if ($owner -ne $CurrentSid) { throw "dashboard state owner mismatch: $Path" }
 }
 
 function Protect-PrivateFile([string] $Path) {
@@ -214,7 +239,7 @@ function Ensure-MachineDashboardToken([string] $StateDir) {
     $existing = Get-Item -LiteralPath $envPath -Force -ErrorAction SilentlyContinue
     if ($existing) {
         if ($existing.PSIsContainer -or (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw "unsafe dashboard token file: $envPath" }
-        Protect-PrivateFile $envPath
+        Assert-PrivateAcl $envPath
         $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
         if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
         return
@@ -235,7 +260,7 @@ function Ensure-MachineDashboardToken([string] $StateDir) {
             if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) { throw }
         }
     } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
-    Protect-PrivateFile $envPath
+    Assert-PrivateAcl $envPath
     $line = (Get-Content -LiteralPath $envPath -Raw).Trim()
     if ($line -notmatch '^RTRT_DASHBOARD_TOKEN=([0-9a-fA-F]{64})$') { throw "invalid dashboard token file: $envPath" }
     $token = $null
@@ -256,7 +281,11 @@ function Install-DashboardTask {
     if ($existing -and -not (Test-OwnedDashboardTask $existing)) {
         throw "refusing foreign scheduled task: $DashboardTaskName"
     }
-    $stateDir = Join-Path $env:USERPROFILE ".rtrt\dashboard"
+    $dashboardHome = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    if (-not [IO.Path]::IsPathRooted($dashboardHome)) { throw "invalid dashboard home" }
+    $managedRoot = Join-Path $dashboardHome ".rtrt"
+    Assert-SafeDirectory $managedRoot
+    $stateDir = Join-Path $managedRoot "dashboard"
     Assert-SafeDirectory $stateDir
     Ensure-MachineDashboardToken $stateDir
     Write-Host ""
@@ -270,7 +299,7 @@ function Install-DashboardTask {
     Register-ScheduledTask -TaskName $DashboardTaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Description $DashboardTaskMarker -Force | Out-Null
     Start-ScheduledTask -TaskName $DashboardTaskName
-    Write-Log "  dashboard task registered + started — http://127.0.0.1:7311"
+    Write-Log "  dashboard task registered + started - http://127.0.0.1:7311"
 }
 
 function Build-FromSource($SrcDir) {
@@ -332,7 +361,7 @@ if (-not $Version) {
         $Version = $null
     }
     if (-not $Version) {
-        Write-Warn "no GitHub Release published yet — falling back to source build from main."
+        Write-Warn "no GitHub Release published yet - falling back to source build from main."
         Write-Warn "Pass -Version vX.Y.Z to pin a release once one is cut, or -Ref BRANCH to track a different branch."
         Write-Host ""
         Require-Cmd git

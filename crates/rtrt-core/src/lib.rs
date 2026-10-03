@@ -13,6 +13,8 @@ pub mod plugin;
 pub mod pool;
 pub mod project;
 pub mod token;
+#[cfg(windows)]
+pub mod windows_acl;
 
 pub use config::{
     AgentsConfig, Config, DEFAULT_API_MAX_TOKENS, LimitsConfig, PoolLimit, ProjectConfig,

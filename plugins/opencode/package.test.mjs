@@ -30,7 +30,7 @@ test("package retains classic root and exposes separate native server and TUI", 
 
   // Then: OpenCode sees separate native entrypoints, while root stays named-only.
   assert.equal(manifest.name, "rtrt-agent")
-  assert.equal(manifest.version, "0.2.0")
+  assert.equal(manifest.version, "0.2.1")
   assert.equal(manifest.type, "module")
   assert.equal(manifest.main, "./index.js")
   assert.deepEqual(manifest.exports, {
@@ -38,27 +38,17 @@ test("package retains classic root and exposes separate native server and TUI", 
     "./server": ["./server.js"],
     "./tui": ["./tui/v2/rtrt-statusline.tsx"],
   })
-  const noticeFiles = [
-    "INDEX.md",
-    ...["cytoscape-fcose@2.2.0", "cytoscape-cola@2.5.1", "cose-base@2.2.0",
-      "layout-base@2.0.1", "webcola@3.4.0", "cytoscape@3.30.2", "subtle@2.6.1",
-      "webpki-roots@0.26.11", "webpki-roots@1.0.7"].map((name) => `${name}/LICENSE`),
-    "ring@0.17.14/LICENSE", "ring@0.17.14/LICENSE-BoringSSL",
-    "ring@0.17.14/LICENSE-other-bits", "ring@0.17.14/src/polyfill/once_cell/LICENSE-APACHE",
-    "ring@0.17.14/src/polyfill/once_cell/LICENSE-MIT", "ring@0.17.14/third_party/fiat/LICENSE",
-    "option-ext@0.2.0/LICENSE.txt",
-    "option-ext@0.2.0/SOURCE.crate",
-  ].map((file) => `THIRD_PARTY_NOTICES/${file}`)
   assert.deepEqual(
     ["package.json", ...manifest.files].toSorted(),
     [
       "LICENSE", "README.ko.md", "README.md", "bin/rtrt-dashboard-open.js", "index.js",
        "package.json", "rtrt-provenance.js", "server.js", "v2/permissions.js", "runtime/dashboard-binary.js",
+       "runtime/dashboard-bootstrap.js", "runtime/dashboard-acl.js", "runtime/dashboard-acl.ps1",
        "runtime/dashboard-files.js", "runtime/dashboard-plugin.js", "runtime/dashboard-process.js",
        "runtime/dashboard-supervisor.js", "tui/index.js", "tui/rtrt-statusline-core.mjs",
        "tui/rtrt-statusline-core.d.mts",
        "tui/v2/native-runtime.mjs", "tui/v2/native-state.mjs", "tui/v2/rtrt-statusline.tsx",
-       ...noticeFiles,
+        "THIRD_PARTY_NOTICES",
     ].toSorted(),
   )
   assert.deepEqual(manifest.dependencies, { "@opencode-ai/sdk": "1.15.13" })

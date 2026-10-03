@@ -202,12 +202,11 @@ fn decode_event(_event: &str, data: &str) -> Result<Option<ChatStreamEvent>> {
     if let Some(u) = v.usage {
         return Ok(Some(ChatStreamEvent::Usage(u.into())));
     }
-    if let Some(choice) = v.choices.into_iter().next() {
-        if let Some(text) = choice.delta.content {
-            if !text.is_empty() {
-                return Ok(Some(ChatStreamEvent::Delta { text }));
-            }
-        }
+    if let Some(choice) = v.choices.into_iter().next()
+        && let Some(text) = choice.delta.content
+        && !text.is_empty()
+    {
+        return Ok(Some(ChatStreamEvent::Delta { text }));
     }
     Ok(None)
 }

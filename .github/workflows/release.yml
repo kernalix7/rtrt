@@ -60,11 +60,46 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+           cargo test --workspace
+
+  license-inventory:
+    name: Check release graph and notice inventory
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Fetch every locked workspace dependency for the offline consumer
+        # `cargo fetch --locked` hydrates the full locked dependency closure (host +
+        # build-dependencies, all platforms reachable through the resolver). The five-
+        # target loop below only fetches archives for the explicit release triples,
+        # which omits transitively-referenced crates such as
+        # `android_system_properties v0.1.5` that `cargo metadata --locked --offline`
+        # still needs because the inventory graph is target-agnostic.
+        run: cargo fetch --locked
+      - name: Fetch locked release target crates
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            cargo fetch --locked --target "$target"
+          done
+      - name: Check release graph and notice inventory
+        run: node packaging/licenses/notice-inventory.mjs
 
   build:
     name: Build ${{ matrix.target }}
-    needs: preflight
+    needs: [preflight, license-inventory]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -107,6 +142,10 @@ jobs:
           cargo build --locked --release --workspace
           --bin rtrt --bin rtrt-mcp --bin rtrt-dashboard
           --target ${{ matrix.target }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
       - name: Stage archive and checksum
         id: package
         shell: bash
@@ -124,7 +163,8 @@ jobs:
             if [ -f "$source.exe" ]; then source="$source.exe"; fi
             cp "$source" "$stage/"
           done
-          cp LICENSE README.md CHANGELOG.md "$stage/"
+          cp LICENSE CHANGELOG.md "$stage/"
+          node scripts/stage-release-archive.mjs "$RELEASE_VERSION" "$stage/README.md"
           cp -R THIRD_PARTY_NOTICES "$stage/"
           (
             cd dist
@@ -145,10 +185,6 @@ jobs:
             dist/${{ steps.package.outputs.asset }}.sha256
           if-no-files-found: error
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          package-manager-cache: false
       - name: Pack exact dashboard platform artifact
         shell: bash
         env:
@@ -174,7 +210,7 @@ jobs:
 
   package-npm:
     name: Test and package npm artifact
-    needs: preflight
+    needs: [preflight, license-inventory]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -184,6 +220,24 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.source_sha }}
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Fetch every locked workspace dependency for offline npm tests
+        # Hydrates the full closure (host + build-deps, all platforms). The five-target
+        # loop below only covers the explicit release triples; npm-test subprocesses
+        # still call `cargo metadata --locked --offline` which is target-agnostic.
+        working-directory: ${{ github.workspace }}
+        run: cargo fetch --locked
+      - name: Fetch locked release target crates for offline npm tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            cargo fetch --locked --target "$target"
+          done
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -215,9 +269,40 @@ jobs:
           path: packaging/npm/publish-package.sh
           if-no-files-found: error
 
+  validate-github-assets:
+    name: Check existing GitHub asset bytes before npm
+    needs: [preflight, license-inventory, build]
+    if: needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: rtrt-${{ needs.preflight.outputs.version }}-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Verify existing GitHub bytes and remote paired tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          (cd artifacts && for checksum in *.sha256; do sha256sum -c "$checksum"; done)
+          node scripts/release-assets.mjs check "$RELEASE_VERSION" "$RELEASE_SOURCE_SHA" artifacts
+
   publish-platform-npm:
     name: Publish dashboard ${{ matrix.platform }}
-    needs: [preflight, build, package-npm]
+    needs: [preflight, license-inventory, build, package-npm, validate-github-assets]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: npm-publish
@@ -254,7 +339,7 @@ jobs:
 
   publish-npm:
     name: Publish and verify npm
-    needs: [preflight, build, package-npm, publish-platform-npm]
+    needs: [preflight, license-inventory, build, package-npm, publish-platform-npm]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: npm-publish
@@ -348,7 +433,7 @@ jobs:
 
   release:
     name: Create or update GitHub Release
-    needs: [preflight, build, publish-npm]
+    needs: [preflight, license-inventory, build, publish-npm]
     if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -378,16 +463,13 @@ jobs:
           source scripts/release-helpers.sh
           extract_changelog_section CHANGELOG.md "$RELEASE_VERSION" > body.md
           test -s body.md
-      - name: Publish GitHub Release after npm verification
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          tag_name: ${{ needs.preflight.outputs.version_tag }}
-          name: ${{ needs.preflight.outputs.version_tag }}
-          body_path: body.md
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          files: |
-            artifacts/*.tar.gz
-            artifacts/*.tar.gz.sha256
-            artifacts/*.zip
-            artifacts/*.zip.sha256
+          node-version: 24
+          package-manager-cache: false
+      - name: Recheck remote paired tags and append missing GitHub assets only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+        run: node scripts/release-assets.mjs publish "$RELEASE_VERSION" "$RELEASE_SOURCE_SHA" artifacts body.md

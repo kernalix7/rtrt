@@ -232,7 +232,7 @@ impl AppState {
     ) -> Result<Self> {
         // Context fields are inert on global routes. Project routes always
         // replace them through selector middleware before handler extraction.
-        let placeholder_root = home.join(".rtrt/dashboard");
+        let placeholder_root = home.join(".rtrt").join("dashboard");
         let project = Arc::new(ProjectIdentity::derive(&placeholder_root)?);
         Ok(Self {
             gateway,

@@ -22,7 +22,7 @@ cargo build --release --workspace</code></pre>
 [![Latest](https://img.shields.io/github/v/release/kernalix7/rtrt?include_prereleases&style=for-the-badge&label=latest&color=2962FF)](https://github.com/kernalix7/rtrt/releases)
 
 [![license](https://img.shields.io/github/license/kernalix7/rtrt?style=flat-square&color=blue)](../LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-CE412B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![rust](https://img.shields.io/badge/rust-1.88%2B-CE412B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![edition](https://img.shields.io/badge/edition-2024-CE412B?style=flat-square)](https://doc.rust-lang.org/edition-guide/)
 [![CI](https://img.shields.io/github/actions/workflow/status/kernalix7/rtrt/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/kernalix7/rtrt/actions/workflows/ci.yml)
 [![stars](https://img.shields.io/github/stars/kernalix7/rtrt?style=flat-square&color=FFD93D&logo=github&logoColor=white)](https://github.com/kernalix7/rtrt/stargazers)
@@ -34,7 +34,7 @@ cargo build --release --workspace</code></pre>
 ---
 
 > ### 상태: 알파
-> RTRT는 초기 단계입니다. 이 소스 트리는 **v0.2.0**을 대상으로 합니다. MCP(stdio + Streamable HTTP), 프로바이더 채팅, BM25 + vector + graph + HNSW 메모리, 자동 캡처, 설치 / 제거, 벤치마크가 구현돼 있습니다. CI는 워크스페이스 테스트, clippy, 포맷, 옵트인 feature 컴파일 검사, macOS Intel 테스트를 실행합니다. 문제는 <https://github.com/kernalix7/rtrt/issues>에 보고해 주세요.
+> RTRT는 초기 단계입니다. 이 소스 트리는 **v0.2.1**을 대상으로 합니다. MCP(stdio + Streamable HTTP), 프로바이더 채팅, BM25 + vector + graph + HNSW 메모리, 자동 캡처, 설치 / 제거, 벤치마크가 구현돼 있습니다. CI는 워크스페이스 테스트, clippy, 포맷, 옵트인 feature 컴파일 검사, macOS Intel 테스트를 실행합니다. 문제는 <https://github.com/kernalix7/rtrt/issues>에 보고해 주세요.
 
 RTRT는 세 기둥만 합칩니다. [`DESIGN.ko.md`](DESIGN.ko.md)에 10개 원칙, [`PERF.ko.md`](PERF.ko.md)에 SLO 표 + 최신 측정값. 프레임워크가 아닌 유닉스 도구 모음 — 안정된 substrate (SQLite / Markdown / JSONL / SHA-256 / Rust / tree-sitter / MCP / SSE / 파이프) 위에 얇은 러스트 레이어. 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 맡깁니다. 핵심 크레이트 zero-`unsafe`, edition 2024.
 

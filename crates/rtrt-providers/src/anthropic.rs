@@ -209,10 +209,10 @@ fn decode_event(event: &str, data: &str) -> Result<Option<ChatStreamEvent>> {
         "content_block_delta" => {
             let v: ContentBlockDelta = serde_json::from_str(data)
                 .map_err(|e| Error::Provider(format!("anthropic delta: {e}")))?;
-            if v.delta.r#type == "text_delta" {
-                if let Some(text) = v.delta.text {
-                    return Ok(Some(ChatStreamEvent::Delta { text }));
-                }
+            if v.delta.r#type == "text_delta"
+                && let Some(text) = v.delta.text
+            {
+                return Ok(Some(ChatStreamEvent::Delta { text }));
             }
             Ok(None)
         }

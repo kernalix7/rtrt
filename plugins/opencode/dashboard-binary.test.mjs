@@ -139,6 +139,9 @@ for (const scenario of binaryPolicyCases) {
     const powershell = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     const harness = `
 $script:visitedRoot = $false
+$script:readRootAcl = $false
+$script:injectedOwner = $false
+$script:injectedAce = $false
 $root = 'C:\\'
 $file = 'C:\\Users\\fixture\\node_modules\\package\\bin\\rtrt-dashboard.exe'
 $trusted = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
@@ -152,26 +155,37 @@ function Get-Acl {
   param([string] $LiteralPath)
   $isFile = $LiteralPath -eq $file
   $acl = if ($isFile) { New-Object Security.AccessControl.FileSecurity } else { New-Object Security.AccessControl.DirectorySecurity }
-  $owner = if ($env:RTRT_TEST_OWNER -eq 'untrusted' -and $LiteralPath -eq $root -or
-               $env:RTRT_TEST_OWNER -eq 'untrusted-file' -and $isFile) { $untrusted }
-           elseif ($LiteralPath -eq $root) { $trusted }
-           else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+  $owner = if (($env:RTRT_TEST_OWNER -eq 'untrusted' -and $LiteralPath -eq $root) -or
+               ($env:RTRT_TEST_OWNER -eq 'untrusted-file' -and $isFile)) { $untrusted }
+            elseif ($LiteralPath -eq $root) { $trusted }
+            else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
   $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier $owner))
-  if ($env:RTRT_TEST_WHERE -eq 'root' -and $LiteralPath -eq $root -or
-      $env:RTRT_TEST_WHERE -eq 'file' -and $isFile) {
+  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner) { throw 'Fixture owner injection failed' }
+  if ($LiteralPath -eq $root) { $script:readRootAcl = $true }
+  if ($owner -eq $untrusted) { $script:injectedOwner = $true }
+  if (($env:RTRT_TEST_WHERE -eq 'root' -and $LiteralPath -eq $root) -or
+      ($env:RTRT_TEST_WHERE -eq 'file' -and $isFile)) {
     $sid = switch ($env:RTRT_TEST_SID) {
       'trusted' { $trusted }
       'creator' { 'S-1-3-0' }
       default { $untrusted }
     }
-    $rights = if ($env:RTRT_TEST_RIGHTS -like '0x*') {
-      [Security.AccessControl.FileSystemRights][Convert]::ToInt32($env:RTRT_TEST_RIGHTS.Substring(2), 16)
+    $mask = if ($env:RTRT_TEST_RIGHTS -like '0x*') {
+      [Convert]::ToInt32($env:RTRT_TEST_RIGHTS.Substring(2), 16)
     } else { [Security.AccessControl.FileSystemRights][Enum]::Parse([Security.AccessControl.FileSystemRights], $env:RTRT_TEST_RIGHTS) }
-    $flags = if ($env:RTRT_TEST_PROP -eq 'InheritOnly') { 'ContainerInherit,ObjectInherit' } else { 'None' }
-    $rule = New-Object Security.AccessControl.FileSystemAccessRule -ArgumentList @((New-Object Security.Principal.SecurityIdentifier $sid), $rights, $flags, $env:RTRT_TEST_PROP, 'Allow')
-    if ($env:RTRT_TEST_RIGHTS -like '0x*' -and
-        (([int]$rule.FileSystemRights -band [int]$rights) -eq 0)) { throw 'Fixture lost generic mask' }
+    $flags = if ($env:RTRT_TEST_PROP -eq 'InheritOnly') { [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit' } else { [Security.AccessControl.InheritanceFlags]::None }
+    $propagation = [Security.AccessControl.PropagationFlags]$env:RTRT_TEST_PROP
+    # Public factory accepts a raw Int32 access mask; the public constructor requires
+    # FileSystemRights and rejects the generic bits (0x10000000 / 0x40000000).
+    $rule = $acl.AccessRuleFactory((New-Object Security.Principal.SecurityIdentifier $sid), [int]$mask, $false, $flags, $propagation, [Security.AccessControl.AccessControlType]::Allow)
     $acl.AddAccessRule($rule)
+    $readback = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+      $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+      $_.InheritanceFlags -eq $flags -and $_.PropagationFlags -eq $propagation -and
+      (([int]$_.FileSystemRights -band [int]$mask) -eq [int]$mask)
+    })
+    if ($readback.Count -ne 1) { throw 'Fixture lost generic mask or ACE on descriptor readback' }
+    $script:injectedAce = $true
   }
   $acl
 }
@@ -179,7 +193,7 @@ try {
 ${policy}
   $result = 'accept'
 } catch { $result = $_.Exception.Message }
-[pscustomobject]@{ Result = $result; VisitedRoot = $script:visitedRoot } | ConvertTo-Json -Compress
+[pscustomobject]@{ Result = $result; VisitedRoot = $script:visitedRoot; ReadRootAcl = $script:readRootAcl; InjectedOwner = $script:injectedOwner; InjectedAce = $script:injectedAce } | ConvertTo-Json -Compress
 `
     // When: run the unmodified production binary-check branch against the typed ACLs.
     const { stdout } = await promisify(execFile)(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
@@ -193,6 +207,9 @@ ${policy}
     // Then: accepted paths reach C:\; early file refusals need not walk further.
     const decision = JSON.parse(stdout.trim())
     assert.equal(decision.VisitedRoot, scenario.rootVisited ?? true)
+    assert.equal(decision.ReadRootAcl, scenario.rootVisited ?? true, "fixture must return the root descriptor to policy")
+    assert.equal(decision.InjectedOwner, Boolean(scenario.owner?.startsWith("untrusted")), "fixture must inject the selected owner")
+    assert.equal(decision.InjectedAce, Boolean(scenario.where), "fixture must retain the selected ACE before the decision")
     assert.equal(decision.Result, scenario.result)
   })
 }

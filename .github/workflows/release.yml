@@ -79,6 +79,14 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+      - name: Fetch every locked workspace dependency for the offline consumer
+        # `cargo fetch --locked` hydrates the full locked dependency closure (host +
+        # build-dependencies, all platforms reachable through the resolver). The five-
+        # target loop below only fetches archives for the explicit release triples,
+        # which omits transitively-referenced crates such as
+        # `android_system_properties v0.1.5` that `cargo metadata --locked --offline`
+        # still needs because the inventory graph is target-agnostic.
+        run: cargo fetch --locked
       - name: Fetch locked release target crates
         run: |
           set -euo pipefail
@@ -216,6 +224,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Fetch every locked workspace dependency for offline npm tests
+        # Hydrates the full closure (host + build-deps, all platforms). The five-target
+        # loop below only covers the explicit release triples; npm-test subprocesses
+        # still call `cargo metadata --locked --offline` which is target-agnostic.
+        working-directory: ${{ github.workspace }}
+        run: cargo fetch --locked
       - name: Fetch locked release target crates for offline npm tests
         working-directory: ${{ github.workspace }}
         run: |

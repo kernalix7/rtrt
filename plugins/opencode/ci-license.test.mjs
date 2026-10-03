@@ -11,15 +11,34 @@ const ci = yaml('ci')
 const release = yaml('release')
 const targets = release.jobs.build.strategy.matrix.include.map(({ target }) => target)
 
+// A step whose `run` is a bare `cargo fetch --locked` (no `--target`). This hydrates
+// the full locked dependency closure; the five-target loop below only fetches archives
+// for explicit release triples, which omits transitively-referenced crates such as
+// `android_system_properties v0.1.5` that `cargo metadata --locked --offline` still
+// needs because the inventory graph is target-agnostic.
+function completeFetchIndex(steps) {
+  return steps.findIndex(({ run }) =>
+    typeof run === 'string' && run.split('\n').some((line) => line.trim() === 'cargo fetch --locked'))
+}
+
 function assertFetchBefore(job, following) {
   const steps = job.steps
   const rust = steps.findIndex(({ uses }) => uses?.startsWith('dtolnay/rust-toolchain@'))
   const cache = steps.findIndex(({ uses }) => uses?.startsWith('Swatinem/rust-cache@'))
   const fetch = steps.findIndex(({ run }) => run?.includes('cargo fetch --locked --target "$target"'))
+  const complete = completeFetchIndex(steps)
   const after = steps.findIndex(({ run }) => run?.includes(following))
   assert.ok(rust >= 0 && rust < cache && cache < fetch && fetch < after,
     'pinned Rust, Cargo cache and locked fetch must precede the offline consumer')
   for (const target of targets) assert.ok(steps[fetch].run.includes(target), `fetch misses ${target}`)
+  // The five-target loop only fetches archives for explicit release triples; it
+  // omits transitively-referenced platform-conditional crates (e.g. the Android
+  // archive) that the target-agnostic `cargo metadata --locked --offline` consumer
+  // still resolves. Require a standalone `cargo fetch --locked` step (no --target)
+  // to hydrate the full locked closure before the consumer.
+  assert.ok(complete >= 0, 'a complete `cargo fetch --locked` step (no --target) must hydrate the full closure')
+  assert.ok(complete < after, 'complete fetch must precede the offline consumer')
+  assert.ok(complete > cache, 'complete fetch must follow the Cargo cache restore')
 }
 
 function assertLicenseGate(workflow) {
@@ -45,6 +64,21 @@ function assertLicenseGate(workflow) {
   assertFetchBefore(jobs['package-npm'], 'npm test')
 }
 
+function assertCiFetch(job, following) {
+  const steps = job.steps
+  const rust = steps.findIndex(({ uses }) => uses?.startsWith('dtolnay/rust-toolchain@'))
+  const cache = steps.findIndex(({ uses }) => uses?.startsWith('Swatinem/rust-cache@'))
+  const fetch = steps.findIndex(({ run }) => run?.includes('cargo fetch --locked --target "$target"'))
+  const complete = completeFetchIndex(steps)
+  const after = steps.findIndex(({ run }) => run?.includes(following))
+  assert.ok(rust >= 0 && rust < cache && cache < fetch && fetch < after,
+    'pinned Rust, Cargo cache and locked fetch must precede the offline CI consumer')
+  for (const target of targets) assert.ok(steps[fetch].run.includes(target), `fetch misses ${target}`)
+  assert.ok(complete >= 0, 'CI needs a complete `cargo fetch --locked` step (no --target) for the offline consumer')
+  assert.ok(complete < after, 'complete fetch must precede the offline consumer')
+  assert.ok(complete > cache, 'complete fetch must follow the Cargo cache restore')
+}
+
 test('release inventory is unconditional and upstream of every publication and staging job', () => {
   // Given: the actual parsed Actions job DAG.
   // When: publication, archive and npm-package prerequisites are inspected.
@@ -52,13 +86,14 @@ test('release inventory is unconditional and upstream of every publication and s
   assertLicenseGate(release)
 })
 
-test('fresh CI Node test jobs fetch the five locked target registries before offline tests', () => {
+test('fresh CI Node test jobs hydrate the full closure and the five locked target registries before offline tests', () => {
   // Given: the real CI jobs and the release build target matrix.
-  // When: CI's offline notice test setup is inspected.
-  // Then: the cache is populated before npm test; CI independently checks inventory.
-  assertFetchBefore(ci.jobs.opencode, 'npm test')
+  // When: CI's offline notice test and npm test setup are inspected.
+  // Then: the cache is populated by a complete fetch AND the five-target loop
+  // before each offline consumer; CI independently checks inventory.
+  assertCiFetch(ci.jobs.opencode, 'npm test')
   assert.ok(ci.jobs['license-inventory'] && !ci.jobs['license-inventory'].if)
-  assertFetchBefore(ci.jobs['license-inventory'], 'node packaging/licenses/notice-inventory.mjs')
+  assertCiFetch(ci.jobs['license-inventory'], 'node packaging/licenses/notice-inventory.mjs')
   const node = ci.jobs['license-inventory'].steps.find(({ uses }) => uses?.startsWith('actions/setup-node@'))
   assert.equal(node?.with?.['node-version'], 24)
 })
@@ -74,13 +109,50 @@ test('DAG and fetch fixtures reject missing inventory prerequisites', () => {
     (jobs) => { jobs['publish-npm'].needs = jobs['publish-npm'].needs.filter((name) => name !== 'license-inventory') },
     (jobs) => { jobs.release.needs = jobs.release.needs.filter((name) => name !== 'license-inventory') },
     (jobs) => { jobs['license-inventory'].if = 'false' },
+    // Strip every `cargo fetch --locked` step (loop + complete). The five-target
+    // loop alone is what the OLD workflow had; the test must keep rejecting it.
     (jobs) => { jobs['license-inventory'].steps = jobs['license-inventory'].steps.filter(({ run }) => !run?.includes('cargo fetch --locked')) },
     (jobs) => { jobs['package-npm'].steps = jobs['package-npm'].steps.filter(({ run }) => !run?.includes('cargo fetch --locked')) },
+    // Strip ONLY the standalone `cargo fetch --locked` step (no --target), leaving
+    // the five-target loop. This is the "only-five-target hydration" regression
+    // that broke the v0.2.1 fresh-cache license-inventory job (CI #111159539081).
+    (jobs) => { jobs['license-inventory'].steps = jobs['license-inventory'].steps.filter(({ run }) => !run?.split('\n').some((line) => line.trim() === 'cargo fetch --locked')) },
+    (jobs) => { jobs['package-npm'].steps = jobs['package-npm'].steps.filter(({ run }) => !run?.split('\n').some((line) => line.trim() === 'cargo fetch --locked')) },
   ]
   // When / Then: each bypass or skipped prerequisite fails the structural contract.
   for (const edit of edits) {
     const fixture = structuredClone(release)
     edit(fixture.jobs)
-    assert.throws(() => assertLicenseGate(fixture))
+    assert.throws(() => assertLicenseGate(fixture), undefined, `edit ${edit.toString().slice(0, 80)} accepted`)
+  }
+})
+
+test('CI fetch fixtures reject the five-target loop as the sole hydration', () => {
+  // Given: a valid CI workflow with one offline-hydration prerequisite removed.
+  // Each edit represents a real regression mode that surfaced in v0.2.1.
+  const probe = (workflow) => {
+    assertCiFetch(workflow.jobs['license-inventory'], 'node packaging/licenses/notice-inventory.mjs')
+    assertCiFetch(workflow.jobs.opencode, 'npm test')
+  }
+  assert.doesNotThrow(() => probe(ci))
+  const edits = [
+    // Strip every `cargo fetch --locked` step (loop + complete) from the inventory
+    // and npm-test jobs. This is what the OLD CI workflow was doing.
+    (jobs) => { jobs['license-inventory'].steps = jobs['license-inventory'].steps.filter(({ run }) => !run?.includes('cargo fetch --locked')) },
+    (jobs) => { jobs.opencode.steps = jobs.opencode.steps.filter(({ run }) => !run?.includes('cargo fetch --locked')) },
+    // Strip ONLY the standalone `cargo fetch --locked` step (no --target), leaving
+    // the five-target loop. The OLD v0.2.1 CI shipped exactly this and broke on a
+    // fresh cache because `android_system_properties v0.1.5` is not an explicit
+    // release triple but the target-agnostic `cargo metadata --locked --offline`
+    // still resolves it.
+    (jobs) => { jobs['license-inventory'].steps = jobs['license-inventory'].steps.filter(({ run }) => !run?.split('\n').some((line) => line.trim() === 'cargo fetch --locked')) },
+    (jobs) => { jobs.opencode.steps = jobs.opencode.steps.filter(({ run }) => !run?.split('\n').some((line) => line.trim() === 'cargo fetch --locked')) },
+  ]
+  // When / Then: each bypass fails the structural consumer check.
+  for (const edit of edits) {
+    const fixture = structuredClone(ci)
+    edit(fixture.jobs)
+    assert.throws(() => probe(fixture), undefined,
+      `CI edit ${edit.toString().slice(0, 80)} accepted only-five-target hydration`)
   }
 })

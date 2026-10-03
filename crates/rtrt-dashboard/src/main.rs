@@ -148,7 +148,7 @@ fn load_machine_config(home: &std::path::Path) -> Result<rtrt_core::Config> {
         }
         return Ok(rtrt_core::Config::default());
     }
-    let path = home.join(".rtrt/config.toml");
+    let path = home.join(".rtrt").join("config.toml");
     if !path.exists() {
         return Ok(rtrt_core::Config::default());
     }
@@ -187,7 +187,7 @@ impl MachineStartup {
             .ok_or_else(|| anyhow::anyhow!("cannot resolve operator home"))?;
         anyhow::ensure!(home.is_absolute(), "invalid operator home");
         let home = std::fs::canonicalize(home)?;
-        let expected = home.join(".rtrt/dashboard");
+        let expected = home.join(".rtrt").join("dashboard");
         let supplied = std::path::Path::new(&args[2]);
         #[cfg(windows)]
         let matches_expected = supplied.is_absolute()
@@ -239,7 +239,7 @@ impl MachineStartup {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("dashboard credential unavailable"))?;
         Ok(Self {
-            projects_root: home.join(".rtrt/projects"),
+            projects_root: home.join(".rtrt").join("projects"),
             home,
             token,
         })

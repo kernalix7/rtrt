@@ -319,7 +319,11 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
     }
 
     // Given: a private fixture in the project scratch area, not USERPROFILE.
-    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
+    let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    let scratch = project_root.join(".rtrt").join("tmp");
     std::fs::create_dir_all(&scratch).unwrap();
     let tmp = tempfile::Builder::new()
         .prefix("machine-windows-")
@@ -327,7 +331,7 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
         .unwrap();
     let _guard = EnvGuard::new(tmp.path());
     let home = tmp.path();
-    let state = home.join(".rtrt/dashboard");
+    let state = home.join(".rtrt").join("dashboard");
     std::fs::create_dir_all(&state).unwrap();
     let system_root = std::env::var_os("SystemRoot").unwrap();
     let powershell =
@@ -364,8 +368,22 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
         ]
     };
 
+    // Given: a plain lexical path whose real target is the canonical private state.
+    let canonical_home = std::fs::canonicalize(home).unwrap();
+    let canonical_state = canonical_home.join(".rtrt").join("dashboard");
+    assert_eq!(std::fs::canonicalize(&state).unwrap(), canonical_state);
+    assert_eq!(
+        state.components().skip(1).collect::<Vec<_>>(),
+        canonical_state.components().skip(1).collect::<Vec<_>>()
+    );
     // When: Node's normal (non-verbatim) state path is passed with HOME != USERPROFILE.
-    let startup = crate::MachineStartup::parse(args()).unwrap();
+    let startup = crate::MachineStartup::parse(args()).unwrap_or_else(|error| {
+        panic!(
+            "{error}; supplied={state:?}, supplied_components={:?}, canonical_home={canonical_home:?}, canonical_state={canonical_state:?}, canonical_components={:?}",
+            state.components().collect::<Vec<_>>(),
+            canonical_state.components().collect::<Vec<_>>()
+        )
+    });
     // Then: this precise fixture is selected; no other home or token path is accepted.
     assert_eq!(startup.home, std::fs::canonicalize(home).unwrap());
     assert_eq!(startup.token, "fixture-only");
@@ -382,6 +400,14 @@ fn machine_startup_accepts_plain_home_override_only_with_private_token() {
             "--machine".into(),
             "--state-dir".into(),
             home.join(".rtrt/./dashboard").into_os_string()
+        ])
+        .is_err()
+    );
+    assert!(
+        crate::MachineStartup::parse([
+            "--machine".into(),
+            "--state-dir".into(),
+            state.join("..").join("dashboard").into_os_string()
         ])
         .is_err()
     );

@@ -59,7 +59,11 @@ mod tests {
         }
 
         // Given: an isolated private fixture, never an operator profile.
-        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rtrt/tmp");
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap();
+        let parent = project_root.join(".rtrt").join("tmp");
         std::fs::create_dir_all(&parent).unwrap();
         let fixture = parent.join(format!(
             "dashboard-acl-{}-{}",

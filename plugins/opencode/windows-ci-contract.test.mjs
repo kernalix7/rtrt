@@ -106,6 +106,29 @@ function assertWindowsDashboardContract(job) {
 
   assert.match(sd, /\$env:SystemDrive/, "must resolve the actual system drive")
   assert.match(sd, new RegExp(`'${SYSTEM_DRIVE_PREFIX}' \\+ \\[guid\\]::NewGuid\\(\\)\\.ToString\\('N'\\)`), "fixture must use the fixed prefix plus a GUID")
+  const rootCreate = "New-Item -ItemType Directory -Path $fixtureProject -ErrorAction Stop | Out-Null"
+  const aclCall = "node --input-type=module -e $aclScript $fixtureProject"
+  const createIndex = sd.indexOf(rootCreate)
+  const aclIndex = sd.indexOf(aclCall)
+  const pluginsIndex = sd.indexOf("New-Item -ItemType Directory -Path (Join-Path $fixtureProject 'plugins')")
+  assert.ok(createIndex > sd.indexOf("try {") && aclIndex > createIndex && pluginsIndex > aclIndex,
+    "fresh root must be created alone inside cleanup try, then hardened before plugins")
+  assert.equal((sd.match(/node --input-type=module -e \$aclScript \$fixtureProject\b/g) ?? []).length, 1,
+    "the fresh-root ACL sequence must run once, never as a later repair")
+  assert.ok(sd.indexOf("Copy-Item -Path") > pluginsIndex, "both ACL calls must precede every copy")
+  assert.equal((sd.match(/New-Item -ItemType Directory -Path \$fixtureProject\b/g) ?? []).length, 1,
+    "only the generated fixture root may be created as the ACL baseline")
+  const aclScript = sd.split("$aclScript = @'\n")[1]?.split("\n'@")[0]
+  assert.ok(aclScript, "ACL seeding must run a scoped Node module")
+  assert.match(aclScript, /import \{ pathToFileURL \} from "node:url"/)
+  assert.match(aclScript, /await import\(pathToFileURL\(path\.join\(process\.env\.GITHUB_WORKSPACE, "plugins", "opencode", "runtime", "dashboard-acl\.js"\)\)\.href\)/,
+    "reuse the unchanged helper from the original checkout, not the copied project")
+  assert.match(aclScript, /const \{ windowsAcl \} = await import\(/)
+  assert.match(aclScript, /await windowsAcl\(process\.argv\[1\], "private-create"\)\s+await windowsAcl\(process\.argv\[1\], "private-check"\)/,
+    "create then check exactly the new root, with no child or profile target")
+  assert.equal((aclScript.match(/await windowsAcl\(/g) ?? []).length, 2, "only private-create and private-check may run")
+  assert.doesNotMatch(aclScript, /catch\b|\.catch\s*\(|Set-Acl|icacls|retry/i, "ACL failure must stop the copy without repair or fallback")
+  assert.match(sd.slice(aclIndex, pluginsIndex), /if \(\$LASTEXITCODE -ne 0\) \{ throw/, "a failed Node child must terminate before plugins")
   assert.match(sd, /Copy-Item -Path \(Join-Path \$env:GITHUB_WORKSPACE 'plugins\\opencode'\)/, "must copy plugins/opencode into the fixture")
   assert.match(sd, /Copy-Item -Path \(Join-Path \$env:GITHUB_WORKSPACE 'install\.ps1'\)/, "must copy install.ps1 into the fixture")
   assert.match(sd, /Push-Location \$copiedProject/, "the real tests must execute from the copied project")
@@ -298,6 +321,33 @@ test("copied-project order, cleanup, and D-root refusal cannot be weakened", () 
     const fixture = structuredClone(baseline)
     mutate(fixture)
     assert.throws(() => assertWindowsDashboardContract(fixture), `mutation ${index} escaped the copied-project/refusal contract`)
+  }
+})
+
+test("fresh owned-root ACL baseline rejects missing, reordered, misdirected, and repaired seeding", () => {
+  // Given: the shipped copied-project step, mutated at one boundary per fixture.
+  const baseline = ci.jobs[JOB]
+  const mutations = [
+    (job) => replaceInStep(job, "New-Item -ItemType Directory -Path $fixtureProject -ErrorAction Stop | Out-Null", "Write-Host 'root skipped'"),
+    (job) => replaceInStep(job, "-Path $fixtureProject -ErrorAction Stop | Out-Null", "-Path $fixtureProject -Force | Out-Null"),
+    (job) => replaceInStep(job, 'await windowsAcl(process.argv[1], "private-create")', 'await windowsAcl(process.argv[1], "private-check")'),
+    (job) => replaceInStep(job,
+      'await windowsAcl(process.argv[1], "private-create")\nawait windowsAcl(process.argv[1], "private-check")',
+      'await windowsAcl(process.argv[1], "private-check")\nawait windowsAcl(process.argv[1], "private-create")'),
+    (job) => replaceInStep(job, "node --input-type=module -e $aclScript $fixtureProject", "node --input-type=module -e $aclScript $driveRoot"),
+    (job) => replaceInStep(job, "node --input-type=module -e $aclScript $fixtureProject", "node --input-type=module -e $aclScript $env:USERPROFILE"),
+    (job) => replaceInStep(job, 'await windowsAcl(process.argv[1], "private-check")', 'await windowsAcl(process.argv[1], "private-create")\n          await windowsAcl(process.argv[1], "private-check")'),
+    (job) => {
+      const step = findRunStep(job, "node --input-type=module -e $aclScript $fixtureProject")
+      const call = "node --input-type=module -e $aclScript $fixtureProject"
+      step.run = step.run.replace(call, "").replace("Push-Location $copiedProject", `${call}\n          Push-Location $copiedProject`)
+    },
+  ]
+  // When / Then: each mutation violates the fresh-root-only, fail-closed ordering.
+  for (const [index, mutate] of mutations.entries()) {
+    const fixture = structuredClone(baseline)
+    mutate(fixture)
+    assert.throws(() => assertWindowsDashboardContract(fixture), `ACL seed mutation ${index} escaped the contract`)
   }
 })
 

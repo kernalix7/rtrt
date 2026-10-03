@@ -318,6 +318,17 @@ jobs:
           $guard = Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode\windows-ci-tap-guard.mjs'
           $pushed = $false
           try {
+            New-Item -ItemType Directory -Path $fixtureProject -ErrorAction Stop | Out-Null
+            $aclScript = @'
+          import path from "node:path"
+          import { pathToFileURL } from "node:url"
+
+          const { windowsAcl } = await import(pathToFileURL(path.join(process.env.GITHUB_WORKSPACE, "plugins", "opencode", "runtime", "dashboard-acl.js")).href)
+          await windowsAcl(process.argv[1], "private-create")
+          await windowsAcl(process.argv[1], "private-check")
+          '@
+            node --input-type=module -e $aclScript $fixtureProject
+            if ($LASTEXITCODE -ne 0) { throw "owned fixture root ACL seeding failed ($LASTEXITCODE)" }
             New-Item -ItemType Directory -Path (Join-Path $fixtureProject 'plugins') -Force | Out-Null
             Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'plugins\opencode') -Destination (Join-Path $fixtureProject 'plugins') -Recurse -Force
             Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') -Destination (Join-Path $fixtureProject 'install.ps1') -Force

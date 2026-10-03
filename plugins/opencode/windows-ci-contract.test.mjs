@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import { assertWindowsTap } from "./windows-ci-tap-guard.mjs"
@@ -159,6 +160,25 @@ test("Windows PS5 installer parser gate runs read-only before the dashboard buil
   assert.match(source, /ErrorId.*StartLineNumber.*StartColumnNumber.*Message/)
   assert.match(source, /timeout: 45000, maxBuffer: 4096/)
   assert.doesNotMatch(source, /ParseInput|Invoke-Expression|Set-Acl|\.NET\.Encoding|ReadAllText/)
+})
+
+test("Windows PS5 installer source stays pure ASCII without a BOM", () => {
+  // Given: the shipped install.ps1 that BOMless Windows PowerShell 5.1 reads as ANSI.
+  const bytes = readFileSync(`${root}install.ps1`)
+  // When: the raw bytes are inspected before any decoding.
+  const nonAscii = [...bytes].filter((byte) => byte > 0x7f)
+  // Then: there is no UTF-8 BOM and every byte is ASCII, so the PS5 ANSI read
+  // cannot fold a multi-byte character into a smart-quote token delimiter.
+  assert.notDeepEqual(
+    [...bytes.subarray(0, 3)],
+    [0xef, 0xbb, 0xbf],
+    "install.ps1 must not begin with a UTF-8 BOM",
+  )
+  assert.deepEqual(
+    nonAscii,
+    [],
+    "install.ps1 must stay ASCII-only so Windows PowerShell 5.1 tokenizes every byte identically",
+  )
 })
 
 test("each weakened Windows dashboard ACL job structure is rejected", () => {

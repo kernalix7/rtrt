@@ -1,4 +1,4 @@
-# RTRT installer — Windows PowerShell.
+# RTRT installer - Windows PowerShell.
 #
 # One-liner install:
 #   irm https://raw.githubusercontent.com/kernalix7/rtrt/main/install.ps1 | iex
@@ -14,7 +14,7 @@
 #   -InstallDir <path>    Install dir (default: $env:LOCALAPPDATA\Programs\rtrt).
 #   -SkipDeps             Skip toolchain check (fail early if missing).
 #                         (env: RTRT_SKIP_DEPS=1)
-#   -Uninstall            Compat shim — removes only an owned task + binaries.
+#   -Uninstall            Compat shim - removes only an owned task + binaries.
 #   -NoSetup              Disable agent setup. Linux strict OpenCode bootstrap
 #                         is unsupported on native Windows. (env: RTRT_NO_SETUP=1)
 #   -NoService            Don't register the rtrt-dashboard logon task.
@@ -36,7 +36,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Windows PowerShell 5.1 may default to TLS 1.0 — force TLS 1.2+ so the
+# Windows PowerShell 5.1 may default to TLS 1.0 - force TLS 1.2+ so the
 # GitHub API / release downloads don't fail the handshake.
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
@@ -139,7 +139,7 @@ function Show-InstallCheck {
     if (-not ($current.Split($pathSep) -contains $InstallDir)) {
         Write-Host ""
         Write-Warn "$InstallDir is not on `$env:PATH."
-        # NOT `setx PATH` — that flattens machine+user PATH into the user value
+        # NOT `setx PATH` - that flattens machine+user PATH into the user value
         # and truncates it at 1024 characters.
         Write-Warn "  Add it (user scope, new shells) via:"
         Write-Warn "    [Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path','User') + ';$InstallDir'), 'User')"
@@ -299,7 +299,7 @@ function Install-DashboardTask {
     Register-ScheduledTask -TaskName $DashboardTaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Description $DashboardTaskMarker -Force | Out-Null
     Start-ScheduledTask -TaskName $DashboardTaskName
-    Write-Log "  dashboard task registered + started — http://127.0.0.1:7311"
+    Write-Log "  dashboard task registered + started - http://127.0.0.1:7311"
 }
 
 function Build-FromSource($SrcDir) {
@@ -361,7 +361,7 @@ if (-not $Version) {
         $Version = $null
     }
     if (-not $Version) {
-        Write-Warn "no GitHub Release published yet — falling back to source build from main."
+        Write-Warn "no GitHub Release published yet - falling back to source build from main."
         Write-Warn "Pass -Version vX.Y.Z to pin a release once one is cut, or -Ref BRANCH to track a different branch."
         Write-Host ""
         Require-Cmd git

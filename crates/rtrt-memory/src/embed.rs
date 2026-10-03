@@ -59,17 +59,16 @@ pub fn vector_to_blob(v: &[f32]) -> Vec<u8> {
 
 /// Little-endian f32 byte BLOB → Vec<f32>. Returns an error if `blob.len() % 4 != 0`.
 pub fn vector_from_blob(blob: &[u8]) -> Result<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return Err(Error::Memory(format!(
             "vector blob length {} is not 4-aligned",
             blob.len()
         )));
     }
-    let mut out = Vec::with_capacity(blob.len() / 4);
-    for chunk in blob.chunks_exact(4) {
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(chunk);
-        out.push(f32::from_le_bytes(buf));
+    let (chunks, _) = blob.as_chunks::<4>();
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
@@ -509,5 +508,13 @@ mod tests {
         let b = vector_to_blob(&v);
         let back = vector_from_blob(&b).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn vector_from_blob_rejects_unaligned_length() {
+        assert!(vector_from_blob(&[]).unwrap().is_empty());
+        assert!(vector_from_blob(&[0u8; 4]).is_ok());
+        assert!(vector_from_blob(&[0u8; 3]).is_err());
+        assert!(vector_from_blob(&[0u8; 5]).is_err());
     }
 }

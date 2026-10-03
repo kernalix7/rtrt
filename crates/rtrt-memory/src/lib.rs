@@ -1696,12 +1696,12 @@ impl std::hash::Hasher for FxHasher {
         // Process whole u64 words where possible; the clusterer only ever feeds
         // u64 / u32 / usize keys, so this hot path dominates.
         const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            let word = u64::from_le_bytes(c.try_into().unwrap());
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for c in chunks {
+            let word = u64::from_le_bytes(*c);
             self.state = (self.state.rotate_left(5) ^ word).wrapping_mul(SEED);
         }
-        for &b in chunks.remainder() {
+        for &b in remainder {
             self.state = (self.state.rotate_left(5) ^ b as u64).wrapping_mul(SEED);
         }
     }
@@ -1802,10 +1802,10 @@ impl MemoryStore {
     /// Explicit legacy/admin/migration open. This never infers or applies a
     /// project identity and remains compatible with existing arbitrary paths.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(Error::Io)?;
-            }
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(Error::Io)?;
         }
         let conn = Connection::open(path.as_ref()).map_err(|e| Error::Memory(e.to_string()))?;
         // WAL lets readers (dashboard API) proceed while a writer (the transcript
@@ -4343,10 +4343,10 @@ impl MemoryStore {
                 .map_err(|e| Error::Memory(e.to_string()))?;
             for row in it {
                 let (id, blob) = row.map_err(|e| Error::Memory(e.to_string()))?;
-                if id_in_scope.contains(&id) {
-                    if let Ok(v) = vector_from_blob(&blob) {
-                        vectors.push((id, v));
-                    }
+                if id_in_scope.contains(&id)
+                    && let Ok(v) = vector_from_blob(&blob)
+                {
+                    vectors.push((id, v));
                 }
             }
         }
@@ -9782,6 +9782,37 @@ mod tests {
             "the catch-all absorbed many singletons, got size {}",
             biggest.size
         );
+    }
+
+    /// Locks [`FxHasher`]'s whole-word + remainder `write` path directly: `u64`
+    /// keys hash through `write_u64`, so the cluster tests never reach it.
+    #[test]
+    fn fx_hasher_write_matches_reference_over_words_and_remainder() {
+        use std::hash::Hasher;
+
+        fn reference_fx(bytes: &[u8]) -> u64 {
+            const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+            let mut state = 0u64;
+            let mut i = 0;
+            while i + 8 <= bytes.len() {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&bytes[i..i + 8]);
+                state = (state.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(SEED);
+                i += 8;
+            }
+            while i < bytes.len() {
+                state = (state.rotate_left(5) ^ bytes[i] as u64).wrapping_mul(SEED);
+                i += 1;
+            }
+            state
+        }
+
+        for len in 0..=17usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let mut hasher = FxHasher::default();
+            hasher.write(&bytes);
+            assert_eq!(hasher.finish(), reference_fx(&bytes), "len {len}");
+        }
     }
 
     /// The pure [`ctfidf_label`] scorer, tested directly (no store): a token

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
@@ -15,6 +15,16 @@ const targets = [
   ["x86_64-pc-windows-msvc", "win32", "x64"],
 ]
 const stageScript = path.join(root, "packaging/npm/stage-dashboard.mjs")
+
+async function noticeFiles(directory, prefix = "THIRD_PARTY_NOTICES") {
+  const files = []
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const relative = path.posix.join(prefix, entry.name)
+    if (entry.isDirectory()) files.push(...await noticeFiles(path.join(directory, entry.name), relative))
+    else if (entry.isFile()) files.push(relative)
+  }
+  return files
+}
 
 async function workspace(t) {
   const parent = path.join(root, ".rtrt/tmp")
@@ -57,7 +67,7 @@ for (const [target, os, cpu] of targets) {
     const metadata = JSON.parse(execFileSync("tar", ["-xOf", archive, "package/package.json"]))
     // Then: filters, bytes and POSIX execute bits survive the actual tarball.
     const files = ["LICENSE", "package.json", `bin/${binary}`,
-      ...manifest.files.filter((file) => file.startsWith("THIRD_PARTY_NOTICES/"))].sort()
+      ...await noticeFiles(path.join(root, "THIRD_PARTY_NOTICES"))].sort()
     assert.deepEqual(dry[0].files.map((file) => file.path).sort(), files)
     assert.deepEqual(packed[0].files.map((file) => file.path).sort(), files)
     assert.equal(metadata.name, `rtrt-dashboard-${os}-${cpu}`)
@@ -106,7 +116,9 @@ test("agent pack includes all declared runtime files and an executable opener", 
   const [packed] = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", directory], { cwd: staged, env }))
   const archive = path.join(directory, packed.filename)
   // Then: no declared runtime is silently dropped; the bin keeps executable mode.
-  assert.deepEqual(packed.files.map((file) => file.path).sort(), ["package.json", ...manifest.files].sort())
+  assert.deepEqual(packed.files.map((file) => file.path).sort(), ["package.json",
+    ...manifest.files.filter((file) => file !== "THIRD_PARTY_NOTICES"),
+    ...await noticeFiles(path.join(root, "THIRD_PARTY_NOTICES"))].sort())
   const opener = execFileSync("tar", ["-tvf", archive, "package/bin/rtrt-dashboard-open.js"], { encoding: "utf8" })
   assert.match(opener, /^-rwxr-xr-x\s/)
   const metadata = JSON.parse(execFileSync("tar", ["-xOf", archive, "package/package.json"]))
@@ -170,7 +182,7 @@ test("REL release waits for all provenance platform publishes before agent and G
   const platforms = jobs["publish-platform-npm"]
   // Then: every native target publishes on REL only, with scoped OIDC permissions.
   assert.ok(platforms, "platform publication job exists")
-  assert.deepEqual(platforms.needs, ["preflight", "build", "package-npm"])
+  assert.deepEqual(platforms.needs, ["preflight", "license-inventory", "build", "package-npm", "validate-github-assets"])
   assert.equal(platforms.if, "needs.preflight.outputs.publish == 'true'")
   assert.deepEqual(platforms.permissions, { contents: "read", "id-token": "write" })
   assert.equal(platforms.environment, "npm-publish")

@@ -1,13 +1,17 @@
 {
   "name": "rtrt-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "RTRT provenance, permission-broker, and local dashboard plugin for OpenCode",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
-    "./server": ["./server.js"],
-    "./tui": ["./tui/v2/rtrt-statusline.tsx"]
+    "./server": [
+      "./server.js"
+    ],
+    "./tui": [
+      "./tui/v2/rtrt-statusline.tsx"
+    ]
   },
   "bin": {
     "rtrt-dashboard-open": "./bin/rtrt-dashboard-open.js"
@@ -19,6 +23,9 @@
     "v2/permissions.js",
     "bin/rtrt-dashboard-open.js",
     "runtime/dashboard-binary.js",
+    "runtime/dashboard-bootstrap.js",
+    "runtime/dashboard-acl.js",
+    "runtime/dashboard-acl.ps1",
     "runtime/dashboard-files.js",
     "runtime/dashboard-plugin.js",
     "runtime/dashboard-process.js",
@@ -32,27 +39,10 @@
     "README.md",
     "README.ko.md",
     "LICENSE",
-    "THIRD_PARTY_NOTICES/INDEX.md",
-    "THIRD_PARTY_NOTICES/cytoscape-fcose@2.2.0/LICENSE",
-    "THIRD_PARTY_NOTICES/cytoscape-cola@2.5.1/LICENSE",
-    "THIRD_PARTY_NOTICES/cose-base@2.2.0/LICENSE",
-    "THIRD_PARTY_NOTICES/layout-base@2.0.1/LICENSE",
-    "THIRD_PARTY_NOTICES/webcola@3.4.0/LICENSE",
-    "THIRD_PARTY_NOTICES/cytoscape@3.30.2/LICENSE",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/LICENSE",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/LICENSE-BoringSSL",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/LICENSE-other-bits",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/src/polyfill/once_cell/LICENSE-APACHE",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/src/polyfill/once_cell/LICENSE-MIT",
-    "THIRD_PARTY_NOTICES/ring@0.17.14/third_party/fiat/LICENSE",
-    "THIRD_PARTY_NOTICES/subtle@2.6.1/LICENSE",
-    "THIRD_PARTY_NOTICES/webpki-roots@0.26.11/LICENSE",
-    "THIRD_PARTY_NOTICES/webpki-roots@1.0.7/LICENSE",
-    "THIRD_PARTY_NOTICES/option-ext@0.2.0/LICENSE.txt",
-    "THIRD_PARTY_NOTICES/option-ext@0.2.0/SOURCE.crate"
+    "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
-    "test": "node --test rtrt-provenance.test.mjs native-v2.test.mjs native-v2-lifecycle.test.mjs v2/permissions-security.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs dashboard-supervisor.test.mjs package.test.mjs notices-package.test.mjs platform-package.test.mjs platform-publish.test.mjs tui/rtrt-statusline.test.mjs tui/v2/native-runtime.test.mjs tui/v2/native-state.test.mjs",
+    "test": "node --test rtrt-provenance.test.mjs native-v2.test.mjs native-v2-lifecycle.test.mjs v2/permissions-security.test.mjs dashboard-binary.test.mjs dashboard-open.test.mjs dashboard-supervisor.test.mjs dashboard-acl.test.mjs package.test.mjs notices-package.test.mjs platform-package.test.mjs platform-publish.test.mjs release-assets.test.mjs archive-readme.test.mjs ci-license.test.mjs release-workflow-contract.test.mjs windows-ci-contract.test.mjs tui/rtrt-statusline.test.mjs tui/v2/native-runtime.test.mjs tui/v2/native-state.test.mjs",
     "sync:platforms": "node ../../packaging/npm/agent-contract.mjs --sync"
   },
   "engines": {
@@ -85,16 +75,24 @@
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {
-    "@opencode/plugin": { "optional": true },
-    "@opentui/core": { "optional": true },
-    "@opentui/solid": { "optional": true },
-    "solid-js": { "optional": true }
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
-    "rtrt-dashboard-linux-x64": "0.2.0",
-    "rtrt-dashboard-linux-arm64": "0.2.0",
-    "rtrt-dashboard-darwin-x64": "0.2.0",
-    "rtrt-dashboard-darwin-arm64": "0.2.0",
-    "rtrt-dashboard-win32-x64": "0.2.0"
+    "rtrt-dashboard-linux-x64": "0.2.1",
+    "rtrt-dashboard-linux-arm64": "0.2.1",
+    "rtrt-dashboard-darwin-x64": "0.2.1",
+    "rtrt-dashboard-darwin-arm64": "0.2.1",
+    "rtrt-dashboard-win32-x64": "0.2.1"
   }
 }

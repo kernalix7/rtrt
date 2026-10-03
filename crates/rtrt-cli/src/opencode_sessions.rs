@@ -760,14 +760,14 @@ pub fn repair_runtime_attribution(
     }
     super::ensure_private_file(db)?;
     let generation = source_generation(db)?;
-    if let Some(roots) = read_runtime_checkpoint(db, authoritative, &generation)? {
-        if source_generation(db)? == generation {
-            return Ok(RuntimeRepair::Complete(RuntimeRepairReport {
-                valid_root_sessions: roots,
-                checkpoint_hit: true,
-                ..RuntimeRepairReport::default()
-            }));
-        }
+    if let Some(roots) = read_runtime_checkpoint(db, authoritative, &generation)?
+        && source_generation(db)? == generation
+    {
+        return Ok(RuntimeRepair::Complete(RuntimeRepairReport {
+            valid_root_sessions: roots,
+            checkpoint_hit: true,
+            ..RuntimeRepairReport::default()
+        }));
     }
     // Absence of OpenCode's cache is authoritative for global only after a
     // successful probe. A stale/missing checkpoint must never revive that
@@ -2102,11 +2102,11 @@ fn route_sessions(
     for _ in 0..rows["session"].len() {
         let mut changed = false;
         for (child, parent) in &parents {
-            if !sessions.contains_key(child) {
-                if let Some(destination) = sessions.get(parent).cloned() {
-                    sessions.insert(child.clone(), destination);
-                    changed = true;
-                }
+            if !sessions.contains_key(child)
+                && let Some(destination) = sessions.get(parent).cloned()
+            {
+                sessions.insert(child.clone(), destination);
+                changed = true;
             }
         }
         if !changed {
@@ -2128,10 +2128,9 @@ fn route_sessions(
         if let (Some(id), Some(session)) = (
             text_field(message_table, row, "id"),
             text_field(message_table, row, "session_id"),
-        ) {
-            if let Some(destination) = sessions.get(session) {
-                messages.insert(id.to_string(), destination.clone());
-            }
+        ) && let Some(destination) = sessions.get(session)
+        {
+            messages.insert(id.to_string(), destination.clone());
         }
     }
     let destinations = sessions.values().cloned().collect::<BTreeSet<_>>();

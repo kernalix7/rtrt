@@ -254,10 +254,10 @@ fn project_for_ancestors<'a>(start: &Path, ancestors: impl Iterator<Item = &'a P
 
         if meta.is_file() {
             // Linked worktree: resolve the main repo from the gitdir pointer.
-            if let Some(main_root) = main_repo_root_from_gitfile(&dot_git) {
-                if let Some(name) = basename(&main_root) {
-                    return name;
-                }
+            if let Some(main_root) = main_repo_root_from_gitfile(&dot_git)
+                && let Some(name) = basename(&main_root)
+            {
+                return name;
             }
             // Worktree pointer was unreadable/unparsable: this ancestor still
             // belongs to *some* repo, so prefer its basename over digging higher.
@@ -329,16 +329,15 @@ pub fn claude_runtime_tmp_dir(project_root: &Path) -> io::Result<PathBuf> {
 
     #[cfg(unix)]
     {
-        if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            if let Ok(xdg_runtime) =
+        if let Some(xdg_runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+            && let Ok(xdg_runtime) =
                 validated_xdg_runtime_dir(Path::new(&xdg_runtime), expected_owner)
-            {
-                return prepare_claude_runtime_tmp_dir_in(
-                    &xdg_runtime,
-                    identity.fingerprint(),
-                    expected_owner,
-                );
-            }
+        {
+            return prepare_claude_runtime_tmp_dir_in(
+                &xdg_runtime,
+                identity.fingerprint(),
+                expected_owner,
+            );
         }
         prepare_claude_runtime_tmp_dir_in(Path::new("/tmp"), identity.fingerprint(), expected_owner)
     }

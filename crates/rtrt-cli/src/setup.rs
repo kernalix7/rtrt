@@ -2216,17 +2216,17 @@ fn drop_opencode_tui_config_at(path: &Path, apply: bool) -> Result<()> {
     backup_if_needed(path)?;
     std::fs::write(path, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("write {}", path.display()))?;
-    if let Some(state_path) = state_path {
-        if let Err(error) = std::fs::remove_file(&state_path) {
-            let rollback = std::fs::write(path, serde_json::to_string_pretty(&before)?);
-            if let Err(rollback) = rollback {
-                bail!(
-                    "remove {} failed ({error}); TUI config rollback also failed ({rollback})",
-                    state_path.display()
-                );
-            }
-            return Err(error).with_context(|| format!("remove {}", state_path.display()));
+    if let Some(state_path) = state_path
+        && let Err(error) = std::fs::remove_file(&state_path)
+    {
+        let rollback = std::fs::write(path, serde_json::to_string_pretty(&before)?);
+        if let Err(rollback) = rollback {
+            bail!(
+                "remove {} failed ({error}); TUI config rollback also failed ({rollback})",
+                state_path.display()
+            );
         }
+        return Err(error).with_context(|| format!("remove {}", state_path.display()));
     }
     println!(
         "removed OpenCode TUI statusline plugin from {}",

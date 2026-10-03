@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { dashboardFiles, unavailable } from "./dashboard-files.js"
 import { resolveDashboardBinary } from "./dashboard-binary.js"
 import { launchDetached, openDashboardBrowser, probeDashboard } from "./dashboard-process.js"
+import { writeDashboardBootstrap } from "./dashboard-bootstrap.js"
 
 export function createDashboardSupervisor({
   env = process.env, platform = process.platform, arch = process.arch, uid = process.geteuid?.(),
@@ -85,7 +86,8 @@ export function createDashboardSupervisor({
       createHmac("sha256", Buffer.from(token, "hex"))
         .update("rtrt-dashboard-browser-bootstrap\0v1\0")
         .update(wire.subarray(0, 33)).digest().copy(wire, 33)
-      await openBrowser(`http://127.0.0.1:7311/#bootstrap=${wire.toString("base64url")}`, { platform })
+      const bootstrap = await writeDashboardBootstrap(files.state, wire.toString("base64url"), { platform, uid })
+      await openBrowser(bootstrap, { platform })
       return "Dashboard open requested."
     } catch {
       // Never expose dependency errors: process errors can contain the bootstrap URL.

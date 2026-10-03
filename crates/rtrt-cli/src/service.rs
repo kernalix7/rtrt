@@ -121,8 +121,9 @@ fn service_open(print_bootstrap: bool) -> Result<()> {
         println!("{url}");
         return Ok(());
     }
+    let bootstrap = write_browser_bootstrap(&state, &credential)?;
     let opener = trusted_opener()?;
-    launch_opener(&opener, &url).with_context(|| {
+    launch_opener(&opener, &bootstrap).with_context(|| {
         "browser opener failed; retry `rtrt service open` or explicitly run `rtrt service open --print-bootstrap`"
     })?;
     Ok(())
@@ -137,15 +138,76 @@ fn bootstrap_url(credential: &str, navigation_id: &str) -> Result<String> {
         "invalid bootstrap credential format"
     );
     anyhow::ensure!(
-        !navigation_id.is_empty()
-            && navigation_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
+        navigation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
         "invalid dashboard navigation id"
     );
-    Ok(format!(
-        "{DASHBOARD_URL}?open={navigation_id}#bootstrap={credential}"
-    ))
+    let marker = if navigation_id.is_empty() {
+        String::new()
+    } else {
+        format!("?open={navigation_id}")
+    };
+    Ok(format!("{DASHBOARD_URL}{marker}#bootstrap={credential}"))
+}
+
+#[cfg(unix)]
+fn write_browser_bootstrap(state: &DashboardState, credential: &str) -> Result<PathBuf> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let url = bootstrap_url(credential, "")?;
+    let destination = state.root.join("bootstrap.html");
+    let owner = std::fs::symlink_metadata(&state.root)?.uid();
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == owner
+                && metadata.permissions().mode() & 0o777 == 0o600
+                && metadata.nlink() == 1
+                && metadata.len() <= 512,
+            "refusing unsafe dashboard bootstrap file"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let temporary = state.root.join(format!(
+        ".bootstrap-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        anyhow::ensure!(
+            file.metadata()?.permissions().mode() & 0o777 == 0o600,
+            "bootstrap file is not private"
+        );
+        write!(
+            file,
+            "<!doctype html><meta http-equiv=\"refresh\" content=\"0;url={url}\">"
+        )?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(destination)
+}
+
+#[cfg(not(unix))]
+fn write_browser_bootstrap(_: &DashboardState, _: &str) -> Result<PathBuf> {
+    bail!("dashboard browser handoff is unsupported on this OS")
 }
 
 fn check_dashboard_health() -> Result<()> {
@@ -236,18 +298,24 @@ fn validate_opener(_path: &Path) -> Result<()> {
     bail!("trusted browser opener is unavailable")
 }
 
-fn launch_opener(opener: &Path, url: &str) -> Result<()> {
-    let status = opener_command(opener, url)
+fn launch_opener(opener: &Path, bootstrap: &Path) -> Result<()> {
+    let status = opener_command(opener, bootstrap)?
         .status()
         .with_context(|| format!("execute trusted browser opener {}", opener.display()))?;
     anyhow::ensure!(status.success(), "browser opener exited unsuccessfully");
     Ok(())
 }
 
-fn opener_command(opener: &Path, url: &str) -> Command {
+fn opener_command(opener: &Path, bootstrap: &Path) -> Result<Command> {
+    anyhow::ensure!(bootstrap.is_absolute(), "bootstrap path must be absolute");
+    let argument = bootstrap.to_string_lossy();
+    anyhow::ensure!(
+        !argument.contains("://") && !argument.contains('#') && !argument.contains("bootstrap="),
+        "bootstrap opener argument must be a local file path"
+    );
     let mut command = Command::new(opener);
-    command.arg(url);
-    command
+    command.arg(bootstrap);
+    Ok(command)
 }
 
 fn systemd_path(value: &str, directive: &str) -> Result<String> {
@@ -1277,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn open_url_and_exact_opener_argv_never_contain_long_token() {
+    fn ordinary_opener_argv_contains_only_local_bootstrap_path() {
         use std::ffi::OsStr;
 
         const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1285,15 +1353,46 @@ mod tests {
             rtrt_core::dashboard_bootstrap::issue_with_nonce(TOKEN, 1_000, 60, [3; 16]).unwrap();
         let url = bootstrap_url(&credential, "3e8-2a").unwrap();
         assert!(!url.contains(TOKEN));
-        assert_eq!(
-            url,
-            format!("{DASHBOARD_URL}?open=3e8-2a#bootstrap={credential}")
-        );
         let path = opener_path_for_os("linux").unwrap();
-        let command = opener_command(&path, &url);
+        let bootstrap = Path::new("/private/dashboard/bootstrap.html");
+        let command = opener_command(&path, bootstrap).unwrap();
         assert_eq!(command.get_program(), OsStr::new("/usr/bin/xdg-open"));
-        assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new(&url)]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [bootstrap.as_os_str()]
+        );
+        assert!(
+            !command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains(&credential))
+        );
         assert_ne!(command.get_program(), OsStr::new("sh"));
+        assert!(opener_command(&path, Path::new(&url)).is_err());
+    }
+
+    #[test]
+    fn ordinary_bootstrap_is_private_bounded_html_with_fixed_loopback_target() {
+        // Given
+        let home = tempfile::tempdir().unwrap();
+        let state = dashboard_state(home.path());
+        ensure_machine_dashboard_token(&state, home.path(), None).unwrap();
+        let credential = rtrt_core::dashboard_bootstrap::issue_with_nonce(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            1_000,
+            60,
+            [3; 16],
+        )
+        .unwrap();
+        // When
+        let file = write_browser_bootstrap(&state, &credential).unwrap();
+        // Then
+        assert_eq!(file, state.root.join("bootstrap.html"));
+        let metadata = std::fs::symlink_metadata(&file).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(metadata.len() < 512);
+        let html = std::fs::read_to_string(file).unwrap();
+        assert!(html.contains(&format!("{DASHBOARD_URL}#bootstrap={credential}")));
+        assert!(!html.contains("?open="));
     }
 
     #[test]

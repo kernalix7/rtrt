@@ -9,6 +9,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-06
+
 ### Fixed
 
 - Local GitHub release discovery now uses an authenticated, draft-aware lookup that reuses an existing draft, pins stable release and asset IDs, and rejects duplicate exact tag matches; paired tag/byte/inventory checks and the no-asset-clobber guard are unchanged.

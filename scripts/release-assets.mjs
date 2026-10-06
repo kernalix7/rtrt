@@ -1,13 +1,17 @@
+// Draft-aware GitHub release reconciliation.
+//
+// The release id discovered by scanning every release page (drafts included) is
+// pinned: every subsequent reread, upload, and PATCH targets that same id. The
+// read-only check never mutates. Existing bytes are re-downloaded by asset id
+// and compared before any write, and publication only happens after a complete
+// draft is re-verified.
 import { createHash } from 'node:crypto'
-import { execFile, spawn } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import { lstat, readdir } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
+import { createGithubAdapter } from './release-github.mjs'
 
-const exec = promisify(execFile)
-const repo = 'kernalix7/rtrt'
 const targets = [
   'x86_64-unknown-linux-gnu.tar.gz',
   'aarch64-unknown-linux-gnu.tar.gz',
@@ -15,7 +19,9 @@ const targets = [
   'aarch64-apple-darwin.tar.gz',
   'x86_64-pc-windows-msvc.zip',
 ]
-const timeout = 120_000
+const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
+const shaPattern = /^[0-9a-f]{40}$/
+const digestPattern = /^sha256:[0-9a-f]{64}$/
 
 export function expectedNames(version) {
   return targets.flatMap((target) => {
@@ -34,127 +40,7 @@ async function fingerprint(file) {
   return { size, digest: `sha256:${hash.digest('hex')}` }
 }
 
-async function gh(...args) {
-  try {
-    return (await exec('gh', args, { timeout, maxBuffer: 1024 * 1024 })).stdout
-  } catch (error) {
-    throw new Error(`GitHub CLI request failed: ${args.slice(0, 3).join(' ')} (${error.code ?? 'unknown'})`)
-  }
-}
-
-async function apiGet(endpoint, allowMissing = false) {
-  // --include preserves HTTP status even when gh exits nonzero for a 404.
-  let output
-  try {
-    output = await exec('gh', ['api', '--include', endpoint], { timeout, maxBuffer: 1024 * 1024 })
-  } catch (error) {
-    output = error
-  }
-  const text = output.stdout?.toString() ?? ''
-  const status = /^HTTP\/\S+\s+(\d{3})/m.exec(text)?.[1]
-  if (status === '404' && allowMissing) return null
-  if (status !== '200' || output.code) throw new Error(`GitHub API read failed (${status ?? output.code ?? 'unknown'})`)
-  const separator = /\r?\n\r?\n/.exec(text)
-  if (!separator) throw new Error('GitHub API response has no JSON body')
-  return JSON.parse(text.slice(separator.index + separator[0].length))
-}
-
-async function downloadAsset(tag, name) {
-  // gh streams exactly the named asset to stdout; no remote metadata URL is used.
-  const child = spawn('gh', ['release', 'download', tag, '--repo', repo, '--pattern', name, '--output', '-'], {
-    stdio: ['ignore', 'pipe', 'ignore'],
-  })
-  const exit = new Promise((resolve) => {
-    let spawnError
-    child.once('error', (error) => { spawnError = error })
-    child.once('close', (code) => resolve({ code, spawnError }))
-  })
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    child.kill('SIGKILL')
-  }, timeout)
-  const hash = createHash('sha256')
-  let size = 0
-  try {
-    for await (const chunk of child.stdout) {
-      size += chunk.length
-      if (size > 512 * 1024 * 1024) {
-        child.kill('SIGKILL')
-        break
-      }
-      hash.update(chunk)
-    }
-    const { code, spawnError } = await exit
-    if (spawnError || timedOut || code !== 0 || size > 512 * 1024 * 1024) {
-      throw new Error(`GitHub asset download failed: ${name}${timedOut ? ' (timeout)' : ''}`, { cause: spawnError })
-    }
-    return { size, digest: `sha256:${hash.digest('hex')}` }
-  } finally {
-    clearTimeout(timer)
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-    await exit
-  }
-}
-
-const github = {
-  async tagCommit(tag) {
-    let ref = await apiGet(`repos/${repo}/git/ref/tags/${tag}`)
-    for (let depth = 0; depth < 4 && ref.object?.type === 'tag'; depth++) {
-      ref = await apiGet(`repos/${repo}/git/tags/${ref.object.sha}`)
-    }
-    if (ref.object?.type !== 'commit') throw new Error(`invalid remote tag target: ${tag}`)
-    return ref.object.sha
-  },
-  release: (tag) => apiGet(`repos/${repo}/releases/tags/${tag}`, true),
-  download: downloadAsset,
-  create: (tag, notes, paths) => gh('release', 'create', tag, ...paths, '--repo', repo, '--verify-tag', '--title', tag, '--notes-file', notes, '--draft'),
-  upload: (tag, paths) => gh('release', 'upload', tag, ...paths, '--repo', repo),
-  publishDraft: (tag) => gh('release', 'edit', tag, '--repo', repo, '--draft=false'),
-}
-
-async function readRelease(adapter, plan, local) {
-  const tag = `v${plan.version}`
-  const expected = expectedNames(plan.version)
-  const release = await adapter.release(tag)
-  if (release === null) return { release, missing: expected }
-  if (!release || release.tag_name !== tag || typeof release.draft !== 'boolean'
-    || typeof release.prerelease !== 'boolean' || typeof release.target_commitish !== 'string'
-    || !release.target_commitish || !Array.isArray(release.assets)) {
-    throw new Error('invalid GitHub release metadata')
-  }
-  if (release.prerelease) throw new Error('GitHub prerelease conflicts with stable publication')
-  if (/^[0-9a-f]{40}$/i.test(release.target_commitish)
-    && release.target_commitish.toLowerCase() !== plan.sourceSha) {
-    throw new Error('GitHub release target conflict')
-  }
-  const remoteNames = new Set()
-  for (const asset of release.assets) {
-    if (!asset || !expected.includes(asset.name) || remoteNames.has(asset.name)
-      || !Number.isSafeInteger(asset.size) || asset.size < 0
-      || (asset.digest != null && !/^sha256:[0-9a-f]{64}$/.test(asset.digest))) {
-      throw new Error(`unexpected or duplicate GitHub asset: ${asset?.name}`)
-    }
-    remoteNames.add(asset.name)
-    const downloaded = await adapter.download(tag, asset.name)
-    const wanted = local.get(asset.name)
-    if (asset.size !== wanted.size || downloaded.size !== wanted.size || downloaded.digest !== wanted.digest
-      || (asset.digest && asset.digest !== downloaded.digest)) {
-      throw new Error(`GitHub asset conflict: ${asset.name}`)
-    }
-  }
-  return { release, missing: expected.filter((name) => !remoteNames.has(name)) }
-}
-
-export async function reconcile(adapter, plan, mode) {
-  const { assetDir, version, sourceSha, notes } = plan
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)
-    || !/^[0-9a-f]{40}$/.test(sourceSha) || !['check', 'publish'].includes(mode)
-    || typeof assetDir !== 'string' || !assetDir || (mode === 'publish' && !notes)) {
-    throw new Error('invalid release arguments')
-  }
-  const tag = `v${version}`
-  const expected = expectedNames(version)
+async function readLocalAssets(assetDir, expected) {
   const present = await readdir(assetDir)
   if (present.length !== expected.length || present.some((name) => !expected.includes(name))) {
     throw new Error('local release asset inventory is incomplete or unexpected')
@@ -165,24 +51,121 @@ export async function reconcile(adapter, plan, mode) {
     if (!(await lstat(path)).isFile() || basename(path) !== name) throw new Error(`invalid asset: ${name}`)
     local.set(name, await fingerprint(path))
   }
+  return local
+}
+
+function selectExactRelease(releases, tag) {
+  if (!Array.isArray(releases)) throw new Error('GitHub release list is malformed')
+  const seenIds = new Set()
+  let match = null
+  for (const release of releases) {
+    if (!release || typeof release !== 'object'
+      || !Number.isSafeInteger(release.id) || release.id <= 0
+      || typeof release.tag_name !== 'string' || !release.tag_name) {
+      throw new Error('GitHub release list is malformed')
+    }
+    if (seenIds.has(release.id)) throw new Error(`duplicate GitHub release id: ${release.id}`)
+    seenIds.add(release.id)
+    if (release.tag_name !== tag) continue
+    if (match) throw new Error(`duplicate GitHub release for exact tag: ${tag}`)
+    match = release
+  }
+  return match
+}
+
+function validateRelease(release, { tag, sourceSha, requireDraft = false }) {
+  if (!release || typeof release !== 'object') throw new Error('invalid GitHub release metadata')
+  if (!Number.isSafeInteger(release.id) || release.id <= 0) throw new Error('invalid GitHub release id')
+  if (release.tag_name !== tag) throw new Error(`GitHub release tag conflict: ${release.tag_name}`)
+  if (typeof release.draft !== 'boolean' || typeof release.prerelease !== 'boolean'
+    || typeof release.target_commitish !== 'string' || !release.target_commitish
+    || !Array.isArray(release.assets)) {
+    throw new Error('invalid GitHub release metadata')
+  }
+  if (/^[0-9a-f]{40}$/i.test(release.target_commitish) && release.target_commitish.toLowerCase() !== sourceSha) {
+    throw new Error('GitHub release target conflict')
+  }
+  if (release.prerelease) throw new Error('GitHub prerelease conflicts with stable publication')
+  if (requireDraft && !release.draft) throw new Error('created GitHub release is not a draft')
+}
+
+function validateAsset(asset, expected, seenNames) {
+  if (!asset || typeof asset !== 'object') throw new Error('unexpected GitHub asset')
+  if (!Number.isSafeInteger(asset.id) || asset.id <= 0) throw new Error(`GitHub asset id is invalid: ${asset.name}`)
+  if (typeof asset.name !== 'string' || !expected.includes(asset.name) || seenNames.has(asset.name)) {
+    throw new Error(`unexpected or duplicate GitHub asset: ${asset.name}`)
+  }
+  if (!Number.isSafeInteger(asset.size) || asset.size < 0) throw new Error(`GitHub asset size is invalid: ${asset.name}`)
+  if (asset.digest != null && !digestPattern.test(asset.digest)) throw new Error(`GitHub asset digest is invalid: ${asset.name}`)
+  if (asset.state !== 'uploaded') throw new Error(`GitHub asset state is not uploaded: ${asset.name}`)
+  if (typeof asset.content_type !== 'string' || !asset.content_type) throw new Error(`GitHub asset type is invalid: ${asset.name}`)
+  seenNames.add(asset.name)
+}
+
+async function verifyRelease(adapter, release, { plan, local, expectedId }) {
+  const tag = `v${plan.version}`
+  validateRelease(release, { tag, sourceSha: plan.sourceSha })
+  if (release.id !== expectedId) {
+    throw new Error(`GitHub release id changed during reread: expected ${expectedId}`)
+  }
+  const expected = expectedNames(plan.version)
+  const seenNames = new Set()
+  for (const asset of release.assets) {
+    validateAsset(asset, expected, seenNames)
+    const downloaded = await adapter.download(asset.id)
+    const wanted = local.get(asset.name)
+    if (asset.size !== wanted.size || downloaded.size !== wanted.size || downloaded.digest !== wanted.digest
+      || (asset.digest && asset.digest !== downloaded.digest)) {
+      throw new Error(`GitHub asset conflict: ${asset.name}`)
+    }
+  }
+  return expected.filter((name) => !seenNames.has(name))
+}
+
+export async function reconcile(adapter, plan, mode) {
+  const { assetDir, version, sourceSha, notes } = plan
+  if (!versionPattern.test(version) || !shaPattern.test(sourceSha)
+    || !['check', 'publish'].includes(mode)
+    || typeof assetDir !== 'string' || !assetDir || (mode === 'publish' && !notes)) {
+    throw new Error('invalid release arguments')
+  }
+  const tag = `v${version}`
+  const expected = expectedNames(version)
+  const local = await readLocalAssets(assetDir, expected)
   for (const paired of [tag, `REL-${tag}`]) {
     if (await adapter.tagCommit(paired) !== sourceSha) throw new Error(`remote paired tag conflict: ${paired}`)
   }
-  const { release, missing } = await readRelease(adapter, plan, local)
-  if (release && !release.draft && missing.length) throw new Error('published GitHub release is incomplete')
+  const listed = selectExactRelease(await adapter.listReleases(), tag)
+  let release = null
+  let missing = expected
+  if (listed) {
+    release = await adapter.getRelease(listed.id)
+    missing = await verifyRelease(adapter, release, { plan, local, expectedId: listed.id })
+    if (!release.draft && missing.length) throw new Error('published GitHub release is incomplete')
+  }
   if (mode === 'check') return missing
-  if (!release) await adapter.create(tag, notes, expected.map((name) => join(assetDir, name)))
-  else if (missing.length) await adapter.upload(tag, missing.map((name) => join(assetDir, name)))
+  let releaseId = release?.id
+  if (!release) {
+    const created = await adapter.createDraft({ tag, sourceSha, title: tag, notesFile: notes })
+    validateRelease(created, { tag, sourceSha, requireDraft: true })
+    releaseId = created.id
+  }
+  if (missing.length) {
+    for (const name of missing) await adapter.uploadAsset(releaseId, join(assetDir, name))
+  }
   if (!release || release.draft) {
-    const staged = await readRelease(adapter, plan, local)
-    if (!staged.release?.draft || staged.missing.length) {
-      throw new Error('draft release asset postcondition incomplete')
+    const staged = await adapter.getRelease(releaseId)
+    const stagedMissing = await verifyRelease(adapter, staged, { plan, local, expectedId: releaseId })
+    if (!staged.draft || stagedMissing.length) throw new Error('draft release asset postcondition incomplete')
+    const recheck = selectExactRelease(await adapter.listReleases(), tag)
+    if (!recheck || recheck.id !== releaseId) throw new Error('exact release tag changed before publication')
+    await adapter.publishRelease(releaseId)
+    const published = await adapter.getRelease(releaseId)
+    const publishedMissing = await verifyRelease(adapter, published, { plan, local, expectedId: releaseId })
+    if (published.draft || published.prerelease) {
+      throw new Error('published release postcondition failed: still draft or prerelease')
     }
-    await adapter.publishDraft(tag)
-    const published = await readRelease(adapter, plan, local)
-    if (!published.release || published.release.draft || published.missing.length) {
-      throw new Error('published release postcondition failed: draft or incomplete assets')
-    }
+    if (publishedMissing.length) throw new Error('published release postcondition failed: incomplete assets')
   }
   return missing
 }
@@ -194,7 +177,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     const [mode, version, sha, directory, notes] = process.argv.slice(2)
     if (mode === 'publish' && !notes) throw new Error('release notes file required')
-    const missing = await reconcile(github, { version, sourceSha: sha, assetDir: directory, notes }, mode)
+    const missing = await reconcile(createGithubAdapter(), { version, sourceSha: sha, assetDir: directory, notes }, mode)
     console.log(`GitHub asset ${mode}: ${missing.length} missing; existing bytes verified`)
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error))

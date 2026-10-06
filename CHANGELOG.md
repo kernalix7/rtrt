@@ -9,6 +9,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- Local GitHub release discovery now uses an authenticated, draft-aware lookup that reuses an existing draft, pins stable release and asset IDs, and rejects duplicate exact tag matches; paired tag/byte/inventory checks and the no-asset-clobber guard are unchanged.
+
 ## [0.2.1] - 2026-10-03
 
 Addresses the v0.2.0 audit. Source builds require Rust 1.88; CI verifies that compiler floor.

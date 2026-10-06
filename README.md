@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 ---
 
 > ### Status: Alpha
-> RTRT is early. This source tree targets **v0.2.1**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. This source tree targets **v0.2.2**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 ## What RTRT is
 

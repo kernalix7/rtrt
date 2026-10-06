@@ -4,35 +4,41 @@
 agent, worktree, invocation 및 permission broker 문맥을 보존하고 로컬 대시보드를
 백그라운드에서 사용할 수 있게 유지합니다.
 
-## 설치 (v1 setup-managed wiring, v0.2.1)
+## 설치 (v1 setup-managed wiring, v0.2.2)
 
-이 소스는 `v0.2.1`을 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
+이 소스는 `v0.2.2`를 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
 필요하며, 소스 트리 단독으로는 게시를 증명하지 않습니다. 현재 install command는
 다음과 같습니다.
 
 ```sh
-npm install rtrt-agent@0.2.1
+npm install rtrt-agent@0.2.2
 ```
 
 `opencode.json`에 등록합니다.
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.1"]
+  "plugin": ["rtrt-agent@0.2.2"]
 }
 ```
 
-소스 트리는 v1 계약 위에 staged native v2 진입점을 포함하며, `v0.2.1` npm release가
-그 소스를 게시합니다. 이미 게시된 `v0.2.0` npm release는 immutable이며 변경되지
-않습니다. 이전 `rtrt-agent@0.1.7` release는 npm에서 그대로이며 아래 native v2
+소스 트리는 v1 계약 위에 staged native v2 진입점을 포함하며, `v0.2.2` npm release가
+그 소스를 게시합니다. 이미 게시된 `v0.2.0`과 `v0.2.1` npm release는 immutable이며
+변경되지 않습니다. 이전 `rtrt-agent@0.1.7` release는 npm에서 그대로이며 아래 native v2
 진입점을 포함하지 않습니다.
 
-v1 패키지 root는 이름 있는 export `RtrtProvenance` 하나를 그대로 유지하며 v0.2.1에서도
+v1 패키지 root는 이름 있는 export `RtrtProvenance` 하나를 그대로 유지하며 v0.2.2에서도
 이름은 바뀌지 않습니다. 선택 사항인 v1 TUI statusline은 별도 setup-managed 통합으로
 남고 v1 패키지는 이를 export하거나 pack하지 않습니다. 아래에 설명하는 native v2
-진입점은 소스 팩에 들어 있으며 v0.2.1 npm release manifest에 추가되어 있습니다. 이
+진입점은 소스 팩에 들어 있으며 v0.2.2 npm release manifest에 추가되어 있습니다. 이
 진입점의 host-side 활성화는 [Native OpenCode 2.0.20 진입점](#native-opencode-2020-진입점)에
 설명한 경계에 따라 달라집니다.
+
+v0.2.2와 v0.2.1의 차이는 GitHub release publisher maintenance뿐입니다 —
+GitHub release 검색, draft 처리, asset ID 고정 로직만 다시 작성했고 쌍 태그·바이트·
+인벤토리 검사와 asset 덮어쓰기 금지 보장은 그대로입니다. `v0.2.1`이 이미 게시한
+내용을 넘어서는 새 사용자 가시 동작, native v2 host 활성화 표면, setup 흐름,
+binary ACL 강화는 도입되지 않습니다.
 
 ## 대시보드
 
@@ -66,18 +72,18 @@ OpenCode는 정상적으로 계속됩니다. 기존 `~/.rtrt` 데이터는 보�
 
 `rtrt setup --agent opencode --apply`는 전체 RTRT 통합을 관리하지만 npm 설치는 수행하지
 않으며, 설정된 패키지는 OpenCode가 시작할 때 설치합니다. Setup은 먼저 정확한
-`rtrt-agent@0.2.1` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
+`rtrt-agent@0.2.2` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
 인식된 legacy RTRT plugin을 제거하며, 이전 단계가 실패하면 legacy runtime을 보존합니다.
 Setup은 `rtrt-agent`의 정확히 일치하는 bare, pinned, ranged, tuple, object 형식만 소유하고
-정확한 `"rtrt-agent@0.2.1"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
+정확한 `"rtrt-agent@0.2.2"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
 `rtrt-opencode` 패키지 spec은 외부 값이며 순서를 유지합니다. 위 직접 등록과
-`opencode plugin rtrt-agent@0.2.1 --global`은 계속 유효합니다.
+`opencode plugin rtrt-agent@0.2.2 --global`은 계속 유효합니다.
 
 관리 agent 소유권 상태는 다음 순서의 첫 비어 있지 않은 root에서 읽습니다.
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, `~/.config/opencode`. 공존은 OMO
 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도
 미래 버전 지원을 보장하지 않습니다. 통합 RTRT 릴리스 워크플로는 정확한 버전의
-대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.1`보다 먼저 게시한 뒤 일치하는 Rust
+대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.2`보다 먼저 게시한 뒤 일치하는 Rust
 릴리스 artifact를 게시합니다.
 
 ### 기존 Windows state와 credential ACL
@@ -90,21 +96,23 @@ file에 비-owner write ACE이거나 상속된 permissive ACE가 있는 기존 �
 거부되며, 시작이 fail closed하고 OpenCode는 대시보드 없이 계속됩니다. 공개
 대시보드 binary에 적용되는 SYSTEM/Admins 및 trusted-OS-binary 면제는 private
 credential 또는 state ACL까지 확장되지 않습니다. 더 오래된 unsafe 기존 state는
-"무통으로" 보이지 않게 다시 쓰여지지 않습니다. 다가오는 `v0.2.1` 후보
-remediation은 fresh state 강화와 unsafe 기존 state 거절을 추가한 것이지,
+"무통으로" 보이지 않게 다시 쓰여지지 않습니다. `v0.2.1` npm release는 fresh state
+강화와 unsafe 기존 state 거절을 도입했고 그 동작은 `v0.2.2`에서도 유지됩니다.
+그 remediation은 fresh state 강화와 unsafe 기존 state 거절을 추가한 것이지,
 삭제나 자동 ACL 복구를 도입한 것이 아니며 운영자 파일을 옮기는 painless
 migration을 약속하지 않습니다. 이미 게시된 `v0.2.0` npm release는 immutable
-이고 이 수정도 포함하지 않습니다.
+이고 이 수정도 포함하지 않습니다. 이미 게시된 `v0.2.1` npm release는 immutable이며
+이 태그 이후 설치에 적용되는 수정의 출처입니다.
 
 ## Native OpenCode 2.0.20 진입점
 
-`v0.2.1` npm release는 native v2 server와 TUI 파일을 pack 목록에 동봉합니다. npm
+`v0.2.2` npm release는 native v2 server와 TUI 파일을 pack 목록에 동봉합니다. npm
 registry의 이전 `rtrt-agent@0.1.7` release는 그 진입점을 포함하거나 등록하지 않으며
 그대로입니다. native 소스의 검증 대상은 정확히 `@opencode/cli@2.0.20`과
 `@opencode/plugin@2.0.20`이며, 1.x SDK의 v2 preview가 아닙니다. 패키지 root는 v1
-이름 있는 export `RtrtProvenance`를 유지합니다 (이름만, v0.2.1에서도 변경 없음).
+이름 있는 export `RtrtProvenance`를 유지합니다 (이름만, v0.2.2에서도 변경 없음).
 
-`v0.2.1` pack에 들어 있는 항목:
+`v0.2.2` pack에 들어 있는 항목:
 
 - `./server`의 native `Plugin.Definition` default export. 이름 있는 `createNativeServer`
   팩토리가 `{ id: "rtrt-agent", setup }` 형태로 생성합니다. v1 `RtrtProvenance`
@@ -154,7 +162,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.1/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
     }
   ]
 }
@@ -166,7 +174,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.1/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
     }
   ]
 }
@@ -220,7 +228,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
 Native local MCP 형식은 `mcp.servers.rtrt.type: "local"`과
 `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]` 같은 `command` 배열을
 사용합니다. 옵션 이름은 `disabled`와 `codemode`이며 sandbox source config에서는 둘
-다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.1`입니다.
+다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.2`입니다.
 `rtrt setup --agent opencode --apply`는 여전히 v1 설정을 기록하며 native v2 설치가
 아닙니다. Setup 자체는 npm 패키지를 설치하지 않고, OpenCode가 시작할 때 설정된
 패키지를 해석합니다.
@@ -229,20 +237,22 @@ Native local MCP 형식은 `mcp.servers.rtrt.type: "local"`과
 MCP-only이며 staged native plugin·footer·forwarding adapter는 그 경로에서
 활성화되지 않습니다. 이 소스 작업은 Docker 배포, `rtrt collector` 서비스, 운영자
 측 `forward` 배선 또는 다른 운영 서비스를 promote, 활성화, 연결하지 않습니다 — 이
-표면은 분리되어 있고 v0.2.1 소스 변경으로 켜지지 않습니다.
+표면은 분리되어 있고 v0.2.2 소스 변경으로 켜지지 않습니다.
 
 ### Windows native 지원
 
 npm 패키지의 dashboard supervisor는 Windows에서 동작합니다 (`.rtrt`, `dashboard`,
 `startup.lock`, `dashboard.env`, `bootstrap.html` ACL 적용을 번들 PowerShell 정책으로
 수행하고 binary trust, 일반 open 경로를 처리하며 `dashboard-acl.test.mjs`,
-`dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증). supervisor test는
-Unix에서 같은 표면을 검증하며 실제 Windows CI lane에는 포함되지 않습니다. 실제
-Windows CI 실행은 아직 기록되어 있지 않습니다. npm 패키지의 Windows 동작 인정은
-**`dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`
-에서 Windows-only skip이 0개인 실제 `windows-latest` CI 실행에 좌우됩니다**. 이
-README는 본 환경에서 해당 gate가 이미 통과했다고 주장하지 않습니다.
-`rtrt-dashboard-open` 바이너리 경로는 Windows에서 출시되지만 Rust CLI의
+`dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증). Unix supervisor
+test는 같은 표면을 Unix에서 검증하며 선택된 Windows lane에는 포함되지 않습니다.
+v0.2.1의 기록 CI 실행 <https://github.com/kernalix7/rtrt/actions/runs/37133785080>은
+Windows-only acceptance 24건과 별도 system-drive binary resolver TAP 18건을 통과했고
+D-root refusal 증명도 수행했습니다. name-filter 형태의 skip만 허용되며 필수 D-root
+refusal은 면제되지 않고 선택된 Windows 전용 케이스는 실행되어야 합니다. 그 실행은
+v0.2.1 후보의 기록이며 `v0.2.2`에 대한 새 승인이 아닙니다. v0.2.2 후보는 release 전에
+같은 gate를 독립적으로 통과해야 하며, 이 README는 그것이 이미 통과했다고 주장하지
+않습니다. `rtrt-dashboard-open` 바이너리 경로는 Windows에서 출시되지만 Rust CLI의
 `rtrt service open`은 Windows에서 거부되므로 <http://127.0.0.1:7311/>을 열고
 대시보드 bootstrap prompt에만 token을 입력하세요.
 

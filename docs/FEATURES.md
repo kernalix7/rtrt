@@ -145,8 +145,8 @@ Vector and hybrid recall require an `Embedder`. The default is `all-MiniLM-L6-v2
 
 ```toml
 [dependencies]
-# Workspace crates are not on crates.io — point at the v0.2.1 tag (or a local clone).
-rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.1", features = ["embeddings"] }
+# Workspace crates are not on crates.io — point at the v0.2.2 tag (or a local clone).
+rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.2", features = ["embeddings"] }
 # rtrt-memory = { path = "../rtrt/crates/rtrt-memory", features = ["embeddings"] }
 ```
 

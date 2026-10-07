@@ -4,34 +4,42 @@
 worktree, invocation, and permission-broker context across supported hooks and keeps
 the local dashboard available in the background.
 
-## Install (v1 setup-managed wiring, v0.2.1)
+## Install (v1 setup-managed wiring, v0.2.2)
 
-This source targets `v0.2.1`. Installation requires a matching published npm release;
+This source targets `v0.2.2`. Installation requires a matching published npm release;
 the source tree alone is not proof of publication. The current install command is:
 
 ```sh
-npm install rtrt-agent@0.2.1
+npm install rtrt-agent@0.2.2
 ```
 
 Register it in `opencode.json`:
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.1"]
+  "plugin": ["rtrt-agent@0.2.2"]
 }
 ```
 
 The source tree carries the staged native v2 entries on top of the v1 contract; the
-`v0.2.1` npm release publishes that source. The already-published `v0.2.0` npm release
-is immutable and does not change. The older `rtrt-agent@0.1.7` release remains unchanged
-on npm and does not include the native v2 entries described below.
+`v0.2.2` npm release publishes that source. The already-published `v0.2.0` and
+`v0.2.1` npm releases are immutable and do not change. The older
+`rtrt-agent@0.1.7` release remains unchanged on npm and does not include the
+native v2 entries described below.
 
 The v1 package root keeps the named export `RtrtProvenance` only — its name is unchanged
-across the v0.2.1 source. The optional v1 TUI statusline stays a separate setup-managed
+across the v0.2.2 source. The optional v1 TUI statusline stays a separate setup-managed
 integration and is not exported or packed by the v1 package. The native v2 entries
-documented below are present in the source pack and added under the v0.2.1 npm release
+documented below are present in the source pack and added under the v0.2.2 npm release
 manifest; their host-side activation depends on the boundary described in
 [Native OpenCode 2.0.20 Entries](#native-opencode-2020-entries).
+
+Compared to `v0.2.1`, `v0.2.2` is a release-publisher maintenance change only:
+the GitHub release discovery, draft handling, and asset ID pinning logic were
+reworked while paired tag / byte / inventory checks and the no-asset-clobber guard
+are unchanged. No new user-facing behavior, native v2 host activation surface,
+setup flow, or binary ACL hardening is introduced beyond what `v0.2.1` already
+shipped.
 
 ## Dashboard
 
@@ -65,19 +73,19 @@ continues normally. Existing `~/.rtrt` data is preserved.
 
 `rtrt setup --agent opencode --apply` manages the full RTRT integration but performs no
 npm installation; OpenCode installs the configured package at startup. Setup first writes
-the exact `rtrt-agent@0.2.1` registration and every replacement managed asset. Only after
+the exact `rtrt-agent@0.2.2` registration and every replacement managed asset. Only after
 those writes succeed does it remove a recognized legacy RTRT plugin; an earlier failure
 preserves the legacy runtime. Setup owns exact bare, pinned, ranged, tuple, and object forms
-of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.1"` string. Old
+of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.2"` string. Old
 unpublished `rtrt` and draft `rtrt-opencode` package specs are foreign and retain their
-order. The direct registration above and `opencode plugin rtrt-agent@0.2.1 --global`
+order. The direct registration above and `opencode plugin rtrt-agent@0.2.2 --global`
 remain valid.
 
 Managed-agent ownership state is read from the first nonempty root in this order:
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`.
 Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither
 is a future-version guarantee. The unified RTRT release workflow publishes the exact
-five exact-version dashboard platform packages before `rtrt-agent@0.2.1`, then publishes
+five exact-version dashboard platform packages before `rtrt-agent@0.2.2`, then publishes
 the matching Rust release artifacts.
 
 ### Existing Windows state and credential ACL
@@ -90,21 +98,23 @@ permissive ACE on private credential or state files are refused: startup fails
 closed and OpenCode continues without the dashboard. The SYSTEM/Admins and
 trusted-OS-binary exemptions used for the public dashboard binary do not extend to
 private credential or state ACLs. Older pre-existing unsafe state does not get
-silently rewritten to "look painless". The upcoming `v0.2.1` candidate
-remediation adds fresh-state hardening and refusal of unsafe existing state; it
-does not introduce deletion or automatic ACL repair, and it does not promise a
-migration that renames operator files. The already-published `v0.2.0` npm
-release is immutable and does not contain these fixes.
+silently rewritten to "look painless". The `v0.2.1` npm release introduced the
+fresh-state hardening and refusal of unsafe existing state, and that behavior is
+retained in `v0.2.2`. The remediation does not introduce deletion or automatic
+ACL repair, and does not promise a migration that renames operator files. The
+already-published `v0.2.0` and `v0.2.1` npm releases are immutable; `v0.2.0`
+does not contain the fresh-state hardening or unsafe-state refusal fixes, and
+`v0.2.1` is the source of those fixes for installs on or after that tag.
 
 ## Native OpenCode 2.0.20 Entries
 
-The `v0.2.1` npm release ships native v2 server and TUI files in the pack inventory.
+The `v0.2.2` npm release ships native v2 server and TUI files in the pack inventory.
 The older `rtrt-agent@0.1.7` release on npm does not include or register those entries
 and stays unchanged. The native source targets exactly `@opencode/cli@2.0.20` and
 `@opencode/plugin@2.0.20`, not the 1.x SDK's v2 preview. The package root remains the
-v1 named export `RtrtProvenance` (name-only, unchanged across v0.2.1).
+v1 named export `RtrtProvenance` (name-only, unchanged across v0.2.2).
 
-What is in the `v0.2.1` pack:
+What is in the `v0.2.2` pack:
 
 - A native `Plugin.Definition` default export at `./server`, constructed by the named
   `createNativeServer` factory and exposing `{ id: "rtrt-agent", setup }`. The v1
@@ -160,7 +170,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.1/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
     }
   ]
 }
@@ -172,7 +182,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.1/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
     }
   ]
 }
@@ -228,7 +238,7 @@ is specific to the exact `@opencode/cli@2.0.20` host that was tested.
 The native local MCP shape uses `mcp.servers.rtrt.type: "local"` and a `command` array
 such as `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]`; the option names are
 `disabled` and `codemode`, both `false` in the sandbox source config. The
-release-pinned v1 registration is `rtrt-agent@0.2.1`. `rtrt setup --agent opencode
+release-pinned v1 registration is `rtrt-agent@0.2.2`. `rtrt setup --agent opencode
 --apply` still writes v1 configuration, not native v2 installation; setup itself does
 not install npm packages, and OpenCode resolves the configured package at startup.
 
@@ -237,7 +247,7 @@ default v2 configuration is MCP-only; the staged native plugin, footer, and forw
 adapter are not activated there. This source work does not promote, activate, or wire
 up a Docker deployment, the `rtrt collector` service, the operator-side `forward`
 plumbing, or any other operational services — those remain separate surfaces and are
-not enabled by the v0.2.1 source change.
+not enabled by the v0.2.2 source change.
 
 ### Windows native support
 
@@ -245,14 +255,18 @@ The npm package's dashboard supervisor runs on Windows (`.rtrt`, `dashboard`,
 `startup.lock`, `dashboard.env`, `bootstrap.html` ACL enforcement via the bundled
 PowerShell policy, binary trust, and ordinary open path — exercised by
 `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`).
-The supervisor test exercises the same surfaces on Unix and is not in the selected
-Windows CI lane; the actual Windows CI run is not yet recorded. Acceptance of the npm
-package's Windows behavior is **subject to a real `windows-latest` CI run with zero
-Windows-only skips in `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and
-`dashboard-open.test.mjs`**; this README does not claim that gate has already passed
-in this environment. The `rtrt-dashboard-open` binary path is shipped on Windows, but
-`rtrt service open` from the Rust CLI is refused on Windows; open
-<http://127.0.0.1:7311/> and enter the token in the dashboard's bootstrap prompt.
+The Unix supervisor test exercises the same surfaces on Unix and is not in the
+selected Windows lane. The historical v0.2.1 reference run
+<https://github.com/kernalix7/rtrt/actions/runs/37133785080> recorded 24 selected
+Windows-only acceptance cases and a separate 18-case system-drive binary resolver
+TAP pass, plus a D-root refusal proof; name-filter-only skips are allowed, mandatory
+D-root refusal is not waived, and selected Windows-only cases must run. That run is
+historical evidence of the v0.2.1 candidate, **not** fresh approval of `v0.2.2`;
+this README does not claim a fresh `windows-latest` run has already passed for the
+v0.2.2 candidate, which must independently clear the same gate before release. The
+`rtrt-dashboard-open` binary path is shipped on Windows, but `rtrt service open`
+from the Rust CLI is refused on Windows; open <http://127.0.0.1:7311/> and enter
+the token in the dashboard's bootstrap prompt.
 
 ## License
 

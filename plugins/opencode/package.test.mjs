@@ -30,7 +30,7 @@ test("package retains classic root and exposes separate native server and TUI", 
 
   // Then: OpenCode sees separate native entrypoints, while root stays named-only.
   assert.equal(manifest.name, "rtrt-agent")
-  assert.equal(manifest.version, "0.2.1")
+  assert.equal(manifest.version, "0.2.2")
   assert.equal(manifest.type, "module")
   assert.equal(manifest.main, "./index.js")
   assert.deepEqual(manifest.exports, {

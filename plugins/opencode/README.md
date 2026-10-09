@@ -4,20 +4,20 @@
 worktree, invocation, and permission-broker context across supported hooks and keeps
 the local dashboard available in the background.
 
-## Install (v1 setup-managed wiring, v0.2.2)
+## Install (v1 setup-managed wiring, v0.2.3)
 
-This source targets `v0.2.2`. Installation requires a matching published npm release;
+This source targets `v0.2.3`. Installation requires a matching published npm release;
 the source tree alone is not proof of publication. The current install command is:
 
 ```sh
-npm install rtrt-agent@0.2.2
+npm install rtrt-agent@0.2.3
 ```
 
 Register it in `opencode.json`:
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.2"]
+  "plugin": ["rtrt-agent@0.2.3"]
 }
 ```
 
@@ -40,6 +40,11 @@ reworked while paired tag / byte / inventory checks and the no-asset-clobber gua
 are unchanged. No new user-facing behavior, native v2 host activation surface,
 setup flow, or binary ACL hardening is introduced beyond what `v0.2.1` already
 shipped.
+
+`v0.2.3` expands the original ring source-header notices and adds the inherited
+JavaScript grammar's MIT notice. It also replaces the dashboard layout's
+`RandomSeed` with an original non-cryptographic 32-bit LCG: the API shape is
+unchanged, while seeded sequences and initial graph positions change.
 
 ## Dashboard
 
@@ -73,19 +78,19 @@ continues normally. Existing `~/.rtrt` data is preserved.
 
 `rtrt setup --agent opencode --apply` manages the full RTRT integration but performs no
 npm installation; OpenCode installs the configured package at startup. Setup first writes
-the exact `rtrt-agent@0.2.2` registration and every replacement managed asset. Only after
+the exact `rtrt-agent@0.2.3` registration and every replacement managed asset. Only after
 those writes succeed does it remove a recognized legacy RTRT plugin; an earlier failure
 preserves the legacy runtime. Setup owns exact bare, pinned, ranged, tuple, and object forms
-of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.2"` string. Old
+of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.3"` string. Old
 unpublished `rtrt` and draft `rtrt-opencode` package specs are foreign and retain their
-order. The direct registration above and `opencode plugin rtrt-agent@0.2.2 --global`
+order. The direct registration above and `opencode plugin rtrt-agent@0.2.3 --global`
 remain valid.
 
 Managed-agent ownership state is read from the first nonempty root in this order:
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`.
 Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither
 is a future-version guarantee. The unified RTRT release workflow publishes the exact
-five exact-version dashboard platform packages before `rtrt-agent@0.2.2`, then publishes
+five exact-version dashboard platform packages before `rtrt-agent@0.2.3`, then publishes
 the matching Rust release artifacts.
 
 ### Existing Windows state and credential ACL
@@ -170,7 +175,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -182,7 +187,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -238,7 +243,7 @@ is specific to the exact `@opencode/cli@2.0.20` host that was tested.
 The native local MCP shape uses `mcp.servers.rtrt.type: "local"` and a `command` array
 such as `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]`; the option names are
 `disabled` and `codemode`, both `false` in the sandbox source config. The
-release-pinned v1 registration is `rtrt-agent@0.2.2`. `rtrt setup --agent opencode
+release-pinned v1 registration is `rtrt-agent@0.2.3`. `rtrt setup --agent opencode
 --apply` still writes v1 configuration, not native v2 installation; setup itself does
 not install npm packages, and OpenCode resolves the configured package at startup.
 
@@ -251,23 +256,26 @@ not enabled by the v0.2.2 source change.
 
 ### Windows native support
 
-The npm package's dashboard supervisor runs on Windows (`.rtrt`, `dashboard`,
-`startup.lock`, `dashboard.env`, `bootstrap.html` ACL enforcement via the bundled
-PowerShell policy, binary trust, and ordinary open path — exercised by
-`dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`).
-The Unix supervisor test exercises the same surfaces on Unix and is not in the
-selected Windows lane. The historical v0.2.1 reference run
-<https://github.com/kernalix7/rtrt/actions/runs/37133785080> recorded 24 selected
-Windows-only acceptance cases and a separate 18-case system-drive binary resolver
-TAP pass, plus a D-root refusal proof; name-filter-only skips are allowed, mandatory
-D-root refusal is not waived, and selected Windows-only cases must run. That run is
-historical evidence of the v0.2.1 candidate, **not** fresh approval of `v0.2.2`;
-this README does not claim a fresh `windows-latest` run has already passed for the
-v0.2.2 candidate, which must independently clear the same gate before release. The
-`rtrt-dashboard-open` binary path is shipped on Windows, but `rtrt service open`
-from the Rust CLI is refused on Windows; open <http://127.0.0.1:7311/> and enter
-the token in the dashboard's bootstrap prompt.
+The npm Windows dashboard supervisor enforces private state ACLs and binary trust.
+`dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`
+exercise its ACL, binary, and open paths.
+
+Each release must pass a fresh `windows-latest` run with 24 selected Windows-only
+acceptance cases, a separate 18-case system-drive binary resolver TAP pass, and the
+mandatory D-root refusal proof. Only name-filter skips are allowed; the three
+dashboard test files must execute with zero Windows-only skips. The Unix supervisor
+test is outside this lane. The [v0.2.1 run](https://github.com/kernalix7/rtrt/actions/runs/37133785080)
+passed these checks; every subsequent release must repeat them.
+
+`rtrt-dashboard-open` is available on Windows. The Rust CLI's `rtrt service open`
+is refused there; open <http://127.0.0.1:7311/> and enter the token in the
+dashboard's bootstrap prompt.
 
 ## License
 
-MIT
+RTRT's plugin source is MIT-licensed. Packaged dashboard binaries include the
+[third-party notice corpus](THIRD_PARTY_NOTICES/INDEX.md) for the default release
+build. `@opencode-ai/sdk@1.15.13` is installed separately by the package manager;
+native OpenCode and renderer packages are optional host peers. Installed dependency
+trees, Docker images, optional features, and downloaded models need their own
+license and notice review.

@@ -145,8 +145,8 @@ Vector and hybrid recall require an `Embedder`. The default is `all-MiniLM-L6-v2
 
 ```toml
 [dependencies]
-# Workspace crates are not on crates.io — point at the v0.2.2 tag (or a local clone).
-rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.2", features = ["embeddings"] }
+# Workspace crates are not on crates.io — point at the v0.2.3 tag (or a local clone).
+rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.3", features = ["embeddings"] }
 # rtrt-memory = { path = "../rtrt/crates/rtrt-memory", features = ["embeddings"] }
 ```
 
@@ -170,6 +170,10 @@ Recall details:
 The `edges` table is reserved for graph traversal.
 
 **First-use note**: `FastEmbedder::new_default()` downloads the model (~90 MB) to fastembed's cache dir on first construction. Subsequent uses are offline.
+
+The optional embedding stack and downloaded model files are outside the default
+release notice inventory. Their licenses apply separately from RTRT's MIT license;
+see [Third-Party Licenses](../THIRD_PARTY_LICENSES.md).
 
 ### LLM-backed extract + compress (the `llm` feature)
 

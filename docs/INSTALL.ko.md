@@ -49,13 +49,22 @@ Linux/macOS 직접 관리: `~/.local/bin/rtrt service install|uninstall|status` 
 
 Windows에서는 `rtrt service` 관리와 open이 거부됩니다. <http://127.0.0.1:7311/>을 열고 dashboard bootstrap prompt에만 token을 입력하세요. Token을 command, URL, task definition에 넣지 마세요.
 
-npm 패키지의 Windows dashboard supervisor(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL 적용, binary trust)는 `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증됩니다. Unix supervisor test는 같은 표면을 Unix에서 검증하며 선택된 Windows lane에는 포함되지 않습니다. v0.2.1의 기록 CI 실행 <https://github.com/kernalix7/rtrt/actions/runs/37133785080>은 Windows-only acceptance 24건과 별도 system-drive binary resolver TAP 18건을 통과했고 D-root refusal 증명도 수행했습니다. name-filter 형태의 skip만 허용되며 필수 D-root refusal은 면제되지 않고 선택된 Windows 전용 케이스는 실행되어야 합니다. 그 실행은 v0.2.1 후보의 기록이며 `v0.2.2`에 대한 새 승인이 아닙니다. v0.2.2 후보는 release 전에 세 dashboard test file에서 Windows-only skip이 0개인 같은 `windows-latest` gate를 독립적으로 통과해야 합니다. 기존 unsafe Windows state(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` 중 private credential 또는 state file에 대한 비-owner write ACE이거나 상속된 permissive ACE)는 시작을 거부하며 자동으로 ACL 복구되거나 삭제되지 않습니다. 공개 대시보드 binary에 적용되는 SYSTEM/Admins 및 trusted-OS-binary 면제는 private credential 또는 state ACL까지 확장되지 않습니다. `v0.2.1` npm release는 fresh state 강화와 unsafe 기존 state 거절을 도입했고 그 동작은 `v0.2.2`에서도 유지됩니다. 그 remediation은 fresh state 강화와 unsafe 기존 state 거절을 추가한 것이지 painless rename-and-migrate 단계를 추가한 것이 아닙니다. 이미 게시된 `v0.2.0`과 `v0.2.1` npm release는 immutable이며 `v0.2.0`은 이 수정도 포함하지 않고 `v0.2.1`이 이 태그 이후 설치에 적용되는 수정의 출처입니다.
+npm 패키지의 Windows dashboard supervisor(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL 적용, binary trust)는 `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증됩니다.
+
+각 릴리스는 새 `windows-latest` 실행에서 선택된 Windows 전용 acceptance 24건,
+별도 system-drive binary resolver TAP 18건, 필수 D-root refusal 증명을 통과해야
+합니다. 이름 필터에 따른 skip만 허용되며 세 dashboard test file의 Windows 전용
+케이스는 skip 없이 실행해야 합니다. Unix supervisor test는 이 lane에 포함되지
+않습니다. [v0.2.1 실행](https://github.com/kernalix7/rtrt/actions/runs/37133785080)은
+이 검사를 통과했으며 이후 릴리스마다 다시 수행해야 합니다.
+
+기존 unsafe Windows state(`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` 중 private credential 또는 state file에 대한 비-owner write ACE이거나 상속된 permissive ACE)는 시작을 거부하며 자동으로 ACL 복구되거나 삭제되지 않습니다. 공개 대시보드 binary에 적용되는 SYSTEM/Admins 및 trusted-OS-binary 면제는 private credential 또는 state ACL까지 확장되지 않습니다. `v0.2.1` npm release는 fresh state 강화와 unsafe 기존 state 거절을 도입했고 그 동작은 `v0.2.2`에서도 유지됩니다. 그 remediation은 fresh state 강화와 unsafe 기존 state 거절을 추가한 것이지 painless rename-and-migrate 단계를 추가한 것이 아닙니다. 이미 게시된 `v0.2.0`과 `v0.2.1` npm release는 immutable이며 `v0.2.0`은 이 수정도 포함하지 않고 `v0.2.1`이 이 태그 이후 설치에 적용되는 수정의 출처입니다.
 
 예시:
 
 ```bash
-# v0.2.2 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.2.2
+# v0.2.3 릴리스 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.3
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -126,6 +135,11 @@ GitHub Release 채널은 페어드 태그 릴리스 워크플로가 완료되면
 - `rtrt-<version>-x86_64-pc-windows-msvc.zip`
 
 각 아카이브에는 `rtrt`, `rtrt-mcp`, `rtrt-dashboard`가 모두 포함됩니다.
+
+릴리스 워크플로는 기본 기능 바이너리용 RTRT `LICENSE`와 `THIRD_PARTY_NOTICES`를
+포함합니다. 선택 기능과 다운로드한 모델은 별도의 라이선스 검토가 필요합니다.
+Docker 이미지와 설치된 npm 의존성 트리에는 이 인벤토리 밖의 구성 요소가 있습니다.
+[서드파티 라이선스](../THIRD_PARTY_LICENSES.md)를 참고하세요.
 
 ## 설치 확인
 

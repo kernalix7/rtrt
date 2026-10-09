@@ -168,7 +168,7 @@ test("readable JamaJS attribution retains the byte-exact embedded Apache section
   // Then: recipients get those exact bytes in a readable standalone file.
   assert.ok(start > 0 && end > start)
   assert.equal(createHash("sha256").update(source).digest("hex"),
-    "ec15ab5df9af3f20708f4faab994accf91cda71848cd5bb10a23432cc50b6745")
+    "7296ca281741b5eda7ec4ed626851275fa9262b37d2ae462319e84f38e1e9c7e")
   assert.equal(notice, `${source.slice(start, end)}\n`)
 })
 

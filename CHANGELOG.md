@@ -9,6 +9,19 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-08
+
+### Fixed
+
+- Preserve original full files carrying license headers from the pinned `ring@0.17.14` source archive. The notice helper rejects other ring versions.
+- Replace the `layout-base@2.0.1` `RandomSeed` Stack Overflow adaptation, whose rights and attribution were uncertain, with an original non-cryptographic 32-bit LCG. The API shape is unchanged; seeded sequences and initial graph positions change.
+- Add the original MIT notice for the inherited `tree-sitter-javascript@0.23.1` grammar dependency as a conservative attribution measure.
+
+### Distribution
+
+- The notice corpus contains 732 files, including 247 ring files: 244 source-header paths unioned with six original notice paths, with three overlaps. The eight supplement entries, nine full-text supplements, and MPL-covered `option-ext@0.2.0` source archive are unchanged.
+- Update release and install pins to `0.2.3`. The Homebrew formula retains its all-zero checksum and remains a template.
+
 ## [0.2.2] - 2026-10-06
 
 ### Fixed

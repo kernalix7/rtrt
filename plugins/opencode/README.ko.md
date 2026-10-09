@@ -4,21 +4,21 @@
 agent, worktree, invocation 및 permission broker 문맥을 보존하고 로컬 대시보드를
 백그라운드에서 사용할 수 있게 유지합니다.
 
-## 설치 (v1 setup-managed wiring, v0.2.2)
+## 설치 (v1 setup-managed wiring, v0.2.3)
 
-이 소스는 `v0.2.2`를 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
+이 소스는 `v0.2.3`을 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
 필요하며, 소스 트리 단독으로는 게시를 증명하지 않습니다. 현재 install command는
 다음과 같습니다.
 
 ```sh
-npm install rtrt-agent@0.2.2
+npm install rtrt-agent@0.2.3
 ```
 
 `opencode.json`에 등록합니다.
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.2"]
+  "plugin": ["rtrt-agent@0.2.3"]
 }
 ```
 
@@ -39,6 +39,11 @@ GitHub release 검색, draft 처리, asset ID 고정 로직만 다시 작성했�
 인벤토리 검사와 asset 덮어쓰기 금지 보장은 그대로입니다. `v0.2.1`이 이미 게시한
 내용을 넘어서는 새 사용자 가시 동작, native v2 host 활성화 표면, setup 흐름,
 binary ACL 강화는 도입되지 않습니다.
+
+`v0.2.3`은 ring 소스 헤더의 원본 고지를 확장하고 상속된 JavaScript 문법의
+MIT 고지를 추가합니다. 대시보드 레이아웃의 `RandomSeed`도 독자적으로 작성한
+비암호학적 32비트 LCG로 교체합니다. API 형태는 그대로이며 시드별 수열과
+그래프 초기 위치는 달라집니다.
 
 ## 대시보드
 
@@ -72,18 +77,18 @@ OpenCode는 정상적으로 계속됩니다. 기존 `~/.rtrt` 데이터는 보�
 
 `rtrt setup --agent opencode --apply`는 전체 RTRT 통합을 관리하지만 npm 설치는 수행하지
 않으며, 설정된 패키지는 OpenCode가 시작할 때 설치합니다. Setup은 먼저 정확한
-`rtrt-agent@0.2.2` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
+`rtrt-agent@0.2.3` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
 인식된 legacy RTRT plugin을 제거하며, 이전 단계가 실패하면 legacy runtime을 보존합니다.
 Setup은 `rtrt-agent`의 정확히 일치하는 bare, pinned, ranged, tuple, object 형식만 소유하고
-정확한 `"rtrt-agent@0.2.2"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
+정확한 `"rtrt-agent@0.2.3"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
 `rtrt-opencode` 패키지 spec은 외부 값이며 순서를 유지합니다. 위 직접 등록과
-`opencode plugin rtrt-agent@0.2.2 --global`은 계속 유효합니다.
+`opencode plugin rtrt-agent@0.2.3 --global`은 계속 유효합니다.
 
 관리 agent 소유권 상태는 다음 순서의 첫 비어 있지 않은 root에서 읽습니다.
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, `~/.config/opencode`. 공존은 OMO
 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도
 미래 버전 지원을 보장하지 않습니다. 통합 RTRT 릴리스 워크플로는 정확한 버전의
-대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.2`보다 먼저 게시한 뒤 일치하는 Rust
+대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.3`보다 먼저 게시한 뒤 일치하는 Rust
 릴리스 artifact를 게시합니다.
 
 ### 기존 Windows state와 credential ACL
@@ -162,7 +167,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -174,7 +179,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -228,7 +233,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
 Native local MCP 형식은 `mcp.servers.rtrt.type: "local"`과
 `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]` 같은 `command` 배열을
 사용합니다. 옵션 이름은 `disabled`와 `codemode`이며 sandbox source config에서는 둘
-다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.2`입니다.
+다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.3`입니다.
 `rtrt setup --agent opencode --apply`는 여전히 v1 설정을 기록하며 native v2 설치가
 아닙니다. Setup 자체는 npm 패키지를 설치하지 않고, OpenCode가 시작할 때 설정된
 패키지를 해석합니다.
@@ -241,21 +246,25 @@ MCP-only이며 staged native plugin·footer·forwarding adapter는 그 경로에
 
 ### Windows native 지원
 
-npm 패키지의 dashboard supervisor는 Windows에서 동작합니다 (`.rtrt`, `dashboard`,
-`startup.lock`, `dashboard.env`, `bootstrap.html` ACL 적용을 번들 PowerShell 정책으로
-수행하고 binary trust, 일반 open 경로를 처리하며 `dashboard-acl.test.mjs`,
-`dashboard-binary.test.mjs`, `dashboard-open.test.mjs`로 검증). Unix supervisor
-test는 같은 표면을 Unix에서 검증하며 선택된 Windows lane에는 포함되지 않습니다.
-v0.2.1의 기록 CI 실행 <https://github.com/kernalix7/rtrt/actions/runs/37133785080>은
-Windows-only acceptance 24건과 별도 system-drive binary resolver TAP 18건을 통과했고
-D-root refusal 증명도 수행했습니다. name-filter 형태의 skip만 허용되며 필수 D-root
-refusal은 면제되지 않고 선택된 Windows 전용 케이스는 실행되어야 합니다. 그 실행은
-v0.2.1 후보의 기록이며 `v0.2.2`에 대한 새 승인이 아닙니다. v0.2.2 후보는 release 전에
-같은 gate를 독립적으로 통과해야 하며, 이 README는 그것이 이미 통과했다고 주장하지
-않습니다. `rtrt-dashboard-open` 바이너리 경로는 Windows에서 출시되지만 Rust CLI의
-`rtrt service open`은 Windows에서 거부되므로 <http://127.0.0.1:7311/>을 열고
-대시보드 bootstrap prompt에만 token을 입력하세요.
+npm Windows dashboard supervisor는 private state ACL과 binary trust를 적용합니다.
+`dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, `dashboard-open.test.mjs`가
+ACL, binary, open 경로를 검사합니다.
+
+각 릴리스는 새 `windows-latest` 실행에서 선택된 Windows 전용 acceptance 24건,
+별도 system-drive binary resolver TAP 18건, 필수 D-root refusal 증명을 통과해야
+합니다. 이름 필터에 따른 skip만 허용되며 세 dashboard test file의 Windows 전용
+케이스는 skip 없이 실행해야 합니다. Unix supervisor test는 이 lane에 포함되지
+않습니다. [v0.2.1 실행](https://github.com/kernalix7/rtrt/actions/runs/37133785080)은
+이 검사를 통과했으며 이후 릴리스마다 다시 수행해야 합니다.
+
+Windows에서 `rtrt-dashboard-open`을 사용할 수 있습니다. Rust CLI의
+`rtrt service open`은 거부되므로 <http://127.0.0.1:7311/>을 열고 대시보드의
+bootstrap prompt에 token을 입력하세요.
 
 ## 라이선스
 
-MIT
+RTRT 플러그인 소스는 MIT 라이선스입니다. 패키지의 대시보드 바이너리는 기본
+릴리스 빌드용 [서드파티 고지 모음](THIRD_PARTY_NOTICES/INDEX.md)을 포함합니다.
+`@opencode-ai/sdk@1.15.13`은 패키지 관리자가 별도로 설치하며 native OpenCode와
+renderer 패키지는 선택적인 host peer입니다. 설치된 의존성 트리, Docker 이미지,
+선택 기능, 다운로드한 모델은 각각의 라이선스와 고지를 검토해야 합니다.

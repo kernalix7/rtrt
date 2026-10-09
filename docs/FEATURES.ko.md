@@ -145,8 +145,8 @@ let hits = store.recall_bm25("my-project", "rust", 5)?;
 
 ```toml
 [dependencies]
-# 워크스페이스 크레이트는 crates.io에 없습니다 — v0.2.2 태그(또는 로컬 클론)를 가리키세요.
-rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.2", features = ["embeddings"] }
+# 워크스페이스 크레이트는 crates.io에 없습니다 — v0.2.3 태그(또는 로컬 클론)를 가리키세요.
+rtrt-memory = { git = "https://github.com/kernalix7/rtrt", tag = "v0.2.3", features = ["embeddings"] }
 # rtrt-memory = { path = "../rtrt/crates/rtrt-memory", features = ["embeddings"] }
 ```
 
@@ -170,6 +170,10 @@ let hits = store.recall_hybrid("my-project", "rust toolchain", 5, &embedder)?;
 `edges` 테이블은 그래프 순회 예약.
 
 **첫 사용 주의**: `FastEmbedder::new_default()`는 fastembed 캐시 디렉터리로 모델(~90 MB)을 처음에 다운로드. 이후는 오프라인.
+
+선택적인 임베딩 구성 요소와 다운로드한 모델 파일은 기본 릴리스 고지 인벤토리에
+포함되지 않습니다. 이들의 라이선스는 RTRT의 MIT 라이선스와 별도로 적용됩니다.
+[서드파티 라이선스](../THIRD_PARTY_LICENSES.md)를 참고하세요.
 
 ### LLM 기반 추출 + 압축 (`llm` 피처)
 

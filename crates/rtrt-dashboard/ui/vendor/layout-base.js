@@ -3217,13 +3217,16 @@ module.exports = Layout;
 
 
 function RandomSeed() {}
-// adapted from: https://stackoverflow.com/a/19303725
+// Non-cryptographic LCG: s' = (1664525*s + 1013904223) mod 2^32.
+// >>> 0 truncates/wraps numeric seeds; NaN and infinities become zero.
+// imul keeps low product bits exact; x stores the last [0, 1) sample.
 RandomSeed.seed = 1;
 RandomSeed.x = 0;
 
 RandomSeed.nextDouble = function () {
-  RandomSeed.x = Math.sin(RandomSeed.seed++) * 10000;
-  return RandomSeed.x - Math.floor(RandomSeed.x);
+  RandomSeed.seed = (Math.imul(RandomSeed.seed >>> 0, 1664525) + 1013904223) >>> 0;
+  RandomSeed.x = RandomSeed.seed / 4294967296;
+  return RandomSeed.x;
 };
 
 module.exports = RandomSeed;

@@ -12,12 +12,26 @@ that contain no license file, and the separate embedded JS notices. A
 license terms. Supplements are original pin texts or, where no upstream text
 exists, the explicitly selected Apache-2.0 standard text. This is not a
 compiled or retained-code SBOM or a legal certification.
+
+The notice directory contains 732 files, including 247 original ring files
+covering 244 source-header paths and six original notice paths (three overlap).
+The eight supplement entries, nine full-text supplements, and MPL-covered
+`option-ext@0.2.0` source archive remain unchanged. The index records the modified
+`layout-base@2.0.1` bundle and the conservative original MIT notice for the
+`tree-sitter-javascript@0.23.1` grammar inherited by `tree-sitter-typescript`.
+
 The classic OpenCode plugin declares `@opencode-ai/sdk@1.15.13` as an npm
 dependency. RTRT's agent tarball does not copy the SDK's `node_modules` bytes;
 the package manager installs that dependency separately. Native OpenCode 2
 plugin and renderer packages are optional host peers, not copied into the
 agent tarball. Redistributing an installed dependency tree or a container
 image requires reviewing that resolved tree's own licenses and notices.
+
+Optional Cargo features and downloaded models are outside the default release
+inventory and need their own license review. Docker base images and OS packages
+are separate dependencies. The current Dockerfile copies only RTRT's LICENSE
+and README, not the third-party notice corpus; this inventory does not establish
+notice coverage for that image.
 
 ## Runtime dependencies
 
@@ -80,7 +94,7 @@ user approval or install consent.
 
 - [rustls](https://crates.io/crates/rustls) — Apache-2.0 OR ISC OR MIT
 - [webpki-roots@0.26.11](https://crates.io/crates/webpki-roots/0.26.11) and [webpki-roots@1.0.7](https://crates.io/crates/webpki-roots/1.0.7) — CDLA-Permissive-2.0 (certificate data; both versions resolved)
-- [ring@0.17.14](https://crates.io/crates/ring/0.17.14) — Apache-2.0 AND ISC in different files, including BoringSSL-derived code; see its upstream `LICENSE`, `LICENSE-BoringSSL`, `LICENSE-other-bits`, and bundled subpart notices in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md)
+- [ring@0.17.14](https://crates.io/crates/ring/0.17.14) — Apache-2.0 AND ISC in different files, including BoringSSL-derived code; see its upstream `LICENSE`, `LICENSE-BoringSSL`, `LICENSE-other-bits`, bundled subpart notices, and original full files carrying source-header grants in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES/INDEX.md)
 - [subtle@2.6.1](https://crates.io/crates/subtle/2.6.1) — BSD-3-Clause
 - [matchit@0.8.4](https://crates.io/crates/matchit/0.8.4) — MIT **AND** BSD-3-Clause; both original license files shipped
 - [rustls-webpki@0.103.15](https://crates.io/crates/rustls-webpki/0.103.15) — ISC; upstream LICENSE shipped

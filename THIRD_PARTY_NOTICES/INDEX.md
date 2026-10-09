@@ -1,8 +1,9 @@
 # Version-pinned distribution notices
 
 These include unmodified LICENSE/LICENCE/COPYING/COPYRIGHT/NOTICE files extracted
-recursively from checksum-pinned registry crates, the public npm LICENSE files
-listed below, and the complete unmodified `option-ext@0.2.0` source crate.
+recursively from checksum-pinned registry crates, original full files carrying
+`ring@0.17.14` source-header grants, the public npm LICENSE files listed below,
+and the complete unmodified `option-ext@0.2.0` source crate.
 `LICENSE` at the distribution root remains RTRT's own MIT license. This directory
 accompanies the source, the five GitHub binary archives, the five dashboard
 platform npm packages, and `rtrt-agent`. `INVENTORY.json` maps the exact three
@@ -12,6 +13,18 @@ upstream archive URL, extracted path and local file SHA-256. It is a deliberatel
 conservative graph union, **not** a retained-code or optimized-binary SBOM and
 not a legal certification. This index's original digest table remains the
 historical selected subset; the inventory maps all additional Rust files.
+
+The directory contains 732 files. Ring contributes 247: the union of 244 pinned
+source-header paths and six original notice paths, with three overlaps. These
+complete files preserve the original bytes from the checksum-pinned archive.
+The collector rejects ring versions other than `0.17.14`. The existing
+eight supplement entries and nine full-text supplements are unchanged.
+
+This corpus covers the default-feature Rust release graphs and the listed JS
+notices. Optional Cargo features, downloaded models, installed npm dependency
+trees, and Docker base/OS packages require separate license and notice review.
+The current Dockerfile copies only RTRT's LICENSE and README into the image;
+it does not copy this notice corpus.
 
 The JS bundles `cytoscape-fcose`, `cytoscape-cola`, `cose-base`, `layout-base`,
 and `webcola` are embedded in the dashboard without their upstream
@@ -33,6 +46,7 @@ the matching `https://registry.npmjs.org/<name>/<version>` `dist.integrity`
 | layout-base@2.0.1 | https://registry.npmjs.org/layout-base/-/layout-base-2.0.1.tgz | `34165e46d8c4b9d719a592e39a60fa5f7324c21a3edd02733e1116b17013defd` |
 | webcola@3.4.0 | https://registry.npmjs.org/webcola/-/webcola-3.4.0.tgz | `94ea191c50624c05d7f9be7231a43c06021a54991c82dd7ed0ff907918f899cd` |
 | cytoscape@3.30.2 | https://registry.npmjs.org/cytoscape/-/cytoscape-3.30.2.tgz | `8e9bfaaf9f5f461642355b0d17c6cf1d0d58c5cb9e00ac983e2d242fd1cfb928` |
+| tree-sitter-javascript@0.23.1 | https://registry.npmjs.org/tree-sitter-javascript/-/tree-sitter-javascript-0.23.1.tgz | `90e80b25a67517a4daf6ad751557bee21efbda7b7a5a554897933245d1734398` |
 | ring@0.17.14 | https://static.crates.io/crates/ring/ring-0.17.14.crate | `a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7` |
 | subtle@2.6.1 | https://static.crates.io/crates/subtle/subtle-2.6.1.crate | `13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292` |
 | webpki-roots@0.26.11 | https://static.crates.io/crates/webpki-roots/webpki-roots-0.26.11.crate | `521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9` |
@@ -73,6 +87,7 @@ LICENSE file.
 | `whatlang@0.16.4/LICENSE` | `9fb62b415784b27e358a03677cac6b56de73425f4fdbb5f4ecf19650af5dfe0c` |
 | `tree-sitter-python@0.23.6/LICENSE` | `d724405ce238a22c0d35769c5a36b386ad5958192efe8bbb304fb2896254575f` |
 | `tree-sitter-typescript@0.23.2/LICENSE` | `49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559` |
+| `tree-sitter-javascript@0.23.1/LICENSE` | `2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1` |
 | `instant-distance@0.6.1/LICENSE` | `43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1` |
 | `rmcp@1.7.0/LICENSE` | `0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a` |
 | `rmcp-macros@1.7.0/LICENSE` | `0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a` |
@@ -93,21 +108,40 @@ rustls-webpki's LICENSE to `third-party/chromium/LICENSE` does not imply that
 file exists in its published registry crate; the cache/archive contains no
 `third-party/` subtree. Do not invent its contents.
 
-The `layout-base@2.0.1/JamaJS-APACHE.txt` file is an exact excerpt (including
-the adaptation description and complete Apache-2.0 terms) from the embedded
-`crates/rtrt-dashboard/ui/vendor/layout-base.js` source, SHA-256
-`ec15ab5df9af3f20708f4faab994accf91cda71848cd5bb10a23432cc50b6745`,
-which was compared to the versioned npm tarball in the v0.2.0 audit. The inline
-attribution names `https://github.com/dragonfly-ai/JamaJS` and describes the
-changes made for fcose. The versioned npm tarball SHA-256 is
-`34165e46d8c4b9d719a592e39a60fa5f7324c21a3edd02733e1116b17013defd`. That digest
-is not a git commit. Registry `gitHead` is
+**Modification notice — RTRT, 2026-10-08:** The vendored `layout-base@2.0.1`
+bundle replaces the Stack Overflow-derived `RandomSeed` implementation, whose
+rights and attribution were uncertain, with an original non-cryptographic
+32-bit LCG. The API shape is preserved; seeded sequences and initial graph
+positions change. The current vendor bundle is modified from upstream.
+
+| Bundle identity | SHA-256 |
+|---|---|
+| Current `crates/rtrt-dashboard/ui/vendor/layout-base.js` | `7296ca281741b5eda7ec4ed626851275fa9262b37d2ae462319e84f38e1e9c7e` |
+| Original upstream `layout-base@2.0.1` bundle (historical) | `ec15ab5df9af3f20708f4faab994accf91cda71848cd5bb10a23432cc50b6745` |
+
+The embedded JamaJS attribution and complete Apache-2.0 excerpt remain unchanged
+from the original upstream bundle: 11,963 bytes, SHA-256
+`c969115b75246adef3cc3cc1213c2717e0959cf7283e7ced16ad2ec84a2e8d44`.
+The standalone `layout-base@2.0.1/JamaJS-APACHE.txt` is also unchanged; it contains
+that excerpt plus its existing final newline, with the digest listed above.
+The inline attribution names `https://github.com/dragonfly-ai/JamaJS` and describes
+the changes made for fcose. The npm archive has a separate SHA-256,
+`34165e46d8c4b9d719a592e39a60fa5f7324c21a3edd02733e1116b17013defd`.
+Registry `gitHead` is
 `3f7549940feef31416cc35ef8256282ebc4d1ecd`, the commit peeled from annotated tag
 `v2.0.1`. The tarball and that git tree have no `NOTICE` file. `dragonfly-ai/JamaJS`
 at the inspected `master` tip also has a LICENSE and no NOTICE file. This does
 **not** guarantee that no pertinent NOTICE existed in another JamaJS commit or
 distribution. The SVD code is a described adaptation, not a byte-identical copy
 of JamaJS. Preserve the embedded source attribution.
+
+The additional `tree-sitter-javascript@0.23.1/LICENSE` conservatively preserves
+the original MIT text, including `Copyright (c) 2014 Max Brunsfeld`, for the
+JavaScript grammar inherited by `tree-sitter-typescript@0.23.2`. The official
+upstream lock at the TypeScript source pin
+`f975a621f4e7f532fe322e13c4f79495e0a7b2e7` resolves JavaScript `0.23.1`.
+The notice comes from the npm `.tgz` listed above, not a Rust `.crate`, and is
+indexed separately from the Cargo component mapping.
 
 For `OR` expressions this inventory records the **unselected upstream SPDX
 expression** and ships *all* original archive license files; it does not claim

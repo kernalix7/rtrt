@@ -49,13 +49,22 @@ Manage Linux/macOS directly with `~/.local/bin/rtrt service install|uninstall|st
 
 On Windows, the installed task uses `%LOCALAPPDATA%\Programs\rtrt\rtrt-dashboard.exe`. Windows `rtrt service` management and opening are refused; open <http://127.0.0.1:7311/> and enter the token only in the dashboard's bootstrap prompt. Never put the token in a command, URL, or task definition.
 
-The npm package's Windows dashboard supervisor (`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL enforcement, binary trust) is exercised by `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`. The Unix supervisor test exercises the same surfaces on Unix and is not in the selected Windows lane. The historical v0.2.1 reference run <https://github.com/kernalix7/rtrt/actions/runs/37133785080> recorded 24 selected Windows-only acceptance cases and a separate 18-case system-drive binary resolver TAP pass, plus a D-root refusal proof; name-filter-only skips are allowed, the mandatory D-root refusal is not waived, and selected Windows-only cases must execute. That run is historical evidence for the v0.2.1 candidate, **not** fresh approval of `v0.2.2`; the v0.2.2 candidate must independently pass the same `windows-latest` gate with zero Windows-only skips in the three dashboard test files before release. Existing unsafe Windows state (any non-owner write ACE or an inherited permissive ACE on private credential or state files in `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, or `bootstrap.html`) refuses startup and is not silently ACL-repaired or deleted; the SYSTEM/Admins and trusted-OS-binary exemptions used for the public dashboard binary do not extend to private credential or state ACLs. The `v0.2.1` npm release introduced the fresh-state hardening and refusal of unsafe existing state; that behavior is retained in `v0.2.2`. The remediation added fresh-state hardening plus existing-state refusal with no painless rename-and-migrate step; the already-published `v0.2.0` and `v0.2.1` npm releases are immutable, `v0.2.0` does not contain these fixes, and `v0.2.1` is the source of the fixes for installs on or after that tag.
+The npm package's Windows dashboard supervisor (`.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` ACL enforcement, binary trust) is exercised by `dashboard-acl.test.mjs`, `dashboard-binary.test.mjs`, and `dashboard-open.test.mjs`.
+
+Each release must pass a fresh `windows-latest` run with 24 selected Windows-only
+acceptance cases, a separate 18-case system-drive binary resolver TAP pass, and the
+mandatory D-root refusal proof. Only name-filter skips are allowed; the three
+dashboard test files must execute with zero Windows-only skips. The Unix supervisor
+test is outside this lane. The [v0.2.1 run](https://github.com/kernalix7/rtrt/actions/runs/37133785080)
+passed these checks; every subsequent release must repeat them.
+
+Existing unsafe Windows state (any non-owner write ACE or an inherited permissive ACE on private credential or state files in `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, or `bootstrap.html`) refuses startup and is not silently ACL-repaired or deleted; the SYSTEM/Admins and trusted-OS-binary exemptions used for the public dashboard binary do not extend to private credential or state ACLs. The `v0.2.1` npm release introduced the fresh-state hardening and refusal of unsafe existing state; that behavior is retained in `v0.2.2`. The remediation added fresh-state hardening plus existing-state refusal with no painless rename-and-migrate step; the already-published `v0.2.0` and `v0.2.1` npm releases are immutable, `v0.2.0` does not contain these fixes, and `v0.2.1` is the source of the fixes for installs on or after that tag.
 
 Examples:
 
 ```bash
-# Pin the v0.2.2 release
-curl -fsSL .../install.sh | sh -s -- --version v0.2.2
+# Pin the v0.2.3 release
+curl -fsSL .../install.sh | sh -s -- --version v0.2.3
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh
@@ -126,6 +135,11 @@ The GitHub Release channel supplies these versioned archives after the paired-ta
 - `rtrt-<version>-x86_64-pc-windows-msvc.zip`
 
 Each archive bundles `rtrt`, `rtrt-mcp`, and `rtrt-dashboard`.
+
+The release workflow includes RTRT's `LICENSE` and `THIRD_PARTY_NOTICES` for the
+default-feature binaries. Optional features and downloaded models need separate
+license review. Docker images and installed npm dependency trees have additional
+components outside this inventory; see [Third-Party Licenses](../THIRD_PARTY_LICENSES.md).
 
 ## Verifying the install
 

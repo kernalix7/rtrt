@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.2.2.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.2.3.
 
 ## CLI
 
@@ -105,10 +105,10 @@ RTRT does not provide a team command, scheduler, roster, worker protocol, or `te
 
 ### OpenCode npm plugin and setup migration
 
-Install `rtrt-agent@0.2.2` with `npm install rtrt-agent@0.2.2` and register it directly with OpenCode's singular root `plugin` key:
+Install `rtrt-agent@0.2.3` with `npm install rtrt-agent@0.2.3` and register it directly with OpenCode's singular root `plugin` key:
 
 ```json
-{ "plugin": ["rtrt-agent@0.2.2"] }
+{ "plugin": ["rtrt-agent@0.2.3"] }
 ```
 
 The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. Both paths write a bounded `bootstrap.html` inside protected dashboard state through an exclusive same-directory temporary file with owner-only permissions or ACL **before** writing HTML, sync, then rename. The ordinary opener argv passes only the local absolute file path; URL, fragment, or `bootstrap=` opener arguments are rejected. The 60-second single-use HMAC credential, nonce replay, Origin, bearer exchange, and UI fragment clearing are unchanged. `rtrt service open --print-bootstrap` still prints only the short-lived warning URL and does not launch a browser; the Linux/macOS `rtrt service open` path uses the same owner-private `bootstrap.html` and absolute local file path argv. The legacy v1 `app_bottom` statusline remains setup-managed; the separate native v2 footer is included in the npm package and is not registered by v1 setup.
@@ -119,7 +119,7 @@ For a complete installation, prefer:
 rtrt setup --agent opencode --apply
 ```
 
-Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.2.2` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.2.3` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
 
 Existing npm-managed Windows `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, and `bootstrap.html` paths are validated before use: any non-owner write ACE or an inherited permissive ACE on private credential or state files refuses startup (fail-soft, OpenCode continues without the dashboard). The SYSTEM/Admins and trusted-OS-binary exemptions used for the public dashboard binary do not extend to private credential or state ACLs. Newly created state and files get owner-only permissions or ACL (current SID FullControl only, inheritance disabled) before sensitive content. Older unsafe existing state is **not** silently ACL-repaired or deleted by the package; there is no painless rename-and-migrate step. The `v0.2.1` npm release introduced the fresh-state hardening plus existing-state refusal; that behavior is retained in `v0.2.2`. The already-published `v0.2.0` and `v0.2.1` npm releases are immutable, `v0.2.0` does not contain these fixes, and `v0.2.1` is the source of the fixes for installs on or after that tag.
 
@@ -140,7 +140,7 @@ Native OpenCode 2.0.20 reads two plugin-configuration files, and they are not th
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -152,7 +152,7 @@ Native OpenCode 2.0.20 reads two plugin-configuration files, and they are not th
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.2/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
     }
   ]
 }
@@ -160,7 +160,7 @@ Native OpenCode 2.0.20 reads two plugin-configuration files, and they are not th
 
 The two-file form was verified locally with the actual `@opencode/cli@2.0.20` host in an isolated HOME/XDG environment: `server.js` is active, native TUI discovery reports `features.tui: true`, RTRT stdio MCP connects, strict TUI typechecking and bundling pass, and headless footer rendering at 120 and 40 columns passes against a real release `rtrt` binary and against a deliberately not-installed binary (missing → `N/A | STATE UNKNOWN | ...`). The verification is specific to the exact `@opencode/cli@2.0.20` host that was tested and is not a guarantee for other OpenCode versions.
 
-For the npm package's Windows dashboard behavior, the historical v0.2.1 CI run <https://github.com/kernalix7/rtrt/actions/runs/37133785080> passed 24 selected acceptance cases, 18 separate system-drive binary resolver cases, and the mandatory D-root refusal proof. Name-filter-only skips are allowed, but selected Windows-only cases must execute. The Unix supervisor test is not in that Windows lane. This is historical evidence, not fresh v0.2.2 approval; the v0.2.2 candidate must independently pass the same `windows-latest` gate before release.
+Each release must pass a fresh `windows-latest` run with 24 selected Windows-only acceptance cases, a separate 18-case system-drive binary resolver TAP pass, and the mandatory D-root refusal proof. Only name-filter skips are allowed; the three dashboard test files must execute with zero Windows-only skips. The Unix supervisor test is outside this lane. The [v0.2.1 run](https://github.com/kernalix7/rtrt/actions/runs/37133785080) passed these checks; every subsequent release must repeat them.
 
 ### OpenCode persistent statusline (legacy v1 setup-managed `app_bottom`)
 

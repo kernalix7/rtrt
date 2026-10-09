@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 ---
 
 > ### Status: Alpha
-> RTRT is early. This source tree targets **v0.2.2**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. This source tree targets **v0.2.3**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 ## What RTRT is
 
@@ -330,3 +330,7 @@ Ko-fi handles international cards and PayPal; fairy.hada.io is a Korean tipping 
 ## License
 
 [MIT](LICENSE) — Kim DaeHyun (kernalix7@kodenet.io)
+
+Bundled components retain their own licenses. See [Third-Party Licenses](THIRD_PARTY_LICENSES.md)
+for the default release notices and the scope of optional features, models, npm
+dependencies, and Docker images.

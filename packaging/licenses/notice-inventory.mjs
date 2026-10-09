@@ -4,6 +4,9 @@ import { createHash } from "node:crypto"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { ringSourceOverlay } from "./ring-source-headers.mjs"
+
+export { assertRingHeaderCoverage } from "./ring-source-headers.mjs"
 
 const root = fileURLToPath(new URL("../../", import.meta.url))
 const notices = path.join(root, "THIRD_PARTY_NOTICES")
@@ -140,6 +143,8 @@ export async function inventory(write = false) {
     assert.ok(pkg.license, `missing SPDX metadata for ${id}`)
     const archive = registryArchiveFor(pkg)
     assert.equal(hash(await readFile(archive)), checksum, `registry archive mismatch: ${id}`)
+    const overlayBytes = new Map((pkg.name === "ring" ? ringSourceOverlay(archive, pkg.version) : [])
+      .map((file) => [file.path, file.bytes]))
     const upstreamNotices = noticePaths(archive, id)
     if (!upstreamNotices.length) {
       const vcs = execFileSync("tar", ["-xOzf", archive, `${pkg.name}-${pkg.version}/.cargo_vcs_info.json`])
@@ -147,11 +152,13 @@ export async function inventory(write = false) {
     }
     // Some registry archives contain SPDX metadata but no license file. Preserve
     // their original manifest as evidence; do not manufacture an upstream text.
-    const paths = upstreamNotices.length ? upstreamNotices : ["Cargo.toml"]
+    const paths = [...new Set([...upstreamNotices.length ? upstreamNotices : ["Cargo.toml"],
+      ...overlayBytes.keys()])].sort()
     const files = []
     for (const relative of paths) {
       const upstream = `${pkg.name}-${pkg.version}/${relative}`
-      const bytes = execFileSync("tar", ["-xOzf", archive, upstream], { maxBuffer: 16 * 1024 * 1024 })
+      const bytes = overlayBytes.get(relative) ??
+        execFileSync("tar", ["-xOzf", archive, upstream], { maxBuffer: 16 * 1024 * 1024 })
       const destination = path.join(notices, id, relative)
       if (write) {
         await mkdir(path.dirname(destination), { recursive: true })

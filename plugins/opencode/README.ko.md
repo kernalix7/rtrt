@@ -4,21 +4,21 @@
 agent, worktree, invocation 및 permission broker 문맥을 보존하고 로컬 대시보드를
 백그라운드에서 사용할 수 있게 유지합니다.
 
-## 설치 (v1 setup-managed wiring, v0.2.3)
+## 설치 (v1 setup-managed wiring, v0.2.4)
 
-이 소스는 `v0.2.3`을 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
+이 소스는 `v0.2.4`을 대상으로 합니다. 설치에는 일치하는 게시된 npm release가
 필요하며, 소스 트리 단독으로는 게시를 증명하지 않습니다. 현재 install command는
 다음과 같습니다.
 
 ```sh
-npm install rtrt-agent@0.2.3
+npm install rtrt-agent@0.2.4
 ```
 
 `opencode.json`에 등록합니다.
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.3"]
+  "plugin": ["rtrt-agent@0.2.4"]
 }
 ```
 
@@ -77,18 +77,18 @@ OpenCode는 정상적으로 계속됩니다. 기존 `~/.rtrt` 데이터는 보�
 
 `rtrt setup --agent opencode --apply`는 전체 RTRT 통합을 관리하지만 npm 설치는 수행하지
 않으며, 설정된 패키지는 OpenCode가 시작할 때 설치합니다. Setup은 먼저 정확한
-`rtrt-agent@0.2.3` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
+`rtrt-agent@0.2.4` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 성공한 뒤에만
 인식된 legacy RTRT plugin을 제거하며, 이전 단계가 실패하면 legacy runtime을 보존합니다.
 Setup은 `rtrt-agent`의 정확히 일치하는 bare, pinned, ranged, tuple, object 형식만 소유하고
-정확한 `"rtrt-agent@0.2.3"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
+정확한 `"rtrt-agent@0.2.4"` string 하나로 정규화합니다. 이전의 미게시 `rtrt`와 초안
 `rtrt-opencode` 패키지 spec은 외부 값이며 순서를 유지합니다. 위 직접 등록과
-`opencode plugin rtrt-agent@0.2.3 --global`은 계속 유효합니다.
+`opencode plugin rtrt-agent@0.2.4 --global`은 계속 유효합니다.
 
 관리 agent 소유권 상태는 다음 순서의 첫 비어 있지 않은 root에서 읽습니다.
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, `~/.config/opencode`. 공존은 OMO
 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도
 미래 버전 지원을 보장하지 않습니다. 통합 RTRT 릴리스 워크플로는 정확한 버전의
-대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.3`보다 먼저 게시한 뒤 일치하는 Rust
+대시보드 플랫폼 패키지 5개를 `rtrt-agent@0.2.4`보다 먼저 게시한 뒤 일치하는 Rust
 릴리스 artifact를 게시합니다.
 
 ### 기존 Windows state와 credential ACL
@@ -167,7 +167,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -179,7 +179,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -233,7 +233,7 @@ TUI에 도달합니다. 두 파일에 같은 `options.bin`을 설정하세요.
 Native local MCP 형식은 `mcp.servers.rtrt.type: "local"`과
 `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]` 같은 `command` 배열을
 사용합니다. 옵션 이름은 `disabled`와 `codemode`이며 sandbox source config에서는 둘
-다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.3`입니다.
+다 `false`입니다. Release에 고정된 v1 등록은 `rtrt-agent@0.2.4`입니다.
 `rtrt setup --agent opencode --apply`는 여전히 v1 설정을 기록하며 native v2 설치가
 아닙니다. Setup 자체는 npm 패키지를 설치하지 않고, OpenCode가 시작할 때 설정된
 패키지를 해석합니다.

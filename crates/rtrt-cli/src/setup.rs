@@ -5,6 +5,7 @@
 //! - `cursor`   — `~/.cursor/mcp.json` (`mcpServers.rtrt`)
 //! - `windsurf` — `~/.windsurf/mcp_config.json` (`mcpServers.rtrt`)
 //! - `codex`    — `~/.codex/config.toml` (`[mcp_servers.rtrt]`)
+//! - `omo`      — native MCP config and an owned extension under `~/.omo/agent`.
 //! - `opencode` — targets whichever of `~/.config/opencode/opencode.json` /
 //!   `opencode.jsonc` already exists (preferring `.json`; opencode itself
 //!   reads `.json` first and a fresh install creates only that file, so
@@ -28,6 +29,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rtrt_core::OutputStyleLevel;
 
+mod omo;
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum AgentKind {
     Claude,
@@ -35,6 +38,7 @@ pub enum AgentKind {
     Windsurf,
     Codex,
     Opencode,
+    Omo,
     Aider,
 }
 
@@ -680,6 +684,7 @@ pub fn run(plan: SetupPlan) -> Result<()> {
             install_terse_rules(plan.agent, plan.apply)?;
             apply_codex_toml(&plan, &binary, &memory_path)
         }
+        AgentKind::Omo => omo::install(&plan),
         AgentKind::Opencode => {
             let provenance_path =
                 opencode_provenance_plugin_path_in(&resolve_opencode_config_root()?);
@@ -2922,6 +2927,7 @@ fn terse_rules_path(agent: AgentKind) -> Option<&'static str> {
         AgentKind::Windsurf => Some(WINDSURF_RULES_REL),
         AgentKind::Codex => Some(CODEX_RULES_REL),
         AgentKind::Opencode => None,
+        AgentKind::Omo => None,
         AgentKind::Aider => Some(AIDER_RULES_REL),
     }
 }
@@ -4131,6 +4137,7 @@ pub fn uninstall_agent(agent: AgentKind, apply: bool) -> Result<()> {
             remove_terse_rules(agent, apply)?;
             drop_codex_toml(apply)
         }
+        AgentKind::Omo => omo::uninstall(apply),
         AgentKind::Opencode => uninstall_opencode(apply),
     }
 }
@@ -5980,7 +5987,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             opencode_provenance_dry_run_status(&url),
-            "[dry-run] would register rtrt-agent@0.2.3 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
+            "[dry-run] would register rtrt-agent@0.2.4 and migrate legacy registrations file:///home/test/OpenCode%20Config/plugins/rtrt-provenance.js and ./plugins/rtrt-provenance.js"
         );
     }
 
@@ -5990,7 +5997,7 @@ mod tests {
             OPENCODE_NPM_PLUGIN_ID,
             concat!("rtrt-agent@", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.2.3");
+        assert_eq!(OPENCODE_NPM_PLUGIN_ID, "rtrt-agent@0.2.4");
     }
 
     /// Writes an opencode config with a pre-existing `mcp.other` server to a

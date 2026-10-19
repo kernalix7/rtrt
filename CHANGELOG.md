@@ -9,6 +9,22 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-19
+
+### Fixed
+
+- Update locked `rustls` to `0.23.46` and inactive optional `quinn-proto` to `0.11.18` to address nine RustSec advisories without enabling HTTP/3 or changing provider configuration.
+
+### Added
+
+- Add `rtrt setup --agent omo` and matching uninstall for OmO/Senpi native, with managed MCP configuration and factory-time MCP registration.
+- Stamp native agent calls with per-call provenance and filter simple successful foreground bash output through `rtrt proxy` without rerunning commands or changing native permissions. Compound commands, errors, cancellation and oversized results preserve the original output.
+- Preserve unrelated configuration and user files, refuse modified or symlinked managed files, and keep other servers' credentials out of dry-run previews. Add paired native usage guidance and isolated OmO native 5.1.35 acceptance.
+
+### Distribution
+
+- Align Rust workspace, Claude plugin, npm package and Homebrew template versions at `0.2.4`. OmO support ships in the native binaries; it does not add another npm package. The Homebrew formula remains a template.
+
 ## [0.2.3] - 2026-10-08
 
 ### Fixed

@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-19
+
+### 수정
+
+- 잠긴 `rustls`를 `0.23.46`, 활성화되지 않은 선택적 `quinn-proto`를 `0.11.18`로 갱신해 RustSec 권고 9건을 해결합니다. HTTP/3를 활성화하거나 provider 설정을 바꾸지 않습니다.
+
+### 추가
+
+- OmO/Senpi native용 `rtrt setup --agent omo`와 대응하는 uninstall을 추가합니다. MCP 설정을 관리하고 factory 시점에 MCP 서버를 등록합니다.
+- Native agent 호출에 호출별 출처를 붙이고 단순한 foreground bash 성공 출력을 `rtrt proxy`로 필터링합니다. 명령을 재실행하거나 native 권한을 바꾸지 않으며, 복합 명령·오류·취소·크기 초과 결과는 원본을 유지합니다.
+- 관련 없는 설정과 사용자 파일을 보존하고 수정되거나 symlink인 관리 파일을 거부하며, dry-run에 다른 서버의 자격 증명을 출력하지 않습니다. 영문·한국어 native 사용 설명과 격리된 OmO native 5.1.35 acceptance를 추가합니다.
+
+### 배포
+
+- Rust workspace·Claude 플러그인·npm 패키지·Homebrew 템플릿 버전을 `0.2.4`로 맞춥니다. OmO 지원은 native 바이너리에 포함되며 별도 npm 패키지는 추가하지 않습니다. Homebrew formula는 템플릿으로 유지합니다.
+
 ## [0.2.3] - 2026-10-08
 
 ### 수정

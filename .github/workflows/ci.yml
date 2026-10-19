@@ -213,6 +213,9 @@ jobs:
           mkdir -p "$config_dir/agents"
           printf '{invalid managed-agent state\n' > "$config_dir/agents/.rtrt-managed-state.json"
       - run: npm test
+      - name: Test OmO native runtime adapter
+        working-directory: ${{ github.workspace }}
+        run: node --test plugins/omo/*.test.mjs
       - name: Install oh-my-openagent compatibility fixture
         run: npm ci --prefix test-fixtures/omo-4.19.4 --ignore-scripts
       - name: Test oh-my-openagent 4.19.4 compatibility

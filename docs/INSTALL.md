@@ -63,8 +63,8 @@ Existing unsafe Windows state (any non-owner write ACE or an inherited permissiv
 Examples:
 
 ```bash
-# Pin the v0.2.3 release
-curl -fsSL .../install.sh | sh -s -- --version v0.2.3
+# Pin the v0.2.4 release
+curl -fsSL .../install.sh | sh -s -- --version v0.2.4
 
 # Track a topic branch
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh

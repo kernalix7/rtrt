@@ -2,7 +2,7 @@
 
 **English** | [한국어](USAGE.ko.md)
 
-This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.2.3.
+This page documents the `rtrt` CLI, the `rtrt-mcp` server, and the `rtrt-dashboard` web UI as of v0.2.4.
 
 ## CLI
 
@@ -103,12 +103,24 @@ rtrt hook proxy-rewrite
 
 RTRT does not provide a team command, scheduler, roster, worker protocol, or `team_dispatch` MCP tool. Multi-agent coordination belongs to the external agent runtime. RTRT remains responsible for compression, memory, provider routing and failover, security scanning, setup integration, and provenance.
 
+### OmO native wiring (v0.2.4+)
+
+```bash
+# Dry-run — prints the writes, writes nothing
+~/.local/bin/rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp
+
+# Apply the same writes
+~/.local/bin/rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp --apply
+```
+
+OmO setup is shipped as a v0.2.4 setup target alongside Claude / Cursor / Codex / Windsurf / opencode. It wires a native MCP entry plus a single native-discoverable extension under the resolved OmO agent directory, with absolute paths so an older `rtrt` or `rtrt-mcp` earlier on PATH cannot win the call. Full install flow, ownership rules, and the verified factory-discovery / codemode bash filtering / per-call provenance behaviors live in [docs/OMO_NATIVE.md](OMO_NATIVE.md).
+
 ### OpenCode npm plugin and setup migration
 
-Install `rtrt-agent@0.2.3` with `npm install rtrt-agent@0.2.3` and register it directly with OpenCode's singular root `plugin` key:
+Install `rtrt-agent@0.2.4` with `npm install rtrt-agent@0.2.4` and register it directly with OpenCode's singular root `plugin` key:
 
 ```json
-{ "plugin": ["rtrt-agent@0.2.3"] }
+{ "plugin": ["rtrt-agent@0.2.4"] }
 ```
 
 The npm package exports RTRT's provenance and permission hooks and starts the version-matched dashboard backend as a detached, loopback-only process. Plugin initialization does not wait for it and does not open a browser. Run `rtrt-dashboard-open`, or explicitly ask the agent to use `rtrt_dashboard_open`, when the browser is needed. Both paths write a bounded `bootstrap.html` inside protected dashboard state through an exclusive same-directory temporary file with owner-only permissions or ACL **before** writing HTML, sync, then rename. The ordinary opener argv passes only the local absolute file path; URL, fragment, or `bootstrap=` opener arguments are rejected. The 60-second single-use HMAC credential, nonce replay, Origin, bearer exchange, and UI fragment clearing are unchanged. `rtrt service open --print-bootstrap` still prints only the short-lived warning URL and does not launch a browser; the Linux/macOS `rtrt service open` path uses the same owner-private `bootstrap.html` and absolute local file path argv. The legacy v1 `app_bottom` statusline remains setup-managed; the separate native v2 footer is included in the npm package and is not registered by v1 setup.
@@ -119,7 +131,7 @@ For a complete installation, prefer:
 rtrt setup --agent opencode --apply
 ```
 
-Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.2.3` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
+Setup performs no npm installation itself. It first writes the exact `rtrt-agent@0.2.4` registration and every replacement managed asset. Only after all of those writes succeed does it perform final cleanup of recognized legacy RTRT plugin entries; a failure before that point preserves the legacy runtime. OpenCode installs the configured npm package and its matching platform dashboard package when it starts. Dashboard startup is fail-soft and preserves existing `~/.rtrt` data. Foreign plugin strings, tuples, objects, and unrecognized legacy entries retain their order and content. Uninstall removes only RTRT-owned entries. The resolved config root is the first nonempty value of `OPENCODE_CONFIG_DIR`, then `$XDG_CONFIG_HOME/opencode`, then the HOME/USERPROFILE fallback root, `~/.config/opencode` on HOME-based systems. Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither is a promise for future versions. The unified release workflow publishes the version-matched Rust artifacts and npm packages.
 
 Existing npm-managed Windows `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, and `bootstrap.html` paths are validated before use: any non-owner write ACE or an inherited permissive ACE on private credential or state files refuses startup (fail-soft, OpenCode continues without the dashboard). The SYSTEM/Admins and trusted-OS-binary exemptions used for the public dashboard binary do not extend to private credential or state ACLs. Newly created state and files get owner-only permissions or ACL (current SID FullControl only, inheritance disabled) before sensitive content. Older unsafe existing state is **not** silently ACL-repaired or deleted by the package; there is no painless rename-and-migrate step. The `v0.2.1` npm release introduced the fresh-state hardening plus existing-state refusal; that behavior is retained in `v0.2.2`. The already-published `v0.2.0` and `v0.2.1` npm releases are immutable, `v0.2.0` does not contain these fixes, and `v0.2.1` is the source of the fixes for installs on or after that tag.
 
@@ -140,7 +152,7 @@ Native OpenCode 2.0.20 reads two plugin-configuration files, and they are not th
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -152,7 +164,7 @@ Native OpenCode 2.0.20 reads two plugin-configuration files, and they are not th
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }

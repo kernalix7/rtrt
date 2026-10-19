@@ -4,20 +4,20 @@
 worktree, invocation, and permission-broker context across supported hooks and keeps
 the local dashboard available in the background.
 
-## Install (v1 setup-managed wiring, v0.2.3)
+## Install (v1 setup-managed wiring, v0.2.4)
 
-This source targets `v0.2.3`. Installation requires a matching published npm release;
+This source targets `v0.2.4`. Installation requires a matching published npm release;
 the source tree alone is not proof of publication. The current install command is:
 
 ```sh
-npm install rtrt-agent@0.2.3
+npm install rtrt-agent@0.2.4
 ```
 
 Register it in `opencode.json`:
 
 ```json
 {
-  "plugin": ["rtrt-agent@0.2.3"]
+  "plugin": ["rtrt-agent@0.2.4"]
 }
 ```
 
@@ -78,19 +78,19 @@ continues normally. Existing `~/.rtrt` data is preserved.
 
 `rtrt setup --agent opencode --apply` manages the full RTRT integration but performs no
 npm installation; OpenCode installs the configured package at startup. Setup first writes
-the exact `rtrt-agent@0.2.3` registration and every replacement managed asset. Only after
+the exact `rtrt-agent@0.2.4` registration and every replacement managed asset. Only after
 those writes succeed does it remove a recognized legacy RTRT plugin; an earlier failure
 preserves the legacy runtime. Setup owns exact bare, pinned, ranged, tuple, and object forms
-of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.3"` string. Old
+of `rtrt-agent` only and normalizes them to one exact `"rtrt-agent@0.2.4"` string. Old
 unpublished `rtrt` and draft `rtrt-opencode` package specs are foreign and retain their
-order. The direct registration above and `opencode plugin rtrt-agent@0.2.3 --global`
+order. The direct registration above and `opencode plugin rtrt-agent@0.2.4 --global`
 remain valid.
 
 Managed-agent ownership state is read from the first nonempty root in this order:
 `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode`, then `~/.config/opencode`.
 Coexistence is CI-gated against OMO 4.19.4 and was verified on OpenCode 1.18.29; neither
 is a future-version guarantee. The unified RTRT release workflow publishes the exact
-five exact-version dashboard platform packages before `rtrt-agent@0.2.3`, then publishes
+five exact-version dashboard platform packages before `rtrt-agent@0.2.4`, then publishes
 the matching Rust release artifacts.
 
 ### Existing Windows state and credential ACL
@@ -175,7 +175,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -187,7 +187,7 @@ entry):
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -243,7 +243,7 @@ is specific to the exact `@opencode/cli@2.0.20` host that was tested.
 The native local MCP shape uses `mcp.servers.rtrt.type: "local"` and a `command` array
 such as `["/absolute/path/to/rtrt-mcp", "--transport", "stdio"]`; the option names are
 `disabled` and `codemode`, both `false` in the sandbox source config. The
-release-pinned v1 registration is `rtrt-agent@0.2.3`. `rtrt setup --agent opencode
+release-pinned v1 registration is `rtrt-agent@0.2.4`. `rtrt setup --agent opencode
 --apply` still writes v1 configuration, not native v2 installation; setup itself does
 not install npm packages, and OpenCode resolves the configured package at startup.
 

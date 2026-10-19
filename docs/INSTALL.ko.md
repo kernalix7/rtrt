@@ -63,8 +63,8 @@ npm 패키지의 Windows dashboard supervisor(`.rtrt`, `dashboard`, `startup.loc
 예시:
 
 ```bash
-# v0.2.3 릴리스 고정
-curl -fsSL .../install.sh | sh -s -- --version v0.2.3
+# v0.2.4 릴리스 고정
+curl -fsSL .../install.sh | sh -s -- --version v0.2.4
 
 # 토픽 브랜치 추적
 RTRT_REF=feature/cache curl -fsSL .../install.sh | sh

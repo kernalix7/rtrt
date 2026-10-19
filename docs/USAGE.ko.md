@@ -2,7 +2,7 @@
 
 [English](USAGE.md) | **한국어**
 
-이 문서는 v0.2.3 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
+이 문서는 v0.2.4 기준 `rtrt` CLI, `rtrt-mcp` 서버, `rtrt-dashboard` 웹 UI 사용법입니다.
 
 ## 빠른 차림표
 
@@ -111,12 +111,24 @@ rtrt hook proxy-rewrite
 
 RTRT는 team 명령, scheduler, roster, worker protocol 또는 `team_dispatch` MCP 도구를 제공하지 않습니다. 멀티 에이전트 코디네이션은 외부 에이전트 런타임이 담당합니다. RTRT는 압축, 메모리, 프로바이더 라우팅과 페일오버, 보안 스캔, setup 통합 및 provenance에 집중합니다.
 
+### OmO native 와이어업 (v0.2.4+)
+
+```bash
+# Dry-run — 변경 내용을 출력만, 쓰지는 않음
+~/.local/bin/rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp
+
+# --apply로 같은 변경 적용
+~/.local/bin/rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp --apply
+```
+
+OmO setup은 v0.2.4부터 Claude / Cursor / Codex / Windsurf / opencode와 같은 setup 대상으로 제공됩니다. native MCP 항목과 resolved OmO 에이전트 디렉터리 아래 native 자동 탐색용 extension 하나를 연결하며, 절대 경로를 써서 PATH 앞쪽의 구버전 `rtrt` 또는 `rtrt-mcp`가 호출을 가져가지 못하게 합니다. 설치 절차 전체, 소유권 규칙, 그리고 검증된 factory 탐색 / codemode bash 필터 / 호출별 출처 동작은 [docs/OMO_NATIVE.ko.md](OMO_NATIVE.ko.md)에 정리돼 있습니다.
+
 ### OpenCode npm 플러그인과 setup 마이그레이션
 
-`rtrt-agent@0.2.3`를 `npm install rtrt-agent@0.2.3`로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
+`rtrt-agent@0.2.4`를 `npm install rtrt-agent@0.2.4`로 설치하고 OpenCode의 단수 루트 `plugin` 키에 직접 등록할 수 있습니다.
 
 ```json
-{ "plugin": ["rtrt-agent@0.2.3"] }
+{ "plugin": ["rtrt-agent@0.2.4"] }
 ```
 
 npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 일치하는 대시보드 backend를 loopback-only detached process로 시작합니다. 플러그인 초기화는 대시보드 준비를 기다리지 않으며 브라우저를 자동으로 열지 않습니다. 필요할 때 `rtrt-dashboard-open`을 실행하거나 에이전트에게 `rtrt_dashboard_open` 도구 사용을 명시적으로 요청합니다. 두 경로 모두 보호된 대시보드 state 안의 같은 디렉터리 임시 파일을 전용(exclusive) 모드로 열고 owner 전용 permission 또는 ACL을 적용한 다음 HTML을 작성·sync 후 rename합니다. 일반 opener argv는 로컬 absolute 파일 경로 하나만 담고, URL·fragment·`bootstrap=` 인자는 거부합니다. 60초 single-use HMAC credential, nonce replay, Origin, bearer exchange, UI fragment clear 동작은 그대로입니다. `rtrt service open --print-bootstrap`은 짧은 경고 URL만 출력하고 브라우저를 실행하지 않습니다. `--print-bootstrap` 없이 Linux/macOS의 `rtrt service open`은 같은 owner 전용 `bootstrap.html`과 absolute 로컬 파일 경로 argv를 사용합니다. Legacy v1 `app_bottom` statusline은 계속 setup이 관리하며, 별도의 native v2 footer는 npm 패키지에 포함되어 있지만 v1 setup으로 등록하지 않습니다.
@@ -127,7 +139,7 @@ npm 패키지는 RTRT provenance 및 permission hook을 내보내고 버전이 �
 rtrt setup --agent opencode --apply
 ```
 
-Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.2.3` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지를 게시합니다.
+Setup 자체는 npm 설치를 수행하지 않습니다. 먼저 정확한 `rtrt-agent@0.2.4` 등록과 모든 대체 관리 asset을 기록합니다. 이 기록이 모두 성공한 뒤에만 인식 가능한 legacy RTRT plugin 항목을 마지막으로 정리하며, 그 전 단계에서 실패하면 legacy runtime을 보존합니다. 설정된 npm 패키지와 일치하는 플랫폼 대시보드 패키지는 OpenCode가 시작할 때 설치합니다. 대시보드 시작은 fail-soft이며 기존 `~/.rtrt` 데이터를 보존합니다. 외부 plugin string, tuple, object와 인식할 수 없는 legacy 항목은 기존 순서와 내용을 유지합니다. Uninstall은 RTRT 소유 항목만 제거합니다. 해석된 config root는 비어 있지 않은 `OPENCODE_CONFIG_DIR`, 다음 `$XDG_CONFIG_HOME/opencode`, 마지막 HOME/USERPROFILE fallback root이며 HOME 기반 system에서는 `~/.config/opencode`입니다. 공존은 OMO 4.19.4를 대상으로 CI에서 검사하고 OpenCode 1.18.29에서 직접 검증했으며, 어느 쪽도 미래 버전 지원을 보장하지 않습니다. 통합 릴리스 워크플로는 버전이 일치하는 Rust artifact와 npm 패키지를 게시합니다.
 
 npm이 관리하는 기존 Windows `.rtrt`, `dashboard`, `startup.lock`, `dashboard.env`, `bootstrap.html` 경로는 사용 전에 검증됩니다. private credential 또는 state file에 비-owner write ACE이거나 상속된 permissive ACE가 있는 기존 경로는 시작을 거부합니다 (fail-soft, OpenCode는 대시보드 없이 계속). 공개 대시보드 binary에 적용되는 SYSTEM/Admins 및 trusted-OS-binary 면제는 private credential 또는 state ACL까지 확장되지 않습니다. 새로 만든 state와 file은 민감한 콘텐츠 이전에 owner 전용 permission 또는 ACL(현재 SID FullControl 전용, inheritance 비활성)을 부여받습니다. 더 오래된 unsafe 기존 state는 패키지에 의해 자동으로 ACL 복구되거나 삭제되지 않으며, painless rename-and-migrate 단계도 없습니다. `v0.2.1` npm release는 fresh state 강화와 기존 state 거절을 도입했고 그 동작은 `v0.2.2`에서도 유지됩니다. 이미 게시된 `v0.2.0`과 `v0.2.1` npm release는 immutable이며 `v0.2.0`은 이 수정도 포함하지 않고 `v0.2.1`이 이 태그 이후 설치에 적용되는 수정의 출처입니다.
 
@@ -148,7 +160,7 @@ Native OpenCode 2.0.20은 플러그인 설정을 위해 두 파일을 읽으며,
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }
@@ -160,7 +172,7 @@ Native OpenCode 2.0.20은 플러그인 설정을 위해 두 파일을 읽으며,
   "plugins": [
     {
       "package": "/absolute/path/to/rtrt-agent",
-      "options": { "bin": "/absolute/path/to/rtrt-0.2.3/rtrt" }
+      "options": { "bin": "/absolute/path/to/rtrt-0.2.4/rtrt" }
     }
   ]
 }

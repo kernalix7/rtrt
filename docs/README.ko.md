@@ -34,7 +34,7 @@ cargo build --release --workspace</code></pre>
 ---
 
 > ### 상태: 알파
-> RTRT는 초기 단계입니다. 이 소스 트리는 **v0.2.3**을 대상으로 합니다. MCP(stdio + Streamable HTTP), 프로바이더 채팅, BM25 + vector + graph + HNSW 메모리, 자동 캡처, 설치 / 제거, 벤치마크가 구현돼 있습니다. CI는 워크스페이스 테스트, clippy, 포맷, 옵트인 feature 컴파일 검사, macOS Intel 테스트를 실행합니다. 문제는 <https://github.com/kernalix7/rtrt/issues>에 보고해 주세요.
+> RTRT는 초기 단계입니다. 이 소스 트리는 **v0.2.4**을 대상으로 합니다. MCP(stdio + Streamable HTTP), 프로바이더 채팅, BM25 + vector + graph + HNSW 메모리, 자동 캡처, 설치 / 제거, 벤치마크가 구현돼 있습니다. CI는 워크스페이스 테스트, clippy, 포맷, 옵트인 feature 컴파일 검사, macOS Intel 테스트를 실행합니다. 문제는 <https://github.com/kernalix7/rtrt/issues>에 보고해 주세요.
 
 RTRT는 세 기둥만 합칩니다. [`DESIGN.ko.md`](DESIGN.ko.md)에 10개 원칙, [`PERF.ko.md`](PERF.ko.md)에 SLO 표 + 최신 측정값. 프레임워크가 아닌 유닉스 도구 모음 — 안정된 substrate (SQLite / Markdown / JSONL / SHA-256 / Rust / tree-sitter / MCP / SSE / 파이프) 위에 얇은 러스트 레이어. 멀티 에이전트 코디네이션은 외부 에이전트 런타임에 맡깁니다. 핵심 크레이트 zero-`unsafe`, edition 2024.
 
@@ -82,6 +82,8 @@ rtrt new dev ./hello --var project_name=hello
 rtrt setup --agent claude --apply
 rtrt setup --agent opencode --apply             # OpenCode MCP 설정에 RTRT 연결
 rtrt setup --agent opencode --sandbox --machine-only --apply # 머신 셸만 허용, cwd는 승인하지 않음
+rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp           # OmO native 와이어링 미리보기 (v0.2.4+, 기본 dry-run)
+rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp --apply   # 같은 명령을 적용
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
 rtrt prompt save greet "say hi"
@@ -99,7 +101,7 @@ rtrt-dashboard
 rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 ```
 
-전체 명령은 [USAGE.ko.md](USAGE.ko.md)에 있습니다.
+전체 명령은 [USAGE.ko.md](USAGE.ko.md)에 있고, OmO native 확장 와이어업은 [OMO_NATIVE.ko.md](OMO_NATIVE.ko.md)에 정리돼 있습니다.
 
 ## 세 기둥
 
@@ -112,7 +114,7 @@ rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 - **`rtrt-mcp`** — rmcp 1.x stdio + Streamable HTTP. 23개 도구 (compress / compress_ml / proxy / repo_map / memory_* / templates_* / provider_chat / agent_call / agent_route / security_scan / permission_prompt). `RTRT_MCP_HTTP_TOKEN` 환경 변수 기반 상수-시간 베어러 가드 + RFC 6454 Origin 검증. 모든 핸들러가 자동 캡처 파이프라인을 통과합니다.
 - **`rtrt-dashboard`** — axum의 Project 페이지는 Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security이고 Tools 페이지는 LLM, Chat, Limits, Environment, Usage, Failover, Connect입니다. Failover는 프로젝트를 선택하지 않았을 때만 글로벌 정책을 편집합니다. 프로젝트를 선택하면 상속 상태는 읽기 전용이며, **Custom**은 프로젝트 오버라이드를 기록하고 **Follow global**은 그 오버라이드를 제거합니다. `RTRT_DASHBOARD_TOKEN` 베어러 미들웨어, 다크모드.
 - **Claude Code 플러그인** — `plugins/claude-code/rtrt/` 훅 12종 (PreToolUse / PostToolUse / PostToolUseFailure / PreCompact / UserPromptSubmit / PostUserPromptSubmit / Notification / Stop / SubagentStart / SubagentStop / SessionStart / SessionEnd). CLI 우선, 대시보드 POST 폴백.
-- **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/opencode/aider --apply`.
+- **에이전트 와이어업** — `rtrt setup --agent claude/cursor/codex/windsurf/opencode/aider --apply`. v0.2.4부터는 OmO native도 같은 setup 흐름을 받습니다 ([OMO_NATIVE.ko.md](OMO_NATIVE.ko.md) 참고).
 - **Linux OpenCode 보안 부트스트랩** — eligible 설치는 machine shell과 기존 global session migration을 자동 적용하며 `--no-setup`으로 끕니다. 설치 cwd는 승인하지 않습니다.
 - **보안 & 라이선스 스캔** — `rtrt-security`: 프로파일 기반 5 엔진(secrets / licenses / deps / patterns / ai), 표준 매핑 빌트인 프로파일 6종(CWE / OWASP / NIST / CIS / SLSA / EU AI Act), `rtrt security scan | profile | gate | init` + 대시보드 보안 페이지 + MCP `security_scan`.
 - **2단 설정 & 프로젝트 라이프사이클** — 글로벌 베이스 커널(`~/.rtrt/config.toml`, `rtrt setup` 관리) + 프로젝트별 `<repo>/.rtrt/config.toml` 오버라이드(유효 설정 = 글로벌 ⊕ 프로젝트, 대시보드 글로벌 따름/커스텀 토글); `rtrt migrate` / `rtrt project refresh`(기본 dry-run, `--apply`) + `rtrt project status/health/repair`.
@@ -124,6 +126,7 @@ rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 |------|------|
 | [INSTALL.ko.md](INSTALL.ko.md) | 설치 경로 — 소스 / GitHub Release 사전 빌드 바이너리 / Homebrew tap / 제거 |
 | [USAGE.ko.md](USAGE.ko.md) | CLI · MCP · 대시보드 사용법 + 자동 캡처 파이프라인 |
+| [OMO_NATIVE.ko.md](OMO_NATIVE.ko.md) | OmO native 확장 API 통합 (v0.2.4+ `setup --agent omo`) |
 | [FEATURES.ko.md](FEATURES.ko.md) | 압축 규칙 / 필터 / 메모리 스키마 / 템플릿 |
 | [ARCHITECTURE.ko.md](ARCHITECTURE.ko.md) | 크레이트 경계 · 데이터 흐름 |
 | [DESIGN.ko.md](DESIGN.ko.md) | 10개 원칙 (프레임워크 아닌 도구 · 세 기둥 · 측정값 성능) |
@@ -148,6 +151,7 @@ rtrt-mcp --admin --memory ~/.rtrt/memory.sqlite
 - [x] Claude Code 플러그인 12개 훅 (`plugins/claude-code/rtrt/`)
 - [x] `install.sh` + `install.ps1` 원라이너 + `release.yml` 5-target 매트릭스
 - [x] `rtrt setup --agent <name>` Claude / Cursor / Codex / Windsurf / opencode 와이어업
+- [x] `rtrt setup --agent omo` v0.2.4 setup 대상 — OmO native 확장 API (factory MCP 탐색, codemode bash 필터, 호출별 출처) ([OMO_NATIVE.ko.md](OMO_NATIVE.ko.md) 참고)
 - [x] criterion 벤치 + per-fixture 절감률 테이블 + `recall_bench` (1K/10K/100K)
 - [x] CI 회귀 게이트 (`.github/workflows/perf.yml` + `scripts/perf-gate.sh`) — 10% p50 회귀 차단
 - [x] `DESIGN.md` + `PERF.md` — 10개 원칙 + SLO 표 + 측정값 정책

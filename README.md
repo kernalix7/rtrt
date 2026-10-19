@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/kernalix7/rtrt/main/uninstall.sh | 
 ---
 
 > ### Status: Alpha
-> RTRT is early. This source tree targets **v0.2.3**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
+> RTRT is early. This source tree targets **v0.2.4**. MCP (stdio + Streamable HTTP), provider chat, BM25 + vector + graph + HNSW memory, auto-capture, install / uninstall, and benchmarks are implemented. CI runs workspace tests, clippy, formatting, optional-feature compile checks, and a macOS Intel test lane. File issues at <https://github.com/kernalix7/rtrt/issues>.
 
 ## What RTRT is
 
@@ -110,6 +110,8 @@ rtrt new dev ./hello --var project_name=hello
 rtrt setup --agent claude --apply               # wire RTRT into Claude Code's MCP config
 rtrt setup --agent opencode --apply             # wire RTRT into OpenCode's MCP config
 rtrt setup --agent opencode --sandbox --machine-only --apply # machine shell only; authorizes no cwd
+rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp          # preview OmO native wiring (v0.2.4+; dry-run by default)
+rtrt setup --agent omo --binary ~/.local/bin/rtrt-mcp --apply   # apply the same OmO native wiring
 rtrt memory save --project p --kind note "fact"
 rtrt memory recall --project p --query rust
 rtrt memory extract --project p --provider openai-compat \
@@ -131,7 +133,7 @@ rtrt benchmark                                  # cargo bench wrapper
 rtrt-mcp --transport http --bind 127.0.0.1:7312 # stdio or Streamable HTTP, 23 tools, bearer-token guard
 ```
 
-See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour.
+See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashboard tour. The OmO native extension wiring is documented under [docs/OMO_NATIVE.md](docs/OMO_NATIVE.md).
 
 ## Key features
 
@@ -216,7 +218,7 @@ See [docs/USAGE.md](docs/USAGE.md) for the full CLI, MCP tool surface, and dashb
 - `rtrt-mcp` (rmcp 1.x) ships 23 tools over stdio **and** Streamable HTTP: `compress`, `compress_ml`, `proxy`, `repo_map`, `memory_save`, `memory_recall` (with qdrant-style payload filter), `memory_timeline`, `memory_profile`, `memory_relations`, `memory_smart_search`, `memory_export`, `memory_consolidate`, `memory_sessions`, `memory_set_block` / `memory_get_block` / `memory_list_blocks` (Letta), `templates_list`, `templates_scaffold`, `provider_chat`, `agent_call`, `agent_route`, `security_scan`, `permission_prompt`
 - HTTP transport hardens with `RTRT_MCP_HTTP_TOKEN` (environment-based constant-time bearer guard, 401 + `WWW-Authenticate`) and `--allowed-origins` (RFC 6454 Origin validation)
 - `rtrt-dashboard` (axum) — Project pages: Overview, Memory, Compression, Command, Statusline, Settings, Templates, Prompts, Diagnose, Security. Tools pages: LLM, Chat, Limits, Environment, Usage, Failover, Connect. Failover edits global policy only with no project selected; a selected project inherits it read-only until **Custom** writes an override, and **Follow global** removes that override. `RTRT_DASHBOARD_TOKEN` enables a bearer-token middleware on every `/api/*`
-- `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf / opencode
+- `rtrt setup --agent <name>` writes the MCP config for Claude / Cursor / Codex / Windsurf / opencode, and v0.2.4+ extends it to OmO native (see [docs/OMO_NATIVE.md](docs/OMO_NATIVE.md))
 - Versioned prompt registry under `~/.rtrt/prompts/<name>/<NNNN>.toml` (`rtrt prompt {save,get,list,versions}`)
 - [Details →](docs/FEATURES.md#mcp-and-dashboard)
 
@@ -231,6 +233,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for deep dives, including the rule-prot
 |----------|---------------|
 | [INSTALL.md](docs/INSTALL.md) | Install paths — source, pre-built GitHub Release binary, Homebrew tap, and uninstall |
 | [USAGE.md](docs/USAGE.md) | CLI reference, MCP tools, dashboard tour, configuration file |
+| [OMO_NATIVE.md](docs/OMO_NATIVE.md) | OmO native extension API integration (v0.2.4+ `setup --agent omo`) |
 | [FEATURES.md](docs/FEATURES.md) | Compression rules, filter strategy, memory schema, multi-provider routing, templates |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Workspace layout, crate boundaries, data flows |
 | [COMPARISON.md](docs/COMPARISON.md) | RTRT vs caveman / agentmemory / rtk / codex-plugin-cc |
@@ -279,6 +282,7 @@ CI runs the same three gates on every push and pull request to `main`.
 - [x] `rtrt-dashboard` axum UI — Project and Tools navigation, including scoped Failover policy editing; dark/light toggle; `RTRT_DASHBOARD_TOKEN` bearer guard
 - [x] `install.sh` + `install.ps1` one-liners + `release.yml` 5-target build matrix
 - [x] `rtrt setup --agent <name>` wires RTRT into Claude / Cursor / Codex / Windsurf / opencode
+- [x] `rtrt setup --agent omo` ships as the v0.2.4 setup target for the OmO native extension API (factory MCP discovery, codemode bash filtering, per-call provenance); see [docs/OMO_NATIVE.md](docs/OMO_NATIVE.md)
 - [x] criterion benchmark harness + per-fixture savings table + `rtrt benchmark` wrapper
 - [x] qdrant-style payload filter DSL (`source=claude,topic~^auth`) on `recall_bm25_with_filter`
 - [x] LLMLingua-style `MlCompressor` scaffold (heuristic backend; ONNX backend deferred)
